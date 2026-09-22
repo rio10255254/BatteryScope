@@ -1,0 +1,26 @@
+name: Windows build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure MSVC build
+        run: cmake -S . -B build -A x64
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Run tests
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Upload portable executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: BatteryScope-windows-x64
+          path: build/Release/BatteryScope.exe
+          if-no-files-found: error

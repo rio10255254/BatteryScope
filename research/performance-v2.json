@@ -1,0 +1,9 @@
+{
+  "version": "0.2.0",
+  "mode": "tray",
+  "elapsed_seconds": 30.02,
+  "cpu_percent_all_cores": 0.088,
+  "working_set_MiB": 15.64,
+  "private_memory_MiB": 2.84,
+  "handles": 187
+}

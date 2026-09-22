@@ -1,0 +1,25 @@
+# Build outputs
+/build/
+/dist/
+*.o
+*.obj
+*.exe
+*.dll
+*.pdb
+
+# Local captures and traces
+*.bmp
+*.etl
+research/e3-probe.xml
+research/e3-provider.txt
+research/diagnostic-v7-first.txt
+research/diagnostic-v7-run*.txt
+
+# IDE and generated files
+.vs/
+.vscode/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/

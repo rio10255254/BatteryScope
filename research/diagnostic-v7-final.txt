@@ -1,0 +1,27 @@
+BatteryScope live diagnostic
+battery_present=1
+ac_known=1
+on_ac=1
+battery_percent=100.000000
+battery_signed_discharge_watts=0.000000
+remaining_wh=58.783000
+processes=358
+inaccessible=209
+services_known=1
+measured_processes=358
+actionable_processes=134
+service_processes=163
+emi_channels=9
+energy_ready=1
+cpu_core_watts=5.918485
+cpu_package_watts=9.933791
+unassigned_cpu_watts=1.095275
+observed_cpu_coverage=0.81494
+timing_mismatch=0
+process_interval_seconds=2.125
+sample_skew_ms=8
+system_process_snapshot=1
+observation_quality=2
+process_snapshot_ms=5.5263
+estimated_processes=358
+attributed_cpu_watts=4.82321

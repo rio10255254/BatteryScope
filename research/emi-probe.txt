@@ -1,0 +1,27 @@
+device=0 version=2 metadata_bytes=174
+ unit=0 rail=RAPL_Package0_Core6_CORE
+device=1 version=2 metadata_bytes=280
+ unit=0 rail=RAPL_Package0_PKG
+ unit=0 rail=RAPL_Package0_Core0_CORE
+device=2 version=2 metadata_bytes=174
+ unit=0 rail=RAPL_Package0_Core4_CORE
+device=3 version=2 metadata_bytes=174
+ unit=0 rail=RAPL_Package0_Core7_CORE
+device=4 version=2 metadata_bytes=174
+ unit=0 rail=RAPL_Package0_Core1_CORE
+device=5 version=2 metadata_bytes=174
+ unit=0 rail=RAPL_Package0_Core2_CORE
+device=6 version=2 metadata_bytes=174
+ unit=0 rail=RAPL_Package0_Core5_CORE
+device=7 version=2 metadata_bytes=174
+ unit=0 rail=RAPL_Package0_Core3_CORE
+RAPL_Package0_Core6_CORE watts=0.31058 interval=2.0146 energy=10369370512500
+RAPL_Package0_PKG watts=5.02813 interval=2.01504 energy=173992735183333
+RAPL_Package0_Core0_CORE watts=0.0223022 interval=2.01504 energy=9241635616666
+RAPL_Package0_Core4_CORE watts=0.00644671 interval=2.01498 energy=6912809925000
+RAPL_Package0_Core7_CORE watts=0.144177 interval=2.01492 energy=8248040429166
+RAPL_Package0_Core1_CORE watts=0.0109363 interval=2.01485 energy=32997874850000
+RAPL_Package0_Core2_CORE watts=0.683632 interval=2.01494 energy=13573747312500
+RAPL_Package0_Core5_CORE watts=0.611397 interval=2.01493 energy=23521273929166
+RAPL_Package0_Core3_CORE watts=0.732749 interval=2.01605 energy=23010868591666
+readable_devices=8
