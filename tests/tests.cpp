@@ -1,5 +1,7 @@
 #include "../src/platform.h"
 #include "../src/energy.h"
+#include "../src/motion.h"
+#include "../src/i18n.h"
 #include <shellapi.h>
 #include <iostream>
 #include <stdexcept>
@@ -61,6 +63,50 @@ struct OwnedChild {
 int wmain(int argc, wchar_t** argv) {
     if (argc == 3 && std::wstring(argv[1]) == L"--child") return child(argv[2]);
     try {
+        Transition easing;
+        easing.move(100, 1000, 180);
+        check(easing.value(1000) == 0 && easing.velocity(1000) == 0, "motion starts at rest without a jump");
+        const double position = easing.value(1060), speed = easing.velocity(1060);
+        easing.move(200, 1060, 180);
+        check(std::abs(easing.value(1060) - position) < 1e-9 && std::abs(easing.velocity(1060) - speed) < 1e-9,
+            "same-direction scroll retarget preserves position and velocity");
+        bool monotonic = true; double previous = easing.value(1060);
+        for (int t = 1061; t <= 1240; ++t) { double v = easing.value(t); monotonic &= v >= previous && v <= 200; previous = v; }
+        check(monotonic && easing.velocity(1240) == 0 && easing.value(1240) == 200, "motion settles exactly without overshoot");
+        easing.move(300, 1300, 180); double reversal = easing.value(1380); easing.move(0, 1380, 180);
+        check(easing.value(1380) == reversal && easing.value(1381) < reversal, "scroll reversal immediately follows input without a jump");
+        easing.move(50, 1382, 0); check(easing.value(1382) == 50 && !easing.active(1382), "reduced motion resolves immediately");
+        english = true; check(std::wstring(tr(L"充電功率")) == L"Charging power", "charging strings are localized");
+        english = false; check(std::wstring(tr(L"充電功率")) == L"充電功率", "language switch returns to Chinese");
+        std::deque<PowerSample> charging;
+        for (uint64_t t = 0; t <= 60000; t += 10000) {
+            auto p = sample(t, -20); p.onAc = p.charging = true; p.remainingWh = 25 + t / 3600000.0 * 20;
+            charging.push_back(p);
+        }
+        auto charge = calculateCharging(charging);
+        check(nearlyEqual(charge.watts, 20) && nearlyEqual(charge.averageWatts, 20), "charging uses positive battery-side watts");
+        check(nearlyEqual(charge.hoursToFull, (50 - *charging.back().remainingWh) / 20) && nearlyEqual(charge.percentPerHour, 40), "stable charging predicts time and percentage-point rate");
+        check(!calculatePower(charging).currentWatts, "charging is never reported as whole-machine discharge");
+        auto modified = charging; modified.pop_back();
+        check(!calculateCharging(modified).hoursToFull, "charging ETA requires sixty continuous seconds");
+        modified = charging; modified.back().charging = false;
+        check(!calculateCharging(modified).watts && !calculateCharging(modified).hoursToFull, "plugged in without charging clears charging estimates");
+        modified = charging; modified.back().onAc = false;
+        check(!calculateCharging(modified).watts, "unplug clears charging measurements immediately");
+        modified = charging; modified.back().watts.reset();
+        check(!calculateCharging(modified).hoursToFull, "unknown charge rate cannot produce an ETA");
+        modified = charging; modified[3].watts.reset();
+        check(!calculateCharging(modified).hoursToFull, "missing sample breaks charging continuity");
+        modified = charging; modified.back().ms += 60000;
+        check(!calculateCharging(modified).hoursToFull, "sleep gap restarts charging warmup");
+        modified = charging; modified.back().remainingWh = 45;
+        check(!calculateCharging(modified).hoursToFull, "capacity recalibration invalidates charging ETA");
+        modified = charging; modified.back().watts = -2;
+        check(!calculateCharging(modified).hoursToFull, "sharp charge taper hides an unstable ETA");
+        modified = charging; for (auto& p : modified) { p.fullWh.reset(); p.remainingWh.reset(); }
+        check(!calculateCharging(modified).hoursToFull && calculateCharging(modified).watts.has_value(), "relative capacity retains watts but cannot predict time to full");
+        modified = charging; modified.back().remainingWh = 50;
+        check(!calculateCharging(modified).hoursToFull, "full battery has no future completion estimate");
         SamplingPolicy policy;
         check(policy.update(false, 1000, 2, 3) == 2, "foreground always samples at two seconds");
         check(policy.update(true, 2000, 2, 3) == 10, "background starts with responsive cadence");

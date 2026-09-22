@@ -19,6 +19,11 @@ struct PowerMetrics {
     bool estimated = false;
     double coverageSeconds = 0;
 };
+struct ChargingMetrics {
+    Value watts, averageWatts, percentPerHour, hoursToFull;
+    double coverageSeconds = 0;
+};
+ChargingMetrics calculateCharging(const std::deque<PowerSample>& history);
 bool sameDischargeSession(const PowerSample& a, const PowerSample& b);
 PowerMetrics calculatePower(const std::deque<PowerSample>& history);
 void appendPower(std::deque<PowerSample>& history, PowerSample sample);
