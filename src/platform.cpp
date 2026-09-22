@@ -248,6 +248,47 @@ bool setSamplerEcoQoS(bool enabled) {
 }
 
 namespace {
+// The Windows SDK intentionally exposes only a subset of
+// SYSTEM_PROCESS_INFORMATION in winternl.h.  NtQuerySystemInformation still
+// returns the stable, extended layout below on supported Windows versions.
+// Keep a private definition so both MSVC and MinGW read the same ABI.
+struct NativeProcessInformation {
+    ULONG nextEntryOffset;
+    ULONG numberOfThreads;
+    LARGE_INTEGER workingSetPrivateSize;
+    ULONG hardFaultCount;
+    ULONG numberOfThreadsHighWatermark;
+    ULONGLONG cycleTime;
+    LARGE_INTEGER createTime;
+    LARGE_INTEGER userTime;
+    LARGE_INTEGER kernelTime;
+    UNICODE_STRING imageName;
+    LONG basePriority;
+    HANDLE uniqueProcessId;
+    HANDLE inheritedFromUniqueProcessId;
+    ULONG handleCount;
+    ULONG sessionId;
+    ULONG_PTR uniqueProcessKey;
+    SIZE_T peakVirtualSize;
+    SIZE_T virtualSize;
+    ULONG pageFaultCount;
+    SIZE_T peakWorkingSetSize;
+    SIZE_T workingSetSize;
+    SIZE_T quotaPeakPagedPoolUsage;
+    SIZE_T quotaPagedPoolUsage;
+    SIZE_T quotaPeakNonPagedPoolUsage;
+    SIZE_T quotaNonPagedPoolUsage;
+    SIZE_T pagefileUsage;
+    SIZE_T peakPagefileUsage;
+    SIZE_T privatePageCount;
+    LARGE_INTEGER readOperationCount;
+    LARGE_INTEGER writeOperationCount;
+    LARGE_INTEGER otherOperationCount;
+    LARGE_INTEGER readTransferCount;
+    LARGE_INTEGER writeTransferCount;
+    LARGE_INTEGER otherTransferCount;
+};
+
 struct RawProcess {
     DWORD pid = 0;
     uint64_t created = 0, cpu = 0, io = 0;
@@ -289,30 +330,30 @@ bool systemProcessSnapshot(std::vector<RawProcess>& result, uint64_t& sampleMs, 
     const uintptr_t last = first + bytes.size();
     size_t offset = 0;
     for (;;) {
-        if (offset + sizeof(SYSTEM_PROCESS_INFORMATION) > bytes.size()) return false;
-        auto process = reinterpret_cast<const SYSTEM_PROCESS_INFORMATION*>(bytes.data() + offset);
-        const ULONG_PTR rawPid = reinterpret_cast<ULONG_PTR>(process->UniqueProcessId);
+        if (offset + sizeof(NativeProcessInformation) > bytes.size()) return false;
+        auto process = reinterpret_cast<const NativeProcessInformation*>(bytes.data() + offset);
+        const ULONG_PTR rawPid = reinterpret_cast<ULONG_PTR>(process->uniqueProcessId);
         if (rawPid && rawPid <= std::numeric_limits<DWORD>::max()) {
             RawProcess row;
             row.pid = DWORD(rawPid);
-            row.created = uint64_t(process->CreateTime.QuadPart);
-            row.cpu = uint64_t(process->KernelTime.QuadPart) + uint64_t(process->UserTime.QuadPart);
-            row.io = process->IoCounters.ReadTransferCount + process->IoCounters.WriteTransferCount;
+            row.created = uint64_t(process->createTime.QuadPart);
+            row.cpu = uint64_t(process->kernelTime.QuadPart) + uint64_t(process->userTime.QuadPart);
+            row.io = uint64_t(process->readTransferCount.QuadPart) + uint64_t(process->writeTransferCount.QuadPart);
             row.ioKnown = true;
             row.memoryKnown = true;
-            row.memoryMB = process->VirtualMemoryCounters.WorkingSetSize / 1048576.0;
-            if (process->ImageName.Buffer && process->ImageName.Length && !(process->ImageName.Length % sizeof(wchar_t))) {
-                const uintptr_t name = reinterpret_cast<uintptr_t>(process->ImageName.Buffer);
-                if (name >= first && name + process->ImageName.Length >= name && name + process->ImageName.Length <= last)
-                    row.name.assign(process->ImageName.Buffer, process->ImageName.Length / sizeof(wchar_t));
+            row.memoryMB = process->workingSetSize / 1048576.0;
+            if (process->imageName.Buffer && process->imageName.Length && !(process->imageName.Length % sizeof(wchar_t))) {
+                const uintptr_t name = reinterpret_cast<uintptr_t>(process->imageName.Buffer);
+                if (name >= first && name + process->imageName.Length >= name && name + process->imageName.Length <= last)
+                    row.name.assign(process->imageName.Buffer, process->imageName.Length / sizeof(wchar_t));
             }
             if (row.name.empty()) row.name = row.pid == 4 ? L"System" : L"PID " + std::to_wstring(row.pid);
             result.push_back(std::move(row));
         }
-        if (!process->NextEntryOffset) break;
-        if (process->NextEntryOffset < sizeof(SYSTEM_PROCESS_INFORMATION)
-            || offset + process->NextEntryOffset <= offset || offset + process->NextEntryOffset >= bytes.size()) return false;
-        offset += process->NextEntryOffset;
+        if (!process->nextEntryOffset) break;
+        if (process->nextEntryOffset < sizeof(NativeProcessInformation)
+            || offset + process->nextEntryOffset <= offset || offset + process->nextEntryOffset >= bytes.size()) return false;
+        offset += process->nextEntryOffset;
     }
     return !result.empty();
 }
