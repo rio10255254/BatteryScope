@@ -1,5 +1,9 @@
 # BatteryScope 驗證紀錄
 
+## 0.9.1：節能工具與人工檢查候選
+
+以 Windows 公開的 `SYSTEM_POWER_STATUS.SystemStatusFlag` 讀取系統回報的節能狀態，提供官方 `ms-settings:batterysaver-settings` 設定頁捷徑；沒有以未公開呼叫直接切換 Windows「節能工具」。候選演算法只在 CPU 能源觀測足夠時，排除服務、可見視窗程序、可見應用程式的子程序及資料不足者，列出值得人工檢查的持續耗能背景程序。測試覆蓋前景子程序、PID 重用、服務及觀測不足情況；不將候選視為安全關閉或保證省電。
+
 ## 0.9.0：一鍵省電
 
 使用 Windows 11 `PowerGetUserConfiguredDCPowerMode` / `PowerSetUserConfiguredDCPowerMode` 切換電池供電時的最佳效率模式。切換前儲存原模式；還原時只在目前仍為最佳效率且留有原模式的情況下操作。示範與 UI 測試停用此按鈕，不更動真實電源模式。此功能不會批次終止程序或停止服務，也不宣稱等同 Windows「節能工具」。

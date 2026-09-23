@@ -1,4 +1,5 @@
 #include "model.h"
+#include <unordered_map>
 
 namespace bs {
 ChargingMetrics calculateCharging(const std::deque<PowerSample>& h) {
@@ -124,5 +125,36 @@ double cpuPercent(uint64_t before, uint64_t after, double seconds, unsigned proc
 }
 double smooth(double previous, double current, double seconds) {
     return previous + (current - previous) * (1 - std::exp(-std::max(seconds, 0.0) / 30));
+}
+std::vector<size_t> reviewCandidates(const Snapshot& state, size_t limit) {
+    std::vector<size_t> result;
+    if (!limit || !state.energy.ready || state.energy.timingMismatch || state.energy.observedCpuCoverage < .75)
+        return result;
+    std::unordered_map<uint32_t, const ProcessRow*> byPid;
+    byPid.reserve(state.processes.size());
+    for (const auto& row : state.processes) byPid[row.pid] = &row;
+    for (size_t i = 0; i < state.processes.size(); ++i) {
+        const auto& row = state.processes[i];
+        if (!row.actionable || row.window || !row.services.empty() || !row.measured || row.path.empty() ||
+            row.busySeconds < 60 || !row.averageCpuWatts || !std::isfinite(*row.averageCpuWatts) ||
+            *row.averageCpuWatts < .5) continue;
+        bool linkedToForegroundOrService = false;
+        uint32_t parentPid = row.parentPid;
+        for (unsigned depth = 0; parentPid && depth < 8; ++depth) {
+            auto found = byPid.find(parentPid);
+            if (found == byPid.end() || found->second->pid == row.pid) break;
+            const auto& parent = *found->second;
+            if (row.created && parent.created && parent.created > row.created) break; // PID reuse.
+            if (parent.window || !parent.services.empty()) { linkedToForegroundOrService = true; break; }
+            if (parent.parentPid == parent.pid) break;
+            parentPid = parent.parentPid;
+        }
+        if (!linkedToForegroundOrService) result.push_back(i);
+    }
+    std::sort(result.begin(), result.end(), [&](size_t a, size_t b) {
+        return *state.processes[a].averageCpuWatts > *state.processes[b].averageCpuWatts;
+    });
+    if (result.size() > limit) result.resize(limit);
+    return result;
 }
 }

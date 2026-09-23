@@ -236,6 +236,22 @@ int wmain(int argc, wchar_t** argv) {
             "twenty second adaptive sampling integrates elapsed energy correctly");
         check(nearlyEqual(energyRows[0].cpuWatts.value_or(0) + energyRows[1].cpuWatts.value_or(0) + report.unassignedCpuWatts.value_or(0), 5),
             "slow cadence conserves the measured core energy budget");
+        Snapshot opportunity; opportunity.energy.ready = true; opportunity.energy.observedCpuCoverage = .9;
+        ProcessRow foreground; foreground.pid = 20; foreground.created = 10; foreground.window = true;
+        ProcessRow helper; helper.pid = 21; helper.parentPid = 20; helper.created = 20; helper.actionable = helper.measured = true;
+        helper.path = L"C:\\Apps\\Helper.exe"; helper.busySeconds = 90; helper.averageCpuWatts = 1.5;
+        ProcessRow independent = helper; independent.pid = 22; independent.parentPid = 0; independent.averageCpuWatts = .8;
+        opportunity.processes = {foreground, helper, independent};
+        auto suggestions = reviewCandidates(opportunity);
+        check(suggestions.size() == 1 && suggestions.front() == 2,
+            "review candidates exclude helpers of visible apps");
+        opportunity.processes[0].created = 30;
+        check(reviewCandidates(opportunity).size() == 2, "reused parent PID does not hide independent background work");
+        opportunity.processes[0].created = 10;
+        opportunity.processes[2].services.push_back({L"test", L"Test", 22, false, false});
+        check(reviewCandidates(opportunity).empty(), "services are never suggested for background review");
+        opportunity.processes[2].services.clear(); opportunity.energy.observedCpuCoverage = .5;
+        check(reviewCandidates(opportunity).empty(), "low observation coverage suppresses suggestions");
         Collector cachedCollector;
         size_t total = 0, inaccessible = 0;
         auto warmRows = cachedCollector.collect(total, inaccessible);

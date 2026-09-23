@@ -12,6 +12,7 @@ using Value = std::optional<double>;
 struct PowerSample {
     uint64_t ms = 0;
     bool present = false, acKnown = false, onAc = false, charging = false;
+    bool saverKnown = false, saverOn = false;
     Value percent, remainingWh, fullWh, watts; // Positive = discharge; negative = charge.
 };
 struct PowerMetrics {
@@ -37,6 +38,7 @@ struct ServiceInfo {
 };
 struct ProcessRow {
     uint32_t pid = 0;
+    uint32_t parentPid = 0;
     uint64_t created = 0;
     std::wstring name, path, kind, reason;
     double cpu = 0, averageCpu = 0, ioMB = 0, averageIo = 0, memoryMB = 0, score = 0;
@@ -78,6 +80,8 @@ struct Snapshot {
     unsigned samplingSeconds = 2;
     bool samplerEcoQoS = false;
 };
+// Review candidates are opportunities to inspect, never a safety verdict or automatic action list.
+std::vector<size_t> reviewCandidates(const Snapshot& state, size_t limit = 5);
 // Conservative cadence: never exceed the energy model's 30 second continuity limit.
 class SamplingPolicy {
     uint64_t quietSince_ = 0, lastMs_ = 0;

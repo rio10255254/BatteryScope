@@ -106,6 +106,8 @@ PowerSample readPower() {
     p.ms = GetTickCount64();
     SYSTEM_POWER_STATUS system{};
     if (GetSystemPowerStatus(&system)) {
+        p.saverKnown = system.SystemStatusFlag <= 1;
+        p.saverOn = system.SystemStatusFlag == 1;
         p.acKnown = system.ACLineStatus != 255;
         p.onAc = system.ACLineStatus == 1;
         p.present = system.BatteryFlag != 255 && !(system.BatteryFlag & 128);
@@ -371,6 +373,7 @@ struct NativeProcessInformation {
 
 struct RawProcess {
     DWORD pid = 0;
+    DWORD parentPid = 0;
     uint64_t created = 0, cpu = 0, io = 0;
     std::wstring name;
     double memoryMB = 0;
@@ -417,6 +420,8 @@ bool systemProcessSnapshot(std::vector<RawProcess>& result, uint64_t& sampleMs, 
         if (rawPid && rawPid <= std::numeric_limits<DWORD>::max()) {
             RawProcess row;
             row.pid = DWORD(rawPid);
+            const ULONG_PTR parent = reinterpret_cast<ULONG_PTR>(process->inheritedFromUniqueProcessId);
+            if (parent <= std::numeric_limits<DWORD>::max()) row.parentPid = DWORD(parent);
             row.created = uint64_t(process->createTime.QuadPart);
             row.cpu = uint64_t(process->kernelTime.QuadPart) + uint64_t(process->userTime.QuadPart);
             row.cpuKnown = true;
@@ -453,7 +458,7 @@ bool toolhelpProcessSnapshot(std::vector<RawProcess>& result, size_t& total,
         Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID));
         FILETIME c{}, e{}, k{}, u{};
         RawProcess row;
-        row.pid = entry.th32ProcessID; row.name = entry.szExeFile;
+        row.pid = entry.th32ProcessID; row.parentPid = entry.th32ParentProcessID; row.name = entry.szExeFile;
         row.cpuKnown = process && GetProcessTimes(process, &c, &e, &k, &u);
         if (row.cpuKnown) {
             row.created = fileTime(c);
@@ -501,7 +506,7 @@ std::vector<ProcessRow> Collector::collect(size_t& total, size_t& inaccessible, 
     std::map<DWORD, Metadata> nextMetadata;
     const unsigned processors = std::max<DWORD>(1, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
     for (const auto& source : raw) {
-        ProcessRow row; row.pid = source.pid; row.name = source.name;
+        ProcessRow row; row.pid = source.pid; row.parentPid = source.parentPid; row.name = source.name;
         row.services = serviceMap[row.pid]; row.window = visible.count(row.pid) != 0;
         row.kind = row.pid <= 4 ? L"Windows 核心" : !row.services.empty() ? L"服務" : row.window ? L"應用程式" : L"背景程序";
         row.created = source.created;

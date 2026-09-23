@@ -22,7 +22,8 @@ using namespace bs;
 constexpr UINT SampleMessage = WM_APP + 1, TrayMessage = WM_APP + 2, ActionMessage = WM_APP + 3, RefreshMessage = WM_APP + 4;
 constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, DetailsId = 104,
     BackgroundId = 105, AllId = 106, StartupId = 107, HideId = 108, MenuId = 109,
-    LanguageZhId = 110, LanguageEnId = 111, PowerDetailsId = 112, SaverModeId = 113, TrayShow = 200, TrayExit = 201;
+    LanguageZhId = 110, LanguageEnId = 111, PowerDetailsId = 112, SaverModeId = 113,
+    EnergySaverSettingsId = 114, ReviewCandidatesId = 115, TrayShow = 200, TrayExit = 201;
 const wchar_t* ClassName = L"BatteryScope.Main.v1";
 const COLORREF Ink = RGB(235, 242, 246), Muted = RGB(146, 161, 174), Green = RGB(104, 225, 188),
     Background = RGB(15, 20, 27), Surface = RGB(24, 32, 42), Border = RGB(41, 53, 65),
@@ -616,6 +617,7 @@ void showPowerDetails() {
     PowerSample p; if (!current.history.empty()) p = current.history.back();
     const auto charge = calculateCharging(current.history);
     std::wstring text = tr(L"電源狀態：") + std::wstring(!p.acKnown ? tr(L"未知") : p.onAc ? tr(L"外部電源") : tr(L"電池供電"));
+    text += tr(L"\nWindows 節能狀態：") + std::wstring(!p.saverKnown ? tr(L"未知") : p.saverOn ? tr(L"已啟用") : tr(L"未啟用"));
     text += tr(L"\n接頭類型：未提供（圓孔／USB-C 無法確認）");
     text += tr(L"\n\n電池端充電功率：") + valueText(charge.watts, L" W") +
         tr(L"\n近 2 分鐘充電平均：") + valueText(charge.averageWatts, L" W") +
@@ -625,6 +627,19 @@ void showPowerDetails() {
     text += tr(L"\n充滿時間需至少 60 秒連續穩定充電資料。接近滿電時會減速；電池保護上限也可能讓充電提前停止，因此不是保證時間。");
     text += tr(L"\n\nWindows 通用電源資訊只回報是否接上外部電源，不能區分圓孔變壓器與 USB-C。偵測到 USB-C 控制器也不能證明目前由它供電。");
     MessageBoxW(mainWindow, text.c_str(), tr(L"電池與充電詳情"), MB_OK | MB_ICONINFORMATION);
+    releaseInteraction();
+}
+void showReviewCandidates() {
+    const auto candidates = reviewCandidates(current);
+    std::wstring content = tr(L"依持續 CPU 活動、可讀身分與前景／服務關聯，列出值得檢查的背景程序。這不是安全關閉判定，也不是關閉後可省電量。\n");
+    if (candidates.empty()) content += tr(L"\n目前沒有符合條件的候選，或觀測資料尚不足。\n");
+    for (size_t index : candidates) {
+        const auto& row = current.processes[index];
+        content += L"\n• " + row.name + L" · PID " + std::to_wstring(row.pid) + L" · " +
+            valueText(row.averageCpuWatts, L" CPU W", 2) + L" · " + std::to_wstring(int(row.busySeconds)) + tr(L" 秒持續活動");
+    }
+    content += tr(L"\n\n可能有同步、下載、音訊、未儲存資料或其他程序依賴。請先查看詳情；程式不會自動休眠或關閉候選。" );
+    MessageBoxW(mainWindow, content.c_str(), tr(L"節能候選 · 需人工判斷"), MB_OK | MB_ICONINFORMATION);
     releaseInteraction();
 }
 bool startupEnabled() {
@@ -896,6 +911,8 @@ void openMenu(POINT point) {
     AppendMenuW(languages, MF_STRING | (english ? MF_CHECKED : 0), LanguageEnId, L"English");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(languages), tr(L"語言 / Language"));
     AppendMenuW(menu, MF_STRING, PowerDetailsId, tr(L"電池與充電詳情"));
+    AppendMenuW(menu, MF_STRING | ((demo || isolatedPreview) ? MF_GRAYED : 0), EnergySaverSettingsId, tr(L"Windows 節能設定…"));
+    AppendMenuW(menu, MF_STRING, ReviewCandidatesId, tr(L"查看節能候選…"));
     const auto saver = querySaverMode();
     const bool saverActionable = !demo && !isolatedPreview && !saver.error && (!saver.efficient || saver.restorable);
     AppendMenuW(menu, MF_STRING | (saverActionable ? 0 : MF_GRAYED) | (saver.efficient ? MF_CHECKED : 0),
@@ -912,7 +929,7 @@ void openMenu(POINT point) {
 void applyLanguage(bool useEnglish) {
     english = useEnglish;
     makeFonts();
-    SetWindowTextW(mainWindow, L"BatteryScope 0.9.0");
+    SetWindowTextW(mainWindow, L"BatteryScope 0.9.1");
     const std::pair<HWND, const wchar_t*> labels[] = {{closeButton, tr(L"正常關閉")}, {killButton, tr(L"強制結束…")},
         {serviceButton, tr(L"停止服務…")}, {detailsButton, tr(L"查看詳情")}, {menuButton, tr(L"設定")}, {hideButton, tr(L"收回")}};
     for (auto pair : labels)
@@ -942,7 +959,7 @@ bool saveLanguage() {
 std::wstring controlTip(HWND control) {
     if (control == saverButton) return tr(L"切換電池供電時的最佳效率模式；可還原原本設定，不會結束程序。這不是 Windows 節能工具開關。");
     if (control == hideButton) return tr(L"收回面板（Esc），背景監測持續運作");
-    if (control == menuButton) return tr(L"設定：一鍵省電、語言、充電詳情、登入時啟動");
+    if (control == menuButton) return tr(L"設定：Windows 節能設定、節能候選、語言與充電詳情");
     if (control == backgroundCheck) return tr(L"只列出沒有可見視窗的程序與服務");
     if (control == allCheck) return tr(L"切換前 10 名與全部程序；滾輪可捲動");
     if (control == detailsButton) return tr(L"查看完整名稱、路徑、耗電範圍與操作限制（Enter）");
@@ -1071,6 +1088,15 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (id == PowerDetailsId) { showPowerDetails(); return 0; }
+        if (id == EnergySaverSettingsId) {
+            if (demo || isolatedPreview) return 0;
+            auto opened = ShellExecuteW(window, L"open", L"ms-settings:batterysaver-settings", nullptr, nullptr, SW_SHOWNORMAL);
+            if (reinterpret_cast<INT_PTR>(opened) <= 32)
+                opened = ShellExecuteW(window, L"open", L"ms-settings:powersleep", nullptr, nullptr, SW_SHOWNORMAL);
+            if (reinterpret_cast<INT_PTR>(opened) <= 32) setNotice(tr(L"無法開啟 Windows 節能設定。"));
+            return 0;
+        }
+        if (id == ReviewCandidatesId) { showReviewCandidates(); return 0; }
         if (id == SaverModeId) {
             if (demo || isolatedPreview) return 0;
             const auto before = querySaverMode();
@@ -1511,7 +1537,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &monitor);
     int initialWidth = std::min(bounds.right, monitor.rcWork.right - monitor.rcWork.left - px(20));
     int initialHeight = std::min(bounds.bottom, monitor.rcWork.bottom - monitor.rcWork.top - px(20));
-    HWND window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, ClassName, L"BatteryScope 0.9.0", WS_POPUP | WS_CLIPCHILDREN,
+    HWND window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, ClassName, L"BatteryScope 0.9.1", WS_POPUP | WS_CLIPCHILDREN,
         monitor.rcWork.right - initialWidth - px(10), monitor.rcWork.bottom - initialHeight - px(10), initialWidth, initialHeight, nullptr, nullptr, instance, nullptr);
     if (!window) return 3;
     SetLayeredWindowAttributes(window, 0, 255, LWA_ALPHA);
