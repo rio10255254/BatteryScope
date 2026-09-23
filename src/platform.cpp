@@ -122,8 +122,14 @@ std::vector<ServiceInfo> readServices(bool& ok) {
                 bool(r.ServiceStatusProcess.dwServiceType & SERVICE_WIN32_SHARE_PROCESS)});
         }
         if (success) { ok = true; break; }
-        if (error != ERROR_MORE_DATA || count == 0) break;
+        if (error != ERROR_MORE_DATA) break;
+        if (count == 0) {
+            if (needed <= buffer.size() || needed > 4 * 1024 * 1024) break;
+            buffer.resize(needed);
+        }
     }
+    // A partial SCM page must not be mistaken for the complete service map.
+    if (!ok) result.clear();
     return result;
 }
 static std::wstring lower(std::wstring s) {
@@ -294,6 +300,7 @@ struct RawProcess {
     uint64_t created = 0, cpu = 0, io = 0;
     std::wstring name;
     double memoryMB = 0;
+    bool cpuKnown = false;
     bool ioKnown = false, memoryKnown = false;
 };
 
@@ -338,6 +345,7 @@ bool systemProcessSnapshot(std::vector<RawProcess>& result, uint64_t& sampleMs, 
             row.pid = DWORD(rawPid);
             row.created = uint64_t(process->createTime.QuadPart);
             row.cpu = uint64_t(process->kernelTime.QuadPart) + uint64_t(process->userTime.QuadPart);
+            row.cpuKnown = true;
             row.io = uint64_t(process->readTransferCount.QuadPart) + uint64_t(process->writeTransferCount.QuadPart);
             row.ioKnown = true;
             row.memoryKnown = true;
@@ -358,7 +366,7 @@ bool systemProcessSnapshot(std::vector<RawProcess>& result, uint64_t& sampleMs, 
     return !result.empty();
 }
 
-bool toolhelpProcessSnapshot(std::vector<RawProcess>& result, size_t& total, size_t& inaccessible,
+bool toolhelpProcessSnapshot(std::vector<RawProcess>& result, size_t& total,
     uint64_t& sampleMs, double& durationMs, CollectionWork& work) {
     const uint64_t begin = GetTickCount64();
     Handle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
@@ -370,16 +378,19 @@ bool toolhelpProcessSnapshot(std::vector<RawProcess>& result, size_t& total, siz
         ++work.processOpens;
         Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID));
         FILETIME c{}, e{}, k{}, u{};
-        if (!process || !GetProcessTimes(process, &c, &e, &k, &u)) { ++inaccessible; continue; }
         RawProcess row;
-        row.pid = entry.th32ProcessID; row.name = entry.szExeFile; row.created = fileTime(c);
-        row.cpu = fileTime(k) + fileTime(u);
-        IO_COUNTERS io{};
-        row.ioKnown = GetProcessIoCounters(process, &io) != FALSE;
-        row.io = io.ReadTransferCount + io.WriteTransferCount;
-        PROCESS_MEMORY_COUNTERS_EX memory{}; memory.cb = sizeof(memory); ++work.memory;
-        row.memoryKnown = GetProcessMemoryInfo(process, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory), sizeof(memory));
-        row.memoryMB = memory.WorkingSetSize / 1048576.0;
+        row.pid = entry.th32ProcessID; row.name = entry.szExeFile;
+        row.cpuKnown = process && GetProcessTimes(process, &c, &e, &k, &u);
+        if (row.cpuKnown) {
+            row.created = fileTime(c);
+            row.cpu = fileTime(k) + fileTime(u);
+            IO_COUNTERS io{};
+            row.ioKnown = GetProcessIoCounters(process, &io) != FALSE;
+            row.io = io.ReadTransferCount + io.WriteTransferCount;
+            PROCESS_MEMORY_COUNTERS_EX memory{}; memory.cb = sizeof(memory); ++work.memory;
+            row.memoryKnown = GetProcessMemoryInfo(process, reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&memory), sizeof(memory));
+            row.memoryMB = memory.WorkingSetSize / 1048576.0;
+        }
         result.push_back(std::move(row));
     } while (Process32NextW(snapshot, &entry));
     const uint64_t end = GetTickCount64();
@@ -394,9 +405,12 @@ std::vector<ProcessRow> Collector::collect(size_t& total, size_t& inaccessible, 
     work_ = {};
     total = inaccessible = 0;
     std::vector<RawProcess> raw;
-    systemSnapshot_ = systemProcessSnapshot(raw, sampleMs_, snapshotDurationMs_);
+    systemSnapshot_ = !forceToolhelp_ && systemProcessSnapshot(raw, sampleMs_, snapshotDurationMs_);
     if (systemSnapshot_) total = raw.size();
-    else if (!toolhelpProcessSnapshot(raw, total, inaccessible, sampleMs_, snapshotDurationMs_, work_)) return {};
+    else {
+        raw.clear(); // A failed native parse may already have appended some entries.
+        if (!toolhelpProcessSnapshot(raw, total, sampleMs_, snapshotDurationMs_, work_)) return {};
+    }
     intervalSeconds_ = previousSampleMs_ && sampleMs_ > previousSampleMs_ && sampleMs_ - previousSampleMs_ <= 30000
         ? (sampleMs_ - previousSampleMs_) / 1000.0 : 0;
     previousSampleMs_ = sampleMs_;
@@ -449,7 +463,7 @@ std::vector<ProcessRow> Collector::collect(size_t& total, size_t& inaccessible, 
         if (!meta.readable) ++inaccessible;
         nextMetadata[row.pid] = std::move(meta);
         auto old = previous_.find(row.pid);
-        if (old != previous_.end() && old->second.created == row.created) {
+        if (source.cpuKnown && old != previous_.end() && old->second.created == row.created) {
             auto& p = old->second;
             const double dt = (now - p.ms) / 1000.0;
             if (dt > 0 && dt <= 30) {
@@ -465,7 +479,8 @@ std::vector<ProcessRow> Collector::collect(size_t& total, size_t& inaccessible, 
             }
         }
         next[row.pid] = {row.created, cpu, ioBytes, now, row.averageCpu, row.averageIo, row.busySeconds, rawIoKnown};
-        if (!row.measured) row.reason = L"採集中";
+        if (!source.cpuKnown) row.reason = L"統計受限";
+        else if (!row.measured) row.reason = L"採集中";
         else if (row.averageCpu < .1 && row.averageIo < .1) row.reason = L"活動低";
         else {
             row.reason = row.averageCpu >= row.averageIo * 2 ? L"CPU 活動" : L"I/O 活動";

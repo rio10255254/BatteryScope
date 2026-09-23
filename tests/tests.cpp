@@ -5,6 +5,7 @@
 #include <shellapi.h>
 #include <iostream>
 #include <stdexcept>
+#include <set>
 
 using namespace bs;
 unsigned passed = 0;
@@ -237,6 +238,14 @@ int wmain(int argc, wchar_t** argv) {
             "warm metadata cache removes repeated queries");
         cachedCollector.reset(); cachedCollector.collect(total, inaccessible);
         check(cachedCollector.work().paths > 0 && cachedCollector.work().processOpens > 0, "resume reset invalidates metadata cache");
+        Collector fallbackCollector(true, true);
+        auto fallbackRows = fallbackCollector.collect(total, inaccessible);
+        std::set<DWORD> fallbackPids;
+        for (const auto& row : fallbackRows) fallbackPids.insert(row.pid);
+        check(!fallbackCollector.systemSnapshot() && fallbackPids.size() == fallbackRows.size() &&
+            fallbackPids.count(GetCurrentProcessId()) && fallbackPids.count(4),
+            "fallback snapshot retains distinct running processes including protected PID 4");
+        check(total >= fallbackRows.size(), "fallback never loses a counted process except idle PID 0");
         check(!safeProcess(GetCurrentProcess(), GetCurrentProcessId()), "refuse to terminate self");
         check(stopService(L"RpcSs", 1, 1) == ERROR_ACCESS_DISABLED_BY_POLICY, "critical service blocked before SCM access");
         check(stopService(L"", 0, 0) == ERROR_INVALID_PARAMETER, "malformed service command rejected");

@@ -46,6 +46,7 @@ class Collector {
     };
     std::map<DWORD, Metadata> metadata_;
     bool cacheEnabled_;
+    bool forceToolhelp_;
     CollectionWork work_;
     std::vector<ServiceInfo> services_;
     bool servicesKnown_ = false;
@@ -54,7 +55,8 @@ class Collector {
     double intervalSeconds_ = 0, snapshotDurationMs_ = 0;
     bool systemSnapshot_ = false;
 public:
-    explicit Collector(bool cacheEnabled = true) : cacheEnabled_(cacheEnabled) {}
+    explicit Collector(bool cacheEnabled = true, bool forceToolhelp = false)
+        : cacheEnabled_(cacheEnabled), forceToolhelp_(forceToolhelp) {}
     std::vector<ProcessRow> collect(size_t& total, size_t& inaccessible, bool background = false);
     const CollectionWork& work() const { return work_; }
     uint64_t sampleMs() const { return sampleMs_; }

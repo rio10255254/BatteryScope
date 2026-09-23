@@ -122,6 +122,7 @@ inline const std::map<std::wstring_view, const wchar_t*> translations = {
     {L"收回", L"Hide"},
     {L"僅背景：開", L"Background: on"},
     {L"僅背景：關", L"Background: off"},
+    {L"統計受限", L"Statistics unavailable"},
     {L"顯示：全部程序", L"Show: all"},
     {L"顯示：前 10 名", L"Show: top 10"},
     {L"收回面板（Esc），背景監測持續運作", L"Hide panel (Esc). Background monitoring continues."},
