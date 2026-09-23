@@ -30,7 +30,8 @@ const COLORREF Ink = RGB(235, 242, 246), Muted = RGB(146, 161, 174), Green = RGB
 HWND mainWindow = nullptr, viewport = nullptr, list = nullptr, closeButton = nullptr, killButton = nullptr, serviceButton = nullptr,
     detailsButton = nullptr, backgroundCheck = nullptr, allCheck = nullptr, hideButton = nullptr, menuButton = nullptr;
 HFONT normalFont = nullptr, smallFont = nullptr, titleFont = nullptr, valueFont = nullptr, metricFont = nullptr;
-HICON appIcon = nullptr;
+HICON appIcon = nullptr, smallIcon = nullptr;
+bool updateTray(bool add);
 UINT dpi = 96, taskbarCreated = 0;
 std::atomic<bool> quit{false}, hidden{false}, resetSamples{false};
 std::mutex mailboxMutex, wakeMutex;
@@ -145,25 +146,27 @@ void makeFonts() {
     for (auto window : {list, closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck, hideButton, menuButton, tooltip})
         if (window) SendMessageW(window, WM_SETFONT, reinterpret_cast<WPARAM>(normalFont), TRUE);
 }
-HICON makeIcon() {
-    HDC screen = GetDC(nullptr), dc = CreateCompatibleDC(screen);
-    HBITMAP color = CreateCompatibleBitmap(screen, 32, 32), mask = CreateBitmap(32, 32, 1, 1, nullptr);
-    HGDIOBJ old = SelectObject(dc, color);
-    fill(dc, {0, 0, 32, 32}, Background);
-    fill(dc, {5, 9, 25, 23}, Green);
-    fill(dc, {25, 13, 28, 19}, Green);
-    fill(dc, {7, 11, 23, 21}, Background);
-    fill(dc, {9, 13, 19, 19}, Green);
-    SelectObject(dc, mask); PatBlt(dc, 0, 0, 32, 32, BLACKNESS);
-    SelectObject(dc, old);
-    ICONINFO info{TRUE, 0, 0, mask, color};
-    HICON icon = CreateIconIndirect(&info);
-    DeleteObject(color); DeleteObject(mask); DeleteDC(dc); ReleaseDC(nullptr, screen); return icon;
+bool refreshIcons() {
+    HINSTANCE module = GetModuleHandleW(nullptr);
+    HICON large = static_cast<HICON>(LoadImageW(module, MAKEINTRESOURCEW(101), IMAGE_ICON,
+        GetSystemMetricsForDpi(SM_CXICON, dpi), GetSystemMetricsForDpi(SM_CYICON, dpi), LR_DEFAULTCOLOR));
+    HICON small = static_cast<HICON>(LoadImageW(module, MAKEINTRESOURCEW(101), IMAGE_ICON,
+        GetSystemMetricsForDpi(SM_CXSMICON, dpi), GetSystemMetricsForDpi(SM_CYSMICON, dpi), LR_DEFAULTCOLOR));
+    if (!large || !small) { if (large) DestroyIcon(large); if (small) DestroyIcon(small); return false; }
+    SendMessageW(mainWindow, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(large));
+    SendMessageW(mainWindow, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small));
+    HICON oldLarge = appIcon, oldSmall = smallIcon;
+    appIcon = large; smallIcon = small;
+    // Replace the shell's copy before releasing the old handles.
+    if (trayAdded) updateTray(false);
+    if (oldLarge) DestroyIcon(oldLarge);
+    if (oldSmall) DestroyIcon(oldSmall);
+    return true;
 }
 bool updateTray(bool add) {
     if (isolatedPreview) return false;
     NOTIFYICONDATAW data{}; data.cbSize = sizeof(data); data.hWnd = mainWindow; data.uID = 1;
-    data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP; data.uCallbackMessage = TrayMessage; data.hIcon = appIcon;
+    data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP; data.uCallbackMessage = TrayMessage; data.hIcon = smallIcon;
     std::wstring text = L"BatteryScope";
     if (!current.history.empty()) {
         const auto& p = current.history.back();
@@ -222,14 +225,15 @@ void stepMotion(double now) {
         if (!active && !panelTargetShown) ShowWindow(mainWindow, SW_HIDE);
         appliedPanelProgress = progress;
     }
-    bool rowsActive = false;
+    bool rowsActive = false, rowsDirty = false;
     for (auto& row : rowMotions) for (auto* motion : {&row.bar, &row.hover, &row.selected}) {
         if (motion->duration) {
-            rowsActive = true;
+            rowsDirty = true;
+            rowsActive |= motion->active(now);
             if (!motion->active(now)) motion->duration = 0;
         }
     }
-    if (!hidden && rowsActive) InvalidateRect(list, nullptr, FALSE);
+    if (!hidden && rowsDirty) InvalidateRect(list, nullptr, FALSE);
     active |= !hidden && rowsActive;
     for (auto& item : buttonMotions) {
         if (item.second.duration) {
@@ -891,7 +895,7 @@ void openMenu(POINT point) {
 void applyLanguage(bool useEnglish) {
     english = useEnglish;
     makeFonts();
-    SetWindowTextW(mainWindow, L"BatteryScope 0.8");
+    SetWindowTextW(mainWindow, L"BatteryScope 0.8.1");
     const std::pair<HWND, const wchar_t*> labels[] = {{closeButton, tr(L"正常關閉")}, {killButton, tr(L"強制結束…")},
         {serviceButton, tr(L"停止服務…")}, {detailsButton, tr(L"查看詳情")}, {menuButton, tr(L"設定")}, {hideButton, tr(L"收回")}};
     for (auto pair : labels)
@@ -934,6 +938,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_CREATE: {
         mainWindow = window;
         dpi = GetDpiForWindow(window);
+        if (!refreshIcons()) return -1;
         readMotionPreference();
         viewport = CreateWindowExW(WS_EX_CONTROLPARENT, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_VSCROLL,
             0, 0, 0, 0, window, nullptr, nullptr, nullptr);
@@ -991,7 +996,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     }
     case WM_DPICHANGED: {
         scrollPosition = scrollPosition * HIWORD(wp) / dpi;
-        dpi = HIWORD(wp); makeFonts(); auto r = reinterpret_cast<RECT*>(lp);
+        dpi = HIWORD(wp); refreshIcons(); makeFonts(); auto r = reinterpret_cast<RECT*>(lp);
         SetWindowPos(window, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
         SetWindowPos(list, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         layout(); return 0;
@@ -1220,6 +1225,33 @@ int diagnostic(const std::wstring& path) {
 bool panelSelfTest(const std::wstring& path) {
     std::ofstream out{std::filesystem::path(path)}; bool ok = true;
     auto check = [&](const char* name, bool result) { out << name << "=" << (result ? "PASS" : "FAIL") << "\n"; ok &= result; };
+    check("executable_contains_shell_icon", ExtractIconExW(executablePath().c_str(), -1, nullptr, nullptr, 0) == 1);
+    bool sizesOK = true;
+    for (int size : {16,20,24,32,40,48,64,128,256}) {
+        HICON icon = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(101), IMAGE_ICON, size, size, LR_DEFAULTCOLOR));
+        ICONINFO info{}; BITMAP bitmap{};
+        const bool read = icon && GetIconInfo(icon, &info);
+        sizesOK &= read && GetObjectW(info.hbmColor, sizeof(bitmap), &bitmap) && bitmap.bmWidth == size && bitmap.bmHeight == size;
+        if (info.hbmColor) DeleteObject(info.hbmColor);
+        if (info.hbmMask) DeleteObject(info.hbmMask);
+        if (icon) DestroyIcon(icon);
+    }
+    check("all_nine_icon_sizes_load", sizesOK);
+    const UINT actualDpi = dpi;
+    bool dpiIconsOK = true;
+    for (UINT testDpi : {96u,120u,144u,192u}) {
+        dpi = testDpi;
+        dpiIconsOK &= refreshIcons();
+        ICONINFO info{}; BITMAP bitmap{};
+        const bool read = GetIconInfo(smallIcon, &info) != FALSE;
+        dpiIconsOK &= read && GetObjectW(info.hbmColor, sizeof(bitmap), &bitmap) && bitmap.bmWidth == GetSystemMetricsForDpi(SM_CXSMICON, dpi);
+        if (info.hbmColor) DeleteObject(info.hbmColor);
+        if (info.hbmMask) DeleteObject(info.hbmMask);
+    }
+    dpi = actualDpi; refreshIcons();
+    check("tray_icon_matches_100_125_150_200_percent_dpi", dpiIconsOK);
+    check("window_uses_embedded_large_and_small_icons", reinterpret_cast<HICON>(SendMessageW(mainWindow, WM_GETICON, ICON_BIG, 0)) == appIcon &&
+        reinterpret_cast<HICON>(SendMessageW(mainWindow, WM_GETICON, ICON_SMALL, 0)) == smallIcon && appIcon && smallIcon);
     if (!isolatedPreview) {
         check("notification_icon_registered", trayAdded);
         NOTIFYICONIDENTIFIER icon{}; icon.cbSize = sizeof(icon); icon.hWnd = mainWindow; icon.uID = 1;
@@ -1279,7 +1311,12 @@ bool panelSelfTest(const std::wstring& path) {
         uint64_t until = GetTickCount64() + milliseconds;
         while (GetTickCount64() < until) {
             MSG event{};
-            while (PeekMessageW(&event, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&event); DispatchMessageW(&event); }
+            while (PeekMessageW(&event, nullptr, 0, 0, PM_REMOVE)) {
+                // Test gestures use synchronous SendMessage. Do not let an
+                // unrelated physical pointer restart hover during idle checks.
+                if ((event.message >= WM_MOUSEFIRST && event.message <= WM_MOUSELAST) || event.message == WM_MOUSELEAVE) continue;
+                TranslateMessage(&event); DispatchMessageW(&event);
+            }
             Sleep(1);
         }
     };
@@ -1423,9 +1460,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     }
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES}; InitCommonControlsEx(&controls);
-    appIcon = makeIcon();
     WNDCLASSEXW wc{}; wc.cbSize = sizeof(wc); wc.hInstance = instance; wc.lpfnWndProc = windowProc;
-    wc.lpszClassName = ClassName; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.hIcon = wc.hIconSm = appIcon;
+    wc.lpszClassName = ClassName; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     if (!RegisterClassExW(&wc)) return 2;
     dpi = GetDpiForSystem();
     RECT bounds{0, 0, px(PanelWidth), px(PanelHeight)};
@@ -1435,7 +1471,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &monitor);
     int initialWidth = std::min(bounds.right, monitor.rcWork.right - monitor.rcWork.left - px(20));
     int initialHeight = std::min(bounds.bottom, monitor.rcWork.bottom - monitor.rcWork.top - px(20));
-    HWND window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, ClassName, L"BatteryScope 0.8", WS_POPUP | WS_CLIPCHILDREN,
+    HWND window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, ClassName, L"BatteryScope 0.8.1", WS_POPUP | WS_CLIPCHILDREN,
         monitor.rcWork.right - initialWidth - px(10), monitor.rcWork.bottom - initialHeight - px(10), initialWidth, initialHeight, nullptr, nullptr, instance, nullptr);
     if (!window) return 3;
     SetLayeredWindowAttributes(window, 0, 255, LWA_ALPHA);
@@ -1475,6 +1511,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (worker.joinable()) worker.join();
     if (actionWorker.joinable()) actionWorker.join();
     for (auto f : {normalFont, smallFont, titleFont, valueFont, metricFont}) if (f) DeleteObject(f);
-    DestroyIcon(appIcon);
+    DestroyIcon(appIcon); DestroyIcon(smallIcon);
     return shotOK ? 0 : 4;
 }
