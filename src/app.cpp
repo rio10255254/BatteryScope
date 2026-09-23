@@ -148,15 +148,15 @@ void makeFonts() {
 }
 bool refreshIcons() {
     HINSTANCE module = GetModuleHandleW(nullptr);
-    HICON large = static_cast<HICON>(LoadImageW(module, MAKEINTRESOURCEW(101), IMAGE_ICON,
+    HICON loadedLargeIcon = static_cast<HICON>(LoadImageW(module, MAKEINTRESOURCEW(101), IMAGE_ICON,
         GetSystemMetricsForDpi(SM_CXICON, dpi), GetSystemMetricsForDpi(SM_CYICON, dpi), LR_DEFAULTCOLOR));
-    HICON small = static_cast<HICON>(LoadImageW(module, MAKEINTRESOURCEW(101), IMAGE_ICON,
+    HICON loadedSmallIcon = static_cast<HICON>(LoadImageW(module, MAKEINTRESOURCEW(101), IMAGE_ICON,
         GetSystemMetricsForDpi(SM_CXSMICON, dpi), GetSystemMetricsForDpi(SM_CYSMICON, dpi), LR_DEFAULTCOLOR));
-    if (!large || !small) { if (large) DestroyIcon(large); if (small) DestroyIcon(small); return false; }
-    SendMessageW(mainWindow, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(large));
-    SendMessageW(mainWindow, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(small));
+    if (!loadedLargeIcon || !loadedSmallIcon) { if (loadedLargeIcon) DestroyIcon(loadedLargeIcon); if (loadedSmallIcon) DestroyIcon(loadedSmallIcon); return false; }
+    SendMessageW(mainWindow, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(loadedLargeIcon));
+    SendMessageW(mainWindow, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(loadedSmallIcon));
     HICON oldLarge = appIcon, oldSmall = smallIcon;
-    appIcon = large; smallIcon = small;
+    appIcon = loadedLargeIcon; smallIcon = loadedSmallIcon;
     // Replace the shell's copy before releasing the old handles.
     if (trayAdded) updateTray(false);
     if (oldLarge) DestroyIcon(oldLarge);
