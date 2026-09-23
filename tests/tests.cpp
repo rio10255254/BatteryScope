@@ -63,6 +63,18 @@ struct OwnedChild {
 };
 int wmain(int argc, wchar_t** argv) {
     if (argc == 3 && std::wstring(argv[1]) == L"--child") return child(argv[2]);
+    if (argc == 2 && std::wstring(argv[1]) == L"--saver-cycle") {
+        // Opt-in local integration check; regular CI tests never change system settings.
+        const auto before = querySaverMode();
+        if (before.error || before.efficient) return 2;
+        const DWORD enable = toggleSaverMode();
+        const auto enabled = querySaverMode();
+        const DWORD restore = enable ? enable : toggleSaverMode();
+        const auto restored = querySaverMode();
+        std::cout << "enable=" << enable << " enabled=" << enabled.efficient << " restorable=" << enabled.restorable
+            << " restore=" << restore << " restored=" << !restored.efficient << '\n';
+        return !enable && enabled.efficient && enabled.restorable && !restore && !restored.error && !restored.efficient ? 0 : 1;
+    }
     try {
         Transition easing;
         easing.move(100, 1000, 180);

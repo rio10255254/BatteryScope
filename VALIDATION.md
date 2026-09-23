@@ -1,5 +1,11 @@
 # BatteryScope 驗證紀錄
 
+## 0.9.0：一鍵省電
+
+使用 Windows 11 `PowerGetUserConfiguredDCPowerMode` / `PowerSetUserConfiguredDCPowerMode` 切換電池供電時的最佳效率模式。切換前儲存原模式；還原時只在目前仍為最佳效率且留有原模式的情況下操作。示範與 UI 測試停用此按鈕，不更動真實電源模式。此功能不會批次終止程序或停止服務，也不宣稱等同 Windows「節能工具」。
+
+本機以選用的 `BatteryScopeTests.exe --saver-cycle` 實測啟用、確認可還原及還原，三步均成功；測試前後皆為 `ded574b5-45a0-4f42-8737-46345c09c238`（最佳效能），未留在省電模式。一般測試與 CI 不執行這項會改動使用者設定的測試。
+
 ## 0.8.2：程序與服務涵蓋核對
 
 2026-09-23 本機以 `--diagnose` 與 Windows `Win32_Process` / `Win32_Service` 即時對照：361 個程序皆進入 BatteryScope 快照；160 個執行中 Win32 服務宿主與 Windows 查詢一致，170 個執行中服務中部分共用宿主。361 個程序皆有連續 CPU 讀值；其中 209 個的路徑或操作安全資訊受限，仍保留 CPU 監測。備援 Toolhelp 路徑的測試確認保留受保護 PID 4 且沒有重複 PID。這是單次即時對照，程序數量會隨時變化。

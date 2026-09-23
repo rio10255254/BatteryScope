@@ -1,20 +1,22 @@
-# BatteryScope 0.8.2
+# BatteryScope 0.9.0
 
 [繁體中文](README.md) | English
 
 A small native Windows battery and background-process monitor built with C++17 and Win32. Portable, dark, bilingual, and entirely local. No web engine, telemetry, driver, or persistent service.
 
-![English charging preview — synthetic demo data](docs/batteryscope-v8-en.png)
+![English charging preview — synthetic demo data](docs/batteryscope-v9-en.png)
 
 ## Getting started
 
-1. Download `BatteryScope-0.8.2-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on Windows 11 x64.
+1. Download `BatteryScope-0.9.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on Windows 11 x64.
 2. Click its battery icon in the notification area to show or hide the panel. Esc hides it; monitoring continues at a lower frequency.
 3. Open **⋯ → Language / 語言 → English** to switch immediately. The setting persists for your Windows account. Selection and scroll position are retained.
 4. Use Background and Show filters, the mouse wheel, arrow keys, Home/End, or Page Up/Down. Enter or double-click opens details.
 5. Select a process to inspect it, request a normal close, force quit with confirmation, or stop an eligible hosted service. Protected processes cannot be closed.
 
 The menu also provides battery and charging details, optional launch at sign-in, and Quit. Launch at sign-in is off until you enable it. Windows permission dialogs, standard dialog buttons, and system-provided service names follow the system language.
+
+The **Save** button sets Windows' battery-side power mode to **Best power efficiency** with one click; **Undo** restores the previous mode, even after restarting BatteryScope. The previous setting is stored under the current user's BatteryScope registry key. While plugged in, this configures the mode for the next battery session. This changes the Windows power mode, not the separate Energy saver switch, and does not close apps or services. The button is unavailable if the Windows API is unsupported or Best efficiency was already selected outside BatteryScope.
 
 ## What the readings mean
 
@@ -48,7 +50,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-To avoid replacing a running executable, use `-OutputDirectory dist/v0.8.2`. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
+To avoid replacing a running executable, use `-OutputDirectory dist/v0.9.0`. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
 
 ```powershell
 .\dist\BatteryScope.exe --demo

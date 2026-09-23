@@ -28,6 +28,13 @@ bool safeProcess(HANDLE process, DWORD pid, std::wstring* reason = nullptr);
 DWORD closeProcess(const ProcessRow& expected, bool force);
 DWORD stopService(const std::wstring& name, DWORD expectedPid, uint64_t expectedCreated);
 bool setSamplerEcoQoS(bool enabled);
+struct SaverMode {
+    DWORD error = ERROR_SUCCESS;
+    bool efficient = false;
+    bool restorable = false;
+};
+SaverMode querySaverMode();
+DWORD toggleSaverMode();
 
 struct CollectionWork { size_t paths = 0, safety = 0, memory = 0, processOpens = 0; };
 

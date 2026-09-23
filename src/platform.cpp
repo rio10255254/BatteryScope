@@ -12,6 +12,80 @@
 #include <limits>
 
 namespace bs {
+namespace {
+constexpr GUID BestEfficiency = {0x961cc777, 0x2547, 0x4f9d, {0x81, 0x74, 0x7d, 0x86, 0x18, 0x1b, 0x8a, 0x7a}};
+constexpr wchar_t SaverRegistryPath[] = L"Software\\BatteryScope";
+constexpr wchar_t SaverRegistryName[] = L"PreviousDCMode";
+using GetDcMode = DWORD (WINAPI*)(GUID*);
+using SetDcMode = DWORD (WINAPI*)(const GUID*);
+struct DcModeApi { GetDcMode get = nullptr; SetDcMode set = nullptr; };
+DcModeApi dcModeApi() {
+    static DcModeApi api = [] {
+        DcModeApi result;
+        HMODULE module = LoadLibraryW(L"powrprof.dll");
+        if (!module) return result;
+        FARPROC get = GetProcAddress(module, "PowerGetUserConfiguredDCPowerMode");
+        FARPROC set = GetProcAddress(module, "PowerSetUserConfiguredDCPowerMode");
+        static_assert(sizeof(get) == sizeof(result.get) && sizeof(set) == sizeof(result.set));
+        std::memcpy(&result.get, &get, sizeof(get));
+        std::memcpy(&result.set, &set, sizeof(set));
+        return result;
+    }();
+    return api;
+}
+bool previousDcMode(GUID& value) {
+    DWORD size = sizeof(value);
+    return RegGetValueW(HKEY_CURRENT_USER, SaverRegistryPath, SaverRegistryName, RRF_RT_REG_BINARY,
+        nullptr, &value, &size) == ERROR_SUCCESS && size == sizeof(value);
+}
+DWORD savePreviousDcMode(const GUID& value) {
+    HKEY key = nullptr;
+    DWORD status = RegCreateKeyExW(HKEY_CURRENT_USER, SaverRegistryPath, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr);
+    if (status) return status;
+    status = RegSetValueExW(key, SaverRegistryName, 0, REG_BINARY, reinterpret_cast<const BYTE*>(&value), sizeof(value));
+    RegCloseKey(key);
+    return status;
+}
+void clearPreviousDcMode() {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, SaverRegistryPath, 0, KEY_SET_VALUE, &key) == ERROR_SUCCESS) {
+        RegDeleteValueW(key, SaverRegistryName);
+        RegCloseKey(key);
+    }
+}
+bool sameGuid(const GUID& a, const GUID& b) { return std::memcmp(&a, &b, sizeof(GUID)) == 0; }
+}
+SaverMode querySaverMode() {
+    SaverMode state;
+    auto api = dcModeApi();
+    if (!api.get || !api.set) { state.error = ERROR_PROC_NOT_FOUND; return state; }
+    GUID current{};
+    state.error = api.get(&current);
+    if (state.error) return state;
+    state.efficient = sameGuid(current, BestEfficiency);
+    GUID previous{};
+    state.restorable = state.efficient && previousDcMode(previous) && !sameGuid(previous, BestEfficiency);
+    return state;
+}
+DWORD toggleSaverMode() {
+    auto api = dcModeApi();
+    if (!api.get || !api.set) return ERROR_PROC_NOT_FOUND;
+    GUID current{};
+    DWORD status = api.get(&current);
+    if (status) return status;
+    if (sameGuid(current, BestEfficiency)) {
+        GUID previous{};
+        if (!previousDcMode(previous) || sameGuid(previous, BestEfficiency)) return ERROR_ALREADY_EXISTS;
+        status = api.set(&previous);
+        if (!status) clearPreviousDcMode();
+        return status;
+    }
+    status = savePreviousDcMode(current);
+    if (status) return status;
+    status = api.set(&BestEfficiency);
+    if (status) clearPreviousDcMode();
+    return status;
+}
 uint64_t fileTime(FILETIME t) { return (uint64_t(t.dwHighDateTime) << 32) | t.dwLowDateTime; }
 std::wstring errorText(DWORD code) {
     wchar_t* buffer = nullptr;

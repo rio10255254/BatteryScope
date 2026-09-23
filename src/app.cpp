@@ -22,13 +22,13 @@ using namespace bs;
 constexpr UINT SampleMessage = WM_APP + 1, TrayMessage = WM_APP + 2, ActionMessage = WM_APP + 3, RefreshMessage = WM_APP + 4;
 constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, DetailsId = 104,
     BackgroundId = 105, AllId = 106, StartupId = 107, HideId = 108, MenuId = 109,
-    LanguageZhId = 110, LanguageEnId = 111, PowerDetailsId = 112, TrayShow = 200, TrayExit = 201;
+    LanguageZhId = 110, LanguageEnId = 111, PowerDetailsId = 112, SaverModeId = 113, TrayShow = 200, TrayExit = 201;
 const wchar_t* ClassName = L"BatteryScope.Main.v1";
 const COLORREF Ink = RGB(235, 242, 246), Muted = RGB(146, 161, 174), Green = RGB(104, 225, 188),
     Background = RGB(15, 20, 27), Surface = RGB(24, 32, 42), Border = RGB(41, 53, 65),
     Selected = RGB(30, 57, 57), Danger = RGB(245, 146, 146);
 HWND mainWindow = nullptr, viewport = nullptr, list = nullptr, closeButton = nullptr, killButton = nullptr, serviceButton = nullptr,
-    detailsButton = nullptr, backgroundCheck = nullptr, allCheck = nullptr, hideButton = nullptr, menuButton = nullptr;
+    detailsButton = nullptr, backgroundCheck = nullptr, allCheck = nullptr, hideButton = nullptr, menuButton = nullptr, saverButton = nullptr;
 HFONT normalFont = nullptr, smallFont = nullptr, titleFont = nullptr, valueFont = nullptr, metricFont = nullptr;
 HICON appIcon = nullptr, smallIcon = nullptr;
 bool updateTray(bool add);
@@ -43,6 +43,7 @@ uint64_t listStructuralChanges = 0;
 std::thread worker, actionWorker;
 bool pendingAction = false, forceAction = false, serviceAction = false, trayAdded = false, demo = false;
 bool trayVersion4 = false, backgroundOnly = false, showAll = false, autoStart = false;
+bool saverActive = false;
 bool isolatedPreview = false;
 std::wstring notice = tr(L"正在讀取電池與程序資料…");
 uint64_t noticeUntil = 0;
@@ -76,6 +77,7 @@ bool recordMotion = false;
 std::vector<double> motionTicks;
 bool canAnimate() { return motionEnabled && !suppressMotion; }
 void stepMotion(double now);
+void refreshSaverButton();
 void armMotionTimer() {
     if (!motionTimerRunning) motionTimerRunning = SetTimer(mainWindow, MotionTimer, USER_TIMER_MINIMUM, nullptr) != 0;
     if (!motionTimerRunning) {
@@ -256,6 +258,7 @@ void showMain() {
     if (panelTargetShown && IsWindowVisible(mainWindow)) { SetForegroundWindow(mainWindow); return; }
     bool wasVisible = IsWindowVisible(mainWindow) != FALSE;
     hidden = false; panelTargetShown = true;
+    refreshSaverButton();
     if (!wasVisible) { positionPanel(); panelMotion = {}; refreshList(); }
     double now = motionNow(); panelMotion.move(1, now, canAnimate() ? 220 : 0);
     SetLayeredWindowAttributes(mainWindow, 0, BYTE(panelMotion.value(now) * 255), LWA_ALPHA);
@@ -292,6 +295,14 @@ void updateButtons() {
     EnableWindow(serviceButton, ready && std::any_of(row->services.begin(), row->services.end(), [](const ServiceInfo& s) { return s.stoppable; }));
     EnableWindow(detailsButton, row.has_value());
     InvalidateRect(mainWindow, nullptr, FALSE);
+}
+void refreshSaverButton() {
+    if (!saverButton) return;
+    const auto state = querySaverMode();
+    saverActive = !state.error && state.efficient;
+    SetWindowTextW(saverButton, state.restorable ? tr(L"還原") : state.efficient ? tr(L"已省電") : tr(L"省電"));
+    EnableWindow(saverButton, !demo && !isolatedPreview && !state.error && (!state.efficient || state.restorable));
+    InvalidateRect(saverButton, nullptr, FALSE);
 }
 void updateRowFeedback() {
     if (refreshingList) return;
@@ -451,6 +462,7 @@ void layout() {
     MoveWindow(killButton, margin + half + gap, bottom + sp(50), half, sp(32), TRUE);
     MoveWindow(backgroundCheck, margin, top - sp(38), half, sp(28), TRUE);
     MoveWindow(allCheck, margin + half + gap, top - sp(38), half, sp(28), TRUE);
+    MoveWindow(saverButton, w - sp(88), sp(47), sp(68), sp(22), TRUE);
     MoveWindow(menuButton, w - sp(92), sp(16), sp(32), sp(30), TRUE);
     MoveWindow(hideButton, w - sp(52), sp(16), sp(32), sp(30), TRUE);
     InvalidateRect(mainWindow, nullptr, FALSE);
@@ -459,7 +471,8 @@ void drawButton(const DRAWITEMSTRUCT& item) {
     RECT r = item.rcItem; HDC dc = item.hDC;
     const bool disabled = (item.itemState & ODS_DISABLED) != 0;
     const bool pressed = (item.itemState & ODS_SELECTED) != 0;
-    const bool checked = (item.CtlID == BackgroundId && backgroundOnly) || (item.CtlID == AllId && showAll);
+    const bool checked = (item.CtlID == BackgroundId && backgroundOnly) || (item.CtlID == AllId && showAll) ||
+        (item.CtlID == SaverModeId && saverActive);
     const bool danger = item.CtlID == KillId;
     fill(dc, r, Background);
     double hover = buttonMotions[item.hwndItem].value(motionNow());
@@ -883,6 +896,10 @@ void openMenu(POINT point) {
     AppendMenuW(languages, MF_STRING | (english ? MF_CHECKED : 0), LanguageEnId, L"English");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(languages), tr(L"語言 / Language"));
     AppendMenuW(menu, MF_STRING, PowerDetailsId, tr(L"電池與充電詳情"));
+    const auto saver = querySaverMode();
+    const bool saverActionable = !demo && !isolatedPreview && !saver.error && (!saver.efficient || saver.restorable);
+    AppendMenuW(menu, MF_STRING | (saverActionable ? 0 : MF_GRAYED) | (saver.efficient ? MF_CHECKED : 0),
+        SaverModeId, saver.restorable ? tr(L"還原原本電池電源模式") : saver.efficient ? tr(L"已使用最佳效率") : tr(L"一鍵省電 · 最佳效率"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, TrayShow, tr(L"顯示面板"));
     AppendMenuW(menu, MF_STRING | (autoStart ? MF_CHECKED : 0) | (demo ? MF_GRAYED : 0), StartupId, tr(L"登入時啟動"));
@@ -895,11 +912,12 @@ void openMenu(POINT point) {
 void applyLanguage(bool useEnglish) {
     english = useEnglish;
     makeFonts();
-    SetWindowTextW(mainWindow, L"BatteryScope 0.8.2");
+    SetWindowTextW(mainWindow, L"BatteryScope 0.9.0");
     const std::pair<HWND, const wchar_t*> labels[] = {{closeButton, tr(L"正常關閉")}, {killButton, tr(L"強制結束…")},
         {serviceButton, tr(L"停止服務…")}, {detailsButton, tr(L"查看詳情")}, {menuButton, tr(L"設定")}, {hideButton, tr(L"收回")}};
     for (auto pair : labels)
         SetWindowTextW(pair.first, tr(pair.second));
+    refreshSaverButton();
     SetWindowTextW(backgroundCheck, backgroundOnly ? tr(L"僅背景：開") : tr(L"僅背景：關"));
     SetWindowTextW(allCheck, showAll ? tr(L"顯示：全部程序") : tr(L"顯示：前 10 名"));
     SetWindowTextW(list, tr(L"CPU 耗電排行"));
@@ -922,8 +940,9 @@ bool saveLanguage() {
     RegCloseKey(key); return result == ERROR_SUCCESS;
 }
 std::wstring controlTip(HWND control) {
+    if (control == saverButton) return tr(L"切換電池供電時的最佳效率模式；可還原原本設定，不會結束程序。這不是 Windows 節能工具開關。");
     if (control == hideButton) return tr(L"收回面板（Esc），背景監測持續運作");
-    if (control == menuButton) return tr(L"設定：語言、充電詳情、登入時啟動");
+    if (control == menuButton) return tr(L"設定：一鍵省電、語言、充電詳情、登入時啟動");
     if (control == backgroundCheck) return tr(L"只列出沒有可見視窗的程序與服務");
     if (control == allCheck) return tr(L"切換前 10 名與全部程序；滾輪可捲動");
     if (control == detailsButton) return tr(L"查看完整名稱、路徑、耗電範圍與操作限制（Enter）");
@@ -963,6 +982,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         serviceButton = button(tr(L"停止服務…"), ServiceId); detailsButton = button(tr(L"查看詳情"), DetailsId);
         backgroundCheck = button(tr(L"僅背景：關"), BackgroundId);
         allCheck = button(tr(L"顯示：前 10 名"), AllId);
+        saverButton = button(tr(L"省電"), SaverModeId);
         menuButton = button(tr(L"設定"), MenuId); hideButton = button(tr(L"收回"), HideId);
         tooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
             CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, window, nullptr, nullptr, nullptr);
@@ -971,13 +991,13 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         SendMessageW(tooltip, TTM_SETTIPTEXTCOLOR, Ink, 0);
         SendMessageW(tooltip, TTM_SETMAXTIPWIDTH, 0, px(300));
         SendMessageW(tooltip, TTM_SETDELAYTIME, TTDT_INITIAL, 550);
-        for (auto control : {closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck, menuButton, hideButton}) {
+        for (auto control : {closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck, saverButton, menuButton, hideButton}) {
             TOOLINFOW tool{}; tool.cbSize = sizeof(tool); tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
             tool.hwnd = window; tool.uId = reinterpret_cast<UINT_PTR>(control); tool.lpszText = LPSTR_TEXTCALLBACKW;
             SendMessageW(tooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
         }
         autoStart = startupEnabled();
-        makeFonts(); layout(); updateButtons();
+        makeFonts(); layout(); updateButtons(); refreshSaverButton();
         BOOL dark = TRUE; DWORD corners = 2;
         DwmSetWindowAttribute(window, 20, &dark, sizeof(dark));
         DwmSetWindowAttribute(window, 33, &corners, sizeof(corners));
@@ -1051,6 +1071,22 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (id == PowerDetailsId) { showPowerDetails(); return 0; }
+        if (id == SaverModeId) {
+            if (demo || isolatedPreview) return 0;
+            const auto before = querySaverMode();
+            if (before.error || (before.efficient && !before.restorable)) {
+                setNotice(tr(L"無法切換電池電源模式。")); return 0;
+            }
+            DWORD result = toggleSaverMode();
+            if (result) setNotice(tr(L"無法切換電池電源模式：") + errorText(result));
+            else if (before.efficient) setNotice(tr(L"已還原原本的電池電源模式。"));
+            else {
+                PowerSample power = readPower();
+                setNotice(power.acKnown && power.onAc ? tr(L"已設定電池供電時使用最佳效率。") : tr(L"已切換至最佳效率；可在選單還原。"));
+            }
+            refreshSaverButton();
+            return 0;
+        }
         if (id == IDCANCEL || id == HideId) { hideMain(); return 0; }
         if (id == MenuId) { RECT r{}; GetWindowRect(menuButton, &r); openMenu({r.left, r.bottom}); return 0; }
         if (id == TrayShow) { showMain(); return 0; }
@@ -1178,7 +1214,7 @@ bool captureWindow(const std::wstring& path) {
     SendMessageW(mainWindow, WM_PRINT, reinterpret_cast<WPARAM>(dc), PRF_CLIENT | PRF_CHILDREN | PRF_ERASEBKGND);
     // The main canvas is owner drawn; WM_PRINTCLIENT supplies its content explicitly.
     paint(dc, rect);
-    for (auto child : {viewport, closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck, hideButton, menuButton}) {
+    for (auto child : {viewport, closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck, saverButton, hideButton, menuButton}) {
         RECT childRect; GetWindowRect(child, &childRect); MapWindowPoints(nullptr, mainWindow, reinterpret_cast<POINT*>(&childRect), 2);
         SaveDC(dc); SetViewportOrgEx(dc, childRect.left, childRect.top, nullptr);
         IntersectClipRect(dc, 0, 0, childRect.right - childRect.left, childRect.bottom - childRect.top);
@@ -1296,6 +1332,10 @@ bool panelSelfTest(const std::wstring& path) {
     SendMessageW(mainWindow, WM_COMMAND, AllId, 0);
     check("all_processes_toggle", showAll);
     check("demo_destructive_actions_disabled", !IsWindowEnabled(killButton) && !IsWindowEnabled(serviceButton));
+    check("demo_power_mode_action_disabled", !IsWindowEnabled(saverButton));
+    RECT saverBounds{}; GetWindowRect(saverButton, &saverBounds);
+    check("saver_button_visible_in_compact_header", IsWindowVisible(saverButton) &&
+        saverBounds.right > saverBounds.left && saverBounds.bottom > saverBounds.top);
     for (int height : {520, PanelHeight}) {
         SetWindowPos(mainWindow, nullptr, 0, 0, px(PanelWidth), px(height), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         RECT listRect{}, actions{}; GetWindowRect(list, &listRect); GetWindowRect(detailsButton, &actions);
@@ -1471,7 +1511,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &monitor);
     int initialWidth = std::min(bounds.right, monitor.rcWork.right - monitor.rcWork.left - px(20));
     int initialHeight = std::min(bounds.bottom, monitor.rcWork.bottom - monitor.rcWork.top - px(20));
-    HWND window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, ClassName, L"BatteryScope 0.8.2", WS_POPUP | WS_CLIPCHILDREN,
+    HWND window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, ClassName, L"BatteryScope 0.9.0", WS_POPUP | WS_CLIPCHILDREN,
         monitor.rcWork.right - initialWidth - px(10), monitor.rcWork.bottom - initialHeight - px(10), initialWidth, initialHeight, nullptr, nullptr, instance, nullptr);
     if (!window) return 3;
     SetLayeredWindowAttributes(window, 0, 255, LWA_ALPHA);
