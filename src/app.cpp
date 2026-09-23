@@ -23,13 +23,15 @@ constexpr UINT SampleMessage = WM_APP + 1, TrayMessage = WM_APP + 2, ActionMessa
 constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, DetailsId = 104,
     BackgroundId = 105, AllId = 106, StartupId = 107, HideId = 108, MenuId = 109,
     LanguageZhId = 110, LanguageEnId = 111, PowerDetailsId = 112, SaverModeId = 113,
-    EnergySaverSettingsId = 114, ReviewCandidatesId = 115, TrayShow = 200, TrayExit = 201;
+    EnergySaverSettingsId = 114, ReviewCandidatesId = 115, InlineBackId = 116, InlineConfirmId = 117,
+    TrayShow = 200, TrayExit = 201;
 const wchar_t* ClassName = L"BatteryScope.Main.v1";
 const COLORREF Ink = RGB(235, 242, 246), Muted = RGB(146, 161, 174), Green = RGB(104, 225, 188),
     Background = RGB(15, 20, 27), Surface = RGB(24, 32, 42), Border = RGB(41, 53, 65),
     Selected = RGB(30, 57, 57), Danger = RGB(245, 146, 146);
 HWND mainWindow = nullptr, viewport = nullptr, list = nullptr, closeButton = nullptr, killButton = nullptr, serviceButton = nullptr,
-    detailsButton = nullptr, backgroundCheck = nullptr, allCheck = nullptr, hideButton = nullptr, menuButton = nullptr, saverButton = nullptr;
+    detailsButton = nullptr, backgroundCheck = nullptr, allCheck = nullptr, hideButton = nullptr, menuButton = nullptr, saverButton = nullptr,
+    inlineText = nullptr, inlineBack = nullptr, inlineConfirm = nullptr;
 HFONT normalFont = nullptr, smallFont = nullptr, titleFont = nullptr, valueFont = nullptr, metricFont = nullptr;
 HICON appIcon = nullptr, smallIcon = nullptr;
 bool updateTray(bool add);
@@ -46,6 +48,12 @@ bool pendingAction = false, forceAction = false, serviceAction = false, trayAdde
 bool trayVersion4 = false, backgroundOnly = false, showAll = false, autoStart = false;
 bool saverActive = false;
 bool isolatedPreview = false;
+enum class InlinePage { none, process, power, candidates, confirm, error };
+InlinePage inlinePage = InlinePage::none;
+bool inlineClosing = false;
+std::wstring inlineTitle;
+std::optional<ProcessRow> inlineProcess;
+std::optional<ProcessRow> pendingForceRow;
 std::wstring notice = tr(L"正在讀取電池與程序資料…");
 uint64_t noticeUntil = 0;
 std::deque<uint64_t> actionMarks;
@@ -58,6 +66,8 @@ double motionNow() {
     return counter.QuadPart * 1000.0 / frequency;
 }
 Transition panelMotion;
+Transition panelHeightMotion;
+int expandedPanelHeight = 0;
 Transition scrollMotion;
 double scrollPosition = 0;
 bool scrollingThumb = false, listRefreshPending = false, applyingScroll = false;
@@ -79,10 +89,13 @@ std::vector<double> motionTicks;
 bool canAnimate() { return motionEnabled && !suppressMotion; }
 void stepMotion(double now);
 void refreshSaverButton();
+void closeInlinePage(bool immediate = false);
+void finishInlineClose();
 void armMotionTimer() {
     if (!motionTimerRunning) motionTimerRunning = SetTimer(mainWindow, MotionTimer, USER_TIMER_MINIMUM, nullptr) != 0;
     if (!motionTimerRunning) {
         panelMotion.duration = 0;
+        panelHeightMotion.duration = 0;
         scrollMotion.duration = 0;
         for (auto& row : rowMotions) row.bar.duration = row.hover.duration = row.selected.duration = 0;
         for (auto& button : buttonMotions) button.second.duration = 0;
@@ -146,7 +159,8 @@ void makeFonts() {
     };
     normalFont = make(12, FW_NORMAL); smallFont = make(11, FW_NORMAL);
     titleFont = make(16, FW_SEMIBOLD); valueFont = make(29, FW_SEMIBOLD); metricFont = make(16, FW_SEMIBOLD);
-    for (auto window : {list, closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck, hideButton, menuButton, tooltip})
+    for (auto window : {list, closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck,
+        hideButton, menuButton, saverButton, inlineText, inlineBack, inlineConfirm, tooltip})
         if (window) SendMessageW(window, WM_SETFONT, reinterpret_cast<WPARAM>(normalFont), TRUE);
 }
 bool refreshIcons() {
@@ -211,6 +225,19 @@ void positionPanel() {
 void stepMotion(double now) {
     if (recordMotion && motionTicks.size() < 128) motionTicks.push_back(now);
     bool active = panelMotion.active(now);
+    if (panelHeightMotion.duration || (panelHeightMotion.to > 0 && !panelHeightMotion.active(now))) {
+        RECT rect{}; GetWindowRect(mainWindow, &rect);
+        int height = std::max(px(280), int(std::lround(panelHeightMotion.value(now))));
+        if (height != rect.bottom - rect.top)
+            SetWindowPos(mainWindow, nullptr, rect.left, rect.bottom - height, rect.right - rect.left, height,
+                SWP_NOZORDER | SWP_NOACTIVATE);
+        if (height != rect.bottom - rect.top) GetWindowRect(mainWindow, &panelRest);
+        active |= panelHeightMotion.active(now);
+        if (!panelHeightMotion.active(now)) {
+            panelHeightMotion.duration = 0;
+            if (inlineClosing) finishInlineClose();
+        }
+    }
     if (scrollMotion.duration) {
         applyScroll(scrollMotion.value(now));
         bool moving = scrollMotion.active(now) && !hidden;
@@ -271,6 +298,7 @@ void hideMain() {
     if (!panelTargetShown && hidden) return;
     if (!trayAdded && !isolatedPreview) trayAdded = updateTray(true);
     if (!trayAdded && !isolatedPreview) { setNotice(tr(L"系統匣無法使用，面板會保持開啟。")); return; }
+    closeInlinePage(true);
     stopScroll();
     hoveredRow = -1; pointerDown = false;
     for (auto& row : rowMotions) { row.hover = {}; row.selected.duration = row.bar.duration = 0; }
@@ -299,6 +327,12 @@ void updateButtons() {
 }
 void refreshSaverButton() {
     if (!saverButton) return;
+    if (demo || isolatedPreview) {
+        saverActive = false;
+        SetWindowTextW(saverButton, tr(L"省電"));
+        EnableWindow(saverButton, FALSE);
+        return;
+    }
     const auto state = querySaverMode();
     saverActive = !state.error && state.efficient;
     SetWindowTextW(saverButton, state.restorable ? tr(L"還原") : state.efficient ? tr(L"已省電") : tr(L"省電"));
@@ -333,7 +367,8 @@ std::wstring selectionHint() {
     return tr(L"建議先正常關閉，保留儲存機會");
 }
 bool deferListRefresh() {
-    return pointerDown || scrollingThumb || scrollMotion.active(motionNow()) || !IsWindowEnabled(mainWindow);
+    return pointerDown || scrollingThumb || scrollMotion.active(motionNow()) ||
+        inlinePage != InlinePage::none || !IsWindowEnabled(mainWindow);
 }
 void releaseInteraction() {
     pointerDown = false;
@@ -466,7 +501,71 @@ void layout() {
     MoveWindow(saverButton, w - sp(88), sp(47), sp(68), sp(22), TRUE);
     MoveWindow(menuButton, w - sp(92), sp(16), sp(32), sp(30), TRUE);
     MoveWindow(hideButton, w - sp(52), sp(16), sp(32), sp(30), TRUE);
+    const bool fullPage = inlinePage == InlinePage::process || inlinePage == InlinePage::confirm || inlinePage == InlinePage::error;
+    const int textTop = fullPage ? sp(128) : top - sp(37);
+    MoveWindow(inlineText, margin + sp(12), textTop, inner - sp(24), std::max(sp(55), h - sp(94) - textTop), TRUE);
+    SendMessageW(inlineText, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(sp(4), sp(4)));
+    const int inlineWidth = inner - sp(24);
+    MoveWindow(inlineBack, margin + sp(12), h - sp(59),
+        inlinePage == InlinePage::confirm ? (inlineWidth - sp(8)) / 2 : inlineWidth, sp(34), TRUE);
+    MoveWindow(inlineConfirm, margin + sp(12) + (inlineWidth - sp(8)) / 2 + sp(8), h - sp(59),
+        (inlineWidth - sp(8)) / 2, sp(34), TRUE);
     InvalidateRect(mainWindow, nullptr, FALSE);
+}
+void resizeForInlinePage(InlinePage page) {
+    RECT rect{}; GetWindowRect(mainWindow, &rect);
+    if (page != InlinePage::none && inlinePage == InlinePage::none) expandedPanelHeight = rect.bottom - rect.top;
+    int target = page == InlinePage::confirm ? px(320) : page == InlinePage::error ? px(360) :
+        page == InlinePage::none ? expandedPanelHeight : expandedPanelHeight;
+    if (target <= 0) return;
+    double now = motionNow();
+    if (!panelHeightMotion.duration) panelHeightMotion.to = rect.bottom - rect.top;
+    panelHeightMotion.move(target, now, canAnimate() && panelTargetShown ? 190 : 0);
+    stepMotion(now);
+    if (panelHeightMotion.active(now)) armMotionTimer();
+}
+void showInlinePage(InlinePage page, const std::wstring& title, const std::wstring& content) {
+    resizeForInlinePage(page);
+    inlinePage = page; inlineTitle = title;
+    std::wstring lines; lines.reserve(content.size() + 32);
+    for (size_t i = 0; i < content.size(); ++i) {
+        if (content[i] == L'\n' && (i == 0 || content[i - 1] != L'\r')) lines += L'\r';
+        lines += content[i];
+    }
+    SetWindowTextW(inlineText, lines.c_str());
+    ShowScrollBar(inlineText, SB_VERT, page == InlinePage::process || page == InlinePage::power ||
+        (page == InlinePage::candidates && lines.size() > 500));
+    SendMessageW(inlineText, EM_SETSEL, 0, 0);
+    SendMessageW(inlineText, EM_SCROLLCARET, 0, 0);
+    for (auto control : {viewport, closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck}) ShowWindow(control, SW_HIDE);
+    ShowWindow(inlineText, SW_SHOW); ShowWindow(inlineBack, SW_SHOW);
+    ShowWindow(inlineConfirm, page == InlinePage::confirm ? SW_SHOW : SW_HIDE);
+    SetWindowTextW(inlineBack, page == InlinePage::confirm ? tr(L"取消") : tr(L"返回排行"));
+    layout(); SetFocus(page == InlinePage::confirm ? inlineBack : inlineText);
+}
+void finishInlineClose() {
+    inlinePage = InlinePage::none; inlineTitle.clear(); inlineProcess.reset(); pendingForceRow.reset();
+    inlineClosing = false;
+    ShowWindow(inlineText, SW_HIDE); ShowWindow(inlineBack, SW_HIDE); ShowWindow(inlineConfirm, SW_HIDE);
+    for (auto control : {viewport, closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck}) ShowWindow(control, SW_SHOW);
+    layout(); updateButtons(); SetFocus(list);
+    if (listRefreshPending) PostMessageW(mainWindow, RefreshMessage, 0, 0);
+}
+void closeInlinePage(bool immediate) {
+    if (inlinePage == InlinePage::none) return;
+    if (!immediate && canAnimate() && panelTargetShown &&
+        (inlinePage == InlinePage::confirm || inlinePage == InlinePage::error)) {
+        inlineClosing = true;
+        resizeForInlinePage(InlinePage::none);
+        return;
+    }
+    if (immediate) {
+        inlineClosing = false;
+        bool oldSuppress = suppressMotion; suppressMotion = true;
+        resizeForInlinePage(InlinePage::none);
+        suppressMotion = oldSuppress;
+    } else resizeForInlinePage(InlinePage::none);
+    finishInlineClose();
 }
 void drawButton(const DRAWITEMSTRUCT& item) {
     RECT r = item.rcItem; HDC dc = item.hDC;
@@ -474,7 +573,7 @@ void drawButton(const DRAWITEMSTRUCT& item) {
     const bool pressed = (item.itemState & ODS_SELECTED) != 0;
     const bool checked = (item.CtlID == BackgroundId && backgroundOnly) || (item.CtlID == AllId && showAll) ||
         (item.CtlID == SaverModeId && saverActive);
-    const bool danger = item.CtlID == KillId;
+    const bool danger = item.CtlID == KillId || item.CtlID == InlineConfirmId;
     fill(dc, r, Background);
     double hover = buttonMotions[item.hwndItem].value(motionNow());
     const double press = pressMotions[item.hwndItem].value(motionNow());
@@ -529,6 +628,14 @@ void paint(HDC dc, RECT bounds) {
     rounded(dc, {margin, sp(21), margin + sp(8), sp(29)}, Green, 8);
     drawText(dc, L"BatteryScope", {margin + sp(18), sp(12), w - sp(98), sp(42)}, Ink, titleFont);
     drawText(dc, demo ? tr(L"示範資料 · 關閉操作已停用") : tr(L"電池與背景活動"), {margin, sp(43), right, sp(63)}, Muted, smallFont);
+    if (inlinePage == InlinePage::process || inlinePage == InlinePage::confirm || inlinePage == InlinePage::error) {
+        rounded(dc, {margin, sp(74), right, h - sp(14)}, Surface, 16);
+        drawText(dc, inlineTitle, {margin + sp(13), sp(84), right - sp(13), sp(114)}, Ink, titleFont);
+        fill(dc, {margin + sp(13), sp(119), right - sp(13), sp(120)}, Border);
+        if (inlinePage != InlinePage::error && GetTickCount64() < noticeUntil)
+            drawText(dc, notice, {margin + sp(13), h - sp(84), right - sp(13), h - sp(64)}, Green, smallFont);
+        return;
+    }
     PowerSample p; if (!current.history.empty()) p = current.history.back();
     const auto& m = current.power;
     const auto charge = calculateCharging(current.history);
@@ -599,6 +706,14 @@ void paint(HDC dc, RECT bounds) {
             Muted, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
     }
     const bool energyReady = current.energy.ready && !current.energy.timingMismatch;
+    if (inlinePage != InlinePage::none) {
+        rounded(dc, {margin, top - sp(88), right, h - sp(14)}, Surface, 16);
+        drawText(dc, inlineTitle, {margin + sp(13), top - sp(81), right - sp(13), top - sp(51)}, Ink, titleFont);
+        fill(dc, {margin + sp(13), top - sp(45), right - sp(13), top - sp(44)}, Border);
+        if (GetTickCount64() < noticeUntil)
+            drawText(dc, notice, {margin + sp(13), h - sp(84), right - sp(13), h - sp(64)}, Green, smallFont);
+        return;
+    }
     drawText(dc, tr(L"CPU 耗電排行"), {margin, top - sp(76), right, top - sp(53)}, Ink, normalFont);
     drawText(dc, energyReady ? tr(L"估計 W ↓") : tr(L"活動排序 ↓"), {right - sp(105), top - sp(76), right, top - sp(53)}, Green, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
     drawText(dc, energyReady ? tr(L"30 秒平滑 · ") + qualityText(current.energy.quality) + L" " + number(current.energy.observedCpuCoverage * 100, 0) + L"%" : tr(L"能源暫不可用，依 CPU / I/O 活動排序"),
@@ -626,7 +741,7 @@ void showPowerDetails() {
     text += tr(L"\n\n充電功率是電池吸收的淨功率，不是插座功率、充電器額定功率或 USB PD 合約瓦數。");
     text += tr(L"\n充滿時間需至少 60 秒連續穩定充電資料。接近滿電時會減速；電池保護上限也可能讓充電提前停止，因此不是保證時間。");
     text += tr(L"\n\nWindows 通用電源資訊只回報是否接上外部電源，不能區分圓孔變壓器與 USB-C。偵測到 USB-C 控制器也不能證明目前由它供電。");
-    MessageBoxW(mainWindow, text.c_str(), tr(L"電池與充電詳情"), MB_OK | MB_ICONINFORMATION);
+    showInlinePage(InlinePage::power, tr(L"電池與充電詳情"), text);
     releaseInteraction();
 }
 void showReviewCandidates() {
@@ -639,7 +754,7 @@ void showReviewCandidates() {
             valueText(row.averageCpuWatts, L" CPU W", 2) + L" · " + std::to_wstring(int(row.busySeconds)) + tr(L" 秒持續活動");
     }
     content += tr(L"\n\n可能有同步、下載、音訊、未儲存資料或其他程序依賴。請先查看詳情；程式不會自動休眠或關閉候選。" );
-    MessageBoxW(mainWindow, content.c_str(), tr(L"節能候選 · 需人工判斷"), MB_OK | MB_ICONINFORMATION);
+    showInlinePage(InlinePage::candidates, tr(L"節能候選 · 需人工判斷"), content);
     releaseInteraction();
 }
 bool startupEnabled() {
@@ -719,7 +834,9 @@ void chooseService(const ProcessRow& row) {
     }
 }
 void showDetails(const ProcessRow& row) {
-    std::wstring content = row.name + L"\nPID: " + std::to_wstring(row.pid) + L"\n\n" + row.path +
+    if (!inlineProcess || &row != &*inlineProcess) inlineProcess = row;
+    std::wstring content = row.name + L"\nPID: " + std::to_wstring(row.pid) +
+        tr(L"\n路徑：") + (row.path.empty() ? tr(L"未知") : row.path) +
         tr(L"\n\nCPU（全機比例）: ") + number(row.cpu) + tr(L"%\n30 秒平滑 CPU: ") + number(row.averageCpu) +
         L"%\nI/O: " + (row.ioKnown ? number(row.ioMB, 2) + L" MB/s" : tr(L"未知")) +
         tr(L"\n記憶體: ") + (row.memoryKnown ? number(row.memoryMB) + tr(L" MB（") + number(row.memoryAgeSeconds, 0) + tr(L" 秒前）") : tr(L"未知"));
@@ -746,7 +863,13 @@ void showDetails(const ProcessRow& row) {
         content += tr(L"\n\n所屬服務（共用程序時無法分別歸因）：");
         for (const auto& s : row.services) content += L"\n• " + s.display + L" (" + s.name + L")";
     }
-    MessageBoxW(mainWindow, content.c_str(), tr(L"程序詳情"), MB_OK | MB_ICONINFORMATION);
+    showInlinePage(InlinePage::process, tr(L"程序詳情"), content);
+}
+void showForceConfirmation(const ProcessRow& row) {
+    if (!pendingForceRow || &row != &*pendingForceRow) pendingForceRow = row;
+    std::wstring text = tr(L"強制結束 ") + row.name + tr(L"（PID ") + std::to_wstring(row.pid) +
+        tr(L"）？\n\n未儲存資料可能遺失。此操作僅結束所選程序，不包含其他子程序。");
+    showInlinePage(InlinePage::confirm, tr(L"確認強制結束"), text);
 }
 
 void sampleLoop() {
@@ -904,6 +1027,13 @@ LRESULT CALLBACK buttonProc(HWND window, UINT message, WPARAM wp, LPARAM lp, UIN
     if (message == WM_NCDESTROY) { buttonMotions.erase(window); pressMotions.erase(window); RemoveWindowSubclass(window, buttonProc, 1); }
     return DefSubclassProc(window, message, wp, lp);
 }
+LRESULT CALLBACK inlineTextProc(HWND window, UINT message, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    if (message == WM_KEYDOWN && wp == VK_ESCAPE) {
+        PostMessageW(mainWindow, WM_COMMAND, InlineBackId, 0); return 0;
+    }
+    if (message == WM_NCDESTROY) RemoveWindowSubclass(window, inlineTextProc, 1);
+    return DefSubclassProc(window, message, wp, lp);
+}
 void openMenu(POINT point) {
     HMENU menu = CreatePopupMenu();
     HMENU languages = CreatePopupMenu();
@@ -929,15 +1059,21 @@ void openMenu(POINT point) {
 void applyLanguage(bool useEnglish) {
     english = useEnglish;
     makeFonts();
-    SetWindowTextW(mainWindow, L"BatteryScope 0.9.1");
+    SetWindowTextW(mainWindow, L"BatteryScope 0.9.2");
     const std::pair<HWND, const wchar_t*> labels[] = {{closeButton, tr(L"正常關閉")}, {killButton, tr(L"強制結束…")},
-        {serviceButton, tr(L"停止服務…")}, {detailsButton, tr(L"查看詳情")}, {menuButton, tr(L"設定")}, {hideButton, tr(L"收回")}};
+        {serviceButton, tr(L"停止服務…")}, {detailsButton, tr(L"查看詳情")}, {menuButton, tr(L"設定")},
+        {hideButton, tr(L"收回")}, {inlineBack, inlinePage == InlinePage::confirm ? tr(L"取消") : tr(L"返回排行")},
+        {inlineConfirm, tr(L"確定強制結束")}};
     for (auto pair : labels)
         SetWindowTextW(pair.first, tr(pair.second));
     refreshSaverButton();
     SetWindowTextW(backgroundCheck, backgroundOnly ? tr(L"僅背景：開") : tr(L"僅背景：關"));
     SetWindowTextW(allCheck, showAll ? tr(L"顯示：全部程序") : tr(L"顯示：前 10 名"));
     SetWindowTextW(list, tr(L"CPU 耗電排行"));
+    if (inlinePage == InlinePage::process && inlineProcess) showDetails(*inlineProcess);
+    if (inlinePage == InlinePage::power) showPowerDetails();
+    if (inlinePage == InlinePage::candidates) showReviewCandidates();
+    if (inlinePage == InlinePage::confirm && pendingForceRow) showForceConfirmation(*pendingForceRow);
     notice = tr(L"正在讀取電池與程序資料…"); noticeUntil = 0;
     if (tooltip) SendMessageW(tooltip, TTM_POP, 0, 0);
     refreshList(); InvalidateRect(mainWindow, nullptr, FALSE);
@@ -957,6 +1093,8 @@ bool saveLanguage() {
     RegCloseKey(key); return result == ERROR_SUCCESS;
 }
 std::wstring controlTip(HWND control) {
+    if (control == inlineBack) return inlinePage == InlinePage::confirm ? tr(L"取消強制結束（Esc）") : tr(L"返回程序排行（Esc）");
+    if (control == inlineConfirm) return tr(L"確認後只結束所選程序；未儲存資料可能遺失");
     if (control == saverButton) return tr(L"切換電池供電時的最佳效率模式；可還原原本設定，不會結束程序。這不是 Windows 節能工具開關。");
     if (control == hideButton) return tr(L"收回面板（Esc），背景監測持續運作");
     if (control == menuButton) return tr(L"設定：Windows 節能設定、節能候選、語言與充電詳情");
@@ -1001,6 +1139,15 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         allCheck = button(tr(L"顯示：前 10 名"), AllId);
         saverButton = button(tr(L"省電"), SaverModeId);
         menuButton = button(tr(L"設定"), MenuId); hideButton = button(tr(L"收回"), HideId);
+        inlineText = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+            0, 0, 0, 0, window, nullptr, nullptr, nullptr);
+        SetWindowSubclass(inlineText, inlineTextProc, 1, 0);
+        SetWindowTheme(inlineText, L"DarkMode_Explorer", nullptr);
+        SendMessageW(inlineText, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(sp(4), sp(4)));
+        inlineBack = button(tr(L"返回排行"), InlineBackId);
+        inlineConfirm = button(tr(L"確定強制結束"), InlineConfirmId);
+        ShowWindow(inlineBack, SW_HIDE);
+        ShowWindow(inlineConfirm, SW_HIDE);
         tooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
             CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, window, nullptr, nullptr, nullptr);
         SetWindowTheme(tooltip, L"", L"");
@@ -1008,7 +1155,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         SendMessageW(tooltip, TTM_SETTIPTEXTCOLOR, Ink, 0);
         SendMessageW(tooltip, TTM_SETMAXTIPWIDTH, 0, px(300));
         SendMessageW(tooltip, TTM_SETDELAYTIME, TTDT_INITIAL, 550);
-        for (auto control : {closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck, saverButton, menuButton, hideButton}) {
+        for (auto control : {closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck,
+            saverButton, menuButton, hideButton, inlineBack, inlineConfirm}) {
             TOOLINFOW tool{}; tool.cbSize = sizeof(tool); tool.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
             tool.hwnd = window; tool.uId = reinterpret_cast<UINT_PTR>(control); tool.lpszText = LPSTR_TEXTCALLBACKW;
             SendMessageW(tooltip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&tool));
@@ -1063,7 +1211,14 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         SelectObject(dc, old); DeleteObject(bitmap); DeleteDC(dc); EndPaint(window, &ps); return 0;
     }
     case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLOREDIT:
     case WM_CTLCOLORBTN:
+        if (reinterpret_cast<HWND>(lp) == inlineText) {
+            SetTextColor(reinterpret_cast<HDC>(wp), Ink);
+            SetBkColor(reinterpret_cast<HDC>(wp), Surface);
+            SetDCBrushColor(reinterpret_cast<HDC>(wp), Surface);
+            return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH));
+        }
         SetBkColor(reinterpret_cast<HDC>(wp), Background); SetDCBrushColor(reinterpret_cast<HDC>(wp), Background);
         return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH));
     case WM_NOTIFY:
@@ -1113,6 +1268,12 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             refreshSaverButton();
             return 0;
         }
+        if (id == InlineBackId || (id == IDCANCEL && inlinePage != InlinePage::none)) { closeInlinePage(); return 0; }
+        if (id == InlineConfirmId) {
+            if (inlinePage != InlinePage::confirm || !pendingForceRow || demo || pendingAction) return 0;
+            ProcessRow target = *pendingForceRow;
+            closeInlinePage(true); startAction(target, true); return 0;
+        }
         if (id == IDCANCEL || id == HideId) { hideMain(); return 0; }
         if (id == MenuId) { RECT r{}; GetWindowRect(menuButton, &r); openMenu({r.left, r.bottom}); return 0; }
         if (id == TrayShow) { showMain(); return 0; }
@@ -1136,8 +1297,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (pendingAction || demo) return 0;
         if (id == CloseId && row->actionable && row->window) startAction(*row, false);
         if (id == KillId && row->actionable) {
-            std::wstring text = tr(L"強制結束 ") + row->name + tr(L"（PID ") + std::to_wstring(row->pid) + tr(L"）？\n\n未儲存資料可能遺失。此操作僅結束所選程序，不包含其他子程序。");
-            if (MessageBoxW(window, text.c_str(), tr(L"確認強制結束"), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES) startAction(*row, true);
+            showForceConfirmation(*row);
         }
         if (id == ServiceId && !row->services.empty()) chooseService(*row);
         releaseInteraction();
@@ -1166,7 +1326,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
                 wp == ERROR_DEPENDENT_SERVICES_RUNNING ? tr(L"有其他執行中的服務依賴此服務，未停止。") :
                 wp == ERROR_ACCESS_DISABLED_BY_POLICY ? tr(L"此服務屬於受保護的系統功能，未停止。") :
                 wp == ERROR_CANCELLED ? tr(L"已取消管理員授權。") : tr(L"操作未完成：") + errorText(DWORD(wp));
-            setNotice(text); MessageBoxW(window, text.c_str(), L"BatteryScope", MB_OK | MB_ICONINFORMATION);
+            setNotice(text);
+            showInlinePage(InlinePage::error, tr(L"操作未完成"), text);
         }
         resetSamples = true; wake.notify_one(); updateButtons(); return 0;
     }
@@ -1240,7 +1401,9 @@ bool captureWindow(const std::wstring& path) {
     SendMessageW(mainWindow, WM_PRINT, reinterpret_cast<WPARAM>(dc), PRF_CLIENT | PRF_CHILDREN | PRF_ERASEBKGND);
     // The main canvas is owner drawn; WM_PRINTCLIENT supplies its content explicitly.
     paint(dc, rect);
-    for (auto child : {viewport, closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck, saverButton, hideButton, menuButton}) {
+    for (auto child : {viewport, closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck,
+        saverButton, hideButton, menuButton, inlineText, inlineBack, inlineConfirm}) {
+        if (!(GetWindowLongPtrW(child, GWL_STYLE) & WS_VISIBLE)) continue;
         RECT childRect; GetWindowRect(child, &childRect); MapWindowPoints(nullptr, mainWindow, reinterpret_cast<POINT*>(&childRect), 2);
         SaveDC(dc); SetViewportOrgEx(dc, childRect.left, childRect.top, nullptr);
         IntersectClipRect(dc, 0, 0, childRect.right - childRect.left, childRect.bottom - childRect.top);
@@ -1352,6 +1515,38 @@ bool panelSelfTest(const std::wstring& path) {
     auto structuralBefore = listStructuralChanges;
     auto before = selection(); refreshList(); auto after = selection();
     check("refresh_reuses_native_items", listStructuralChanges == structuralBefore);
+    if (after) showDetails(*after);
+    check("details_open_inside_panel", inlinePage == InlinePage::process && IsWindowVisible(inlineText) &&
+        !IsWindowVisible(viewport) && IsWindowVisible(inlineBack));
+    int textLength = GetWindowTextLengthW(inlineText);
+    std::wstring detailText(size_t(textLength) + 1, L'\0');
+    GetWindowTextW(inlineText, detailText.data(), int(detailText.size()));
+    check("inline_details_keep_paragraphs", detailText.find(L"\r\n") != std::wstring::npos);
+    applyLanguage(true);
+    check("inline_details_switch_language", inlineTitle == tr(L"程序詳情"));
+    applyLanguage(false);
+    SendMessageW(mainWindow, WM_COMMAND, IDCANCEL, 0);
+    check("escape_returns_to_ranking", inlinePage == InlinePage::none && IsWindowVisible(viewport) && IsWindowVisible(mainWindow));
+    showPowerDetails();
+    check("power_details_reuse_panel", inlinePage == InlinePage::power && IsWindowVisible(inlineText));
+    SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
+    showReviewCandidates();
+    check("candidate_review_reuses_panel", inlinePage == InlinePage::candidates && IsWindowVisible(inlineText));
+    SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
+    if (after) showForceConfirmation(*after);
+    RECT compactConfirmation{}; GetWindowRect(mainWindow, &compactConfirmation);
+    check("force_confirmation_reuses_panel", inlinePage == InlinePage::confirm &&
+        IsWindowVisible(inlineConfirm) && IsWindowVisible(inlineBack) && GetFocus() == inlineBack &&
+        compactConfirmation.bottom - compactConfirmation.top == px(320));
+    SendMessageW(mainWindow, WM_COMMAND, IDCANCEL, 0);
+    RECT restoredConfirmation{}; GetWindowRect(mainWindow, &restoredConfirmation);
+    check("force_confirmation_cancel_is_safe", inlinePage == InlinePage::none && !pendingForceRow && !pendingAction);
+    check("ranking_height_restored", restoredConfirmation.bottom - restoredConfirmation.top == px(PanelHeight));
+    showInlinePage(InlinePage::error, tr(L"操作未完成"), tr(L"此服務目前不接受停止要求。"));
+    RECT compactError{}; GetWindowRect(mainWindow, &compactError);
+    check("action_error_reuses_panel", inlinePage == InlinePage::error && IsWindowVisible(inlineText) &&
+        compactError.bottom - compactError.top == px(360));
+    SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
     check("selection_survives_refresh", before && after && before->pid == after->pid && before->created == after->created);
     SendMessageW(mainWindow, WM_COMMAND, BackgroundId, 0);
     check("background_filter", backgroundOnly && displayed.size() == current.processes.size() - 1);
@@ -1398,6 +1593,17 @@ bool panelSelfTest(const std::wstring& path) {
     pump(320);
     GetLayeredWindowAttributes(mainWindow, nullptr, &alpha, &flags);
     check("animated_open_finishes_opaque", alpha == 255 && IsWindowVisible(mainWindow) && !panelMotion.active(motionNow()));
+    showForceConfirmation(current.processes.front());
+    check("confirmation_height_animates", panelHeightMotion.active(motionNow()) && inlinePage == InlinePage::confirm);
+    pump(240);
+    RECT animatedCompact{}; GetWindowRect(mainWindow, &animatedCompact);
+    check("confirmation_height_settles", animatedCompact.bottom - animatedCompact.top == px(320));
+    SendMessageW(mainWindow, WM_COMMAND, IDCANCEL, 0);
+    check("ranking_waits_for_expand", inlineClosing && inlinePage == InlinePage::confirm && panelHeightMotion.active(motionNow()));
+    pump(240);
+    RECT animatedRestored{}; GetWindowRect(mainWindow, &animatedRestored);
+    check("ranking_returns_after_expand", !inlineClosing && inlinePage == InlinePage::none &&
+        animatedRestored.bottom - animatedRestored.top == px(PanelHeight) && IsWindowVisible(viewport));
     current.processes.front().averageCpuWatts = 2.0; refreshList();
     check("power_bars_animate_between_samples", std::any_of(rowMotions.begin(), rowMotions.end(), [](const RowMotion& row) { return row.bar.active(motionNow()); }));
     check("numeric_watts_remain_latest_measurement", !displayed.empty() && displayed.front().averageCpuWatts == 2.0);
@@ -1537,7 +1743,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &monitor);
     int initialWidth = std::min(bounds.right, monitor.rcWork.right - monitor.rcWork.left - px(20));
     int initialHeight = std::min(bounds.bottom, monitor.rcWork.bottom - monitor.rcWork.top - px(20));
-    HWND window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, ClassName, L"BatteryScope 0.9.1", WS_POPUP | WS_CLIPCHILDREN,
+    HWND window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, ClassName, L"BatteryScope 0.9.2", WS_POPUP | WS_CLIPCHILDREN,
         monitor.rcWork.right - initialWidth - px(10), monitor.rcWork.bottom - initialHeight - px(10), initialWidth, initialHeight, nullptr, nullptr, instance, nullptr);
     if (!window) return 3;
     SetLayeredWindowAttributes(window, 0, 255, LWA_ALPHA);
@@ -1555,6 +1761,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     }
     else worker = std::thread(sampleLoop);
     applyLanguage(english);
+    if (screenshot && option(L"--details") && !current.processes.empty()) showDetails(current.processes.front());
+    if (screenshot && option(L"--power-details")) showPowerDetails();
+    if (screenshot && option(L"--candidates")) showReviewCandidates();
+    if (screenshot && option(L"--confirm") && !current.processes.empty()) showForceConfirmation(current.processes.front());
     if (screenshot && option(L"--scrolled")) scrollTo(px(17), true);
     if (screenshot && option(L"--selected") && !displayed.empty()) ListView_SetItemState(list, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
     bool trayOnly = !args.empty() && args[0] == L"--tray";
