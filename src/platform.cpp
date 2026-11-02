@@ -7,6 +7,8 @@
 #include <setupapi.h>
 #include <tlhelp32.h>
 #include <psapi.h>
+#include <pdh.h>
+#include <pdhmsg.h>
 #include <set>
 #include <cwctype>
 #include <cstring>
@@ -290,6 +292,36 @@ PowerSample readPower() {
     return p;
 }
 
+GpuUsage::GpuUsage() {
+    PDH_HQUERY query = nullptr;
+    if (PdhOpenQueryW(nullptr, 0, &query) != ERROR_SUCCESS) return;
+    PDH_HCOUNTER counter = nullptr;
+    if (PdhAddEnglishCounterW(query, L"\\GPU Engine(*)\\Utilization Percentage", 0, &counter) != ERROR_SUCCESS) {
+        PdhCloseQuery(query); return;
+    }
+    query_ = query; counter_ = counter;
+}
+GpuUsage::~GpuUsage() { if (query_) PdhCloseQuery(static_cast<PDH_HQUERY>(query_)); }
+bool GpuUsage::sample(std::unordered_map<uint32_t, double>& usage) {
+    usage.clear();
+    if (!query_) return false;
+    if (PdhCollectQueryData(static_cast<PDH_HQUERY>(query_)) != ERROR_SUCCESS) { primed_ = false; return false; }
+    if (!primed_) { primed_ = true; return false; } // rate counters need two samples
+    DWORD bytes = 0, count = 0;
+    PDH_STATUS status = PdhGetFormattedCounterArrayW(static_cast<PDH_HCOUNTER>(counter_), PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, &bytes, &count, nullptr);
+    if (status != PDH_STATUS(PDH_MORE_DATA) || !bytes) return false;
+    std::vector<BYTE> buffer(bytes);
+    auto items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buffer.data());
+    status = PdhGetFormattedCounterArrayW(static_cast<PDH_HCOUNTER>(counter_), PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, &bytes, &count, items);
+    if (status != ERROR_SUCCESS) return false;
+    std::vector<std::pair<std::wstring, double>> instances;
+    instances.reserve(count);
+    for (DWORD i = 0; i < count; ++i)
+        if (items[i].szName && (items[i].FmtValue.CStatus == PDH_CSTATUS_VALID_DATA || items[i].FmtValue.CStatus == PDH_CSTATUS_NEW_DATA))
+            instances.emplace_back(items[i].szName, items[i].FmtValue.doubleValue);
+    usage = aggregateGpu(instances);
+    return true;
+}
 struct ScHandle {
     SC_HANDLE value = nullptr;
     explicit ScHandle(SC_HANDLE h) : value(h) {}
@@ -512,10 +544,10 @@ static_assert(sizeof(NativeProcessInformation) == 0x100 && sizeof(NativeThreadIn
 struct RawProcess {
     DWORD pid = 0;
     DWORD parentPid = 0;
-    uint64_t created = 0, cpu = 0, io = 0;
+    uint64_t created = 0, cpu = 0, io = 0, cycles = 0;
     std::wstring name;
     double memoryMB = 0;
-    bool cpuKnown = false;
+    bool cpuKnown = false, cyclesKnown = false;
     bool ioKnown = false, memoryKnown = false;
 };
 
@@ -564,6 +596,7 @@ bool systemProcessSnapshot(std::vector<RawProcess>& result, uint64_t& sampleMs, 
             row.created = uint64_t(process->createTime.QuadPart);
             row.cpu = uint64_t(process->kernelTime.QuadPart) + uint64_t(process->userTime.QuadPart);
             row.cpuKnown = true;
+            row.cycles = process->cycleTime; row.cyclesKnown = process->cycleTime != 0;
             row.io = uint64_t(process->readTransferCount.QuadPart) + uint64_t(process->writeTransferCount.QuadPart);
             row.ioKnown = true;
             row.memoryKnown = true;
@@ -618,6 +651,9 @@ bool toolhelpProcessSnapshot(std::vector<RawProcess>& result, size_t& total,
         if (row.cpuKnown) {
             row.created = fileTime(c);
             row.cpu = fileTime(k) + fileTime(u);
+            ULONG64 cycles = 0;
+            row.cyclesKnown = QueryProcessCycleTime(process, &cycles) && cycles;
+            row.cycles = cycles;
             IO_COUNTERS io{};
             row.ioKnown = GetProcessIoCounters(process, &io) != FALSE;
             row.io = io.ReadTransferCount + io.WriteTransferCount;
@@ -716,11 +752,13 @@ std::vector<ProcessRow> Collector::collect(size_t& total, size_t& inaccessible, 
                 row.averageCpu = smooth(p.averageCpu, row.cpu, dt);
                 row.averageIo = smooth(p.averageIo, row.ioMB, dt);
                 row.busySeconds = row.cpu >= 1 || (row.ioKnown && row.ioMB >= 1) ? p.busySeconds + dt : 0;
+                if (source.cyclesKnown && p.cyclesKnown && source.cycles >= p.cycles) row.cycleRate = (source.cycles - p.cycles) / dt;
                 // An activity heuristic, NOT watts or a calibrated energy attribution.
                 row.score = row.averageCpu + std::min(20.0, row.averageIo * 2);
             }
         }
-        next[row.pid] = {row.created, cpu, ioBytes, sampleMs_, row.averageCpu, row.averageIo, row.busySeconds, rawIoKnown};
+        next[row.pid] = {row.created, cpu, ioBytes, sampleMs_, row.averageCpu, row.averageIo, row.busySeconds, rawIoKnown,
+            source.cycles, source.cyclesKnown};
         row.activity = !source.cpuKnown ? ActivityReason::limited : !row.measured ? ActivityReason::warming
             : row.averageCpu < .1 && row.averageIo < .1 ? ActivityReason::low
             : row.averageCpu >= row.averageIo * 2 ? ActivityReason::cpu : ActivityReason::io;

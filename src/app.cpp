@@ -6,6 +6,7 @@
 #include "ui.h"
 #include <commctrl.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <uxtheme.h>
 #include <dwmapi.h>
 #include <windowsx.h>
@@ -34,6 +35,7 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     HotkeyToggleId = 124, ThemeSystemId = 125, ThemeDarkId = 126, ThemeLightId = 127, StylePixelId = 128, StyleSmoothId = 129,
     ModeAcEfficiencyId = 140, ModeAcBalancedId = 141, ModeAcPerformanceId = 142,
     ModeDcEfficiencyId = 143, ModeDcBalancedId = 144, ModeDcPerformanceId = 145, RestoreModesId = 146, TrayPercentId = 147,
+    DrainAlertId = 148, HistoryId = 149, HistoryToggleId = 150, ClearHistoryId = 151,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1;
 const wchar_t* ClassName = L"BatteryScope.Main.v1";
@@ -60,6 +62,9 @@ HICON appIcon = nullptr, smallIcon = nullptr, headerIcon = nullptr;
 bool updateTray(bool add);
 UINT dpi = 96, taskbarCreated = 0;
 std::atomic<bool> quit{false}, hidden{false}, resetSamples{false};
+// Daily history, owned by the sampler thread; the UI flips these flags.
+std::atomic<bool> historyEnabled{true}, clearHistoryRequest{false};
+int localDate(int daysBack = 0); // yyyymmdd in local time, `daysBack` days ago
 std::mutex mailboxMutex, wakeMutex;
 std::condition_variable wake;
 // The sampler hands each process list over by move: mailboxProcesses says the
@@ -79,11 +84,20 @@ void* effectiveWatch = nullptr;
 PowerModes powerModes;
 HWND modeButtons[6] = {}, restoreModesButton = nullptr, energySettingsButton = nullptr;
 bool isolatedPreview = false;
-enum class InlinePage { none, process, power, candidates, ledger, powerMode, confirm, error };
+enum class InlinePage { none, process, power, candidates, ledger, powerMode, history, confirm, error };
 unsigned lowBatteryThreshold = 0; // percent; 0 = off
 LowBatteryMonitor lowBattery;
 bool hotkeyEnabled = false, hotkeyRegistered = false;
 bool trayPercent = true;          // show the battery percentage as the notification icon
+bool drainAlerts = false;         // notify about sustained high-power background work
+std::set<std::pair<uint32_t, uint64_t>> drainNotified;
+uint64_t lastDrainAlert = 0;
+bool balloonOpensCandidates = false;
+// Learned charging curve and detected charge limit, saved under HKCU\Software\BatteryScope.
+ChargeCurve chargeCurve;
+std::optional<int> chargeLimit;
+uint64_t curveLastMs = 0, curveSavedAt = 0;
+bool curveDirty = false;
 HICON trayIcon = nullptr;         // generated percentage icon (owned)
 std::wstring trayIconKey;
 InlinePage inlinePage = InlinePage::none;
@@ -217,6 +231,41 @@ std::wstring durationText(Value hours) {
     if (!minutes) return {};
     return tr(L"約 ") + (minutes >= 60 ? std::to_wstring(minutes / 60) + tr(L" 小時 ") : L"") + std::to_wstring(minutes % 60) + tr(L" 分");
 }
+// "11/02" from yyyymmdd.
+std::wstring dayLabel(int date) { return std::to_wstring(date / 100 % 100) + L"/" + (date % 100 < 10 ? L"0" : L"") + std::to_wstring(date % 100); }
+// A range when the 5-minute and longer means disagree by more than 15%.
+std::wstring remainingText(const PowerMetrics& m) {
+    if (m.hoursRemainingLow && m.hoursRemainingHigh && *m.hoursRemainingHigh > *m.hoursRemainingLow * 1.15 && *m.hoursRemainingHigh < 100) {
+        const int low = roundedMinutes(*m.hoursRemainingLow), high = roundedMinutes(*m.hoursRemainingHigh);
+        if (high < 60) return tr(L"約 ") + std::to_wstring(low) + L"–" + std::to_wstring(high) + tr(L" 分");
+        return tr(L"約 ") + number(*m.hoursRemainingLow, 1) + L"–" + number(*m.hoursRemainingHigh, 1) + tr(L" 小時");
+    }
+    return durationText(m.hoursRemaining);
+}
+// Time to full (or to a detected charge limit): the learned curve when it covers
+// the way, else the at-current-rate estimate. Both need 60 s of steady charging.
+struct ChargeEta { Value hours; int target = 100; bool curve = false; };
+ChargeEta chargeEta(const ChargingMetrics& c, const PowerSample& p) {
+    ChargeEta eta;
+    if (!p.charging || !p.percent || !p.fullWh || !p.remainingWh) { eta.hours = c.hoursToFull; return eta; }
+    if (chargeLimit && *p.percent < *chargeLimit - .5) eta.target = *chargeLimit;
+    const bool stable = c.coverageSeconds >= 60 && c.averageWatts && c.watts && *c.averageWatts > .5 && *c.watts > .5;
+    if (stable) {
+        if (auto curve = chargeCurve.hoursTo(*p.percent, eta.target, *p.fullWh, std::min(*c.averageWatts, *c.watts))) {
+            eta.hours = curve; eta.curve = true; return eta;
+        }
+    }
+    if (eta.target == 100) eta.hours = c.hoursToFull;
+    else if (c.hoursToFull) {
+        const double energy = *p.fullWh * eta.target / 100 - *p.remainingWh;
+        if (energy > 0) eta.hours = energy / std::min(*c.averageWatts, *c.watts);
+    }
+    return eta;
+}
+std::wstring etaLabel(const ChargeEta& eta) {
+    if (eta.target < 100) return tr(L"至 ") + std::to_wstring(eta.target) + tr(L"% 上限") + (eta.curve ? tr(L" · 依充電曲線") : tr(L" · 依目前速度"));
+    return eta.curve ? tr(L"至充滿 · 依充電曲線") : tr(L"至充滿 · 依目前速度");
+}
 int listTop() {
     RECT r{}; GetClientRect(mainWindow, &r);
     return sp(r.bottom < px(480) ? 270 : r.bottom < px(600) ? 308 : 366);
@@ -306,11 +355,15 @@ std::wstring trayText() {
     if (p.charging) {
         const auto charge = calculateCharging(current.history);
         text += tr(L" · 充電 ") + valueText(charge.watts, L" W");
-        if (auto full = durationText(charge.hoursToFull); !full.empty()) text += english ? L" · " + full + L" to full" : L" · " + full + L"充滿";
+        const auto eta = chargeEta(charge, p);
+        if (auto full = durationText(eta.hours); !full.empty()) {
+            const std::wstring goal = eta.target < 100 ? std::to_wstring(eta.target) + L"%" : L"";
+            text += english ? L" · " + full + L" to " + (goal.empty() ? L"full" : goal) : L" · " + full + (goal.empty() ? L"充滿" : L"到 " + goal);
+        }
     } else if (p.onAc) text += tr(L" · 插電中");
     else {
         text += L" · " + valueText(current.power.currentWatts, L" W");
-        if (auto left = durationText(current.power.hoursRemaining); !left.empty()) text += english ? L" · " + left + L" left" : L" · 續航" + left;
+        if (auto left = remainingText(current.power); !left.empty()) text += english ? L" · " + left + L" left" : L" · 續航" + left;
     }
     return text;
 }
@@ -347,23 +400,37 @@ bool updateTray(bool add) {
     if (add) { data.uVersion = NOTIFYICON_VERSION_4; trayVersion4 = Shell_NotifyIconW(NIM_SETVERSION, &data) != FALSE; }
     return true;
 }
+void showBalloon(const std::wstring& title, const std::wstring& body, bool opensCandidates) {
+    NOTIFYICONDATAW data{}; data.cbSize = sizeof(data); data.hWnd = mainWindow; data.uID = 1;
+    data.uFlags = NIF_INFO; data.dwInfoFlags = NIIF_WARNING | NIIF_RESPECT_QUIET_TIME;
+    wcsncpy_s(data.szInfoTitle, title.c_str(), _TRUNCATE);
+    wcsncpy_s(data.szInfo, body.c_str(), _TRUNCATE);
+    if (Shell_NotifyIconW(NIM_MODIFY, &data)) balloonOpensCandidates = opensCandidates;
+}
 // One Windows notification when the battery reaches the chosen threshold.
 void showLowBatteryNotice() {
     if (!trayAdded || current.history.empty()) return;
     const auto& p = current.history.back();
     std::wstring body = tr(L"目前耗電 ") + valueText(current.power.currentWatts, L" W");
-    if (auto left = durationText(current.power.hoursRemaining); !left.empty()) body += english ? L" · " + left + L" left" : L" · 續航" + left;
+    if (auto left = remainingText(current.power); !left.empty()) body += english ? L" · " + left + L" left" : L" · 續航" + left;
     for (const auto& row : current.processes) {
         if (!row.averageCpuWatts || *row.averageCpuWatts < .3 || row.pid <= 4) continue;
         body += tr(L"\n耗電最高：") + (row.services.size() == 1 ? row.services.front().display : row.name) +
             L" (" + valueText(row.averageCpuWatts, L" W", 1) + L")";
         break;
     }
-    NOTIFYICONDATAW data{}; data.cbSize = sizeof(data); data.hWnd = mainWindow; data.uID = 1;
-    data.uFlags = NIF_INFO; data.dwInfoFlags = NIIF_WARNING | NIIF_RESPECT_QUIET_TIME;
-    wcsncpy_s(data.szInfoTitle, (tr(L"電量偏低 · ") + valueText(p.percent, L"%", 0)).c_str(), _TRUNCATE);
-    wcsncpy_s(data.szInfo, body.c_str(), _TRUNCATE);
-    Shell_NotifyIconW(NIM_MODIFY, &data);
+    showBalloon(tr(L"電量偏低 · ") + valueText(p.percent, L"%", 0), body, false);
+}
+// One drain notification per process, at most every 10 minutes, on battery only.
+void checkDrainAlert() {
+    if (!drainAlerts || demo || isolatedPreview || !trayAdded || GetTickCount64() - lastDrainAlert < 600000) return;
+    const auto index = drainAlertCandidate(current, drainNotified);
+    if (!index) return;
+    const auto& row = current.processes[*index];
+    drainNotified.insert({row.pid, row.created});
+    lastDrainAlert = GetTickCount64();
+    showBalloon(tr(L"背景程式持續耗電"), row.name + tr(L" 已在背景持續使用約 ") + valueText(row.averageCpuWatts, L" W", 1) +
+        tr(L" CPU 電力（") + std::to_wstring(int(row.busySeconds / 60)) + tr(L" 分鐘）。點此查看。"), true);
 }
 void refreshList();
 void positionPanel() {
@@ -689,9 +756,9 @@ void layout() {
     MoveWindow(powerButton, w - sp(108), sp(47), sp(88), sp(22), TRUE);
     MoveWindow(menuButton, w - sp(92), sp(16), sp(32), sp(30), TRUE);
     MoveWindow(hideButton, w - sp(52), sp(16), sp(32), sp(30), TRUE);
-    const bool fullPage = inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode ||
+    const bool fullPage = inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history ||
         inlinePage == InlinePage::confirm || inlinePage == InlinePage::error;
-    const int textTop = inlinePage == InlinePage::powerMode ? sp(318) : fullPage ? sp(128) : top - sp(37);
+    const int textTop = inlinePage == InlinePage::powerMode ? sp(318) : inlinePage == InlinePage::history ? sp(262) : fullPage ? sp(128) : top - sp(37);
     {
         const int pageLeft = margin + sp(12), pageWidth = inner - sp(24), modeGap = sp(6);
         const int third = (pageWidth - 2 * modeGap) / 3, pageHalf = (pageWidth - modeGap) / 2;
@@ -730,7 +797,8 @@ void showInlinePage(InlinePage page, const std::wstring& title, const std::wstri
         lines += content[i];
     }
     SetWindowTextW(inlineText, lines.c_str());
-    ShowScrollBar(inlineText, SB_VERT, page == InlinePage::process || page == InlinePage::power || page == InlinePage::ledger || page == InlinePage::powerMode ||
+    ShowScrollBar(inlineText, SB_VERT, page == InlinePage::process || page == InlinePage::power || page == InlinePage::ledger ||
+        page == InlinePage::powerMode || page == InlinePage::history ||
         (page == InlinePage::candidates && lines.size() > 500));
     SendMessageW(inlineText, EM_SETSEL, 0, 0);
     SendMessageW(inlineText, EM_SCROLLCARET, 0, 0);
@@ -895,10 +963,11 @@ void drawProcess(const DRAWITEMSTRUCT& item) {
     rounded(dc, chip, inverted ? tileColor : blend(tileColor, Ink, theme.dark ? .08 : .06), 5);
     if (theme.highContrast) outline(dc, chip, sub, 5);
     drawText(dc, kind, chip, sub, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-    drawText(dc, L"PID " + std::to_wstring(row.pid), {chip.right + sp(6), y + sp(29), right - sp(100), y + sp(47)}, sub, smallFont);
+    drawText(dc, L"PID " + std::to_wstring(row.pid), {chip.right + sp(6), y + sp(29), right - sp(158), y + sp(47)}, sub, smallFont);
     // CPU share is easier to read at a glance; the watt range is on the details page.
     std::wstring range = L"CPU " + (row.measured ? number(row.cpu) + L"%" : L"—");
-    drawText(dc, range, {right - sp(102), y + sp(29), right, y + sp(47)}, sub, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    if (row.gpuPercent && *row.gpuPercent >= 1) range += L" · GPU " + number(*row.gpuPercent, 0) + L"%";
+    drawText(dc, range, {right - sp(156), y + sp(29), right, y + sp(47)}, sub, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
     if (row.averageCpuWatts && !displayed.empty() && displayed.front().averageCpuWatts && *displayed.front().averageCpuWatts > 0) {
         const double ratio = item.itemID < rowMotions.size() ? rowMotions[item.itemID].bar.value(motionNow()) : 0;
         const int barTop = y + sp(49), barBottom = barTop + std::max(2, sp(3));
@@ -923,7 +992,8 @@ void paint(HDC dc, RECT bounds) {
     if (headerIcon) DrawIconEx(dc, margin, sp(15), headerIcon, sp(22), sp(22), 0, nullptr, DI_NORMAL);
     drawText(dc, L"BatteryScope", {margin + sp(30), sp(11), w - sp(98), sp(40)}, Ink, titleFont);
     drawText(dc, demo ? tr(L"示範資料 · 關閉操作已停用") : tr(L"電池與背景活動"), {margin + sp(30), sp(39), w - sp(96), sp(60)}, Muted, smallFont);
-    if (inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::confirm || inlinePage == InlinePage::error) {
+    if (inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history ||
+        inlinePage == InlinePage::confirm || inlinePage == InlinePage::error) {
         card(dc, {margin, sp(74), right, h - sp(14)}, Surface, 14);
         drawText(dc, inlineTitle, {margin + sp(14), sp(84), right - sp(14), sp(114)}, Ink, titleFont);
         fill(dc, {margin + sp(14), sp(119), right - sp(14), sp(119) + 1}, Border);
@@ -936,6 +1006,35 @@ void paint(HDC dc, RECT bounds) {
                 plugged ? Green : Muted, smallFont);
             drawText(dc, std::wstring(tr(L"用電池時")) + (!plugged ? tr(L" · 目前") : L""), {margin + sp(14), sp(212), right - sp(14), sp(232)},
                 !plugged ? Green : Muted, smallFont);
+        }
+        if (inlinePage == InlinePage::history) {
+            // Seven calendar days ending today; days without records show an empty slot.
+            const RECT plot{margin + sp(18), sp(146), right - sp(18), sp(228)};
+            drawText(dc, tr(L"每日放電 Wh"), {margin + sp(14), sp(124), right - sp(14), sp(142)}, Muted, smallFont);
+            double peak = 1;
+            int dates[7];
+            for (int i = 0; i < 7; ++i) dates[i] = localDate(6 - i);
+            auto find = [&](int date) -> const DayStats* {
+                for (const auto& day : current.days) if (day.date == date) return &day;
+                return nullptr;
+            };
+            for (int date : dates) if (auto day = find(date)) peak = std::max(peak, day->dischargedWh);
+            const int gap = sp(6), slot = (int(plot.right - plot.left) - 6 * gap) / 7;
+            for (int i = 0; i < 7; ++i) {
+                const int x = plot.left + i * (slot + gap);
+                const DayStats* day = find(dates[i]);
+                const double wh = day ? day->dischargedWh : 0;
+                const int height = wh > 0 ? std::max(sp(3), int((plot.bottom - plot.top - sp(16)) * wh / peak)) : 0;
+                const RECT bar{x, plot.bottom - height, x + slot, plot.bottom};
+                fill(dc, {x, plot.bottom, x + slot, plot.bottom + std::max(1, pixelStyle ? pixelUnit() / 2 : 1)}, Border);
+                if (height) {
+                    rounded(dc, bar, i == 6 ? Green : blend(Green, Surface, theme.highContrast ? 0 : .45), 3);
+                    drawText(dc, number(wh, wh < 10 ? 1 : 0), {x - sp(6), bar.top - sp(16), x + slot + sp(6), bar.top - sp(1)}, Muted, smallFont,
+                        DT_CENTER | DT_SINGLELINE | DT_BOTTOM);
+                }
+                drawText(dc, dayLabel(dates[i]), {x - sp(6), plot.bottom + sp(3), x + slot + sp(6), plot.bottom + sp(20)},
+                    i == 6 ? Ink : Muted, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            }
         }
         if (inlinePage != InlinePage::error && GetTickCount64() < noticeUntil)
             drawText(dc, notice, {margin + sp(14), h - sp(84), right - sp(14), h - sp(64)}, Green, smallFont);
@@ -970,7 +1069,9 @@ void paint(HDC dc, RECT bounds) {
         blend(Muted, Surface, .25), level, blend(Surface, Border, .7), p.charging, Ink, Surface, pixelUnit());
     else ui::drawBattery(dc, {right - sp(16) - sp(60), sp(121), right - sp(16), sp(143)}, p.percent ? *p.percent / 100 : 0,
         blend(Muted, Surface, .25), level, p.charging, Ink, Surface);
-    drawText(dc, p.charging ? tr(L"充電中") : plugged ? (p.percent && *p.percent >= 99.5 ? tr(L"已充滿") : tr(L"未充電")) : tr(L"剩餘電量"),
+    const bool atLimit = plugged && !p.charging && chargeLimit && p.percent && std::abs(*p.percent - *chargeLimit) <= 1.5;
+    drawText(dc, p.charging ? tr(L"充電中") : atLimit ? tr(L"充電上限 ") + std::to_wstring(*chargeLimit) + L"%" :
+        plugged ? (p.percent && *p.percent >= 99.5 ? tr(L"已充滿") : tr(L"未充電")) : tr(L"剩餘電量"),
         {right - sp(146), sp(151), right - sp(16), sp(172)}, Muted, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
     if (!minimal) {
         const int gap = sp(8), half = (right - margin - gap) / 2;
@@ -987,9 +1088,10 @@ void paint(HDC dc, RECT bounds) {
             {rateCard.left + sp(12), rateCard.top + sp(19), rateCard.right - sp(8), rateCard.bottom - sp(3)}, Ink, strongFont);
         std::wstring remaining = tr(L"估計續航 —");
         if (plugged) remaining = p.charging ? tr(L"等待穩定充電資料") : valueText(p.remainingWh, L"", 1) + L" / " + valueText(p.fullWh, L" Wh", 1);
-        if (auto text = durationText(p.charging ? charge.hoursToFull : m.hoursRemaining); !text.empty()) remaining = text;
+        const auto eta = chargeEta(charge, p);
+        if (auto text = p.charging ? durationText(eta.hours) : remainingText(m); !text.empty()) remaining = text;
         // Plugged in without charging there is no time to show, so show stored energy instead.
-        drawText(dc, plugged ? (p.charging ? tr(L"至充滿 · 依目前速度") : tr(L"剩餘容量")) : tr(L"近 5 分鐘 ") + valueText(m.averageWatts, L" W"),
+        drawText(dc, plugged ? (p.charging ? etaLabel(eta) : tr(L"剩餘容量")) : tr(L"近 5 分鐘 ") + valueText(m.averageWatts, L" W"),
             {timeCard.left + sp(12), timeCard.top + sp(4), timeCard.right - sp(8), timeCard.top + sp(20)}, Muted, smallFont);
         drawText(dc, remaining, {timeCard.left + sp(12), timeCard.top + sp(19), timeCard.right - sp(8), timeCard.bottom - sp(3)}, Ink, strongFont);
     }
@@ -1096,10 +1198,16 @@ void showPowerDetails() {
     text += tr(L"\n電池健康度：") + (health ? number(*health, 0) + tr(L"%（滿充 ") + valueText(p.fullWh, L" Wh") +
         tr(L" / 設計 ") + valueText(p.designWh, L" Wh") + tr(L"）") : std::wstring(tr(L"未提供")));
     text += tr(L"\n充電循環：") + (p.cycleCount ? std::to_wstring(*p.cycleCount) + tr(L" 次") : std::wstring(tr(L"未提供")));
-    text += tr(L"\n至充滿（依目前速度）：") + valueText(charge.hoursToFull, tr(L" 小時"), 2);
+    const auto eta = chargeEta(charge, p);
+    text += L"\n" + etaLabel(eta) + tr(L"：") + valueText(eta.hours, tr(L" 小時"), 2);
+    text += tr(L"\n偵測到的充電上限：") + (chargeLimit ? tr(L"約 ") + std::to_wstring(*chargeLimit) + tr(L"%（插電時電量長時間停在此處，可能是電池保護設定）")
+        : std::wstring(tr(L"未偵測到")));
+    int learned = 0;
+    for (int band = 0; band < ChargeCurve::Bands; ++band) learned += chargeCurve.samples(band) >= 6;
+    text += tr(L"\n已學習的充電曲線：") + std::to_wstring(learned * 5) + tr(L"% 的電量區間");
     text += tr(L"\n\n健康度是目前滿充容量占原廠設計容量的比例，會隨使用逐漸下降；新電池可能略高於 100%。");
     text += tr(L"\n\n充電功率是電池吸收的淨功率，不是插座功率、充電器額定功率或 USB PD 合約瓦數。");
-    text += tr(L"\n充滿時間需至少 60 秒連續穩定充電資料。接近滿電時會減速；電池保護上限也可能讓充電提前停止，因此不是保證時間。");
+    text += tr(L"\n充滿時間需至少 60 秒連續穩定充電資料。BatteryScope 會記錄這台電腦在各電量區間的實際充電速度；學到的區間涵蓋剩餘路程時，會依充電曲線預估接近滿電時的減速，否則依目前速度估算。偵測到充電上限時改預估到上限。這些都不是保證時間。");
     text += tr(L"\n\nWindows 通用電源資訊只回報是否接上外部電源，不能區分圓孔變壓器與 USB-C。偵測到 USB-C 控制器也不能證明目前由它供電。");
     showInlinePage(InlinePage::power, tr(L"電池與充電詳情"), text);
     releaseInteraction();
@@ -1117,6 +1225,27 @@ bool writeSetting(const wchar_t* name, DWORD value) {
     auto result = RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value));
     RegCloseKey(key); return result == ERROR_SUCCESS;
 }
+bool writeBinarySetting(const wchar_t* name, const std::vector<uint8_t>& bytes) {
+    if (demo || isolatedPreview) return true;
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\BatteryScope", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) return false;
+    auto result = RegSetValueExW(key, name, 0, REG_BINARY, bytes.data(), DWORD(bytes.size()));
+    RegCloseKey(key); return result == ERROR_SUCCESS;
+}
+// Learns from each new battery sample: charging rate per band, and a charge limit
+// when the level holds steady below full while plugged in.
+void learnFromSample() {
+    if (demo || isolatedPreview || current.history.empty()) return;
+    const auto& p = current.history.back();
+    if (p.ms <= curveLastMs) return;
+    curveLastMs = p.ms;
+    if (p.present && p.acKnown && p.onAc && p.charging && p.percent && p.watts && std::isfinite(*p.watts) && *p.watts < -.5) {
+        chargeCurve.add(*p.percent, -*p.watts); curveDirty = true;
+        if (chargeLimit && *p.percent > *chargeLimit + 2) { chargeLimit.reset(); writeSetting(L"ChargeLimit", 0); }
+    }
+    if (auto limit = detectChargeLimit(current.history); limit && limit != chargeLimit) { chargeLimit = limit; writeSetting(L"ChargeLimit", DWORD(*limit)); }
+    if (curveDirty && p.ms - curveSavedAt >= 300000) { writeBinarySetting(L"ChargeCurve", chargeCurve.save()); curveSavedAt = p.ms; curveDirty = false; }
+}
 void loadSettings() {
     english = readSetting(L"Language", 0) == 1;
     const DWORD storedTheme = readSetting(L"Theme", 0);
@@ -1126,6 +1255,14 @@ void loadSettings() {
     hotkeyEnabled = readSetting(L"Hotkey", 0) == 1;
     pixelStyle = readSetting(L"Style", 1) != 0;
     trayPercent = readSetting(L"TrayPercent", 1) != 0;
+    drainAlerts = readSetting(L"DrainAlert", 0) == 1;
+    historyEnabled = readSetting(L"History", 1) != 0;
+    std::vector<uint8_t> curve(512); DWORD curveBytes = DWORD(curve.size());
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\BatteryScope", L"ChargeCurve", RRF_RT_REG_BINARY, nullptr, curve.data(), &curveBytes) == ERROR_SUCCESS) {
+        curve.resize(curveBytes); chargeCurve.load(curve);
+    }
+    const DWORD limit = readSetting(L"ChargeLimit", 0);
+    if (limit >= 40 && limit <= 96) chargeLimit = int(limit);
 }
 void showLedger() {
     std::wstring content = tr(L"自 BatteryScope 啟動以來，依 CPU 能源分攤累計各程式的耗能，含已結束的程序。");
@@ -1163,7 +1300,7 @@ bool writeUtf8(const std::wstring& path, const std::wstring& text) {
 // history next to it as "<name>-power.csv". Returns the power file path.
 std::optional<std::wstring> exportCsv(const std::wstring& path) {
     std::wstring processes = L"rank,name,pid,kind,cpu_percent,avg_cpu_percent,cpu_watts,avg_cpu_watts,cpu_watts_low,cpu_watts_high,"
-        L"session_cpu_mwh,memory_mb,io_mb_per_s,services,path\r\n";
+        L"session_cpu_mwh,memory_mb,io_mb_per_s,gpu_percent,services,path\r\n";
     for (size_t i = 0; i < current.processes.size(); ++i) {
         const auto& row = current.processes[i];
         std::wstring services;
@@ -1173,6 +1310,7 @@ std::optional<std::wstring> exportCsv(const std::wstring& path) {
             csvNumber(row.cpuWatts, 3) + L"," + csvNumber(row.averageCpuWatts, 3) + L"," + csvNumber(row.cpuWattsLow, 3) + L"," +
             csvNumber(row.cpuWattsHigh, 3) + L"," + csvNumber(row.cpuMilliWh, 2) + L"," +
             (row.memoryKnown ? number(row.memoryMB, 1) : L"") + L"," + (row.ioKnown && row.measured ? number(row.ioMB, 3) : L"") + L"," +
+            csvNumber(row.gpuPercent, 1) + L"," +
             csvField(services) + L"," + csvField(row.path) + L"\r\n";
     }
     std::wstring power = L"seconds_ago,percent,battery_watts_positive_discharge,remaining_wh,full_wh,on_ac,charging\r\n";
@@ -1249,6 +1387,28 @@ std::wstring powerModeText() {
     else if (!powerModes.acKnown || !powerModes.dcKnown) text += tr(L"\n\n灰色的選項表示此電腦未提供該設定。");
     text += tr(L"\n\nBatteryScope 第一次變更某一項時會記住原本的設定，可用「還原原本設定」恢復；不會結束任何程式。");
     return text;
+}
+std::wstring historyText() {
+    std::wstring text;
+    if (current.days.empty()) text = tr(L"還沒有紀錄。BatteryScope 執行時會每天累計用電池的時間、放電與充電量，以及最耗電的程式。");
+    const int today = localDate();
+    for (auto it = current.days.rbegin(); it != current.days.rend(); ++it) {
+        const auto& day = *it;
+        text += (text.empty() ? L"" : L"\n\n") + dayLabel(day.date) + (day.date == today ? tr(L"（今天）") : L"") +
+            tr(L" · 用電池 ") + (day.batteryMinutes >= 1 ? durationText(day.batteryMinutes / 60).substr(std::wstring(tr(L"約 ")).size()) : L"0" + std::wstring(tr(L" 分"))) +
+            tr(L" · 放電 ") + number(day.dischargedWh, 1) + L" Wh" + tr(L" · 充電 ") + number(day.chargedWh, 1) + L" Wh";
+        if (!day.apps.empty()) {
+            text += tr(L"\n  CPU 最耗電：");
+            for (size_t i = 0; i < day.apps.size() && i < 3; ++i)
+                text += (i ? tr(L"、") : L"") + day.apps[i].first + L" " + number(day.apps[i].second, 0) + L" mWh";
+        }
+    }
+    text += tr(L"\n\n紀錄只存在這台電腦（%LOCALAPPDATA%\\BatteryScope\\history.csv），保留 60 天；可在選單關閉或清除。BatteryScope 沒有執行的時間不會被記錄。");
+    return text;
+}
+void showHistoryPage() {
+    showInlinePage(InlinePage::history, tr(L"歷史紀錄 · 7 天"), historyText());
+    releaseInteraction();
 }
 void showPowerModePage() {
     refreshPowerModeControls();
@@ -1372,7 +1532,8 @@ void showDetails(const ProcessRow& row) {
         tr(L"\n\nCPU（全機比例）: ") + number(row.cpu) + tr(L"%\n30 秒平滑 CPU: ") + number(row.averageCpu) +
         L"%\nI/O: " + (row.ioKnown ? number(row.ioMB, 2) + L" MB/s" : tr(L"未知")) +
         tr(L"\n記憶體: ") + (row.memoryKnown ? number(row.memoryMB) + tr(L" MB（") + number(row.memoryAgeSeconds, 0) + tr(L" 秒前）") : tr(L"未知")) +
-        tr(L"\n活動: ") + activityText(row);
+        tr(L"\n活動: ") + activityText(row) +
+        tr(L"\nGPU 使用率: ") + (row.gpuPercent ? number(*row.gpuPercent, 0) + tr(L"%（最忙碌的 GPU 引擎；不是瓦數）") : std::wstring(tr(L"未取得")));
     if (row.cpuWatts) {
         content += tr(L"\n\n本次 CPU 估計: ") + valueText(row.cpuWatts, L" W", 2) +
             tr(L"\n30 秒平滑 CPU 估計: ") + valueText(row.averageCpuWatts, L" W", 2) +
@@ -1386,6 +1547,8 @@ void showDetails(const ProcessRow& row) {
         if (!current.history.empty() && current.history.back().fullWh && row.averageCpuWatts)
             content += tr(L"\nCPU 部分估計耗電速度: ") + number(*row.averageCpuWatts / *current.history.back().fullWh * 100, 2) + tr(L" 百分點／小時");
         content += tr(L"\n\n用 EMI 量到的核心能源約束分攤。持續固定在同一核心的執行緒優先按該核心分配；其餘依 CPU 時間估計。範圍反映未知的核心排程位置，並非統計信賴區間；不同指令與 SMT 仍可能產生誤差。");
+        if (current.energy.cycleWeighted)
+            content += tr(L"\n本次其餘部分依 CPU 週期加權：同樣的 CPU 時間在較高時脈下會分到較多能源。");
     }
     content += tr(L"\n\n本次 CPU 核心 ") + valueText(current.energy.coreWatts, L" W") +
         tr(L" · CPU 未歸因 ") + valueText(current.energy.unassignedCpuWatts, L" W") +
@@ -1405,13 +1568,60 @@ void showForceConfirmation(const ProcessRow& row) {
     showInlinePage(InlinePage::confirm, tr(L"確認強制結束"), text);
 }
 
+int localDate(int daysBack) {
+    SYSTEMTIME now{}; GetLocalTime(&now);
+    if (daysBack) {
+        FILETIME file{}; SystemTimeToFileTime(&now, &file);
+        ULARGE_INTEGER value{}; value.LowPart = file.dwLowDateTime; value.HighPart = file.dwHighDateTime;
+        value.QuadPart -= uint64_t(daysBack) * 24 * 3600 * 10000000ull;
+        file.dwLowDateTime = value.LowPart; file.dwHighDateTime = value.HighPart;
+        FileTimeToSystemTime(&file, &now);
+    }
+    return now.wYear * 10000 + now.wMonth * 100 + now.wDay;
+}
+// %LOCALAPPDATA%\BatteryScope\history.csv; empty if the folder is unavailable.
+std::wstring historyPath() {
+    PWSTR folder = nullptr;
+    std::wstring path;
+    // FOLDERID_LocalAppData, defined here so no extra GUID library is needed.
+    static const KNOWNFOLDERID localAppData = {0xF1B32785, 0x6FBA, 0x4FCF, {0x9D, 0x55, 0x7B, 0x8E, 0x7F, 0x15, 0x70, 0x91}};
+    if (SUCCEEDED(SHGetKnownFolderPath(localAppData, 0, nullptr, &folder)) && folder) path = std::wstring(folder) + L"\\BatteryScope";
+    if (folder) CoTaskMemFree(folder);
+    return path.empty() ? path : path + L"\\history.csv";
+}
+bool loadHistory(DailyHistory& history) {
+    std::ifstream in(std::filesystem::path(historyPath()), std::ios::binary);
+    if (!in) return false;
+    std::string bytes((std::istreambuf_iterator<char>(in)), {});
+    if (bytes.rfind("\xEF\xBB\xBF", 0) == 0) bytes.erase(0, 3);
+    const int size = MultiByteToWideChar(CP_UTF8, 0, bytes.data(), int(bytes.size()), nullptr, 0);
+    std::wstring text(size_t(std::max(0, size)), L'\0');
+    if (size > 0) MultiByteToWideChar(CP_UTF8, 0, bytes.data(), int(bytes.size()), text.data(), size);
+    return history.load(text);
+}
+// Writes to a temporary file first so a crash never leaves a truncated history.
+bool saveHistory(const DailyHistory& history) {
+    const std::wstring path = historyPath();
+    if (path.empty()) return false;
+    std::error_code error;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), error);
+    const std::wstring temporary = path + L".tmp";
+    if (!writeUtf8(temporary, history.save())) return false;
+    return MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+}
 void sampleLoop() {
     Collector collector;
     EnergyReader energyReader;
     CpuAttributor attributor;
     EnergyLedger ledger;
+    GpuUsage gpu;
+    DailyHistory history;
+    bool historyDirty = false;
+    uint64_t historySavedAt = GetTickCount64();
+    if (historyEnabled) loadHistory(history);
     SamplingPolicy policy;
     Snapshot state;
+    state.days = history.recent(7);
     uint64_t nextProcess = 0, nextPower = 0;
     bool previousHidden = false, qosInitialized = false;
     while (!quit) {
@@ -1425,6 +1635,7 @@ void sampleLoop() {
         if (now >= nextPower) {
             appendPower(state.history, readPower()); state.power = calculatePower(state.history);
             nextPower = now + (background ? 10000 : 6000); changed = true;
+            if (historyEnabled) { history.addPower(state.history.back(), localDate()); historyDirty = true; }
         }
         if (now >= nextProcess) {
             state.energy = energyReader.sample();
@@ -1436,6 +1647,17 @@ void sampleLoop() {
             else energyReader.sampleThreadPlacement(state.processes, collector.threadSnapshot());
             attributor.apply(state.processes, state.energy, collector.sampleMs(), std::max<DWORD>(1, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)));
             ledger.update(state.processes, state.energy, collector.sampleMs());
+            if (historyEnabled) { history.addApps(state.processes, state.energy, collector.sampleMs(), localDate()); historyDirty = true; }
+            // GPU utilization is only shown in the panel, so it is sampled only while visible.
+            state.gpuKnown = false;
+            if (background) gpu.reset();
+            else if (gpu.available()) {
+                std::unordered_map<uint32_t, double> usage;
+                if (gpu.sample(usage)) {
+                    state.gpuKnown = true;
+                    for (auto& row : state.processes) { auto found = usage.find(row.pid); row.gpuPercent = found != usage.end() ? found->second : 0.0; }
+                }
+            }
             state.ledger = ledger.top(15); state.ledgerCoreMilliWh = ledger.coreMilliWh(); state.ledgerStartedMs = ledger.startedMs();
             // Package power already includes the cores: never add it to core energy.
             if (state.energy.coreWatts && !state.history.empty()) {
@@ -1453,6 +1675,14 @@ void sampleLoop() {
             if (background) nextPower = nextProcess;
             changed = processSampled = true;
         }
+        if (clearHistoryRequest.exchange(false)) {
+            history.clear(); historyDirty = false;
+            const std::wstring path = historyPath();
+            if (!path.empty()) DeleteFileW(path.c_str());
+            changed = true;
+        }
+        if (historyDirty && (now - historySavedAt >= 600000 || quit)) { saveHistory(history); historySavedAt = now; historyDirty = false; }
+        if (changed) state.days = historyEnabled ? history.recent(7) : std::vector<DayStats>{};
         if (changed) {
             state.ms = now;
             {
@@ -1473,6 +1703,7 @@ void sampleLoop() {
         std::unique_lock<std::mutex> lock(wakeMutex);
         wake.wait_for(lock, std::chrono::milliseconds(next > now ? next - now : 1));
     }
+    if (historyDirty && historyEnabled) saveHistory(history);
 }
 
 LRESULT CALLBACK listProc(HWND window, UINT message, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
@@ -1589,6 +1820,7 @@ void openMenu(POINT point) {
     AppendMenuW(menu, MF_STRING, PowerModeId, tr(L"電源模式…"));
     AppendMenuW(menu, MF_STRING, PowerDetailsId, tr(L"電池與充電詳情"));
     AppendMenuW(menu, MF_STRING, LedgerId, tr(L"本次累計耗能"));
+    AppendMenuW(menu, MF_STRING, HistoryId, tr(L"歷史紀錄（7 天）"));
     AppendMenuW(menu, MF_STRING, ReviewCandidatesId, tr(L"找出耗電的背景程式…"));
     AppendMenuW(menu, MF_STRING | (preview ? MF_GRAYED : 0), ExportCsvId, tr(L"匯出 CSV…"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -1611,6 +1843,11 @@ void openMenu(POINT point) {
         AppendMenuW(alerts, MF_STRING | (lowBatteryThreshold == level.second ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), level.first,
             level.second ? (std::to_wstring(level.second) + L"%").c_str() : tr(L"關閉"));
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(alerts), tr(L"低電量提醒"));
+    AppendMenuW(menu, MF_STRING | (drainAlerts ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), DrainAlertId, tr(L"背景耗電提醒"));
+    HMENU records = CreatePopupMenu();
+    AppendMenuW(records, MF_STRING | (historyEnabled ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), HistoryToggleId, tr(L"記錄每日歷史"));
+    AppendMenuW(records, MF_STRING | (preview ? MF_GRAYED : 0), ClearHistoryId, tr(L"清除歷史紀錄…"));
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(records), tr(L"歷史紀錄設定"));
     AppendMenuW(menu, MF_STRING | (trayPercent ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), TrayPercentId, tr(L"系統匣顯示電量數字"));
     AppendMenuW(menu, MF_STRING | (hotkeyEnabled ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), HotkeyToggleId, tr(L"快速鍵 Ctrl+Alt+B"));
     AppendMenuW(menu, MF_STRING | (autoStart ? MF_CHECKED : 0) | (demo ? MF_GRAYED : 0), StartupId, tr(L"登入時啟動"));
@@ -1643,6 +1880,7 @@ void applyLanguage(bool useEnglish) {
     if (inlinePage == InlinePage::candidates) showReviewCandidates();
     if (inlinePage == InlinePage::ledger) showLedger();
     if (inlinePage == InlinePage::powerMode) showPowerModePage();
+    if (inlinePage == InlinePage::history) showHistoryPage();
     if (inlinePage == InlinePage::confirm && pendingForceRow) showForceConfirmation(*pendingForceRow);
     notice = tr(L"正在讀取電池與程序資料…"); noticeUntil = 0;
     if (tooltip) SendMessageW(tooltip, TTM_POP, 0, 0);
@@ -1814,6 +2052,29 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             if (!demo && !isolatedPreview) setLowBatteryThreshold(unsigned(id - LowBatteryOffId) * 10);
             return 0;
         }
+        if (id == HistoryId) { showHistoryPage(); return 0; }
+        if (id == DrainAlertId) {
+            if (demo || isolatedPreview) return 0;
+            drainAlerts = !drainAlerts; drainNotified.clear();
+            if (!writeSetting(L"DrainAlert", drainAlerts ? 1 : 0)) setNotice(tr(L"無法儲存設定。"));
+            else setNotice(drainAlerts ? tr(L"背景程式持續高耗電（約 2 W 以上、10 分鐘）時會通知。") : tr(L"已關閉背景耗電提醒。"));
+            return 0;
+        }
+        if (id == HistoryToggleId) {
+            if (demo || isolatedPreview) return 0;
+            historyEnabled = !historyEnabled;
+            if (!writeSetting(L"History", historyEnabled ? 1 : 0)) setNotice(tr(L"無法儲存設定。"));
+            else setNotice(historyEnabled ? tr(L"已開始記錄每日歷史。") : tr(L"已停止記錄；既有紀錄保留，可另外清除。"));
+            return 0;
+        }
+        if (id == ClearHistoryId) {
+            if (demo || isolatedPreview) return 0;
+            if (MessageBoxW(window, tr(L"刪除這台電腦上所有 BatteryScope 歷史紀錄？此動作無法復原。"), L"BatteryScope", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
+                clearHistoryRequest = true; wake.notify_one();
+                setNotice(tr(L"已清除歷史紀錄。"));
+            }
+            return 0;
+        }
         if (id == TrayPercentId) {
             if (demo || isolatedPreview) return 0;
             trayPercent = !trayPercent;
@@ -1917,6 +2178,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (trayAdded) updateTray(false);
         if (!demo && !isolatedPreview && !current.history.empty() && lowBattery.update(current.history.back(), lowBatteryThreshold))
             showLowBatteryNotice();
+        learnFromSample();
+        checkDrainAlert();
         return 0;
     }
     case ActionMessage: {
@@ -1947,7 +2210,11 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (wp == PanelHotkey) toggleMain();
         return 0;
     case TrayMessage:
-        if (trayVersion4 ? LOWORD(lp) == NIN_BALLOONUSERCLICK : lp == NIN_BALLOONUSERCLICK) { showMain(); return 0; }
+        if (trayVersion4 ? LOWORD(lp) == NIN_BALLOONUSERCLICK : lp == NIN_BALLOONUSERCLICK) {
+            showMain();
+            if (balloonOpensCandidates) showReviewCandidates();
+            return 0;
+        }
         if ((trayVersion4 && (LOWORD(lp) == NIN_SELECT || LOWORD(lp) == NIN_KEYSELECT)) ||
             (!trayVersion4 && lp == WM_LBUTTONUP)) toggleMain();
         if ((trayVersion4 && LOWORD(lp) == WM_CONTEXTMENU) || (!trayVersion4 && lp == WM_RBUTTONUP)) {
@@ -1963,6 +2230,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         KillTimer(window, NoticeTimer);
         registerPanelHotkey(false);
         unwatchEffectivePowerMode(effectiveWatch); effectiveWatch = nullptr;
+        if (curveDirty) writeBinarySetting(L"ChargeCurve", chargeCurve.save());
         quit = true; wake.notify_one();
         NOTIFYICONDATAW data{}; data.cbSize = sizeof(data); data.hWnd = window; data.uID = 1;
         if (trayAdded) Shell_NotifyIconW(NIM_DELETE, &data);
@@ -1989,6 +2257,7 @@ Snapshot demoSnapshot() {
         row.window = i == 1;
         row.cpu = 8.2 / (i + 1); row.ioMB = 2.5 / (i + 1); row.memoryMB = 180.0 / (i + 1);
         row.activity = ActivityReason::cpu; row.busySeconds = i == 3 ? 0 : 42;
+        row.gpuPercent = i == 1 ? 18.0 : 0.0;
         row.measured = row.ioKnown = row.memoryKnown = true;
         state.processes.push_back(row);
     }
@@ -2007,6 +2276,13 @@ Snapshot demoSnapshot() {
     state.ledger = {{L"CloudSync.exe", 182.4, 1, true}, {L"Browser.exe", 121.7, 6, true}, {L"UpdateWorker.exe", 64.0, 1, true},
         {L"VideoExport.exe", 41.3, 2, false}, {L"svchost.exe", 22.9, 9, true}};
     state.ledgerCoreMilliWh = 610; state.ledgerStartedMs = now - 47 * 60000; // Explicitly synthetic preview data.
+    const double demoDays[][3] = {{142, 21.4, 30.2}, {96, 13.8, 20.1}, {0, 0, 12.5}, {188, 27.9, 35.0}, {121, 17.2, 18.4}, {64, 9.6, 14.2}, {47, 6.9, 0}};
+    for (int i = 0; i < 7; ++i) {
+        if (i == 2) continue; // a day without records
+        DayStats day; day.date = localDate(6 - i); day.batteryMinutes = demoDays[i][0]; day.dischargedWh = demoDays[i][1]; day.chargedWh = demoDays[i][2];
+        day.apps = {{L"Browser.exe", 820.0 - i * 40}, {L"CloudSync.exe", 410.0 + i * 15}, {L"UpdateWorker.exe", 160}};
+        state.days.push_back(day);
+    }
     state.servicesKnown = true; state.totalProcesses = 5; state.ms = now; return state;
 }
 bool captureWindow(const std::wstring& path) {
@@ -2201,9 +2477,16 @@ bool panelSelfTest(const std::wstring& path) {
         check("tray_icon_shows_battery_percentage", read && bitmap.bmWidth == GetSystemMetricsForDpi(SM_CXSMICON, dpi) &&
             opaque > size_t(bitmap.bmWidth * bitmap.bmHeight / 2) && distinct >= 3 && currentTrayIcon(nullptr) == icon);
     }
+    showHistoryPage();
+    std::wstring historyBody(size_t(GetWindowTextLengthW(inlineText)) + 1, L'\0');
+    GetWindowTextW(inlineText, historyBody.data(), int(historyBody.size()));
+    check("history_page_lists_days_newest_first", inlinePage == InlinePage::history && current.days.size() == 6 &&
+        historyBody.find(dayLabel(current.days.back().date)) < historyBody.find(dayLabel(current.days.front().date)) &&
+        historyBody.find(L"Browser.exe") != std::wstring::npos);
+    SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
     const auto tip = trayText();
     check("tray_tooltip_shows_level_power_and_time", tip.find(L"%") != std::wstring::npos && tip.find(L" W") != std::wstring::npos &&
-        tip.find(durationText(current.power.hoursRemaining)) != std::wstring::npos && tip.size() < 128);
+        tip.find(remainingText(current.power)) != std::wstring::npos && tip.size() < 128);
     const auto savedTheme = themeChoice;
     const COLORREF darkBackground = ui::palette(ui::ThemeChoice::dark).background;
     SendMessageW(mainWindow, WM_COMMAND, ThemeLightId, 0);
@@ -2449,6 +2732,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     suppressMotion = screenshot || uiTest;
     auto option = [&](const wchar_t* value) { return std::find(args.begin(), args.end(), value) != args.end(); };
     if (!demo && !isolatedPreview) loadSettings();
+    else historyEnabled = false; // previews and tests never read or write history
     if (option(L"--english")) english = true;
     if (option(L"--chinese")) english = false;
     if (option(L"--light")) themeChoice = ui::ThemeChoice::light;
@@ -2494,6 +2778,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         if (option(L"--empty")) current.processes.clear();
         if (option(L"--no-energy")) { current.energy.ready = false; for (auto& row : current.processes) { row.averageCpuWatts.reset(); row.cpuWattsLow.reset(); row.cpuWattsHigh.reset(); } }
         current.power = calculatePower(current.history);
+        for (int band = 0; band < ChargeCurve::Bands; ++band) // synthetic preview curve: tapers after 80%
+            for (int i = 0; i < 8; ++i) chargeCurve.add(band * 5 + 2, band < 16 ? 24 : 9);
         refreshList();
     }
     else worker = std::thread(sampleLoop);
@@ -2509,6 +2795,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (screenshot && option(L"--candidates")) showReviewCandidates();
     if (screenshot && option(L"--ledger")) showLedger();
     if (screenshot && option(L"--power-mode")) showPowerModePage();
+    if (screenshot && option(L"--history")) showHistoryPage();
     if (screenshot && option(L"--confirm") && !current.processes.empty()) showForceConfirmation(current.processes.front());
     if (screenshot && option(L"--scrolled")) scrollTo(px(17), true);
     if (screenshot && option(L"--selected") && !displayed.empty()) ListView_SetItemState(list, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);

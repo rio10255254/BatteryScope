@@ -50,6 +50,23 @@ EffectiveMode effectiveModeFromValue(int value);
 void* watchEffectivePowerMode(void (*callback)(EffectiveMode, void*), void* context);
 void unwatchEffectivePowerMode(void* token);
 
+// Per-process GPU utilization from the Windows "GPU Engine" performance
+// counters (the source Task Manager uses). Utilization, not watts.
+class GpuUsage {
+    void* query_ = nullptr;
+    void* counter_ = nullptr;
+    bool primed_ = false;
+public:
+    GpuUsage();
+    ~GpuUsage();
+    GpuUsage(const GpuUsage&) = delete;
+    GpuUsage& operator=(const GpuUsage&) = delete;
+    bool available() const { return counter_ != nullptr; }
+    // Usage since the previous call, by PID; false until two samples exist.
+    bool sample(std::unordered_map<uint32_t, double>& usage);
+    void reset() { primed_ = false; }
+};
+
 struct CollectionWork { size_t paths = 0, safety = 0, memory = 0, processOpens = 0; };
 
 class Collector {
@@ -57,6 +74,8 @@ class Collector {
         uint64_t created = 0, cpu = 0, io = 0, ms = 0;
         double averageCpu = 0, averageIo = 0, busySeconds = 0;
         bool ioKnown = false;
+        uint64_t cycles = 0;
+        bool cyclesKnown = false;
     };
     std::map<DWORD, Previous> previous_;
     struct Metadata {

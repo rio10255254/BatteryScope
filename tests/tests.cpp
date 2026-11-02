@@ -355,6 +355,69 @@ int wmain(int argc, wchar_t** argv) {
             worn.designWh = 0; check(!batteryHealth(worn), "zero design capacity never divides");
             worn.designWh = 40; check(nearlyEqual(batteryHealth(worn), 112.5), "a new battery may report above 100 percent");
         }
+        {
+            // Remaining-time range: 30 minutes at 8 W, then the last 4 minutes at 16 W.
+            std::deque<PowerSample> mixed;
+            for (uint64_t t = 0; t <= 1800000; t += 10000) {
+                auto p = sample(t, t >= 1560000 ? 16.0 : 8.0); p.remainingWh = 40; appendPower(mixed, p);
+            }
+            auto range = calculatePower(mixed);
+            check(range.hoursRemainingLow && range.hoursRemainingHigh && *range.hoursRemainingLow < *range.hoursRemainingHigh &&
+                nearlyEqual(range.hoursRemainingHigh, 40 / *range.longAverageWatts) && *range.longAverageWatts < *range.averageWatts,
+                "remaining time range spans the short and long discharge means");
+            std::deque<PowerSample> steady;
+            for (uint64_t t = 0; t <= 600000; t += 10000) { auto p = sample(t, 10.0); p.remainingWh = 40; appendPower(steady, p); }
+            range = calculatePower(steady);
+            check(nearlyEqual(range.hoursRemainingLow, 4) && nearlyEqual(range.hoursRemainingHigh, 4), "steady load gives a zero-width range");
+            std::deque<PowerSample> brief;
+            for (uint64_t t = 0; t <= 60000; t += 10000) { auto p = sample(t, 10.0); p.remainingWh = 40; appendPower(brief, p); }
+            check(!calculatePower(brief).hoursRemainingLow, "range needs two minutes of discharge");
+        }
+        {
+            auto held = [](uint64_t t, double percent) { PowerSample p; p.ms = t; p.present = p.acKnown = p.onAc = true; p.percent = percent; return p; };
+            std::deque<PowerSample> limit;
+            for (uint64_t t = 0; t <= 200000; t += 10000) limit.push_back(held(t, 80 + (t % 20000 ? .3 : 0)));
+            check(detectChargeLimit(limit) == 80, "steady plugged-in level below full is reported as a charge limit");
+            limit.pop_back(); limit.pop_back(); limit.pop_back();
+            check(!detectChargeLimit(limit), "charge limit needs three steady minutes");
+            std::deque<PowerSample> full;
+            for (uint64_t t = 0; t <= 200000; t += 10000) full.push_back(held(t, 99));
+            check(!detectChargeLimit(full), "a full battery is not a charge limit");
+            std::deque<PowerSample> charging;
+            for (uint64_t t = 0; t <= 200000; t += 10000) { auto p = held(t, 80); p.charging = t < 100000; charging.push_back(p); }
+            check(!detectChargeLimit(charging), "charging inside the window resets limit detection");
+        }
+        {
+            ChargeCurve curve;
+            check(!curve.hoursTo(50, 100, 50, 20), "an empty charge curve gives no estimate");
+            for (int band = 0; band < ChargeCurve::Bands; ++band)
+                for (int i = 0; i < 8; ++i) curve.add(band * 5 + 2, band < 16 ? 20 : 5); // fast to 80%, slow taper after
+            const auto taper = curve.hoursTo(70, 100, 50, 20);
+            // 70-80%: 5 Wh at 20 W = .25 h; 80-100%: 10 Wh at 5 W = 2 h.
+            check(nearlyEqual(taper, 2.25), "charge curve follows the learned taper above 80 percent");
+            check(nearlyEqual(curve.hoursTo(70, 80, 50, 20), .25), "charge curve can stop at a charge limit");
+            check(nearlyEqual(curve.hoursTo(70, 80, 50, 10), .5), "a slower live rate scales the learned curve");
+            ChargeCurve copy;
+            check(copy.load(curve.save()) && nearlyEqual(copy.hoursTo(70, 100, 50, 20), 2.25) && !copy.load({1, 2, 3}),
+                "charge curve round-trips through storage and rejects malformed data");
+        }
+        {
+            CpuAttributor cycleAttributor; CpuEnergyReport cycleReport; cycleReport.ready = true; cycleReport.coreWatts = 8;
+            cycleReport.cores = {{4, 1}, {4, 1}}; cycleReport.intervalSeconds = 2;
+            ProcessRow fast; fast.pid = 40; fast.created = 1; fast.measured = true; fast.cpu = 25; fast.cycleRate = 3e9;
+            ProcessRow slow = fast; slow.pid = 41; slow.cycleRate = 1e9;
+            std::vector<ProcessRow> cycleRows{fast, slow};
+            cycleAttributor.apply(cycleRows, cycleReport, 1000, 4);
+            check(cycleReport.cycleWeighted && cycleRows[0].pid == 40 && nearlyEqual(cycleRows[0].cpuWatts, 6) && nearlyEqual(cycleRows[1].cpuWatts, 2),
+                "equal CPU time at three times the cycles gets three times the energy");
+            check(nearlyEqual(cycleReport.unassignedCpuWatts, 0), "cycle weighting conserves the core energy budget");
+            CpuAttributor extreme; slow.cycleRate = 1e6; cycleRows = {fast, slow};
+            extreme.apply(cycleRows, cycleReport, 1000, 4);
+            check(*cycleRows[0].cpuWatts / *cycleRows[1].cpuWatts <= 9.0001, "cycle weighting is bounded against counter glitches");
+            CpuAttributor partial; slow.cycleRate.reset(); cycleRows = {fast, slow};
+            partial.apply(cycleRows, cycleReport, 1000, 4);
+            check(!cycleReport.cycleWeighted && nearlyEqual(cycleRows[0].cpuWatts, 4), "a single process with cycles keeps time-based shares");
+        }
         check(roundedMinutes(1.5) == 90 && roundedMinutes(.001) == 1 && roundedMinutes(-1) == 0, "durations round up to whole minutes");
         Snapshot opportunity; opportunity.energy.ready = true; opportunity.energy.observedCpuCoverage = .9;
         ProcessRow foreground; foreground.pid = 20; foreground.created = 10; foreground.window = true;
@@ -372,6 +435,55 @@ int wmain(int argc, wchar_t** argv) {
         check(reviewCandidates(opportunity).empty(), "services are never suggested for background review");
         opportunity.processes[2].services.clear(); opportunity.energy.observedCpuCoverage = .5;
         check(reviewCandidates(opportunity).empty(), "low observation coverage suppresses suggestions");
+        {
+            Snapshot drain; drain.energy.ready = true; drain.energy.observedCpuCoverage = .9;
+            PowerSample onBattery = sample(1000); drain.history.push_back(onBattery);
+            ProcessRow worker; worker.pid = 50; worker.created = 5; worker.actionable = worker.measured = true; worker.path = L"C:\\Apps\\Worker.exe";
+            worker.busySeconds = 700; worker.averageCpuWatts = 2.4;
+            ProcessRow light = worker; light.pid = 51; light.averageCpuWatts = 1.0;
+            ProcessRow young = worker; young.pid = 52; young.busySeconds = 120; young.averageCpuWatts = 5;
+            drain.processes = {light, young, worker};
+            std::set<std::pair<uint32_t,uint64_t>> notified;
+            auto alert = drainAlertCandidate(drain, notified);
+            check(alert && drain.processes[*alert].pid == 50, "drain alert picks sustained high-power background work only");
+            notified.insert({50, 5});
+            check(!drainAlertCandidate(drain, notified), "each process is reported once");
+            notified.clear(); drain.history.back().onAc = true;
+            check(!drainAlertCandidate(drain, notified), "no drain alert while plugged in");
+        }
+        {
+            uint32_t pid = 0; std::wstring engine;
+            check(parseGpuInstance(L"pid_1234_luid_0x00000000_0x0000D1A5_phys_0_eng_0_engtype_3D", pid, engine) && pid == 1234 && engine == L"3D" &&
+                !parseGpuInstance(L"luid_0x0_engtype_3D", pid, engine) && !parseGpuInstance(L"pid_12_luid_0x0", pid, engine),
+                "GPU engine instance names give the process and engine type");
+            auto gpu = aggregateGpu({{L"pid_7_luid_0x0_0x1_phys_0_eng_0_engtype_3D", 30}, {L"pid_7_luid_0x0_0x1_phys_0_eng_1_engtype_3D", 15},
+                {L"pid_7_luid_0x0_0x1_phys_0_eng_2_engtype_VideoDecode", 60}, {L"pid_9_luid_0x0_0x1_phys_0_eng_0_engtype_Copy", 140},
+                {L"_Total", 99}});
+            check(nearlyEqual(gpu[7], 60) && nearlyEqual(gpu[9], 100) && gpu.size() == 2, "GPU use is the busiest engine type per process, capped at 100");
+        }
+        {
+            DailyHistory history;
+            for (uint64_t t = 0; t <= 600000; t += 10000) history.addPower(sample(t, 12.0), 20261102);
+            auto plugged = sample(610000, -20); plugged.onAc = plugged.charging = true; history.addPower(plugged, 20261102);
+            for (uint64_t t = 620000; t <= 3620000; t += 10000) { auto p = sample(t, -20); p.onAc = p.charging = true; history.addPower(p, 20261102); }
+            auto days = history.recent(7);
+            check(days.size() == 1 && nearlyEqual(days[0].batteryMinutes, 10) && nearlyEqual(days[0].dischargedWh, 2) && nearlyEqual(days[0].chargedWh, 20 * 3010 / 3600.0),
+                "daily history integrates time on battery, discharge, and charge energy");
+            CpuEnergyReport valid; valid.ready = true; valid.intervalSeconds = 2;
+            ProcessRow app; app.pid = 1; app.created = 1; app.name = L"Editor.exe"; app.cpuWatts = 3.6;
+            history.addApps({app}, valid, 1000, 20261102); history.addApps({app}, valid, 1000, 20261102);
+            history.addApps({app}, valid, 3000, 20261103);
+            days = history.recent(7);
+            check(days.size() == 2 && days[0].apps.size() == 1 && nearlyEqual(days[0].apps[0].second, 2) && nearlyEqual(days[1].apps[0].second, 2),
+                "per-day app energy rolls over at midnight and ignores replayed samples");
+            DailyHistory restored;
+            check(restored.load(history.save()) && restored.recent(7).size() == 2 && nearlyEqual(restored.recent(7)[0].dischargedWh, 2) &&
+                restored.recent(7)[1].apps[0].first == L"Editor.exe", "daily history round-trips through its file format");
+            check(!restored.load(L"garbage\n1,2\n") && restored.recent(7).empty(), "malformed history files are rejected safely");
+            DailyHistory long_;
+            for (int d = 1; d <= 70; ++d) long_.addPower(sample(uint64_t(d) * 100000000), 20260000 + d);
+            check(long_.recent(100).size() == DailyHistory::KeepDays, "history keeps a bounded number of days");
+        }
         Collector cachedCollector;
         size_t total = 0, inaccessible = 0;
         auto warmRows = cachedCollector.collect(total, inaccessible);

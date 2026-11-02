@@ -150,6 +150,30 @@ void CpuAttributor::apply(std::vector<ProcessRow>& rows, CpuEnergyReport& report
         rows[i].placementCoverage=demand>0?std::min(1.0,mapped/demand):0;
         unknownDemand[i]=std::max(0.0,demand-mapped); unknownTotal+=unknownDemand[i];
     }
+    // Cycle weighting: among processes that report CPU cycles, split the unknown
+    // demand by cycles rather than time, since a second of CPU time at a higher
+    // clock uses more energy. The group's total demand is unchanged, and each
+    // process moves at most 3x either way to contain counter glitches.
+    report.cycleWeighted = false;
+    {
+        double groupTime = 0, groupCycles = 0; size_t groupSize = 0;
+        std::vector<double> cycles(rows.size(), 0);
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const double demand = rows[i].measured ? std::max(0.0, rows[i].cpu / 100 * processors) : 0;
+            if (unknownDemand[i] <= 0 || demand <= 0 || !rows[i].cycleRate || !std::isfinite(*rows[i].cycleRate) || *rows[i].cycleRate <= 0) continue;
+            cycles[i] = *rows[i].cycleRate * unknownDemand[i] / demand;
+            groupTime += unknownDemand[i]; groupCycles += cycles[i]; ++groupSize;
+        }
+        if (groupSize >= 2 && groupCycles > 0 && groupTime > 0) {
+            std::vector<double> weighted(rows.size(), 0); double weightedSum = 0;
+            for (size_t i = 0; i < rows.size(); ++i) if (cycles[i] > 0) {
+                weighted[i] = std::clamp(groupTime * cycles[i] / groupCycles, unknownDemand[i] / 3, unknownDemand[i] * 3);
+                weightedSum += weighted[i];
+            }
+            for (size_t i = 0; i < rows.size(); ++i) if (cycles[i] > 0) unknownDemand[i] = weighted[i] * groupTime / weightedSum;
+            report.cycleWeighted = true;
+        }
+    }
     size_t rowIndex=0;
     for (auto& row : rows) {
         row.cpuWatts.reset(); row.averageCpuWatts.reset(); row.cpuWattsLow.reset(); row.cpuWattsHigh.reset(); row.cpuMilliWh.reset();
