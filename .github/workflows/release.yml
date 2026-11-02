@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check the tag matches src/version.h
+        shell: pwsh
+        run: |
+          $match = Select-String -Path src/version.h -Pattern 'BS_VERSION_STRING "([0-9.]+)"'
+          $version = $match.Matches[0].Groups[1].Value
+          if ("v$version" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} does not match version $version in src/version.h" }
+          "VERSION=$version" >> $env:GITHUB_ENV
+      - name: Configure MSVC build
+        run: cmake -S . -B build -A x64
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Run tests
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "BatteryScope-$env:VERSION-win64"
+          New-Item -ItemType Directory -Path package | Out-Null
+          Copy-Item build/Release/BatteryScope.exe package/
+          # The embedded pixel font is SIL OFL 1.1: its license ships with the binary.
+          Copy-Item src/assets/pixel-ui-OFL.txt package/
+          Compress-Archive -Path package/* -DestinationPath "$name.zip"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $name = "BatteryScope-$env:VERSION-win64"
+          $notes = "docs/releases/${{ github.ref_name }}.md"
+          if (Test-Path $notes) {
+            gh release create "${{ github.ref_name }}" "$name.zip" "$name.zip.sha256" --title "BatteryScope $env:VERSION" --notes-file $notes
+          } else {
+            gh release create "${{ github.ref_name }}" "$name.zip" "$name.zip.sha256" --title "BatteryScope $env:VERSION" --generate-notes
+          }
