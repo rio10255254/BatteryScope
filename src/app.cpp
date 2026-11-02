@@ -689,6 +689,8 @@ bool pluggedInNow() { return !current.history.empty() && current.history.back().
 // The header pill shows the mode Windows applies right now and opens the power mode page.
 void refreshPowerButton() {
     if (!powerButton) return;
+    // Synthetic preview: Windows applies the mode chosen for the current power source.
+    if (demo || isolatedPreview) effectiveMode = pluggedInNow() ? EffectiveMode::performance : EffectiveMode::efficiency;
     powerSaving = effectiveMode == EffectiveMode::energySaver || effectiveMode == EffectiveMode::efficiency;
     SetWindowTextW(powerButton, effectiveName(effectiveMode));
     EnableWindow(powerButton, TRUE);
@@ -1739,6 +1741,7 @@ void refreshPowerModeControls() {
     else { // Synthetic preview: plugged in at Best performance, on battery at Best efficiency.
         powerModes = {}; powerModes.ac = PowerMode::performance; powerModes.dc = PowerMode::efficiency;
         powerModes.acKnown = powerModes.dcKnown = true;
+        refreshPowerButton();
     }
     for (int i = 0; i < 6; ++i) {
         EnableWindow(modeButtons[i], editable && (i < 3 ? powerModes.acKnown : powerModes.dcKnown));
@@ -2410,8 +2413,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (hotkeyEnabled && !demo && !isolatedPreview && !registerPanelHotkey(true)) hotkeyEnabled = false;
         if (!demo && !isolatedPreview) loadAutoOverrides();
         if (miniEnabled && !isolatedPreview) setMiniWindow(true);
-        if (demo || isolatedPreview) effectiveMode = EffectiveMode::performance; // synthetic preview
-        else effectiveWatch = watchEffectivePowerMode([](EffectiveMode mode, void* target) {
+        if (!demo && !isolatedPreview) effectiveWatch = watchEffectivePowerMode([](EffectiveMode mode, void* target) {
             PostMessageW(static_cast<HWND>(target), PowerModeMessage, WPARAM(mode), 0);
         }, window);
         refreshPowerButton();
@@ -2695,6 +2697,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             InvalidateRect(window, nullptr, FALSE);
         }
         if (trayAdded) updateTray(false);
+        if (demo || isolatedPreview) refreshPowerButton(); // the preview mode follows the power source
         if (!demo && !isolatedPreview && !current.history.empty() && lowBattery.update(current.history.back(), lowBatteryThreshold))
             showLowBatteryNotice();
         learnFromSample();

@@ -1,12 +1,39 @@
-# BatteryScope 0.10.0
+# BatteryScope
+
+**A Windows laptop battery monitor that shows how much power each app is using.** One portable EXE, no installer, everything stays on your PC. Pixel-style interface (smooth style available), English and Traditional Chinese, dark and light themes.
 
 [繁體中文](README.md) | English
 
-A small native Windows battery and background-process monitor built with C++17 and Win32. Portable, dark, bilingual, and entirely local. No web engine, telemetry, driver, or persistent service.
+[![Download the latest release](https://img.shields.io/github/v/release/rio10255254/BatteryScope?label=download&style=for-the-badge)](https://github.com/rio10255254/BatteryScope/releases/latest)
+![Windows 10 1703+ / 11 x64](https://img.shields.io/badge/Windows-10%201703%2B%20%2F%2011%20x64-0078D4?style=for-the-badge)
 
-![English charging preview — synthetic demo data](docs/batteryscope-v9-en.png)
+![BatteryScope main panel, charging in the light theme, power mode page, and 7-day history (demo data)](docs/screenshots/showcase-en.png)
 
-## Getting started
+<sub>Screenshots use the built-in demo mode's synthetic data.</sub>
+
+## Download
+
+Get `BatteryScope-0.10.0-win64.zip` from the **[Releases page](https://github.com/rio10255254/BatteryScope/releases/latest)**, extract it, and run `BatteryScope.exe`.
+
+- Requires Windows 10 version 1703 or later (Windows 11 recommended), 64-bit. No installer or administrator rights needed.
+- The EXE is not code-signed; if SmartScreen appears the first time, choose **More info → Run anyway**.
+- It lives in the notification area, where the icon shows the battery percentage; click it to show or hide the panel.
+
+## Highlights
+
+- **Live power and time left:** whole-PC discharge or charge watts, drain rate, time left (shown as a range when the load is unsteady), time to full from a learned charging curve, and charge-limit detection.
+- **Which app drains the battery:** estimated per-app watts from the CPU's hardware energy counters, plus CPU and GPU use; inspect, close, force quit, or stop a service.
+- **Power modes in one click:** set *Plugged in* and *On battery* to Efficiency, Balanced, or Performance separately and see the mode Windows actually applies; per-app Efficiency mode and automatic switching rules.
+- **Battery health:** health, cycle count, and their trend, plus sleep drain detection.
+- **7-day history:** daily discharge chart, a daily grade and achievements, and a shareable summary card.
+- **Helpful alerts:** low battery, background drain, sleep drain, and charge-level reminders.
+- **Small and quiet:** tray resident, a mini floating window, the Ctrl+Alt+B shortcut, CSV export; no network access, telemetry, or background service.
+
+![Share today's card](docs/screenshots/card-en.png)
+
+Details follow.
+
+## Using it
 
 1. Download `BatteryScope-0.10.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on Windows 11 x64.
 2. Click its battery icon in the notification area to show or hide the panel. Esc hides it; monitoring continues at a lower frequency.
@@ -69,7 +96,6 @@ The CPU model has been exercised on a Ryzen 9 8945HS with compatible EMI counter
 
 The 360 × 640 logical-pixel panel adapts to DPI and smaller work areas. Process, battery, and candidate details, force-quit confirmation, and action errors stay inside the dark panel. Short confirmation pages shrink to 320 logical pixels and expand back to the ranking on return. Back or Esc returns to the selected row; Cancel has initial focus on the force-quit page. Service selection and Windows UAC still use system dialogs. Short finite animations ease opening, hiding, resizing, scrolling, row selection, hover, and button presses. Repeated same-direction scroll input carries velocity forward; reversing input changes direction without a position jump or overscroll.
 
-![In-panel confirmation using synthetic demo data](docs/batteryscope-v9.2-confirm-en.png)
 
 List replacement is deferred during scrolling, presses, and in-panel information pages. Status hints explain which actions are available. Animations honor Windows' reduced-motion preference and stop their timer when idle or hidden. Battery device handles are kept open and re-enumerated only after a read failure, every 5 minutes, or every minute while no battery is found; while hidden, the service list refreshes every 30 seconds (actions still re-check it live). Sampling stays on a background thread: every 2 seconds while open, and 10–20 seconds while hidden with EcoQoS requested for the sampler. The app does not raise the system timer resolution.
 
