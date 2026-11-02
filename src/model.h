@@ -222,6 +222,11 @@ private:
     uint64_t lastAppsMs_ = 0;
 };
 
+// Automatic power mode rules. Performance while a listed app runs takes
+// precedence; otherwise "saver" (on-battery mode set to Efficiency) once on
+// battery at or below the threshold, until external power or 10 points above it.
+enum class AutoMode { none, saver, performance };
+AutoMode decideAutoMode(AutoMode current, bool performanceAppActive, const PowerSample& sample, unsigned saverThreshold);
 // Conservative cadence: never exceed the energy model's 30 second continuity limit.
 class SamplingPolicy {
     uint64_t quietSince_ = 0, lastMs_ = 0;

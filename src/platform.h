@@ -47,6 +47,18 @@ enum class EffectiveMode { unknown, energySaver, efficiency, balanced, performan
 EffectiveMode effectiveModeFromValue(int value);
 // The callback runs on a system thread, first with the current mode. Returns
 // null if unsupported; pass the token to unwatchEffectivePowerMode.
+// Automatic rules change a mode and later undo only their own change, without
+// the Restore-original bookkeeping. overridePowerMode returns the overlay it
+// replaced; undoPowerModeOverride puts it back only if the side is still at
+// `mode` (so a change the user made meanwhile is kept).
+DWORD overridePowerMode(bool pluggedIn, PowerMode mode, GUID& replaced);
+DWORD undoPowerModeOverride(bool pluggedIn, PowerMode mode, const GUID& replaced);
+// Windows 11 "Efficiency mode" for one process, as in Task Manager: EcoQoS
+// execution-speed throttling plus idle priority. The same identity and safety
+// checks as closing apply. Enabling stores the original priority class in
+// `priority`; disabling restores it and hands throttling back to Windows.
+DWORD setProcessEfficiency(const ProcessRow& expected, bool enable, DWORD& priority);
+bool processEfficiencyOn(DWORD pid);
 void* watchEffectivePowerMode(void (*callback)(EffectiveMode, void*), void* context);
 void unwatchEffectivePowerMode(void* token);
 

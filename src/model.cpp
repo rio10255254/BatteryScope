@@ -282,6 +282,14 @@ Value extraMinutesIfStopped(const PowerMetrics& m, const PowerSample& p, double 
     const double minutes = (*p.remainingWh / (average - appWatts) - *p.remainingWh / average) * 60;
     return minutes >= 1 ? Value(std::min(minutes, 24.0 * 60)) : Value{};
 }
+AutoMode decideAutoMode(AutoMode current, bool performanceAppActive, const PowerSample& p, unsigned threshold) {
+    if (performanceAppActive) return AutoMode::performance;
+    const bool known = p.present && p.acKnown && p.percent && std::isfinite(*p.percent);
+    if (!threshold || !known || p.onAc || p.charging) return AutoMode::none;
+    if (*p.percent <= threshold) return AutoMode::saver;
+    if (current == AutoMode::saver && *p.percent < threshold + 10.0) return AutoMode::saver;
+    return AutoMode::none;
+}
 bool ChargeReminder::update(const PowerSample& p, unsigned target) {
     if (!target || !p.present || !p.acKnown || !p.percent || !std::isfinite(*p.percent)) return false;
     if (!p.onAc || *p.percent < target - 5.0) { armed_ = true; return false; }

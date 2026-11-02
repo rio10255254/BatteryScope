@@ -522,6 +522,18 @@ int wmain(int argc, wchar_t** argv) {
                 restored.recent(1).front().apps.size() == 1 && !restored.recent(1).front().healthPercent,
                 "history files from the previous version still load");
         }
+        {
+            auto battery = [](double percent, bool ac) { PowerSample p; p.present = p.acKnown = true; p.onAc = ac; p.percent = percent; return p; };
+            check(decideAutoMode(AutoMode::none, false, battery(25, false), 30) == AutoMode::saver &&
+                decideAutoMode(AutoMode::saver, false, battery(35, false), 30) == AutoMode::saver &&
+                decideAutoMode(AutoMode::saver, false, battery(41, false), 30) == AutoMode::none &&
+                decideAutoMode(AutoMode::none, false, battery(35, false), 30) == AutoMode::none,
+                "low-battery saver engages at the threshold and releases ten points above it");
+            check(decideAutoMode(AutoMode::saver, false, battery(25, true), 30) == AutoMode::none, "external power releases the saver rule");
+            check(decideAutoMode(AutoMode::saver, true, battery(15, false), 30) == AutoMode::performance &&
+                decideAutoMode(AutoMode::none, false, battery(15, false), 0) == AutoMode::none,
+                "a listed app takes precedence; threshold zero disables the saver rule");
+        }
         Collector cachedCollector;
         size_t total = 0, inaccessible = 0;
         auto warmRows = cachedCollector.collect(total, inaccessible);
@@ -552,6 +564,20 @@ int wmain(int argc, wchar_t** argv) {
             auto wrong = fixture.row; ++wrong.created;
             check(closeProcess(wrong, true) == ERROR_NOT_FOUND && WaitForSingleObject(fixture.process, 0) == WAIT_TIMEOUT, "stale PID identity cannot terminate a replacement");
             check(closeProcess(fixture.row, true) == ERROR_SUCCESS && WaitForSingleObject(fixture.process, 0) == WAIT_OBJECT_0, "force termination of owned test child only");
+        }
+        {
+            OwnedChild fixture(3);
+            DWORD original = 0;
+            const DWORD before = GetPriorityClass(fixture.process);
+            check(setProcessEfficiency(fixture.row, true, original) == ERROR_SUCCESS && GetPriorityClass(fixture.process) == IDLE_PRIORITY_CLASS &&
+                processEfficiencyOn(fixture.row.pid) && original == before, "efficiency mode throttles and lowers priority of an owned test child");
+            check(setProcessEfficiency(fixture.row, false, original) == ERROR_SUCCESS && GetPriorityClass(fixture.process) == before &&
+                !processEfficiencyOn(fixture.row.pid), "turning efficiency mode off restores priority and hands throttling back to Windows");
+            auto stale = fixture.row; ++stale.created;
+            check(setProcessEfficiency(stale, true, original) == ERROR_NOT_FOUND, "efficiency mode revalidates process identity");
+            ProcessRow self; self.pid = GetCurrentProcessId(); FILETIME c{}, e{}, k{}, u{};
+            GetProcessTimes(GetCurrentProcess(), &c, &e, &k, &u); self.created = fileTime(c);
+            check(setProcessEfficiency(self, true, original) == ERROR_ACCESS_DENIED, "efficiency mode refuses the monitor itself");
         }
         {
             OwnedChild fixture(2);

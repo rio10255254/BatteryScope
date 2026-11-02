@@ -146,6 +146,26 @@ DWORD restorePowerModes() {
     }
     return result;
 }
+DWORD overridePowerMode(bool pluggedIn, PowerMode mode, GUID& replaced) {
+    if (mode == PowerMode::other) return ERROR_INVALID_PARAMETER;
+    const auto& api = powerApi();
+    GetUserMode get = pluggedIn ? api.getAc : api.getDc;
+    SetUserMode set = pluggedIn ? api.setAc : api.setDc;
+    if (!get || !set) return ERROR_PROC_NOT_FOUND;
+    DWORD status = get(&replaced);
+    return status ? status : set(&modeGuid(mode));
+}
+DWORD undoPowerModeOverride(bool pluggedIn, PowerMode mode, const GUID& replaced) {
+    const auto& api = powerApi();
+    GetUserMode get = pluggedIn ? api.getAc : api.getDc;
+    SetUserMode set = pluggedIn ? api.setAc : api.setDc;
+    if (!get || !set) return ERROR_PROC_NOT_FOUND;
+    GUID current{};
+    DWORD status = get(&current);
+    if (status) return status;
+    if (!sameGuid(current, modeGuid(mode))) return ERROR_SUCCESS; // the user changed it since: leave theirs
+    return set(&replaced);
+}
 void* watchEffectivePowerMode(void (*callback)(EffectiveMode, void*), void* context) {
     const auto& api = powerApi();
     if (!api.registerEffective || !api.unregisterEffective || !callback) return nullptr;
@@ -422,6 +442,39 @@ DWORD closeProcess(const ProcessRow& expected, bool force) {
     CloseRequest request{expected.pid};
     EnumWindows(requestClose, reinterpret_cast<LPARAM>(&request));
     return request.count ? ERROR_SUCCESS : ERROR_NOT_SUPPORTED;
+}
+DWORD setProcessEfficiency(const ProcessRow& expected, bool enable, DWORD& priority) {
+    Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_INFORMATION | SYNCHRONIZE, FALSE, expected.pid));
+    if (!process) return GetLastError();
+    if (!matchesCreation(process, expected.created) || WaitForSingleObject(process, 0) != WAIT_TIMEOUT) return ERROR_NOT_FOUND;
+    if (!safeProcess(process, expected.pid)) return ERROR_ACCESS_DENIED;
+    bool servicesOK = false;
+    auto services = readServices(servicesOK);
+    if (!servicesOK) return ERROR_ACCESS_DENIED;
+    for (const auto& service : services) if (service.pid == expected.pid) return ERROR_ACCESS_DENIED;
+    if (enable) {
+        const DWORD current = GetPriorityClass(process);
+        if (!current) return GetLastError();
+        priority = current == IDLE_PRIORITY_CLASS ? NORMAL_PRIORITY_CLASS : current;
+    }
+    PROCESS_POWER_THROTTLING_STATE state{};
+    state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    // Enabled: always throttle execution speed. Disabled: let Windows decide again.
+    state.ControlMask = enable ? PROCESS_POWER_THROTTLING_EXECUTION_SPEED : 0;
+    state.StateMask = enable ? PROCESS_POWER_THROTTLING_EXECUTION_SPEED : 0;
+    if (!SetProcessInformation(process, ProcessPowerThrottling, &state, sizeof(state))) return GetLastError();
+    if (!SetPriorityClass(process, enable ? IDLE_PRIORITY_CLASS : (priority ? priority : NORMAL_PRIORITY_CLASS))) {
+        const DWORD error = GetLastError();
+        if (enable) { state.ControlMask = state.StateMask = 0; SetProcessInformation(process, ProcessPowerThrottling, &state, sizeof(state)); }
+        return error;
+    }
+    return ERROR_SUCCESS;
+}
+bool processEfficiencyOn(DWORD pid) {
+    Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+    PROCESS_POWER_THROTTLING_STATE state{}; state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    return process && GetProcessInformation(process, ProcessPowerThrottling, &state, sizeof(state)) &&
+        (state.ControlMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) && (state.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED);
 }
 static bool protectedService(const std::wstring& name) {
     static const std::set<std::wstring> deny = {

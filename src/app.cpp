@@ -13,6 +13,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <cwctype>
 #include <set>
 #include <filesystem>
@@ -37,7 +38,8 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     ModeDcEfficiencyId = 143, ModeDcBalancedId = 144, ModeDcPerformanceId = 145, RestoreModesId = 146, TrayPercentId = 147,
     DrainAlertId = 148, HistoryId = 149, HistoryToggleId = 150, ClearHistoryId = 151,
     ChargeReminderOffId = 152, ChargeReminder80Id = 153, ChargeReminder85Id = 154, ChargeReminder90Id = 155, ChargeReminder100Id = 156,
-    SleepAlertId = 157,
+    SleepAlertId = 157, AutoSaverOffId = 158, AutoSaver20Id = 159, AutoSaver30Id = 160, PerfAppsPageId = 161, ClearPerfAppsId = 162,
+    EcoToggleId = 163, PerfAppToggleId = 164,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1;
 const wchar_t* ClassName = L"BatteryScope.Main.v1";
@@ -87,7 +89,7 @@ void* effectiveWatch = nullptr;
 PowerModes powerModes;
 HWND modeButtons[6] = {}, restoreModesButton = nullptr, energySettingsButton = nullptr;
 bool isolatedPreview = false;
-enum class InlinePage { none, process, power, candidates, ledger, powerMode, history, confirm, error };
+enum class InlinePage { none, process, power, candidates, ledger, powerMode, history, perfApps, confirm, error };
 unsigned lowBatteryThreshold = 0; // percent; 0 = off
 LowBatteryMonitor lowBattery;
 bool hotkeyEnabled = false, hotkeyRegistered = false;
@@ -101,6 +103,27 @@ bool sleepAlerts = true;          // notify after a sleep with unusual battery d
 unsigned seenSleeps = 0;
 unsigned chargeReminderTarget = 0; // percent; 0 = off
 ChargeReminder chargeReminder;
+// Processes BatteryScope put in efficiency mode, with their original priority; undone on exit.
+struct EfficientProcess { uint32_t pid; uint64_t created; DWORD priority; };
+std::vector<EfficientProcess> efficientProcesses;
+HWND ecoButton = nullptr, perfAppButton = nullptr;
+// Automatic power mode rules and the overrides they currently hold.
+unsigned autoSaverThreshold = 0;          // percent; 0 = off
+std::set<std::wstring> performanceApps;   // lowercase executable names
+AutoMode autoApplied = AutoMode::none;
+struct AutoOverride { bool active = false; PowerMode mode = PowerMode::balanced; GUID replaced{}; };
+AutoOverride autoAc, autoDc;
+uint64_t performanceSeenAt = 0;
+std::wstring lowerName(std::wstring text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](wchar_t c) { return wchar_t(towlower(c)); });
+    return text;
+}
+bool isEfficient(const ProcessRow& row) {
+    return std::any_of(efficientProcesses.begin(), efficientProcesses.end(),
+        [&](const EfficientProcess& p) { return p.pid == row.pid && p.created == row.created; });
+}
+bool performanceListed(const ProcessRow& row) { return !row.name.empty() && performanceApps.count(lowerName(row.name)) != 0; }
+void refreshPowerModeControls();
 // Learned charging curve and detected charge limit, saved under HKCU\Software\BatteryScope.
 ChargeCurve chargeCurve;
 std::optional<int> chargeLimit;
@@ -316,7 +339,7 @@ void makeFonts() {
         systemFont = normalFont;
     }
     for (auto window : {list, closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck,
-        hideButton, menuButton, powerButton, inlineBack, inlineConfirm, restoreModesButton, energySettingsButton,
+        hideButton, menuButton, powerButton, inlineBack, inlineConfirm, restoreModesButton, energySettingsButton, ecoButton, perfAppButton,
         modeButtons[0], modeButtons[1], modeButtons[2], modeButtons[3], modeButtons[4], modeButtons[5]})
         if (window) SendMessageW(window, WM_SETFONT, reinterpret_cast<WPARAM>(normalFont), TRUE);
     for (auto window : {inlineText, tooltip})
@@ -794,7 +817,13 @@ void layout() {
         MoveWindow(restoreModesButton, pageLeft, sp(276), pageHalf, sp(30), TRUE);
         MoveWindow(energySettingsButton, pageLeft + pageHalf + modeGap, sp(276), pageWidth - pageHalf - modeGap, sp(30), TRUE);
     }
-    MoveWindow(inlineText, margin + sp(12), textTop, inner - sp(24), std::max(sp(55), h - sp(94) - textTop), TRUE);
+    const int textBottom = inlinePage == InlinePage::process ? h - sp(140) : h - sp(94);
+    MoveWindow(inlineText, margin + sp(12), textTop, inner - sp(24), std::max(sp(55), textBottom - textTop), TRUE);
+    {
+        const int pageLeft = margin + sp(12), pageWidth = inner - sp(24), pageHalf = (pageWidth - sp(8)) / 2;
+        MoveWindow(ecoButton, pageLeft, h - sp(103), pageHalf, sp(32), TRUE);
+        MoveWindow(perfAppButton, pageLeft + pageHalf + sp(8), h - sp(103), pageWidth - pageHalf - sp(8), sp(32), TRUE);
+    }
     SendMessageW(inlineText, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(sp(4), sp(4)));
     const int inlineWidth = inner - sp(24);
     MoveWindow(inlineBack, margin + sp(12), h - sp(59),
@@ -833,6 +862,7 @@ void showInlinePage(InlinePage page, const std::wstring& title, const std::wstri
     ShowWindow(inlineText, SW_SHOW); ShowWindow(inlineBack, SW_SHOW);
     ShowWindow(inlineConfirm, page == InlinePage::confirm ? SW_SHOW : SW_HIDE);
     for (HWND control : modeButtons) ShowWindow(control, page == InlinePage::powerMode ? SW_SHOW : SW_HIDE);
+    for (HWND control : {ecoButton, perfAppButton}) ShowWindow(control, page == InlinePage::process ? SW_SHOW : SW_HIDE);
     for (HWND control : {restoreModesButton, energySettingsButton}) ShowWindow(control, page == InlinePage::powerMode ? SW_SHOW : SW_HIDE);
     SetWindowTextW(inlineBack, page == InlinePage::confirm ? tr(L"取消") : tr(L"返回排行"));
     layout();
@@ -849,6 +879,7 @@ void finishInlineClose() {
     ShowWindow(inlineText, SW_HIDE); ShowWindow(inlineBack, SW_HIDE); ShowWindow(inlineConfirm, SW_HIDE);
     for (HWND control : modeButtons) ShowWindow(control, SW_HIDE);
     ShowWindow(restoreModesButton, SW_HIDE); ShowWindow(energySettingsButton, SW_HIDE);
+    ShowWindow(ecoButton, SW_HIDE); ShowWindow(perfAppButton, SW_HIDE);
     for (auto control : {viewport, closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck}) ShowWindow(control, SW_SHOW);
     layout(); updateButtons(); SetFocus(list);
     if (listRefreshPending) PostMessageW(mainWindow, RefreshMessage, 0, 0);
@@ -874,7 +905,8 @@ void drawButton(const DRAWITEMSTRUCT& item) {
     const bool disabled = (item.itemState & ODS_DISABLED) != 0;
     const bool pressed = (item.itemState & ODS_SELECTED) != 0;
     const UINT id = item.CtlID;
-    const bool inlineButton = id == InlineBackId || id == InlineConfirmId || isModeButton(id) || id == RestoreModesId || id == EnergySaverSettingsId;
+    const bool inlineButton = id == InlineBackId || id == InlineConfirmId || isModeButton(id) || id == RestoreModesId || id == EnergySaverSettingsId ||
+        id == EcoToggleId || id == PerfAppToggleId;
     const COLORREF behind = inlineButton ? Surface : Background;
     fill(dc, r, behind);
     const double hover = disabled ? 0 : buttonMotions[item.hwndItem].value(motionNow());
@@ -896,7 +928,8 @@ void drawButton(const DRAWITEMSTRUCT& item) {
         } else if (id == MenuId) ui::drawDots(dc, r, glyph, std::max(1.2f, sp(2) * .8f));
         else ui::drawChevron(dc, r, glyph, std::max(1.5f, float(sp(2))));
     } else {
-        const bool checked = (id == BackgroundId && backgroundOnly) || (id == AllId && showAll) || (id == PowerModeId && powerSaving) || modeSelected(id);
+        const bool checked = (id == BackgroundId && backgroundOnly) || (id == AllId && showAll) || (id == PowerModeId && powerSaving) || modeSelected(id) ||
+            (id == EcoToggleId && inlineProcess && isEfficient(*inlineProcess)) || (id == PerfAppToggleId && inlineProcess && performanceListed(*inlineProcess));
         if (disabled && checked && isModeButton(id)) {
             face = theme.accentSoft; edgeColor = blend(Green, behind, .55); text = blend(Green, behind, .25);
             if (theme.highContrast) { face = theme.selected; text = theme.selectedInk; edgeColor = CLR_INVALID; }
@@ -911,7 +944,7 @@ void drawButton(const DRAWITEMSTRUCT& item) {
             face = blend(Danger, Ink, hover * .14); text = theme.dark ? Background : RGB(255, 255, 255); faceFont = strongFont;
         } else if (id == KillId) {
             face = blend(Surface, theme.raised, hover); edgeColor = blend(Danger, behind, .45); text = Danger;
-        } else if (id == BackgroundId || id == AllId || id == PowerModeId || isModeButton(id)) {
+        } else if (id == BackgroundId || id == AllId || id == PowerModeId || isModeButton(id) || id == EcoToggleId || id == PerfAppToggleId) {
             if (checked) {
                 face = id == PowerModeId ? Green : theme.accentSoft;
                 edgeColor = id == PowerModeId ? CLR_INVALID : blend(Green, behind, .35);
@@ -985,7 +1018,7 @@ void drawProcess(const DRAWITEMSTRUCT& item) {
     drawText(dc, name, {left, y + sp(7), right - sp(90), y + sp(28)}, ink, normalFont);
     drawText(dc, valueText(row.averageCpuWatts, L" W", 2), {right - sp(90), y + sp(6), right, y + sp(29)},
         accent, metricFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
-    const std::wstring kind = tr(row.kind.c_str());
+    const std::wstring kind = std::wstring(tr(row.kind.c_str())) + (isEfficient(row) ? tr(L" · 效率") : L"");
     RECT chip{left, y + sp(31), left + textWidth(dc, kind, smallFont) + sp(12), y + sp(45)};
     rounded(dc, chip, inverted ? tileColor : blend(tileColor, Ink, theme.dark ? .08 : .06), 5);
     if (theme.highContrast) outline(dc, chip, sub, 5);
@@ -1063,8 +1096,10 @@ void paint(HDC dc, RECT bounds) {
                     i == 6 ? Ink : Muted, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
             }
         }
-        if (inlinePage != InlinePage::error && GetTickCount64() < noticeUntil)
-            drawText(dc, notice, {margin + sp(14), h - sp(84), right - sp(14), h - sp(64)}, Green, smallFont);
+        if (inlinePage != InlinePage::error && GetTickCount64() < noticeUntil) {
+            const int noticeTop = inlinePage == InlinePage::process ? h - sp(134) : h - sp(84);
+            drawText(dc, notice, {margin + sp(14), noticeTop, right - sp(14), noticeTop + sp(20)}, Green, smallFont);
+        }
         return;
     }
     PowerSample p; if (!current.history.empty()) p = current.history.back();
@@ -1261,6 +1296,91 @@ bool writeBinarySetting(const wchar_t* name, const std::vector<uint8_t>& bytes) 
     auto result = RegSetValueExW(key, name, 0, REG_BINARY, bytes.data(), DWORD(bytes.size()));
     RegCloseKey(key); return result == ERROR_SUCCESS;
 }
+std::set<std::wstring> readNames(const wchar_t* name) {
+    std::set<std::wstring> names;
+    DWORD bytes = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\BatteryScope", name, RRF_RT_REG_MULTI_SZ, nullptr, nullptr, &bytes) != ERROR_SUCCESS || bytes > 65536) return names;
+    std::wstring buffer(bytes / sizeof(wchar_t) + 2, L'\0');
+    bytes = DWORD(buffer.size() * sizeof(wchar_t));
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\BatteryScope", name, RRF_RT_REG_MULTI_SZ, nullptr, buffer.data(), &bytes) != ERROR_SUCCESS) return names;
+    for (const wchar_t* item = buffer.c_str(); *item; item += wcslen(item) + 1) names.insert(item);
+    return names;
+}
+bool writeNames(const wchar_t* name, const std::set<std::wstring>& names) {
+    if (demo || isolatedPreview) return true;
+    std::wstring block;
+    for (const auto& item : names) { block += item; block += L'\0'; }
+    block += L'\0';
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\BatteryScope", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) return false;
+    auto result = RegSetValueExW(key, name, 0, REG_MULTI_SZ, reinterpret_cast<const BYTE*>(block.data()), DWORD(block.size() * sizeof(wchar_t)));
+    RegCloseKey(key); return result == ERROR_SUCCESS;
+}
+// Overrides held by the automatic rules are saved so a crash or forced exit can
+// be undone at the next start.
+void saveAutoOverrides() {
+    std::vector<uint8_t> bytes(3 + 2 * (1 + sizeof(GUID)));
+    bytes[0] = 1; bytes[1] = uint8_t(autoApplied); bytes[2] = 0;
+    size_t at = 3;
+    for (const AutoOverride* side : {&autoAc, &autoDc}) {
+        bytes[at++] = side->active ? uint8_t(1 + int(side->mode)) : 0;
+        std::memcpy(bytes.data() + at, &side->replaced, sizeof(GUID)); at += sizeof(GUID);
+    }
+    writeBinarySetting(L"AutoOverrides", bytes);
+}
+void undoAutoOverrides() {
+    for (auto [side, pluggedIn] : {std::pair<AutoOverride*, bool>{&autoAc, true}, {&autoDc, false}}) {
+        if (side->active) undoPowerModeOverride(pluggedIn, side->mode, side->replaced);
+        *side = {};
+    }
+    autoApplied = AutoMode::none;
+}
+void loadAutoOverrides() {
+    std::vector<uint8_t> bytes(64); DWORD size = DWORD(bytes.size());
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\BatteryScope", L"AutoOverrides", RRF_RT_REG_BINARY, nullptr, bytes.data(), &size) != ERROR_SUCCESS
+        || size != 3 + 2 * (1 + sizeof(GUID)) || bytes[0] != 1) return;
+    size_t at = 3;
+    for (AutoOverride* side : {&autoAc, &autoDc}) {
+        side->active = bytes[at] >= 1 && bytes[at] <= 3;
+        if (side->active) side->mode = PowerMode(bytes[at] - 1);
+        std::memcpy(&side->replaced, bytes.data() + at + 1, sizeof(GUID)); at += 1 + sizeof(GUID);
+    }
+    undoAutoOverrides(); // a previous run ended while holding overrides
+    saveAutoOverrides();
+}
+// Re-evaluated on every sample: listed apps (with a 30 s grace after they exit)
+// set both modes to Performance; low battery sets the on-battery mode to
+// Efficiency. Each change is undone only if the user has not changed it since.
+void applyAutoPowerRules() {
+    if (demo || isolatedPreview || current.history.empty()) return;
+    const uint64_t now = GetTickCount64();
+    for (const auto& row : current.processes) if (performanceListed(row)) { performanceSeenAt = now; break; }
+    const bool performanceActive = performanceSeenAt && now - performanceSeenAt < 30000;
+    const AutoMode desired = decideAutoMode(autoApplied, performanceActive, current.history.back(), autoSaverThreshold);
+    if (desired == autoApplied) return;
+    undoAutoOverrides();
+    if (desired == AutoMode::saver) {
+        autoDc.mode = PowerMode::efficiency; autoDc.active = overridePowerMode(false, PowerMode::efficiency, autoDc.replaced) == ERROR_SUCCESS;
+    } else if (desired == AutoMode::performance) {
+        autoAc.mode = autoDc.mode = PowerMode::performance;
+        autoAc.active = overridePowerMode(true, PowerMode::performance, autoAc.replaced) == ERROR_SUCCESS;
+        autoDc.active = overridePowerMode(false, PowerMode::performance, autoDc.replaced) == ERROR_SUCCESS;
+    }
+    autoApplied = autoAc.active || autoDc.active ? desired : AutoMode::none;
+    saveAutoOverrides();
+    setNotice(autoApplied == AutoMode::saver ? tr(L"電量偏低：已自動把「用電池時」切到效率。") :
+        autoApplied == AutoMode::performance ? tr(L"效能清單中的程式正在執行：已切到效能模式。") : tr(L"已還原自動切換前的電源模式。"));
+    if (inlinePage == InlinePage::powerMode) refreshPowerModeControls();
+}
+void showPerformanceApps() {
+    std::wstring text = tr(L"清單中的程式執行時，插電與用電池時都會自動切到效能模式；全部結束 30 秒後還原。在程序詳情頁按「加入效能清單」新增或移除。\n");
+    if (performanceApps.empty()) text += tr(L"\n清單是空的。");
+    for (const auto& name : performanceApps) text += L"\n• " + name;
+    text += tr(L"\n\n低電量自動省電：") + (autoSaverThreshold ? std::to_wstring(autoSaverThreshold) + tr(L"% 以下把「用電池時」切到效率，接上電源或回升 10% 後還原。")
+        : std::wstring(tr(L"關閉")));
+    showInlinePage(InlinePage::perfApps, tr(L"自動電源模式"), text);
+    releaseInteraction();
+}
 // Learns from each new battery sample: charging rate per band, and a charge limit
 // when the level holds steady below full while plugged in.
 void learnFromSample() {
@@ -1288,6 +1408,9 @@ void loadSettings() {
     sleepAlerts = readSetting(L"SleepAlert", 1) != 0;
     const DWORD reminder = readSetting(L"ChargeReminder", 0);
     chargeReminderTarget = reminder == 80 || reminder == 85 || reminder == 90 || reminder == 100 ? reminder : 0;
+    const DWORD saver = readSetting(L"AutoSaver", 0);
+    autoSaverThreshold = saver == 20 || saver == 30 ? saver : 0;
+    performanceApps = readNames(L"PerformanceApps");
     historyEnabled = readSetting(L"History", 1) != 0;
     std::vector<uint8_t> curve(512); DWORD curveBytes = DWORD(curve.size());
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\BatteryScope", L"ChargeCurve", RRF_RT_REG_BINARY, nullptr, curve.data(), &curveBytes) == ERROR_SUCCESS) {
@@ -1572,6 +1695,16 @@ void chooseService(const ProcessRow& row) {
         startAction(row, false, service);
     }
 }
+void refreshProcessButtons() {
+    if (!ecoButton || !perfAppButton) return;
+    const bool editable = !demo && !isolatedPreview && inlineProcess.has_value();
+    const bool efficient = inlineProcess && isEfficient(*inlineProcess), listed = inlineProcess && performanceListed(*inlineProcess);
+    SetWindowTextW(ecoButton, efficient ? tr(L"取消效率模式") : tr(L"效率模式"));
+    SetWindowTextW(perfAppButton, listed ? tr(L"移出效能清單") : tr(L"加入效能清單"));
+    EnableWindow(ecoButton, editable && !pendingAction && (efficient || inlineProcess->actionable));
+    EnableWindow(perfAppButton, editable && !inlineProcess->name.empty());
+    InvalidateRect(ecoButton, nullptr, FALSE); InvalidateRect(perfAppButton, nullptr, FALSE);
+}
 void showDetails(const ProcessRow& row) {
     if (!inlineProcess || &row != &*inlineProcess) inlineProcess = row;
     std::wstring content = row.name + L"\nPID: " + std::to_wstring(row.pid) +
@@ -1609,7 +1742,10 @@ void showDetails(const ProcessRow& row) {
         content += tr(L"\n\n所屬服務（共用程序時無法分別歸因）：");
         for (const auto& s : row.services) content += L"\n• " + s.display + L" (" + s.name + L")";
     }
+    if (isEfficient(row)) content += tr(L"\n\n效率模式：開啟（由 BatteryScope 設定；結束 BatteryScope 時會還原）。");
+    if (performanceListed(row)) content += tr(L"\n效能清單：此程式執行時，插電與用電池都會自動切到效能模式。");
     showInlinePage(InlinePage::process, tr(L"程序詳情"), content);
+    refreshProcessButtons();
 }
 void showForceConfirmation(const ProcessRow& row) {
     if (!pendingForceRow || &row != &*pendingForceRow) pendingForceRow = row;
@@ -1908,6 +2044,15 @@ void openMenu(POINT point) {
         AppendMenuW(reminders, MF_STRING | (chargeReminderTarget == target.second ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), target.first,
             target.second ? (std::to_wstring(target.second) + L"%").c_str() : tr(L"關閉"));
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(reminders), tr(L"充電提醒"));
+    HMENU automatic = CreatePopupMenu();
+    const std::pair<int, unsigned> savers[] = {{AutoSaverOffId, 0}, {AutoSaver20Id, 20}, {AutoSaver30Id, 30}};
+    for (const auto& item : savers)
+        AppendMenuW(automatic, MF_STRING | (autoSaverThreshold == item.second ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), item.first,
+            item.second ? (tr(L"低電量省電：") + std::to_wstring(item.second) + L"%").c_str() : tr(L"低電量省電：關閉"));
+    AppendMenuW(automatic, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(automatic, MF_STRING, PerfAppsPageId, (tr(L"效能清單（") + std::to_wstring(performanceApps.size()) + tr(L" 個）…")).c_str());
+    AppendMenuW(automatic, MF_STRING | (preview || performanceApps.empty() ? MF_GRAYED : 0), ClearPerfAppsId, tr(L"清空效能清單"));
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(automatic), tr(L"自動電源模式"));
     HMENU records = CreatePopupMenu();
     AppendMenuW(records, MF_STRING | (historyEnabled ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), HistoryToggleId, tr(L"記錄每日歷史"));
     AppendMenuW(records, MF_STRING | (preview ? MF_GRAYED : 0), ClearHistoryId, tr(L"清除歷史紀錄…"));
@@ -1945,6 +2090,7 @@ void applyLanguage(bool useEnglish) {
     if (inlinePage == InlinePage::ledger) showLedger();
     if (inlinePage == InlinePage::powerMode) showPowerModePage();
     if (inlinePage == InlinePage::history) showHistoryPage();
+    if (inlinePage == InlinePage::perfApps) showPerformanceApps();
     if (inlinePage == InlinePage::confirm && pendingForceRow) showForceConfirmation(*pendingForceRow);
     notice = tr(L"正在讀取電池與程序資料…"); noticeUntil = 0;
     if (tooltip) SendMessageW(tooltip, TTM_POP, 0, 0);
@@ -1998,6 +2144,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         for (int i = 0; i < 6; ++i) { modeButtons[i] = button(modeName(PowerMode(i % 3)), ModeAcEfficiencyId + i); ShowWindow(modeButtons[i], SW_HIDE); }
         restoreModesButton = button(tr(L"還原原本設定"), RestoreModesId); ShowWindow(restoreModesButton, SW_HIDE);
         energySettingsButton = button(tr(L"Windows 節能設定"), EnergySaverSettingsId); ShowWindow(energySettingsButton, SW_HIDE);
+        ecoButton = button(tr(L"效率模式"), EcoToggleId); ShowWindow(ecoButton, SW_HIDE);
+        perfAppButton = button(tr(L"加入效能清單"), PerfAppToggleId); ShowWindow(perfAppButton, SW_HIDE);
         menuButton = button(tr(L"設定"), MenuId); hideButton = button(tr(L"收回"), HideId);
         inlineText = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
             0, 0, 0, 0, window, nullptr, nullptr, nullptr);
@@ -2026,6 +2174,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
         trayAdded = updateTray(true);
         if (hotkeyEnabled && !demo && !isolatedPreview && !registerPanelHotkey(true)) hotkeyEnabled = false;
+        if (!demo && !isolatedPreview) loadAutoOverrides();
         if (demo || isolatedPreview) effectiveMode = EffectiveMode::performance; // synthetic preview
         else effectiveWatch = watchEffectivePowerMode([](EffectiveMode mode, void* target) {
             PostMessageW(static_cast<HWND>(target), PowerModeMessage, WPARAM(mode), 0);
@@ -2117,6 +2266,49 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (id == HistoryId) { showHistoryPage(); return 0; }
+        if (id == PerfAppsPageId) { showPerformanceApps(); return 0; }
+        if (id >= AutoSaverOffId && id <= AutoSaver30Id) {
+            if (demo || isolatedPreview) return 0;
+            static const unsigned values[] = {0, 20, 30};
+            autoSaverThreshold = values[id - AutoSaverOffId];
+            if (!writeSetting(L"AutoSaver", autoSaverThreshold)) setNotice(tr(L"無法儲存設定。"));
+            else setNotice(autoSaverThreshold ? tr(L"用電池且電量降到 ") + std::to_wstring(autoSaverThreshold) + tr(L"% 時會自動切到效率。") : tr(L"已關閉低電量自動省電。"));
+            applyAutoPowerRules();
+            return 0;
+        }
+        if (id == ClearPerfAppsId) {
+            if (demo || isolatedPreview) return 0;
+            performanceApps.clear(); writeNames(L"PerformanceApps", performanceApps);
+            setNotice(tr(L"已清空效能清單。")); applyAutoPowerRules();
+            return 0;
+        }
+        if (id == EcoToggleId) {
+            if (demo || isolatedPreview || !inlineProcess) return 0;
+            const ProcessRow row = *inlineProcess;
+            auto found = std::find_if(efficientProcesses.begin(), efficientProcesses.end(),
+                [&](const EfficientProcess& p) { return p.pid == row.pid && p.created == row.created; });
+            DWORD priority = found != efficientProcesses.end() ? found->priority : 0;
+            const bool enable = found == efficientProcesses.end();
+            const DWORD result = setProcessEfficiency(row, enable, priority);
+            if (result == ERROR_SUCCESS || (!enable && result == ERROR_NOT_FOUND)) {
+                if (enable) efficientProcesses.push_back({row.pid, row.created, priority}); else efficientProcesses.erase(found);
+                setNotice(enable ? tr(L"已開啟效率模式：降低優先順序並以省電方式執行。") : tr(L"已取消效率模式。"));
+            } else setNotice(tr(L"無法變更效率模式：") + errorText(result));
+            showDetails(row); refreshList();
+            return 0;
+        }
+        if (id == PerfAppToggleId) {
+            if (demo || isolatedPreview || !inlineProcess || inlineProcess->name.empty()) return 0;
+            const ProcessRow row = *inlineProcess;
+            const std::wstring name = lowerName(row.name);
+            const bool add = !performanceApps.count(name);
+            if (add) performanceApps.insert(name); else performanceApps.erase(name);
+            if (!writeNames(L"PerformanceApps", performanceApps)) setNotice(tr(L"無法儲存設定。"));
+            else setNotice(add ? tr(L"已加入效能清單：執行時會自動切到效能模式。") : tr(L"已移出效能清單。"));
+            applyAutoPowerRules();
+            showDetails(row);
+            return 0;
+        }
         if (id == SleepAlertId) {
             if (demo || isolatedPreview) return 0;
             sleepAlerts = !sleepAlerts;
@@ -2260,6 +2452,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         learnFromSample();
         checkDrainAlert();
         checkBatteryNotices();
+        applyAutoPowerRules();
         return 0;
     }
     case ActionMessage: {
@@ -2312,6 +2505,12 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         registerPanelHotkey(false);
         unwatchEffectivePowerMode(effectiveWatch); effectiveWatch = nullptr;
         if (curveDirty) writeBinarySetting(L"ChargeCurve", chargeCurve.save());
+        if (autoApplied != AutoMode::none) { undoAutoOverrides(); saveAutoOverrides(); }
+        for (const auto& entry : efficientProcesses) {
+            ProcessRow row; row.pid = entry.pid; row.created = entry.created; DWORD priority = entry.priority;
+            setProcessEfficiency(row, false, priority); // processes that already exited simply fail
+        }
+        efficientProcesses.clear();
         quit = true; wake.notify_one();
         NOTIFYICONDATAW data{}; data.cbSize = sizeof(data); data.hWnd = window; data.uID = 1;
         if (trayAdded) Shell_NotifyIconW(NIM_DELETE, &data);
@@ -2384,7 +2583,7 @@ bool captureWindow(const std::wstring& path) {
     // Owner-drawn controls are rendered through the same draw functions the
     // window uses, so captures do not depend on WM_PRINT support for them.
     for (auto child : {viewport, closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck,
-        powerButton, hideButton, menuButton, inlineText, inlineBack, inlineConfirm, restoreModesButton, energySettingsButton,
+        powerButton, hideButton, menuButton, inlineText, inlineBack, inlineConfirm, restoreModesButton, energySettingsButton, ecoButton, perfAppButton,
         modeButtons[0], modeButtons[1], modeButtons[2], modeButtons[3], modeButtons[4], modeButtons[5]}) {
         if (!(GetWindowLongPtrW(child, GWL_STYLE) & WS_VISIBLE)) continue;
         RECT childRect; GetWindowRect(child, &childRect); MapWindowPoints(nullptr, mainWindow, reinterpret_cast<POINT*>(&childRect), 2);
@@ -2524,6 +2723,8 @@ bool panelSelfTest(const std::wstring& path) {
     std::wstring detailText(size_t(textLength) + 1, L'\0');
     GetWindowTextW(inlineText, detailText.data(), int(detailText.size()));
     check("inline_details_keep_paragraphs", detailText.find(L"\r\n") != std::wstring::npos);
+    check("details_offer_efficiency_and_performance_list_read_only_in_demo", IsWindowVisible(ecoButton) && IsWindowVisible(perfAppButton) &&
+        !IsWindowEnabled(ecoButton) && !IsWindowEnabled(perfAppButton));
     check("details_estimate_battery_gain_when_closed", after && after->averageCpuWatts &&
         extraMinutesIfStopped(current.power, current.history.back(), *after->averageCpuWatts).has_value() &&
         detailText.find(tr(L"\n若關閉此程式：CPU 部分約可多用 ")) != std::wstring::npos);
@@ -2873,6 +3074,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         if (option(L"--empty")) current.processes.clear();
         if (option(L"--no-energy")) { current.energy.ready = false; for (auto& row : current.processes) { row.averageCpuWatts.reset(); row.cpuWattsLow.reset(); row.cpuWattsHigh.reset(); } }
         current.power = calculatePower(current.history);
+        if (!current.processes.empty()) efficientProcesses.push_back({current.processes[2].pid, current.processes[2].created, NORMAL_PRIORITY_CLASS});
+        performanceApps = {L"browser.exe"}; // synthetic preview list
         for (int band = 0; band < ChargeCurve::Bands; ++band) // synthetic preview curve: tapers after 80%
             for (int i = 0; i < 8; ++i) chargeCurve.add(band * 5 + 2, band < 16 ? 24 : 9);
         refreshList();
