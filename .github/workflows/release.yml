@@ -4,6 +4,15 @@ on:
   push:
     tags:
       - 'v*'
+  # Manual runs create the tag on the commit they run from.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, for example v0.10.0
+        required: true
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: write
@@ -18,7 +27,7 @@ jobs:
         run: |
           $match = Select-String -Path src/version.h -Pattern 'BS_VERSION_STRING "([0-9.]+)"'
           $version = $match.Matches[0].Groups[1].Value
-          if ("v$version" -ne "${{ github.ref_name }}") { throw "Tag ${{ github.ref_name }} does not match version $version in src/version.h" }
+          if ("v$version" -ne "$env:TAG") { throw "Tag $env:TAG does not match version $version in src/version.h" }
           "VERSION=$version" >> $env:GITHUB_ENV
       - name: Configure MSVC build
         run: cmake -S . -B build -A x64
@@ -43,9 +52,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $name = "BatteryScope-$env:VERSION-win64"
-          $notes = "docs/releases/${{ github.ref_name }}.md"
+          $notes = "docs/releases/$($env:TAG).md"
           if (Test-Path $notes) {
-            gh release create "${{ github.ref_name }}" "$name.zip" "$name.zip.sha256" --title "BatteryScope $env:VERSION" --notes-file $notes
+            gh release create "$env:TAG" "$name.zip" "$name.zip.sha256" --target "${{ github.sha }}" --title "BatteryScope $env:VERSION" --notes-file $notes
           } else {
-            gh release create "${{ github.ref_name }}" "$name.zip" "$name.zip.sha256" --title "BatteryScope $env:VERSION" --generate-notes
+            gh release create "$env:TAG" "$name.zip" "$name.zip.sha256" --target "${{ github.sha }}" --title "BatteryScope $env:VERSION" --generate-notes
           }
