@@ -82,6 +82,14 @@ struct CpuEnergyReport {
     std::wstring status = L"正在尋找硬體能源計數器";
     std::vector<CoreEnergy> cores;
 };
+// Session CPU energy for one executable name, summed over its processes,
+// including processes that have already exited.
+struct LedgerEntry {
+    std::wstring name;
+    double milliWh = 0;
+    unsigned processes = 0;
+    bool running = false;
+};
 struct Snapshot {
     std::deque<PowerSample> history;
     PowerMetrics power;
@@ -92,9 +100,25 @@ struct Snapshot {
     uint64_t ms = 0;
     unsigned samplingSeconds = 2;
     bool samplerEcoQoS = false;
+    std::vector<LedgerEntry> ledger;
+    double ledgerCoreMilliWh = 0;
+    uint64_t ledgerStartedMs = 0;
 };
 // Review candidates are opportunities to inspect, never a safety verdict or automatic action list.
 std::vector<size_t> reviewCandidates(const Snapshot& state, size_t limit = 5);
+// Fires once when a discharging battery reaches the threshold (percent). It
+// re-arms on external power or after recovering five points above the threshold.
+class LowBatteryMonitor {
+    bool armed_ = true;
+public:
+    void reset() { armed_ = true; }
+    bool update(const PowerSample& sample, unsigned threshold);
+};
+// One RFC 4180 CSV field. Text that a spreadsheet would treat as a formula is
+// prefixed with an apostrophe, since process names and paths are untrusted.
+std::wstring csvField(const std::wstring& value);
+// Whole minutes for a duration in hours, rounded up and at least 1; 0 if invalid.
+int roundedMinutes(double hours);
 // Conservative cadence: never exceed the energy model's 30 second continuity limit.
 class SamplingPolicy {
     uint64_t quietSince_ = 0, lastMs_ = 0;

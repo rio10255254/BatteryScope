@@ -1,5 +1,7 @@
 #include "energy.h"
 #include <numeric>
+#include <cwctype>
+#include <unordered_map>
 
 namespace bs {
 Value energyDeltaWatts(uint64_t e0, uint64_t e1, uint64_t t0, uint64_t t1) {
@@ -53,6 +55,53 @@ void alignProcessObservation(CpuEnergyReport& report, double processInterval, ui
         report.timingMismatch = true;
         report.status = L"程序與能源採樣未對齊，本次暫不分攤";
     }
+}
+void EnergyLedger::update(const std::vector<ProcessRow>& rows, const CpuEnergyReport& report, uint64_t ms) {
+    if (!startedMs_) startedMs_ = ms;
+    if (ms <= lastMs_) return; // A replayed snapshot must not count twice.
+    lastMs_ = ms;
+    for (auto& item : items_) item.second.running = false;
+    const bool valid = report.ready && !report.timingMismatch && std::isfinite(report.intervalSeconds)
+        && report.intervalSeconds > 0 && report.intervalSeconds <= 30;
+    if (valid && report.coreWatts && std::isfinite(*report.coreWatts) && *report.coreWatts > 0)
+        coreMilliWh_ += *report.coreWatts * report.intervalSeconds / 3.6;
+    for (const auto& row : rows) {
+        const double add = valid && row.cpuWatts && std::isfinite(*row.cpuWatts) && *row.cpuWatts > 0
+            ? *row.cpuWatts * report.intervalSeconds / 3.6 : 0;
+        auto found = items_.find({row.pid, row.created});
+        if (found == items_.end()) {
+            if (add <= 0) continue;
+            found = items_.emplace(std::make_pair(row.pid, row.created),
+                Item{row.services.size() == 1 ? row.services.front().display : row.name, 0, false}).first;
+        }
+        found->second.running = true;
+        found->second.milliWh += add;
+    }
+    // Bound memory on long sessions: drop the smallest exited entries.
+    if (items_.size() > 600) {
+        std::vector<std::pair<double, std::pair<uint32_t,uint64_t>>> exited;
+        for (const auto& item : items_) if (!item.second.running) exited.push_back({item.second.milliWh, item.first});
+        std::sort(exited.begin(), exited.end());
+        for (size_t i = 0; i < exited.size() && items_.size() > 500; ++i) items_.erase(exited[i].second);
+    }
+}
+std::vector<LedgerEntry> EnergyLedger::top(size_t limit) const {
+    std::unordered_map<std::wstring, LedgerEntry> byName;
+    for (const auto& item : items_) {
+        std::wstring key = item.second.name;
+        std::transform(key.begin(), key.end(), key.begin(), [](wchar_t c) { return wchar_t(std::towlower(c)); });
+        auto& entry = byName[key];
+        if (entry.name.empty()) entry.name = item.second.name;
+        entry.milliWh += item.second.milliWh; ++entry.processes; entry.running |= item.second.running;
+    }
+    std::vector<LedgerEntry> result;
+    result.reserve(byName.size());
+    for (auto& entry : byName) result.push_back(std::move(entry.second));
+    std::sort(result.begin(), result.end(), [](const LedgerEntry& a, const LedgerEntry& b) {
+        return a.milliWh != b.milliWh ? a.milliWh > b.milliWh : a.name < b.name;
+    });
+    if (result.size() > limit) result.resize(limit);
+    return result;
 }
 ObservationQuality classifyObservation(const CpuEnergyReport& report) {
     if (!report.ready || report.timingMismatch) return ObservationQuality::unavailable;

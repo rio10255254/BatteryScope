@@ -119,6 +119,24 @@ PowerMetrics calculatePower(const std::deque<PowerSample>& h) {
     }
     return m;
 }
+bool LowBatteryMonitor::update(const PowerSample& s, unsigned threshold) {
+    if (!threshold || !s.present || !s.acKnown || !s.percent || !std::isfinite(*s.percent)) return false;
+    if (s.onAc || s.charging || *s.percent >= threshold + 5.0) { armed_ = true; return false; }
+    if (*s.percent <= threshold && armed_) { armed_ = false; return true; }
+    return false;
+}
+std::wstring csvField(const std::wstring& value) {
+    std::wstring text = value;
+    if (!text.empty() && std::wstring(L"=+-@\t\r").find(text.front()) != std::wstring::npos) text.insert(text.begin(), L'\'');
+    if (text.find_first_of(L",\"\r\n") == std::wstring::npos) return text;
+    std::wstring quoted = L"\"";
+    for (wchar_t c : text) { if (c == L'"') quoted += L'"'; quoted += c; }
+    return quoted + L"\"";
+}
+int roundedMinutes(double hours) {
+    if (!std::isfinite(hours) || hours <= 0) return 0;
+    return std::max(1, int(std::ceil(hours * 60)));
+}
 double cpuPercent(uint64_t before, uint64_t after, double seconds, unsigned processors) {
     if (after < before || seconds <= 0 || processors == 0) return 0;
     return std::clamp((after - before) / 10000000.0 / seconds / processors * 100, 0.0, 100.0);

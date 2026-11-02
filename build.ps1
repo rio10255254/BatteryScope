@@ -15,7 +15,7 @@ try {
     & $resourceCompiler app.rc -O coff -o $resourceOutput
     if ($LASTEXITCODE) { throw 'Resource compilation failed.' }
     $common = @('-std=c++17','-O2','-Wall','-Wextra','-Wpedantic','-DUNICODE','-D_UNICODE','-DNOMINMAX','-D_WIN32_WINNT=0x0A00','-DWINVER=0x0A00','-static','-static-libgcc','-static-libstdc++','-finput-charset=UTF-8','-fexec-charset=UTF-8')
-    & $compiler @common -municode -mwindows app.cpp model.cpp platform.cpp energy_model.cpp energy_reader.cpp $resourceOutput -o $applicationOutput -lcomctl32 -lshell32 -lsetupapi -ladvapi32 -lpsapi -luxtheme -ldwmapi -lgdi32 -luser32 '-Wl,--dynamicbase' '-Wl,--nxcompat' -s
+    & $compiler @common -municode -mwindows app.cpp ui.cpp model.cpp platform.cpp energy_model.cpp energy_reader.cpp $resourceOutput -o $applicationOutput -lcomctl32 -lshell32 -lsetupapi -ladvapi32 -lpsapi -luxtheme -ldwmapi -lgdiplus -lcomdlg32 -lole32 -lgdi32 -luser32 '-Wl,--dynamicbase' '-Wl,--nxcompat' -s
     if ($LASTEXITCODE) { throw 'Application compilation failed.' }
     if ($Test) {
         & $compiler @common -municode ..\tests\tests.cpp model.cpp platform.cpp energy_model.cpp energy_reader.cpp -o $testOutput -lsetupapi -ladvapi32 -lpsapi -luser32 -lshell32

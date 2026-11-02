@@ -27,6 +27,21 @@ public:
     void clearThreadPlacement();
     void reset();
 };
+// Integrates each process's attributed CPU watts over the session and keeps
+// exited processes, so short-lived or finished work still counts.
+class EnergyLedger {
+    struct Item { std::wstring name; double milliWh = 0; bool running = false; };
+    std::map<std::pair<uint32_t,uint64_t>, Item> items_;
+    double coreMilliWh_ = 0;
+    uint64_t lastMs_ = 0, startedMs_ = 0;
+public:
+    void update(const std::vector<ProcessRow>& rows, const CpuEnergyReport& report, uint64_t ms);
+    // Aggregated by executable name (case-insensitive), highest energy first.
+    std::vector<LedgerEntry> top(size_t limit) const;
+    double coreMilliWh() const { return coreMilliWh_; }
+    uint64_t startedMs() const { return startedMs_; }
+    size_t tracked() const { return items_.size(); }
+};
 class CpuAttributor {
     struct History { double watts = 0, low = 0, high = 0, milliWh = 0; uint64_t last = 0; };
     std::map<std::pair<uint32_t,uint64_t>, History> history_;

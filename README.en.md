@@ -14,7 +14,18 @@ A small native Windows battery and background-process monitor built with C++17 a
 4. Use Background and Show filters, the mouse wheel, arrow keys, Home/End, or Page Up/Down. Enter or double-click opens details.
 5. Select a process to inspect it, request a normal close, force quit with confirmation, or stop an eligible hosted service. Protected processes cannot be closed.
 
-The menu also provides battery and charging details, optional launch at sign-in, and Quit. Launch at sign-in is off until you enable it. If you move the folder, opening BatteryScope from the new location repoints the entry automatically; an entry for another BatteryScope copy that still exists is left unchanged. Windows permission dialogs, standard dialog buttons, and system-provided service names follow the system language.
+The menu also provides theme, battery and charging details, session energy, CSV export, a low battery alert, the Ctrl+Alt+B shortcut, optional launch at sign-in, and Quit. Launch at sign-in is off until you enable it. If you move the folder, opening BatteryScope from the new location repoints the entry automatically; an entry for another BatteryScope copy that still exists is left unchanged. Windows permission dialogs, standard dialog buttons, and system-provided service names follow the system language.
+
+**Appearance and extras**
+
+- **Theme:** **⋯ → Theme** offers *Use Windows setting* (default; follows the Windows app light/dark mode live), *Dark*, or *Light*. When a Windows contrast theme is on, the panel always uses system colors and outlines cards and buttons. Shapes, the chart, and the battery glyph are antialiased with GDI+; ranking rows show each app's icon, with a letter tile for protected processes whose path cannot be read.
+- **Tray tooltip:** shows battery level, discharge watts, and estimated time left; while charging, charging watts and estimated time to full.
+- **Session energy:** CPU energy (mWh) attributed to each app since BatteryScope started, grouping processes with the same name and keeping processes that have exited, with each app's share of total CPU core energy. Requires compatible CPU energy counters.
+- **Low battery alert:** 10%, 20%, 30%, or off (default). On battery, one Windows notification appears when the level reaches the threshold, with current drain, time left, and the top consumer. It re-arms on external power or after recovering 5 points. Clicking it opens the panel.
+- **Export CSV:** saves the current ranking (watts, range, session mWh, memory, path) and the 30-minute battery history (`-power.csv`) as UTF-8 CSV. Names that a spreadsheet would treat as formulas are prefixed with an apostrophe.
+- **Shortcut:** when enabled (off by default), Ctrl+Alt+B shows or hides the panel from anywhere. If another app owns it, BatteryScope says so and leaves it off.
+
+Theme, alert threshold, and shortcut settings are stored under `HKCU\Software\BatteryScope`; demo and screenshot modes never write them.
 
 The **Save** button sets Windows' battery-side power mode to **Best power efficiency** with one click; **Undo** restores the previous mode, even after restarting BatteryScope. The previous setting is stored under the current user's BatteryScope registry key. While plugged in, this configures the mode for the next battery session. This changes the Windows power mode, not the separate Energy saver switch, and does not close apps or services. The button is unavailable if the Windows API is unsupported or Best efficiency was already selected outside BatteryScope.
 
@@ -65,6 +76,6 @@ To avoid replacing a running executable, use `-OutputDirectory dist/v0.9.2`. The
 .\dist\BatteryScope.exe --tray-test C:\temp\tray-test.txt
 ```
 
-The destination folder must exist. Screenshots use synthetic data only when the demo option is selected. `--compact`, `--minimal`, `--plugged`, `--no-energy`, and `--selected` are available for preview checks.
+The destination folder must exist. Screenshots use synthetic data only when the demo option is selected. `--compact`, `--minimal`, `--plugged`, `--no-energy`, `--selected`, `--light`, `--dark`, `--high-contrast` (previews the contrast palette from current system colors), and `--ledger` are available for preview checks.
 
 Power API references: [Battery status](https://learn.microsoft.com/en-us/windows/win32/power/battery-status-str), [system power status](https://learn.microsoft.com/en-us/windows/win32/power/system-power-status).

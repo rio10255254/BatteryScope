@@ -3,6 +3,7 @@
 #include "motion.h"
 #include "i18n.h"
 #include "version.h"
+#include "ui.h"
 #include <commctrl.h>
 #include <shellapi.h>
 #include <uxtheme.h>
@@ -11,9 +12,11 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
+#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <iterator>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -25,17 +28,24 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     BackgroundId = 105, AllId = 106, StartupId = 107, HideId = 108, MenuId = 109,
     LanguageZhId = 110, LanguageEnId = 111, PowerDetailsId = 112, SaverModeId = 113,
     EnergySaverSettingsId = 114, ReviewCandidatesId = 115, InlineBackId = 116, InlineConfirmId = 117,
+    LedgerId = 118, ExportCsvId = 119, LowBatteryOffId = 120, LowBattery10Id = 121, LowBattery20Id = 122, LowBattery30Id = 123,
+    HotkeyToggleId = 124, ThemeSystemId = 125, ThemeDarkId = 126, ThemeLightId = 127,
     TrayShow = 200, TrayExit = 201;
+constexpr int PanelHotkey = 1;
 const wchar_t* ClassName = L"BatteryScope.Main.v1";
 const wchar_t* const AppTitle = L"BatteryScope " BS_VERSION_STRING;
-const COLORREF Ink = RGB(235, 242, 246), Muted = RGB(146, 161, 174), Green = RGB(104, 225, 188),
-    Background = RGB(15, 20, 27), Surface = RGB(24, 32, 42), Border = RGB(41, 53, 65),
-    Selected = RGB(30, 57, 57), Danger = RGB(245, 146, 146);
+// Theme palette; the short names below mirror it for the drawing code.
+ui::ThemeChoice themeChoice = ui::ThemeChoice::system;
+bool previewContrast = false; // --high-contrast preview option
+ui::Palette theme = ui::palette(ui::ThemeChoice::dark);
+COLORREF Ink = theme.ink, Muted = theme.muted, Green = theme.accent, Background = theme.background,
+    Surface = theme.surface, Border = theme.border, Selected = theme.selected, Danger = theme.danger;
+ui::IconCache processIcons;
 HWND mainWindow = nullptr, viewport = nullptr, list = nullptr, closeButton = nullptr, killButton = nullptr, serviceButton = nullptr,
     detailsButton = nullptr, backgroundCheck = nullptr, allCheck = nullptr, hideButton = nullptr, menuButton = nullptr, saverButton = nullptr,
     inlineText = nullptr, inlineBack = nullptr, inlineConfirm = nullptr;
-HFONT normalFont = nullptr, smallFont = nullptr, titleFont = nullptr, valueFont = nullptr, metricFont = nullptr;
-HICON appIcon = nullptr, smallIcon = nullptr;
+HFONT normalFont = nullptr, smallFont = nullptr, strongFont = nullptr, titleFont = nullptr, valueFont = nullptr, metricFont = nullptr;
+HICON appIcon = nullptr, smallIcon = nullptr, headerIcon = nullptr;
 bool updateTray(bool add);
 UINT dpi = 96, taskbarCreated = 0;
 std::atomic<bool> quit{false}, hidden{false}, resetSamples{false};
@@ -53,7 +63,10 @@ bool pendingAction = false, forceAction = false, serviceAction = false, trayAdde
 bool trayVersion4 = false, backgroundOnly = false, showAll = false, autoStart = false;
 bool saverActive = false;
 bool isolatedPreview = false;
-enum class InlinePage { none, process, power, candidates, confirm, error };
+enum class InlinePage { none, process, power, candidates, ledger, confirm, error };
+unsigned lowBatteryThreshold = 0; // percent; 0 = off
+LowBatteryMonitor lowBattery;
+bool hotkeyEnabled = false, hotkeyRegistered = false;
 InlinePage inlinePage = InlinePage::none;
 bool inlineClosing = false;
 std::wstring inlineTitle;
@@ -115,10 +128,7 @@ void readMotionPreference() {
 
 int px(int value) { return MulDiv(value, int(dpi), 96); }
 int sp(int value) { return px(MulDiv(value, 85, 100)); }
-COLORREF blend(COLORREF a, COLORREF b, double t) {
-    return RGB(int(GetRValue(a) + (GetRValue(b) - GetRValue(a)) * t),
-        int(GetGValue(a) + (GetGValue(b) - GetGValue(a)) * t), int(GetBValue(a) + (GetBValue(b) - GetBValue(a)) * t));
-}
+COLORREF blend(COLORREF a, COLORREF b, double t) { return ui::mix(a, b, t); }
 std::wstring number(double value, int precision = 1) {
     std::wostringstream stream; stream << std::fixed << std::setprecision(precision) << value; return stream.str();
 }
@@ -153,13 +163,24 @@ void drawText(HDC dc, const std::wstring& text, RECT r, COLORREF color, HFONT fa
     DrawTextW(dc, text.c_str(), -1, &r, format | DT_NOPREFIX);
 }
 void fill(HDC dc, RECT rect, COLORREF color) {
-    HBRUSH brush = CreateSolidBrush(color); FillRect(dc, &rect, brush); DeleteObject(brush);
+    SetDCBrushColor(dc, color); FillRect(dc, &rect, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
 }
-void rounded(HDC dc, RECT rect, COLORREF color, int radius = 12) {
-    HBRUSH brush = CreateSolidBrush(color); auto oldBrush = SelectObject(dc, brush);
-    auto oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
-    RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, px(radius), px(radius));
-    SelectObject(dc, oldPen); SelectObject(dc, oldBrush); DeleteObject(brush);
+// `radius` is the corner radius in logical pixels.
+void rounded(HDC dc, RECT rect, COLORREF color, int radius = 12) { ui::fillRound(dc, rect, color, float(sp(radius))); }
+// A surface card; contrast themes add an outline because fills alone may match the background.
+void card(HDC dc, RECT rect, COLORREF color, int radius) {
+    rounded(dc, rect, color, radius);
+    if (theme.highContrast) ui::strokeRound(dc, rect, Border, float(sp(radius)), 1.0f);
+}
+int textWidth(HDC dc, const std::wstring& text, HFONT face) {
+    font(dc, face); SIZE size{}; GetTextExtentPoint32W(dc, text.c_str(), int(text.size()), &size); return size.cx;
+}
+// "About 1 h 5 min"; empty when there is no usable estimate.
+std::wstring durationText(Value hours) {
+    if (!hours || *hours >= 100) return {};
+    const int minutes = roundedMinutes(*hours);
+    if (!minutes) return {};
+    return tr(L"約 ") + (minutes >= 60 ? std::to_wstring(minutes / 60) + tr(L" 小時 ") : L"") + std::to_wstring(minutes % 60) + tr(L" 分");
 }
 int listTop() {
     RECT r{}; GetClientRect(mainWindow, &r);
@@ -171,16 +192,29 @@ void setNotice(std::wstring text) {
     InvalidateRect(mainWindow, nullptr, FALSE);
 }
 void makeFonts() {
-    for (auto f : {normalFont, smallFont, titleFont, valueFont, metricFont}) if (f) DeleteObject(f);
+    for (auto f : {normalFont, smallFont, strongFont, titleFont, valueFont, metricFont}) if (f) DeleteObject(f);
     auto make = [](int height, int weight) {
         return CreateFontW(-px(height), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, english ? L"Segoe UI" : L"Microsoft JhengHei UI");
     };
-    normalFont = make(12, FW_NORMAL); smallFont = make(11, FW_NORMAL);
+    normalFont = make(12, FW_NORMAL); smallFont = make(11, FW_NORMAL); strongFont = make(12, FW_SEMIBOLD);
     titleFont = make(16, FW_SEMIBOLD); valueFont = make(29, FW_SEMIBOLD); metricFont = make(16, FW_SEMIBOLD);
     for (auto window : {list, closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck,
         hideButton, menuButton, saverButton, inlineText, inlineBack, inlineConfirm, tooltip})
         if (window) SendMessageW(window, WM_SETFONT, reinterpret_cast<WPARAM>(normalFont), TRUE);
+}
+void applyTheme() {
+    theme = ui::palette(themeChoice, previewContrast);
+    Ink = theme.ink; Muted = theme.muted; Green = theme.accent; Background = theme.background;
+    Surface = theme.surface; Border = theme.border; Selected = theme.selected; Danger = theme.danger;
+    if (!mainWindow) return;
+    const wchar_t* controls = theme.highContrast ? nullptr : theme.dark ? L"DarkMode_Explorer" : L"Explorer";
+    for (HWND control : {viewport, list, inlineText}) if (control) SetWindowTheme(control, controls, nullptr);
+    if (list) { ListView_SetBkColor(list, Background); ListView_SetTextBkColor(list, Background); ListView_SetTextColor(list, Ink); }
+    if (tooltip) { SendMessageW(tooltip, TTM_SETTIPBKCOLOR, Surface, 0); SendMessageW(tooltip, TTM_SETTIPTEXTCOLOR, Ink, 0); }
+    BOOL dark = theme.dark; DwmSetWindowAttribute(mainWindow, 20, &dark, sizeof(dark));
+    COLORREF edge = theme.highContrast ? Ink : Border; DwmSetWindowAttribute(mainWindow, 34, &edge, sizeof(edge));
+    RedrawWindow(mainWindow, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
 }
 bool refreshIcons() {
     HINSTANCE module = GetModuleHandleW(nullptr);
@@ -197,22 +231,53 @@ bool refreshIcons() {
     if (trayAdded) updateTray(false);
     if (oldLarge) DestroyIcon(oldLarge);
     if (oldSmall) DestroyIcon(oldSmall);
+    if (headerIcon) DestroyIcon(headerIcon);
+    headerIcon = static_cast<HICON>(LoadImageW(module, MAKEINTRESOURCEW(101), IMAGE_ICON, sp(22), sp(22), LR_DEFAULTCOLOR));
+    processIcons.clear();
     return true;
+}
+std::wstring trayText() {
+    std::wstring text = L"BatteryScope";
+    if (current.history.empty()) return text;
+    const auto& p = current.history.back();
+    text += L" · " + valueText(p.percent, L"%", 0);
+    if (p.charging) {
+        const auto charge = calculateCharging(current.history);
+        text += tr(L" · 充電 ") + valueText(charge.watts, L" W");
+        if (auto full = durationText(charge.hoursToFull); !full.empty()) text += english ? L" · " + full + L" to full" : L" · " + full + L"充滿";
+    } else if (p.onAc) text += tr(L" · 插電中");
+    else {
+        text += L" · " + valueText(current.power.currentWatts, L" W");
+        if (auto left = durationText(current.power.hoursRemaining); !left.empty()) text += english ? L" · " + left + L" left" : L" · 續航" + left;
+    }
+    return text;
 }
 bool updateTray(bool add) {
     if (isolatedPreview) return false;
     NOTIFYICONDATAW data{}; data.cbSize = sizeof(data); data.hWnd = mainWindow; data.uID = 1;
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP; data.uCallbackMessage = TrayMessage; data.hIcon = smallIcon;
-    std::wstring text = L"BatteryScope";
-    if (!current.history.empty()) {
-        const auto& p = current.history.back();
-        text += L" · " + valueText(p.percent, L"%", 0);
-        text += p.onAc ? tr(L" · 插電中") : L" · " + valueText(current.power.currentWatts, L" W");
-    }
-    wcsncpy_s(data.szTip, text.c_str(), _TRUNCATE);
+    wcsncpy_s(data.szTip, trayText().c_str(), _TRUNCATE);
     if (!Shell_NotifyIconW(add ? NIM_ADD : NIM_MODIFY, &data)) return false;
     if (add) { data.uVersion = NOTIFYICON_VERSION_4; trayVersion4 = Shell_NotifyIconW(NIM_SETVERSION, &data) != FALSE; }
     return true;
+}
+// One Windows notification when the battery reaches the chosen threshold.
+void showLowBatteryNotice() {
+    if (!trayAdded || current.history.empty()) return;
+    const auto& p = current.history.back();
+    std::wstring body = tr(L"目前耗電 ") + valueText(current.power.currentWatts, L" W");
+    if (auto left = durationText(current.power.hoursRemaining); !left.empty()) body += english ? L" · " + left + L" left" : L" · 續航" + left;
+    for (const auto& row : current.processes) {
+        if (!row.averageCpuWatts || *row.averageCpuWatts < .3 || row.pid <= 4) continue;
+        body += tr(L"\n耗電最高：") + (row.services.size() == 1 ? row.services.front().display : row.name) +
+            L" (" + valueText(row.averageCpuWatts, L" W", 1) + L")";
+        break;
+    }
+    NOTIFYICONDATAW data{}; data.cbSize = sizeof(data); data.hWnd = mainWindow; data.uID = 1;
+    data.uFlags = NIF_INFO; data.dwInfoFlags = NIIF_WARNING | NIIF_RESPECT_QUIET_TIME;
+    wcsncpy_s(data.szInfoTitle, (tr(L"電量偏低 · ") + valueText(p.percent, L"%", 0)).c_str(), _TRUNCATE);
+    wcsncpy_s(data.szInfo, body.c_str(), _TRUNCATE);
+    Shell_NotifyIconW(NIM_MODIFY, &data);
 }
 void refreshList();
 void positionPanel() {
@@ -552,7 +617,7 @@ void showInlinePage(InlinePage page, const std::wstring& title, const std::wstri
         lines += content[i];
     }
     SetWindowTextW(inlineText, lines.c_str());
-    ShowScrollBar(inlineText, SB_VERT, page == InlinePage::process || page == InlinePage::power ||
+    ShowScrollBar(inlineText, SB_VERT, page == InlinePage::process || page == InlinePage::power || page == InlinePage::ledger ||
         (page == InlinePage::candidates && lines.size() > 500));
     SendMessageW(inlineText, EM_SETSEL, 0, 0);
     SendMessageW(inlineText, EM_SCROLLCARET, 0, 0);
@@ -590,22 +655,61 @@ void drawButton(const DRAWITEMSTRUCT& item) {
     RECT r = item.rcItem; HDC dc = item.hDC;
     const bool disabled = (item.itemState & ODS_DISABLED) != 0;
     const bool pressed = (item.itemState & ODS_SELECTED) != 0;
-    const bool checked = (item.CtlID == BackgroundId && backgroundOnly) || (item.CtlID == AllId && showAll) ||
-        (item.CtlID == SaverModeId && saverActive);
-    const bool danger = item.CtlID == KillId || item.CtlID == InlineConfirmId;
-    fill(dc, r, Background);
-    double hover = buttonMotions[item.hwndItem].value(motionNow());
+    const UINT id = item.CtlID;
+    const bool inlineButton = id == InlineBackId || id == InlineConfirmId;
+    const COLORREF behind = inlineButton ? Surface : Background;
+    fill(dc, r, behind);
+    const double hover = disabled ? 0 : buttonMotions[item.hwndItem].value(motionNow());
     const double press = pressMotions[item.hwndItem].value(motionNow());
     const int inset = int(std::lround(px(1) * press));
     InflateRect(&r, -inset, -inset);
-    rounded(dc, r, pressed ? Border : blend(checked ? Selected : Surface, Border, disabled ? 0 : hover), 10);
     wchar_t title[128]{}; GetWindowTextW(item.hwndItem, title, int(std::size(title)));
-    if (item.CtlID == MenuId) wcscpy_s(title, L"⋯");
-    if (item.CtlID == HideId) wcscpy_s(title, L"⌄");
-    drawText(dc, title, r, disabled ? RGB(87, 102, 115) : danger ? Danger : checked ? Green : Ink,
-        normalFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-    if (item.itemState & ODS_FOCUS) {
-        InflateRect(&r, -sp(3), -sp(3)); SetTextColor(dc, Muted); DrawFocusRect(dc, &r);
+    const float radius = id == SaverModeId ? (r.bottom - r.top) / 2.0f : float(sp(9));
+    COLORREF face = theme.raised, outline = CLR_INVALID, text = Ink;
+    HFONT faceFont = normalFont;
+    if (id == MenuId || id == HideId) {
+        face = hover > .01 || pressed ? blend(behind, theme.raised, std::max(hover, pressed ? 1.0 : 0.0)) : behind;
+        if (face != behind) rounded(dc, r, face, 9);
+        if (theme.highContrast && hover > .5) ui::strokeRound(dc, r, Border, radius, 1.0f);
+        const COLORREF glyph = disabled ? theme.faint : blend(Muted, Ink, hover);
+        if (id == MenuId) ui::drawDots(dc, r, glyph, std::max(1.2f, sp(2) * .8f));
+        else ui::drawChevron(dc, r, glyph, std::max(1.5f, float(sp(2))));
+    } else {
+        const bool checked = (id == BackgroundId && backgroundOnly) || (id == AllId && showAll) || (id == SaverModeId && saverActive);
+        if (disabled) {
+            face = blend(Surface, behind, .35); text = theme.faint;
+            if (theme.highContrast) outline = theme.faint;
+        } else if (theme.highContrast && (id == CloseId || id == InlineConfirmId || checked)) {
+            face = theme.selected; text = theme.selectedInk; faceFont = id == CloseId || id == InlineConfirmId ? strongFont : normalFont;
+        } else if (id == CloseId) {
+            face = blend(Green, Ink, hover * .14); text = theme.accentInk; faceFont = strongFont;
+        } else if (id == InlineConfirmId) {
+            face = blend(Danger, Ink, hover * .14); text = theme.dark ? Background : RGB(255, 255, 255); faceFont = strongFont;
+        } else if (id == KillId) {
+            face = blend(Surface, theme.raised, hover); outline = blend(Danger, behind, .45); text = Danger;
+        } else if (id == BackgroundId || id == AllId || id == SaverModeId) {
+            if (checked) {
+                face = id == SaverModeId ? Green : theme.accentSoft;
+                outline = id == SaverModeId ? CLR_INVALID : blend(Green, behind, .35);
+                text = id == SaverModeId ? theme.accentInk : Green;
+                if (id == SaverModeId) face = blend(Green, Ink, hover * .14);
+            } else {
+                face = blend(id == SaverModeId ? theme.accentSoft : Surface, theme.raised, hover);
+                outline = id == SaverModeId ? CLR_INVALID : Border;
+                text = id == SaverModeId ? Green : Muted;
+            }
+        } else {
+            face = blend(theme.raised, Border, hover * .6);
+        }
+        if (pressed) face = blend(face, Ink, .1);
+        ui::fillRound(dc, r, face, radius);
+        if (theme.highContrast && outline == CLR_INVALID) outline = Border;
+        if (outline != CLR_INVALID) ui::strokeRound(dc, r, outline, radius, 1.0f);
+        drawText(dc, title, r, text, faceFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    }
+    if ((item.itemState & ODS_FOCUS) && !(item.itemState & ODS_NOFOCUSRECT)) {
+        RECT ring = item.rcItem;
+        ui::strokeRound(dc, ring, theme.highContrast ? Ink : blend(Green, behind, .15), radius + 1, float(std::max(2, px(2))));
     }
 }
 void drawProcess(const DRAWITEMSTRUCT& item) {
@@ -616,27 +720,48 @@ void drawProcess(const DRAWITEMSTRUCT& item) {
     const double focus = item.itemID < rowMotions.size() ? rowMotions[item.itemID].selected.value(motionNow()) : double(selected);
     const double hover = item.itemID < rowMotions.size() ? rowMotions[item.itemID].hover.value(motionNow()) : 0;
     RECT tile = r; tile.bottom -= sp(4);
-    rounded(dc, tile, blend(blend(Surface, Border, hover * .45), Selected, focus), 10);
-    if (focus > .01) rounded(dc, {r.left + sp(3), r.top + sp(13), r.left + sp(5), tile.bottom - sp(13)}, blend(Surface, Green, focus), 2);
-    const int left = r.left + sp(38), right = r.right - sp(12), y = r.top;
-    drawText(dc, std::to_wstring(item.itemID + 1), {r.left + sp(10), y + sp(10), left - sp(6), y + sp(29)}, Muted, smallFont);
+    const COLORREF tileColor = blend(blend(Surface, theme.raised, hover), Selected, focus);
+    rounded(dc, tile, tileColor, 10);
+    if (theme.highContrast) ui::strokeRound(dc, tile, selected ? Green : Border, float(sp(10)), selected ? 2.0f : 1.0f);
+    if (focus > .01) rounded(dc, {r.left + sp(3), r.top + sp(14), r.left + sp(6), tile.bottom - sp(14)}, blend(tileColor, Green, focus), 2);
+    const bool inverted = theme.highContrast && selected;
+    const COLORREF ink = inverted ? theme.selectedInk : Ink, sub = inverted ? theme.selectedInk : Muted, accent = inverted ? theme.selectedInk : Green;
+    // Application icon, or a letter tile for processes without a readable image path.
+    const int iconSize = sp(24), iconX = r.left + sp(12), iconY = tile.top + (tile.bottom - tile.top - iconSize) / 2 - sp(2);
     std::wstring name = row.services.size() == 1 ? row.services.front().display : tr(row.name.c_str());
+    if (HICON icon = processIcons.get(row.path, iconSize)) DrawIconEx(dc, iconX, iconY, icon, iconSize, iconSize, 0, nullptr, DI_NORMAL);
+    else {
+        RECT avatar{iconX, iconY, iconX + iconSize, iconY + iconSize};
+        rounded(dc, avatar, blend(tileColor, Green, .2), 6);
+        wchar_t letter = L'?';
+        for (wchar_t c : name) if (iswalnum(c)) { letter = wchar_t(towupper(c)); break; }
+        drawText(dc, std::wstring(1, letter), avatar, accent, strongFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    }
+    const int left = iconX + iconSize + sp(10), right = r.right - sp(12), y = r.top;
     if (row.services.size() > 1) name += L" · " + std::to_wstring(row.services.size()) + tr(L" 項服務");
-    drawText(dc, name, {left, y + sp(7), right - sp(90), y + sp(28)}, Ink, normalFont);
+    drawText(dc, name, {left, y + sp(7), right - sp(90), y + sp(28)}, ink, normalFont);
     drawText(dc, valueText(row.averageCpuWatts, L" W", 2), {right - sp(90), y + sp(6), right, y + sp(29)},
-        Green, metricFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
-    drawText(dc, std::wstring(tr(row.kind.c_str())) + L" · " + std::to_wstring(row.pid), {left, y + sp(29), right - sp(100), y + sp(46)}, Muted, smallFont);
+        accent, metricFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    const std::wstring kind = tr(row.kind.c_str());
+    RECT chip{left, y + sp(31), left + textWidth(dc, kind, smallFont) + sp(12), y + sp(45)};
+    rounded(dc, chip, inverted ? tileColor : blend(tileColor, Ink, theme.dark ? .08 : .06), 5);
+    if (theme.highContrast) ui::strokeRound(dc, chip, sub, float(sp(5)), 1.0f);
+    drawText(dc, kind, chip, sub, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    drawText(dc, L"PID " + std::to_wstring(row.pid), {chip.right + sp(6), y + sp(29), right - sp(100), y + sp(47)}, sub, smallFont);
     std::wstring range = row.cpuWattsLow && row.cpuWattsHigh ?
         number(*row.cpuWattsLow, 2) + L"–" + number(*row.cpuWattsHigh, 2) + L" W" :
         L"CPU " + (row.measured ? number(row.cpu) + L"%" : L"—");
-    drawText(dc, range, {right - sp(102), y + sp(29), right, y + sp(46)}, Muted, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    drawText(dc, range, {right - sp(102), y + sp(29), right, y + sp(47)}, sub, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
     if (row.averageCpuWatts && !displayed.empty() && displayed.front().averageCpuWatts && *displayed.front().averageCpuWatts > 0) {
         const double ratio = item.itemID < rowMotions.size() ? rowMotions[item.itemID].bar.value(motionNow()) : 0;
-        fill(dc, {left, y + sp(50), right, y + sp(52)}, Border);
-        fill(dc, {left, y + sp(50), left + int((right - left) * ratio), y + sp(52)}, selected ? Green : RGB(57, 119, 105));
+        const int barTop = y + sp(49), barBottom = barTop + std::max(2, sp(3));
+        rounded(dc, {left, barTop, right, barBottom}, blend(tileColor, Border, .9), 2);
+        const int filled = int((right - left) * std::clamp(ratio, 0.0, 1.0));
+        if (filled > 0) rounded(dc, {left, barTop, left + std::max(filled, sp(3)), barBottom}, selected ? accent : theme.accentDim, 2);
     }
     if ((item.itemState & ODS_FOCUS) && GetFocus() == list && !(SendMessageW(list, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS)) {
-        InflateRect(&tile, -sp(2), -sp(2)); DrawFocusRect(dc, &tile);
+        InflateRect(&tile, -sp(1), -sp(1));
+        ui::strokeRound(dc, tile, theme.highContrast ? ink : blend(Green, tileColor, .25), float(sp(10)), float(std::max(2, px(2))));
     }
 }
 void paint(HDC dc, RECT bounds) {
@@ -644,15 +769,15 @@ void paint(HDC dc, RECT bounds) {
     const int w = bounds.right, h = bounds.bottom, margin = sp(18), right = w - margin;
     const bool compact = h < px(600), minimal = h < px(480);
     const int top = listTop();
-    rounded(dc, {margin, sp(21), margin + sp(8), sp(29)}, Green, 8);
-    drawText(dc, L"BatteryScope", {margin + sp(18), sp(12), w - sp(98), sp(42)}, Ink, titleFont);
-    drawText(dc, demo ? tr(L"示範資料 · 關閉操作已停用") : tr(L"電池與背景活動"), {margin, sp(43), right, sp(63)}, Muted, smallFont);
+    if (headerIcon) DrawIconEx(dc, margin, sp(15), headerIcon, sp(22), sp(22), 0, nullptr, DI_NORMAL);
+    drawText(dc, L"BatteryScope", {margin + sp(30), sp(11), w - sp(98), sp(40)}, Ink, titleFont);
+    drawText(dc, demo ? tr(L"示範資料 · 關閉操作已停用") : tr(L"電池與背景活動"), {margin + sp(30), sp(39), w - sp(96), sp(60)}, Muted, smallFont);
     if (inlinePage == InlinePage::process || inlinePage == InlinePage::confirm || inlinePage == InlinePage::error) {
-        rounded(dc, {margin, sp(74), right, h - sp(14)}, Surface, 16);
-        drawText(dc, inlineTitle, {margin + sp(13), sp(84), right - sp(13), sp(114)}, Ink, titleFont);
-        fill(dc, {margin + sp(13), sp(119), right - sp(13), sp(120)}, Border);
+        card(dc, {margin, sp(74), right, h - sp(14)}, Surface, 14);
+        drawText(dc, inlineTitle, {margin + sp(14), sp(84), right - sp(14), sp(114)}, Ink, titleFont);
+        fill(dc, {margin + sp(14), sp(119), right - sp(14), sp(119) + 1}, Border);
         if (inlinePage != InlinePage::error && GetTickCount64() < noticeUntil)
-            drawText(dc, notice, {margin + sp(13), h - sp(84), right - sp(13), h - sp(64)}, Green, smallFont);
+            drawText(dc, notice, {margin + sp(14), h - sp(84), right - sp(14), h - sp(64)}, Green, smallFont);
         return;
     }
     PowerSample p; if (!current.history.empty()) p = current.history.back();
@@ -663,87 +788,98 @@ void paint(HDC dc, RECT bounds) {
     std::wstring rateLabel = !p.present ? tr(L"仍可監測程序 CPU") : p.charging ? tr(L"電池端 · 非充電器輸出") : plugged ? tr(L"接頭類型未提供") :
         m.estimated ? tr(L"依電量變化估算") : tr(L"電池回報的整機放電");
     if (minimal && m.percentPerHour) rateLabel = number(*m.percentPerHour) + tr(L" 百分點 / 小時");
-    rounded(dc, {margin, sp(74), right, sp(180)}, Surface, 18);
-    drawText(dc, p.charging ? tr(L"充電功率") : plugged ? tr(L"外部電源") : tr(L"目前耗電"), {margin + sp(16), sp(85), right - sp(122), sp(105)}, Muted, smallFont);
-    drawText(dc, currentW, {margin + sp(14), sp(105), right - sp(119), sp(151)}, Ink, valueFont);
-    drawText(dc, rateLabel, {margin + sp(16), sp(153), right - sp(100), sp(172)}, Muted, smallFont);
-    drawText(dc, valueText(p.percent, L"%", 0), {right - sp(108), sp(92), right - sp(16), sp(126)},
-        Green, titleFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
-    fill(dc, {right - sp(92), sp(136), right - sp(16), sp(140)}, Border);
-    if (p.percent) fill(dc, {right - sp(92), sp(136), right - sp(92) + int(sp(76) * std::clamp(*p.percent, 0.0, 100.0) / 100), sp(140)}, Green);
+    // Hero card: power on the left, battery level on the right.
+    card(dc, {margin, sp(72), right, sp(180)}, Surface, 16);
+    drawText(dc, p.charging ? tr(L"充電功率") : plugged ? tr(L"外部電源") : tr(L"目前耗電"), {margin + sp(16), sp(84), right - sp(122), sp(103)}, Muted, smallFont);
+    drawText(dc, currentW, {margin + sp(14), sp(102), right - sp(119), sp(150)}, Ink, valueFont);
+    drawText(dc, rateLabel, {margin + sp(16), sp(152), right - sp(150), sp(172)}, Muted, smallFont);
+    const bool low = p.percent && !plugged && *p.percent <= 20;
+    const COLORREF level = !p.percent ? Muted : p.charging ? Green : low && *p.percent <= 10 ? Danger : low ? theme.warn : Green;
+    drawText(dc, valueText(p.percent, L"%", 0), {right - sp(112), sp(84), right - sp(16), sp(116)},
+        p.percent ? Ink : Muted, titleFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    ui::drawBattery(dc, {right - sp(16) - sp(60), sp(121), right - sp(16), sp(143)}, p.percent ? *p.percent / 100 : 0,
+        blend(Muted, Surface, .25), level, p.charging, Ink, Surface);
     drawText(dc, p.charging ? tr(L"充電中") : plugged ? (p.percent && *p.percent >= 99.5 ? tr(L"已充滿") : tr(L"未充電")) : tr(L"剩餘電量"),
-        {right - sp(100), sp(151), right - sp(16), sp(172)}, Muted, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+        {right - sp(146), sp(151), right - sp(16), sp(172)}, Muted, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
     if (!minimal) {
-        int middle = w / 2;
-        drawText(dc, p.charging ? tr(L"充電速度") : plugged ? tr(L"電池狀態") : tr(L"耗電速度"), {margin + sp(2), sp(192), middle, sp(209)}, Muted, smallFont);
-        drawText(dc, plugged && !p.charging ? (p.percent && *p.percent >= 99.5 ? tr(L"已充滿") : tr(L"已接電，暫未充電")) : valueText(p.charging ? charge.percentPerHour : m.percentPerHour, tr(L" 百分點 / 小時")), {margin + sp(2), sp(211), middle, sp(235)}, Ink, normalFont);
+        const int gap = sp(8), half = (right - margin - gap) / 2;
+        const RECT rateCard{margin, sp(187), margin + half, sp(228)}, timeCard{margin + half + gap, sp(187), right, sp(228)};
+        card(dc, rateCard, Surface, 12); card(dc, timeCard, Surface, 12);
+        drawText(dc, p.charging ? tr(L"充電速度") : plugged ? tr(L"電池狀態") : tr(L"耗電速度"),
+            {rateCard.left + sp(12), rateCard.top + sp(4), rateCard.right - sp(8), rateCard.top + sp(20)}, Muted, smallFont);
+        drawText(dc, plugged && !p.charging ? (p.percent && *p.percent >= 99.5 ? tr(L"已充滿") : tr(L"已接電，暫未充電")) : valueText(p.charging ? charge.percentPerHour : m.percentPerHour, tr(L" 百分點 / 小時")),
+            {rateCard.left + sp(12), rateCard.top + sp(19), rateCard.right - sp(8), rateCard.bottom - sp(3)}, Ink, strongFont);
         std::wstring remaining = tr(L"估計續航 —");
-        auto hours = p.charging ? charge.hoursToFull : m.hoursRemaining;
         if (plugged) remaining = p.charging ? tr(L"等待穩定充電資料") : L"—";
-        if (hours && *hours < 100) {
-            int minutes = std::max(1, int(std::ceil(*hours * 60)));
-            remaining = tr(L"約 ") + (minutes >= 60 ? std::to_wstring(minutes / 60) + tr(L" 小時 ") : L"") + std::to_wstring(minutes % 60) + tr(L" 分");
-        }
-        drawText(dc, plugged ? tr(L"至充滿 · 依目前速度") : tr(L"近 5 分鐘 ") + valueText(m.averageWatts, L" W"), {middle + sp(8), sp(192), right, sp(209)}, Muted, smallFont);
-        drawText(dc, remaining, {middle + sp(8), sp(211), right, sp(235)}, Ink, normalFont);
+        if (auto text = durationText(p.charging ? charge.hoursToFull : m.hoursRemaining); !text.empty()) remaining = text;
+        drawText(dc, plugged ? tr(L"至充滿 · 依目前速度") : tr(L"近 5 分鐘 ") + valueText(m.averageWatts, L" W"),
+            {timeCard.left + sp(12), timeCard.top + sp(4), timeCard.right - sp(8), timeCard.top + sp(20)}, Muted, smallFont);
+        drawText(dc, remaining, {timeCard.left + sp(12), timeCard.top + sp(19), timeCard.right - sp(8), timeCard.bottom - sp(3)}, Ink, strongFont);
     }
     if (!compact) {
-        RECT chart{margin, sp(240), right, sp(282)};
-        rounded(dc, chart, Surface, 12);
+        RECT chart{margin, sp(236), right, sp(284)};
+        card(dc, chart, Surface, 12);
         const bool chargingChart = p.charging;
         auto chartPower = [chargingChart](const PowerSample& point) -> Value {
             if (!point.present || !point.acKnown || !point.watts || !std::isfinite(*point.watts)) return {};
             if (chargingChart) return point.onAc && point.charging && *point.watts < 0 ? Value(-*point.watts) : Value{};
             return !point.onAc && !point.charging && *point.watts >= 0 ? point.watts : Value{};
         };
-        drawText(dc, chargingChart ? tr(L"30 分鐘 · 充電 W") : tr(L"30 分鐘 · 放電 W"), {chart.left + sp(12), chart.top + sp(6), chart.right - sp(12), chart.top + sp(22)}, Muted, smallFont);
-        RECT plot{chart.left + sp(12), chart.top + sp(24), chart.right - sp(12), chart.bottom - sp(5)};
+        drawText(dc, chargingChart ? tr(L"30 分鐘 · 充電 W") : tr(L"30 分鐘 · 放電 W"), {chart.left + sp(12), chart.top + sp(5), chart.right - sp(90), chart.top + sp(21)}, Muted, smallFont);
+        RECT plot{chart.left + sp(12), chart.top + sp(24), chart.right - sp(12), chart.bottom - sp(6)};
         double maximum = 10;
         uint64_t last = current.history.empty() ? GetTickCount64() : current.history.back().ms;
         for (const auto& point : current.history) if (auto watts = chartPower(point)) maximum = std::max(maximum, std::ceil(*watts / 5) * 5);
+        const int middle = (plot.top + plot.bottom) / 2;
+        ui::drawDashedLine(dc, {plot.left, middle}, {plot.right, middle}, blend(Border, Surface, .2), 1.0f);
         fill(dc, {plot.left, plot.bottom, plot.right, plot.bottom + 1}, Border);
-        HPEN linePen = CreatePen(PS_SOLID, std::max(1, sp(2)), Green); HGDIOBJ oldPen = SelectObject(dc, linePen);
-        bool connected = false, any = false; uint64_t previous = 0;
+        std::vector<std::vector<POINT>> segments;
+        uint64_t previous = 0; bool connected = false;
         for (const auto& point : current.history) {
             auto watts = chartPower(point);
             if (!watts) { connected = false; continue; }
-            int x = plot.right - int((last - point.ms) / 1800000.0 * (plot.right - plot.left));
-            int y = plot.bottom - int(*watts / maximum * (plot.bottom - plot.top));
-            if (connected && point.ms - previous <= 30000) { LineTo(dc, x, y); any = true; }
-            else MoveToEx(dc, x, y, nullptr);
+            POINT at{plot.right - int((last - point.ms) / 1800000.0 * (plot.right - plot.left)),
+                plot.bottom - int(std::min(*watts, maximum) / maximum * (plot.bottom - plot.top))};
+            if (!connected || point.ms - previous > 30000) segments.emplace_back();
+            segments.back().push_back(at);
             connected = true; previous = point.ms;
         }
-        SelectObject(dc, oldPen); DeleteObject(linePen);
-        HPEN marker = CreatePen(PS_DOT, 1, RGB(218, 174, 105)); oldPen = SelectObject(dc, marker);
+        bool any = false;
+        for (const auto& segment : segments) any |= segment.size() > 1;
+        if (any) ui::drawSeries(dc, plot, segments, Green, std::max(1.5f, float(sp(2))), Green);
         for (auto time : actionMarks) if (!chargingChart && time <= last && last - time <= 1800000) {
             int x = plot.right - int((last - time) / 1800000.0 * (plot.right - plot.left));
-            MoveToEx(dc, x, plot.top, nullptr); LineTo(dc, x, plot.bottom);
+            ui::drawDashedLine(dc, {x, plot.top}, {x, plot.bottom}, theme.warn, 1.0f);
         }
-        SelectObject(dc, oldPen); DeleteObject(marker);
         if (!any) drawText(dc, chargingChart ? tr(L"等待充電資料") : plugged ? tr(L"插電期間暫停放電曲線") : tr(L"等待放電資料"), plot, Muted, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-        drawText(dc, L"0–" + number(maximum, 0) + L" W", {chart.right - sp(90), chart.top + sp(6), chart.right - sp(12), chart.top + sp(22)},
+        drawText(dc, L"0–" + number(maximum, 0) + L" W", {chart.right - sp(90), chart.top + sp(5), chart.right - sp(12), chart.top + sp(21)},
             Muted, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
     }
     const bool energyReady = current.energy.ready && !current.energy.timingMismatch;
     if (inlinePage != InlinePage::none) {
-        rounded(dc, {margin, top - sp(88), right, h - sp(14)}, Surface, 16);
-        drawText(dc, inlineTitle, {margin + sp(13), top - sp(81), right - sp(13), top - sp(51)}, Ink, titleFont);
-        fill(dc, {margin + sp(13), top - sp(45), right - sp(13), top - sp(44)}, Border);
+        card(dc, {margin, top - sp(77), right, h - sp(14)}, Surface, 14);
+        drawText(dc, inlineTitle, {margin + sp(14), top - sp(72), right - sp(14), top - sp(45)}, Ink, titleFont);
+        fill(dc, {margin + sp(14), top - sp(41), right - sp(14), top - sp(40)}, Border);
         if (GetTickCount64() < noticeUntil)
-            drawText(dc, notice, {margin + sp(13), h - sp(84), right - sp(13), h - sp(64)}, Green, smallFont);
+            drawText(dc, notice, {margin + sp(14), h - sp(84), right - sp(14), h - sp(64)}, Green, smallFont);
         return;
     }
-    drawText(dc, tr(L"CPU 耗電排行"), {margin, top - sp(76), right, top - sp(53)}, Ink, normalFont);
-    drawText(dc, energyReady ? tr(L"估計 W ↓") : tr(L"活動排序 ↓"), {right - sp(105), top - sp(76), right, top - sp(53)}, Green, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    const std::wstring sortLabel = energyReady ? tr(L"估計 W ↓") : tr(L"活動排序 ↓");
+    const int chipWidth = textWidth(dc, sortLabel, smallFont) + sp(16);
+    drawText(dc, tr(L"CPU 耗電排行"), {margin, top - sp(78), right - chipWidth - sp(8), top - sp(56)}, Ink, strongFont);
+    const RECT sortChip{right - chipWidth, top - sp(76), right, top - sp(58)};
+    rounded(dc, sortChip, theme.accentSoft, 9);
+    if (theme.highContrast) ui::strokeRound(dc, sortChip, Green, float(sp(9)), 1.0f);
+    drawText(dc, sortLabel, sortChip, Green, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     drawText(dc, energyReady ? tr(L"30 秒平滑 · ") + qualityText(current.energy.quality) + L" " + number(current.energy.observedCpuCoverage * 100, 0) + L"%" : tr(L"能源暫不可用，依 CPU / I/O 活動排序"),
-        {margin, top - sp(57), right, top - sp(40)}, Muted, smallFont);
+        {margin, top - sp(56), right, top - sp(40)}, Muted, smallFont);
     if (displayed.empty()) {
         drawText(dc, backgroundOnly ? tr(L"目前沒有符合篩選的程序") : tr(L"正在讀取程序…"),
             {margin, top + sp(12), right, top + sp(44)}, Muted, normalFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     }
     int footer = h - sp(51);
     std::wstring status = GetTickCount64() < noticeUntil || current.processes.empty() ? notice : selectionHint();
-    drawText(dc, status, {margin, footer, right, footer + sp(19)}, Muted, smallFont);
+    drawText(dc, status, {margin, footer, right, footer + sp(19)}, GetTickCount64() < noticeUntil ? Green : Muted, smallFont);
     drawText(dc, tr(L"個別瓦數僅估計 CPU，非程式總耗電"),
         {margin, footer + sp(21), right, footer + sp(39)}, Muted, smallFont);
 }
@@ -762,6 +898,118 @@ void showPowerDetails() {
     text += tr(L"\n\nWindows 通用電源資訊只回報是否接上外部電源，不能區分圓孔變壓器與 USB-C。偵測到 USB-C 控制器也不能證明目前由它供電。");
     showInlinePage(InlinePage::power, tr(L"電池與充電詳情"), text);
     releaseInteraction();
+}
+DWORD readSetting(const wchar_t* name, DWORD fallback) {
+    DWORD value = 0, bytes = sizeof(value);
+    return RegGetValueW(HKEY_CURRENT_USER, L"Software\\BatteryScope", name, RRF_RT_REG_DWORD, nullptr, &value, &bytes) == ERROR_SUCCESS
+        ? value : fallback;
+}
+// Preview and test modes never persist preferences.
+bool writeSetting(const wchar_t* name, DWORD value) {
+    if (demo || isolatedPreview) return true;
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\BatteryScope", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) return false;
+    auto result = RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value));
+    RegCloseKey(key); return result == ERROR_SUCCESS;
+}
+void loadSettings() {
+    english = readSetting(L"Language", 0) == 1;
+    const DWORD storedTheme = readSetting(L"Theme", 0);
+    themeChoice = storedTheme <= 2 ? ui::ThemeChoice(storedTheme) : ui::ThemeChoice::system;
+    const DWORD threshold = readSetting(L"LowBattery", 0);
+    lowBatteryThreshold = threshold == 10 || threshold == 20 || threshold == 30 ? threshold : 0;
+    hotkeyEnabled = readSetting(L"Hotkey", 0) == 1;
+}
+void showLedger() {
+    std::wstring content = tr(L"自 BatteryScope 啟動以來，依 CPU 能源分攤累計各程式的耗能，含已結束的程序。");
+    if (current.ledgerStartedMs && current.ms > current.ledgerStartedMs) {
+        if (auto watched = durationText((current.ms - current.ledgerStartedMs) / 3600000.0); !watched.empty())
+            content += tr(L"\n已監測：") + watched;
+    }
+    content += tr(L"\nCPU 核心總計：") + number(current.ledgerCoreMilliWh, 1) + L" mWh\n";
+    if (current.ledger.empty()) content += tr(L"\n尚無資料：需要可用的 CPU 能源計數器與一段觀測時間。\n");
+    for (size_t i = 0; i < current.ledger.size(); ++i) {
+        const auto& entry = current.ledger[i];
+        content += L"\n" + std::to_wstring(i + 1) + L". " + entry.name + L" · " + number(entry.milliWh, 1) + L" mWh";
+        if (current.ledgerCoreMilliWh > 0) content += L" · " + number(entry.milliWh / current.ledgerCoreMilliWh * 100, 0) + L"%";
+        if (entry.processes > 1) content += L" · " + std::to_wstring(entry.processes) + tr(L" 個程序");
+        if (!entry.running) content += tr(L" · 已結束");
+    }
+    content += tr(L"\n\n百分比是占 CPU 核心總耗能的比例。這是 CPU 能源分攤估計，不含 GPU、螢幕與儲存；關閉程式不保證省下相同能量。");
+    showInlinePage(InlinePage::ledger, tr(L"本次累計耗能"), content);
+    releaseInteraction();
+}
+const wchar_t* kindToken(const std::wstring& kind) {
+    return kind == L"Windows 核心" ? L"kernel" : kind == L"服務" ? L"service" : kind == L"應用程式" ? L"app" : L"background";
+}
+std::wstring csvNumber(Value value, int precision) { return value && std::isfinite(*value) ? number(*value, precision) : L""; }
+bool writeUtf8(const std::wstring& path, const std::wstring& text) {
+    const int size = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), int(text.size()), nullptr, 0, nullptr, nullptr);
+    std::string bytes = "\xEF\xBB\xBF"; // BOM so spreadsheet apps detect UTF-8
+    bytes.resize(3 + size_t(std::max(0, size)));
+    if (size > 0) WideCharToMultiByte(CP_UTF8, 0, text.c_str(), int(text.size()), bytes.data() + 3, size, nullptr, nullptr);
+    std::ofstream out(std::filesystem::path(path), std::ios::binary | std::ios::trunc);
+    out.write(bytes.data(), std::streamsize(bytes.size()));
+    return out.good();
+}
+// Writes the current process ranking to `path` and the 30-minute battery
+// history next to it as "<name>-power.csv". Returns the power file path.
+std::optional<std::wstring> exportCsv(const std::wstring& path) {
+    std::wstring processes = L"rank,name,pid,kind,cpu_percent,avg_cpu_percent,cpu_watts,avg_cpu_watts,cpu_watts_low,cpu_watts_high,"
+        L"session_cpu_mwh,memory_mb,io_mb_per_s,services,path\r\n";
+    for (size_t i = 0; i < current.processes.size(); ++i) {
+        const auto& row = current.processes[i];
+        std::wstring services;
+        for (const auto& service : row.services) services += (services.empty() ? L"" : L"; ") + service.name;
+        processes += std::to_wstring(i + 1) + L"," + csvField(row.name) + L"," + std::to_wstring(row.pid) + L"," + kindToken(row.kind) + L"," +
+            (row.measured ? number(row.cpu, 2) : L"") + L"," + (row.measured ? number(row.averageCpu, 2) : L"") + L"," +
+            csvNumber(row.cpuWatts, 3) + L"," + csvNumber(row.averageCpuWatts, 3) + L"," + csvNumber(row.cpuWattsLow, 3) + L"," +
+            csvNumber(row.cpuWattsHigh, 3) + L"," + csvNumber(row.cpuMilliWh, 2) + L"," +
+            (row.memoryKnown ? number(row.memoryMB, 1) : L"") + L"," + (row.ioKnown && row.measured ? number(row.ioMB, 3) : L"") + L"," +
+            csvField(services) + L"," + csvField(row.path) + L"\r\n";
+    }
+    std::wstring power = L"seconds_ago,percent,battery_watts_positive_discharge,remaining_wh,full_wh,on_ac,charging\r\n";
+    const uint64_t last = current.history.empty() ? 0 : current.history.back().ms;
+    for (const auto& sample : current.history) {
+        power += number((last - sample.ms) / 1000.0, 0) + L"," + csvNumber(sample.percent, 1) + L"," + csvNumber(sample.watts, 3) + L"," +
+            csvNumber(sample.remainingWh, 3) + L"," + csvNumber(sample.fullWh, 3) + L"," +
+            (sample.acKnown ? std::to_wstring(int(sample.onAc)) : L"") + L"," + std::to_wstring(int(sample.charging)) + L"\r\n";
+    }
+    std::filesystem::path powerPath(path);
+    powerPath.replace_filename(powerPath.stem().wstring() + L"-power" + powerPath.extension().wstring());
+    if (!writeUtf8(path, processes) || !writeUtf8(powerPath.wstring(), power)) return std::nullopt;
+    return powerPath.wstring();
+}
+void chooseCsvExport() {
+    SYSTEMTIME now{}; GetLocalTime(&now);
+    wchar_t file[MAX_PATH]{};
+    swprintf_s(file, L"BatteryScope-%04u%02u%02u-%02u%02u.csv", unsigned(now.wYear), unsigned(now.wMonth), unsigned(now.wDay),
+        unsigned(now.wHour), unsigned(now.wMinute));
+    const std::wstring filter = std::wstring(tr(L"CSV 檔案")) + L" (*.csv)" + L'\0' + L"*.csv" + L'\0' + L'\0';
+    OPENFILENAMEW dialog{}; dialog.lStructSize = sizeof(dialog); dialog.hwndOwner = mainWindow;
+    dialog.lpstrFilter = filter.c_str(); dialog.lpstrFile = file; dialog.nMaxFile = MAX_PATH; dialog.lpstrDefExt = L"csv";
+    dialog.lpstrTitle = tr(L"匯出 CSV");
+    dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
+    if (!GetSaveFileNameW(&dialog)) { releaseInteraction(); return; }
+    auto powerFile = exportCsv(file);
+    setNotice(powerFile ? tr(L"已匯出程序排行與電量紀錄（-power.csv）。") : tr(L"無法寫入 CSV 檔案。"));
+    releaseInteraction();
+}
+void setLowBatteryThreshold(unsigned threshold) {
+    lowBatteryThreshold = threshold; lowBattery.reset();
+    if (!writeSetting(L"LowBattery", threshold)) setNotice(tr(L"無法儲存設定。"));
+    else setNotice(threshold ? tr(L"電量降到 ") + std::to_wstring(threshold) + tr(L"% 時會通知。") : tr(L"已關閉低電量提醒。"));
+}
+// Ctrl+Alt+B shows or hides the panel from anywhere when enabled.
+bool registerPanelHotkey(bool enable) {
+    if (hotkeyRegistered) { UnregisterHotKey(mainWindow, PanelHotkey); hotkeyRegistered = false; }
+    if (enable) hotkeyRegistered = RegisterHotKey(mainWindow, PanelHotkey, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'B') != FALSE;
+    return !enable || hotkeyRegistered;
+}
+void setTheme(ui::ThemeChoice choice) {
+    themeChoice = choice;
+    applyTheme();
+    if (!writeSetting(L"Theme", DWORD(choice))) setNotice(tr(L"無法儲存設定。"));
 }
 void showReviewCandidates() {
     const auto candidates = reviewCandidates(current);
@@ -917,6 +1165,7 @@ void sampleLoop() {
     Collector collector;
     EnergyReader energyReader;
     CpuAttributor attributor;
+    EnergyLedger ledger;
     SamplingPolicy policy;
     Snapshot state;
     uint64_t nextProcess = 0, nextPower = 0;
@@ -942,6 +1191,8 @@ void sampleLoop() {
             if (background) energyReader.clearThreadPlacement();
             else energyReader.sampleThreadPlacement(state.processes, collector.threadSnapshot());
             attributor.apply(state.processes, state.energy, collector.sampleMs(), std::max<DWORD>(1, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)));
+            ledger.update(state.processes, state.energy, collector.sampleMs());
+            state.ledger = ledger.top(15); state.ledgerCoreMilliWh = ledger.coreMilliWh(); state.ledgerStartedMs = ledger.startedMs();
             // Package power already includes the cores: never add it to core energy.
             if (state.energy.coreWatts && !state.history.empty()) {
                 const auto& battery = state.history.back();
@@ -1089,22 +1340,39 @@ LRESULT CALLBACK inlineTextProc(HWND window, UINT message, WPARAM wp, LPARAM lp,
     return DefSubclassProc(window, message, wp, lp);
 }
 void openMenu(POINT point) {
+    const bool preview = demo || isolatedPreview;
     HMENU menu = CreatePopupMenu();
     HMENU languages = CreatePopupMenu();
     AppendMenuW(languages, MF_STRING | (!english ? MF_CHECKED : 0), LanguageZhId, L"繁體中文");
     AppendMenuW(languages, MF_STRING | (english ? MF_CHECKED : 0), LanguageEnId, L"English");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(languages), tr(L"語言 / Language"));
+    HMENU themes = CreatePopupMenu();
+    AppendMenuW(themes, MF_STRING | (themeChoice == ui::ThemeChoice::system ? MF_CHECKED : 0), ThemeSystemId, tr(L"跟隨 Windows"));
+    AppendMenuW(themes, MF_STRING | (themeChoice == ui::ThemeChoice::dark ? MF_CHECKED : 0), ThemeDarkId, tr(L"深色"));
+    AppendMenuW(themes, MF_STRING | (themeChoice == ui::ThemeChoice::light ? MF_CHECKED : 0), ThemeLightId, tr(L"淺色"));
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(themes), tr(L"主題"));
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, PowerDetailsId, tr(L"電池與充電詳情"));
-    AppendMenuW(menu, MF_STRING | ((demo || isolatedPreview) ? MF_GRAYED : 0), EnergySaverSettingsId, tr(L"Windows 節能設定…"));
+    AppendMenuW(menu, MF_STRING, LedgerId, tr(L"本次累計耗能"));
     AppendMenuW(menu, MF_STRING, ReviewCandidatesId, tr(L"查看節能候選…"));
+    AppendMenuW(menu, MF_STRING | (preview ? MF_GRAYED : 0), ExportCsvId, tr(L"匯出 CSV…"));
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING | (preview ? MF_GRAYED : 0), EnergySaverSettingsId, tr(L"Windows 節能設定…"));
     const auto saver = querySaverMode();
-    const bool saverActionable = !demo && !isolatedPreview && !saver.error && (!saver.efficient || saver.restorable);
+    const bool saverActionable = !preview && !saver.error && (!saver.efficient || saver.restorable);
     AppendMenuW(menu, MF_STRING | (saverActionable ? 0 : MF_GRAYED) | (saver.efficient ? MF_CHECKED : 0),
         SaverModeId, saver.restorable ? tr(L"還原原本電池電源模式") : saver.efficient ? tr(L"已使用最佳效率") : tr(L"一鍵省電 · 最佳效率"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, TrayShow, tr(L"顯示面板"));
+    HMENU alerts = CreatePopupMenu();
+    const std::pair<int, unsigned> levels[] = {{LowBatteryOffId, 0}, {LowBattery10Id, 10}, {LowBattery20Id, 20}, {LowBattery30Id, 30}};
+    for (const auto& level : levels)
+        AppendMenuW(alerts, MF_STRING | (lowBatteryThreshold == level.second ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), level.first,
+            level.second ? (std::to_wstring(level.second) + L"%").c_str() : tr(L"關閉"));
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(alerts), tr(L"低電量提醒"));
+    AppendMenuW(menu, MF_STRING | (hotkeyEnabled ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), HotkeyToggleId, tr(L"快速鍵 Ctrl+Alt+B"));
     AppendMenuW(menu, MF_STRING | (autoStart ? MF_CHECKED : 0) | (demo ? MF_GRAYED : 0), StartupId, tr(L"登入時啟動"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, TrayShow, tr(L"顯示面板"));
     AppendMenuW(menu, MF_STRING | (pendingAction ? MF_GRAYED : 0), TrayExit, tr(L"結束 BatteryScope"));
     SetForegroundWindow(mainWindow);
     TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, 0, mainWindow, nullptr);
@@ -1127,31 +1395,20 @@ void applyLanguage(bool useEnglish) {
     if (inlinePage == InlinePage::process && inlineProcess) showDetails(*inlineProcess);
     if (inlinePage == InlinePage::power) showPowerDetails();
     if (inlinePage == InlinePage::candidates) showReviewCandidates();
+    if (inlinePage == InlinePage::ledger) showLedger();
     if (inlinePage == InlinePage::confirm && pendingForceRow) showForceConfirmation(*pendingForceRow);
     notice = tr(L"正在讀取電池與程序資料…"); noticeUntil = 0;
     if (tooltip) SendMessageW(tooltip, TTM_POP, 0, 0);
     refreshList(); InvalidateRect(mainWindow, nullptr, FALSE);
     if (trayAdded) updateTray(false);
 }
-void loadLanguage() {
-    DWORD language = 0, bytes = sizeof(language);
-    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\BatteryScope", L"Language", RRF_RT_REG_DWORD,
-        nullptr, &language, &bytes) == ERROR_SUCCESS) english = language == 1;
-}
-bool saveLanguage() {
-    if (demo || isolatedPreview) return true;
-    HKEY key = nullptr;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\BatteryScope", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) return false;
-    const DWORD language = english ? 1 : 0;
-    auto result = RegSetValueExW(key, L"Language", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&language), sizeof(language));
-    RegCloseKey(key); return result == ERROR_SUCCESS;
-}
+bool saveLanguage() { return writeSetting(L"Language", english ? 1 : 0); }
 std::wstring controlTip(HWND control) {
     if (control == inlineBack) return inlinePage == InlinePage::confirm ? tr(L"取消強制結束（Esc）") : tr(L"返回程序排行（Esc）");
     if (control == inlineConfirm) return tr(L"確認後只結束所選程序；未儲存資料可能遺失");
     if (control == saverButton) return tr(L"切換電池供電時的最佳效率模式；可還原原本設定，不會結束程序。這不是 Windows 節能工具開關。");
     if (control == hideButton) return tr(L"收回面板（Esc），背景監測持續運作");
-    if (control == menuButton) return tr(L"設定：Windows 節能設定、節能候選、語言與充電詳情");
+    if (control == menuButton) return tr(L"設定：主題、語言、累計耗能、匯出、低電量提醒與快速鍵");
     if (control == backgroundCheck) return tr(L"只列出沒有可見視窗的程序與服務");
     if (control == allCheck) return tr(L"切換前 10 名與全部程序；滾輪可捲動");
     if (control == detailsButton) return tr(L"查看完整名稱、路徑、耗電範圍與操作限制（Enter）");
@@ -1171,13 +1428,10 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         viewport = CreateWindowExW(WS_EX_CONTROLPARENT, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_VSCROLL,
             0, 0, 0, 0, window, nullptr, nullptr, nullptr);
         SetWindowSubclass(viewport, viewportProc, 1, 0);
-        SetWindowTheme(viewport, L"DarkMode_Explorer", nullptr);
         list = CreateWindowExW(0, WC_LISTVIEWW, tr(L"CPU 耗電排行"), WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOCOLUMNHEADER | LVS_OWNERDRAWFIXED,
             0, 0, 0, 0, viewport, reinterpret_cast<HMENU>(ListId), nullptr, nullptr);
         SetWindowSubclass(list, listProc, 1, 0);
         ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
-        SetWindowTheme(list, L"DarkMode_Explorer", nullptr);
-        ListView_SetBkColor(list, Background); ListView_SetTextBkColor(list, Background); ListView_SetTextColor(list, Ink);
         const wchar_t* titles[] = {tr(L"程序與 CPU 估計瓦數")};
         for (int i = 0; i < int(std::size(titles)); ++i) {
             LVCOLUMNW column{}; column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT; column.pszText = const_cast<wchar_t*>(titles[i]);
@@ -1196,7 +1450,6 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         inlineText = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
             0, 0, 0, 0, window, nullptr, nullptr, nullptr);
         SetWindowSubclass(inlineText, inlineTextProc, 1, 0);
-        SetWindowTheme(inlineText, L"DarkMode_Explorer", nullptr);
         SendMessageW(inlineText, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(sp(4), sp(4)));
         inlineBack = button(tr(L"返回排行"), InlineBackId);
         inlineConfirm = button(tr(L"確定強制結束"), InlineConfirmId);
@@ -1205,8 +1458,6 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         tooltip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
             CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, window, nullptr, nullptr, nullptr);
         SetWindowTheme(tooltip, L"", L"");
-        SendMessageW(tooltip, TTM_SETTIPBKCOLOR, Surface, 0);
-        SendMessageW(tooltip, TTM_SETTIPTEXTCOLOR, Ink, 0);
         SendMessageW(tooltip, TTM_SETMAXTIPWIDTH, 0, px(300));
         SendMessageW(tooltip, TTM_SETDELAYTIME, TTDT_INITIAL, 550);
         for (auto control : {closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck,
@@ -1217,12 +1468,12 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         }
         autoStart = startupEnabled();
         makeFonts(); layout(); updateButtons(); refreshSaverButton();
-        BOOL dark = TRUE; DWORD corners = 2;
-        DwmSetWindowAttribute(window, 20, &dark, sizeof(dark));
+        DWORD corners = 2;
         DwmSetWindowAttribute(window, 33, &corners, sizeof(corners));
-        DwmSetWindowAttribute(window, 34, &Border, sizeof(Border));
+        applyTheme();
         taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
         trayAdded = updateTray(true);
+        if (hotkeyEnabled && !demo && !isolatedPreview && !registerPanelHotkey(true)) hotkeyEnabled = false;
         return 0;
     }
     case WM_MEASUREITEM:
@@ -1246,7 +1497,12 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (wp == MotionTimer) { stepMotion(motionNow()); return 0; }
         if (wp == NoticeTimer) { KillTimer(window, NoticeTimer); noticeUntil = 0; InvalidateRect(window, nullptr, FALSE); return 0; }
         break;
+    case WM_SYSCOLORCHANGE:
+    case WM_THEMECHANGED:
+        applyTheme(); return 0;
     case WM_SETTINGCHANGE:
+        if (wp == SPI_SETHIGHCONTRAST || (lp && CompareStringOrdinal(reinterpret_cast<const wchar_t*>(lp), -1, L"ImmersiveColorSet", -1, TRUE) == CSTR_EQUAL))
+            applyTheme();
         readMotionPreference();
         if (!canAnimate()) {
             panelMotion.duration = 0;
@@ -1297,6 +1553,25 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (id == PowerDetailsId) { showPowerDetails(); return 0; }
+        if (id == LedgerId) { showLedger(); return 0; }
+        if (id == ExportCsvId) { if (!demo && !isolatedPreview) chooseCsvExport(); return 0; }
+        if (id >= LowBatteryOffId && id <= LowBattery30Id) {
+            if (!demo && !isolatedPreview) setLowBatteryThreshold(unsigned(id - LowBatteryOffId) * 10);
+            return 0;
+        }
+        if (id == HotkeyToggleId) {
+            if (demo || isolatedPreview) return 0;
+            const bool wanted = !hotkeyEnabled;
+            if (!registerPanelHotkey(wanted)) { setNotice(tr(L"Ctrl+Alt+B 已被其他程式使用，未啟用快速鍵。")); return 0; }
+            hotkeyEnabled = wanted;
+            if (!writeSetting(L"Hotkey", hotkeyEnabled ? 1 : 0)) setNotice(tr(L"無法儲存設定。"));
+            else setNotice(hotkeyEnabled ? tr(L"已啟用快速鍵 Ctrl+Alt+B。") : tr(L"已停用快速鍵。"));
+            return 0;
+        }
+        if (id == ThemeSystemId || id == ThemeDarkId || id == ThemeLightId) {
+            setTheme(id == ThemeSystemId ? ui::ThemeChoice::system : id == ThemeDarkId ? ui::ThemeChoice::dark : ui::ThemeChoice::light);
+            return 0;
+        }
         if (id == EnergySaverSettingsId) {
             if (demo || isolatedPreview) return 0;
             auto opened = ShellExecuteW(window, L"open", L"ms-settings:batterysaver-settings", nullptr, nullptr, SW_SHOWNORMAL);
@@ -1375,6 +1650,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             InvalidateRect(window, nullptr, FALSE);
         }
         if (trayAdded) updateTray(false);
+        if (!demo && !isolatedPreview && !current.history.empty() && lowBattery.update(current.history.back(), lowBatteryThreshold))
+            showLowBatteryNotice();
         return 0;
     }
     case ActionMessage: {
@@ -1395,7 +1672,11 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_POWERBROADCAST:
         if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND || wp == PBT_APMPOWERSTATUSCHANGE) { resetSamples = true; wake.notify_one(); }
         return TRUE;
+    case WM_HOTKEY:
+        if (wp == PanelHotkey) toggleMain();
+        return 0;
     case TrayMessage:
+        if (trayVersion4 ? LOWORD(lp) == NIN_BALLOONUSERCLICK : lp == NIN_BALLOONUSERCLICK) { showMain(); return 0; }
         if ((trayVersion4 && (LOWORD(lp) == NIN_SELECT || LOWORD(lp) == NIN_KEYSELECT)) ||
             (!trayVersion4 && lp == WM_LBUTTONUP)) toggleMain();
         if ((trayVersion4 && LOWORD(lp) == WM_CONTEXTMENU) || (!trayVersion4 && lp == WM_RBUTTONUP)) {
@@ -1409,6 +1690,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_DESTROY: {
         KillTimer(window, MotionTimer); motionTimerRunning = false;
         KillTimer(window, NoticeTimer);
+        registerPanelHotkey(false);
         quit = true; wake.notify_one();
         NOTIFYICONDATAW data{}; data.cbSize = sizeof(data); data.hWnd = window; data.uID = 1;
         if (trayAdded) Shell_NotifyIconW(NIM_DELETE, &data);
@@ -1449,6 +1731,9 @@ Snapshot demoSnapshot() {
     double demoAttributed=0;
     for(const auto& row:state.processes) demoAttributed+=*row.cpuWatts;
     state.energy.unassignedCpuWatts=*state.energy.coreWatts-demoAttributed;
+    state.ledger = {{L"CloudSync.exe", 182.4, 1, true}, {L"Browser.exe", 121.7, 6, true}, {L"UpdateWorker.exe", 64.0, 1, true},
+        {L"VideoExport.exe", 41.3, 2, false}, {L"svchost.exe", 22.9, 9, true}};
+    state.ledgerCoreMilliWh = 610; state.ledgerStartedMs = now - 47 * 60000; // Explicitly synthetic preview data.
     state.servicesKnown = true; state.totalProcesses = 5; state.ms = now; return state;
 }
 bool captureWindow(const std::wstring& path) {
@@ -1462,13 +1747,34 @@ bool captureWindow(const std::wstring& path) {
     SendMessageW(mainWindow, WM_PRINT, reinterpret_cast<WPARAM>(dc), PRF_CLIENT | PRF_CHILDREN | PRF_ERASEBKGND);
     // The main canvas is owner drawn; WM_PRINTCLIENT supplies its content explicitly.
     paint(dc, rect);
+    // Owner-drawn controls are rendered through the same draw functions the
+    // window uses, so captures do not depend on WM_PRINT support for them.
     for (auto child : {viewport, closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck,
         saverButton, hideButton, menuButton, inlineText, inlineBack, inlineConfirm}) {
         if (!(GetWindowLongPtrW(child, GWL_STYLE) & WS_VISIBLE)) continue;
         RECT childRect; GetWindowRect(child, &childRect); MapWindowPoints(nullptr, mainWindow, reinterpret_cast<POINT*>(&childRect), 2);
+        const int cw = childRect.right - childRect.left, ch = childRect.bottom - childRect.top;
         SaveDC(dc); SetViewportOrgEx(dc, childRect.left, childRect.top, nullptr);
-        IntersectClipRect(dc, 0, 0, childRect.right - childRect.left, childRect.bottom - childRect.top);
-        SendMessageW(child, WM_PRINT, reinterpret_cast<WPARAM>(dc), PRF_CLIENT | PRF_NONCLIENT | PRF_CHILDREN | PRF_ERASEBKGND); RestoreDC(dc, -1);
+        IntersectClipRect(dc, 0, 0, cw, ch);
+        if (child == viewport) {
+            fill(dc, {0, 0, cw, ch}, Background);
+            for (int index = 0; index < int(displayed.size()); ++index) {
+                RECT item{}; ListView_GetItemRect(list, index, &item, LVIR_BOUNDS);
+                MapWindowPoints(list, viewport, reinterpret_cast<POINT*>(&item), 2);
+                if (item.bottom <= 0 || item.top >= ch) continue;
+                DRAWITEMSTRUCT draw{}; draw.CtlType = ODT_LISTVIEW; draw.CtlID = ListId; draw.itemID = UINT(index);
+                draw.hwndItem = list; draw.hDC = dc; draw.rcItem = item;
+                if (ListView_GetItemState(list, index, LVIS_SELECTED)) draw.itemState |= ODS_SELECTED;
+                drawProcess(draw);
+            }
+        } else if ((GetWindowLongPtrW(child, GWL_STYLE) & BS_TYPEMASK) == BS_OWNERDRAW && child != inlineText) {
+            DRAWITEMSTRUCT draw{}; draw.CtlType = ODT_BUTTON; draw.CtlID = UINT(GetDlgCtrlID(child));
+            draw.hwndItem = child; draw.hDC = dc; draw.rcItem = {0, 0, cw, ch};
+            if (!IsWindowEnabled(child)) draw.itemState |= ODS_DISABLED;
+            if (GetFocus() == child) draw.itemState |= ODS_FOCUS;
+            drawButton(draw);
+        } else SendMessageW(child, WM_PRINT, reinterpret_cast<WPARAM>(dc), PRF_CLIENT | PRF_NONCLIENT | PRF_CHILDREN | PRF_ERASEBKGND);
+        RestoreDC(dc, -1);
     }
     BITMAPFILEHEADER file{}; file.bfType = 0x4d42; file.bfOffBits = sizeof(file) + sizeof(BITMAPINFOHEADER); file.bfSize = file.bfOffBits + w * h * 4;
     std::ofstream output(std::filesystem::path(path), std::ios::binary);
@@ -1594,6 +1900,38 @@ bool panelSelfTest(const std::wstring& path) {
     showReviewCandidates();
     check("candidate_review_reuses_panel", inlinePage == InlinePage::candidates && IsWindowVisible(inlineText));
     SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
+    showLedger();
+    std::wstring ledgerText(size_t(GetWindowTextLengthW(inlineText)) + 1, L'\0');
+    GetWindowTextW(inlineText, ledgerText.data(), int(ledgerText.size()));
+    check("session_energy_reuses_panel", inlinePage == InlinePage::ledger && IsWindowVisible(inlineText) &&
+        ledgerText.find(L"CloudSync.exe") != std::wstring::npos && ledgerText.find(tr(L" · 已結束")) != std::wstring::npos);
+    SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
+    const auto tip = trayText();
+    check("tray_tooltip_shows_level_power_and_time", tip.find(L"%") != std::wstring::npos && tip.find(L" W") != std::wstring::npos &&
+        tip.find(durationText(current.power.hoursRemaining)) != std::wstring::npos && tip.size() < 128);
+    const auto savedTheme = themeChoice;
+    const COLORREF darkBackground = ui::palette(ui::ThemeChoice::dark).background;
+    SendMessageW(mainWindow, WM_COMMAND, ThemeLightId, 0);
+    const bool lightApplied = themeChoice == ui::ThemeChoice::light &&
+        (theme.highContrast || (!theme.dark && Background != darkBackground)) && ListView_GetBkColor(list) == Background;
+    SendMessageW(mainWindow, WM_COMMAND, ThemeDarkId, 0);
+    check("theme_switch_updates_palette_and_list", lightApplied && themeChoice == ui::ThemeChoice::dark &&
+        (theme.highContrast || theme.dark) && ListView_GetBkColor(list) == Background);
+    themeChoice = savedTheme; applyTheme();
+    {
+        wchar_t folder[MAX_PATH]{}; GetTempPathW(MAX_PATH, folder);
+        const std::wstring csvPath = std::wstring(folder) + L"BatteryScope-panel-" + std::to_wstring(GetCurrentProcessId()) + L".csv";
+        const auto powerPath = exportCsv(csvPath);
+        auto readFile = [](const std::wstring& file) {
+            std::ifstream in(std::filesystem::path(file), std::ios::binary);
+            return std::string(std::istreambuf_iterator<char>(in), {});
+        };
+        const std::string table = readFile(csvPath), power = powerPath ? readFile(*powerPath) : std::string();
+        check("csv_export_writes_ranking_and_history", powerPath && table.rfind("\xEF\xBB\xBFrank,name,pid", 0) == 0 &&
+            table.find("CloudSync.exe") != std::string::npos && power.find("seconds_ago,percent") != std::string::npos &&
+            std::count(power.begin(), power.end(), '\n') == std::ptrdiff_t(current.history.size() + 1));
+        DeleteFileW(csvPath.c_str()); if (powerPath) DeleteFileW(powerPath->c_str());
+    }
     if (after) showForceConfirmation(*after);
     RECT compactConfirmation{}; GetWindowRect(mainWindow, &compactConfirmation);
     check("force_confirmation_reuses_panel", inlinePage == InlinePage::confirm &&
@@ -1792,9 +2130,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     isolatedPreview = screenshot || (uiTest && !trayTest);
     suppressMotion = screenshot || uiTest;
     auto option = [&](const wchar_t* value) { return std::find(args.begin(), args.end(), value) != args.end(); };
-    if (!demo && !isolatedPreview) loadLanguage();
+    if (!demo && !isolatedPreview) loadSettings();
     if (option(L"--english")) english = true;
     if (option(L"--chinese")) english = false;
+    if (option(L"--light")) themeChoice = ui::ThemeChoice::light;
+    if (option(L"--dark")) themeChoice = ui::ThemeChoice::dark;
+    previewContrast = isolatedPreview && option(L"--high-contrast");
+    theme = ui::palette(themeChoice, previewContrast);
+    ui::startGraphics();
     if (isolatedPreview || demo) ClassName = L"BatteryScope.Preview.v3";
     Handle singleton(CreateMutexW(nullptr, FALSE, isolatedPreview || demo ? L"Local\\BatteryScope.Preview.v3" : L"Local\\BatteryScope.Main.v1"));
     if (!singleton) return 1;
@@ -1843,6 +2186,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (screenshot && option(L"--details") && !current.processes.empty()) showDetails(current.processes.front());
     if (screenshot && option(L"--power-details")) showPowerDetails();
     if (screenshot && option(L"--candidates")) showReviewCandidates();
+    if (screenshot && option(L"--ledger")) showLedger();
     if (screenshot && option(L"--confirm") && !current.processes.empty()) showForceConfirmation(current.processes.front());
     if (screenshot && option(L"--scrolled")) scrollTo(px(17), true);
     if (screenshot && option(L"--selected") && !displayed.empty()) ListView_SetItemState(list, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
@@ -1865,7 +2209,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     }
     if (worker.joinable()) worker.join();
     if (actionWorker.joinable()) actionWorker.join();
-    for (auto f : {normalFont, smallFont, titleFont, valueFont, metricFont}) if (f) DeleteObject(f);
-    DestroyIcon(appIcon); DestroyIcon(smallIcon);
+    for (auto f : {normalFont, smallFont, strongFont, titleFont, valueFont, metricFont}) if (f) DeleteObject(f);
+    DestroyIcon(appIcon); DestroyIcon(smallIcon); if (headerIcon) DestroyIcon(headerIcon);
+    processIcons.clear();
+    ui::stopGraphics();
     return shotOK ? 0 : 4;
 }

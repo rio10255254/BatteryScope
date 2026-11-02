@@ -297,6 +297,45 @@ int wmain(int argc, wchar_t** argv) {
             "twenty second adaptive sampling integrates elapsed energy correctly");
         check(nearlyEqual(energyRows[0].cpuWatts.value_or(0) + energyRows[1].cpuWatts.value_or(0) + report.unassignedCpuWatts.value_or(0), 5),
             "slow cadence conserves the measured core energy budget");
+        {
+            EnergyLedger ledger; CpuEnergyReport ledgerReport; ledgerReport.ready = true; ledgerReport.intervalSeconds = 2; ledgerReport.coreWatts = 6;
+            ProcessRow tab; tab.pid = 30; tab.created = 1; tab.name = L"Browser.exe"; tab.cpuWatts = 1.8;
+            ProcessRow tab2 = tab; tab2.pid = 31; tab2.name = L"browser.EXE"; tab2.cpuWatts = .9;
+            ProcessRow idle = tab; idle.pid = 32; idle.name = L"Idle.exe"; idle.cpuWatts.reset();
+            ledger.update({tab, tab2, idle}, ledgerReport, 1000);
+            ledger.update({tab, tab2, idle}, ledgerReport, 1000);
+            auto ranking = ledger.top(10);
+            check(ranking.size() == 1 && ranking[0].processes == 2 && nearlyEqual(ranking[0].milliWh, 2.7 * 2 / 3.6) && ranking[0].running,
+                "session ledger groups an app's processes by name and ignores replayed samples");
+            check(nearlyEqual(ledger.coreMilliWh(), 6 * 2 / 3.6) && ledger.tracked() == 2, "ledger tracks core energy and skips processes without estimates");
+            ledger.update({tab2}, ledgerReport, 3000);
+            ranking = ledger.top(10);
+            check(ranking.size() == 1 && nearlyEqual(ranking[0].milliWh, (2.7 + .9) * 2 / 3.6), "exited processes keep their session energy");
+            ledgerReport.timingMismatch = true; ledger.update({tab2}, ledgerReport, 5000);
+            check(nearlyEqual(ledger.top(10)[0].milliWh, (2.7 + .9) * 2 / 3.6), "misaligned samples add no energy");
+            ledgerReport.timingMismatch = false;
+            for (uint32_t i = 0; i < 700; ++i) {
+                ProcessRow brief = tab; brief.pid = 1000 + i; brief.name = L"Brief" + std::to_wstring(i) + L".exe"; brief.cpuWatts = .01 * (i + 1);
+                ledger.update({brief}, ledgerReport, 7000 + i * 2000);
+            }
+            check(ledger.tracked() <= 600 && ledger.top(1)[0].name == L"Brief699.exe", "ledger bounds memory and keeps the largest exited entries");
+        }
+        {
+            LowBatteryMonitor monitor;
+            auto battery = [](double percent, bool ac) { PowerSample p; p.present = p.acKnown = true; p.onAc = p.charging = ac; p.percent = percent; return p; };
+            check(!monitor.update(battery(50, false), 20) && monitor.update(battery(20, false), 20), "low battery alert fires at the threshold while discharging");
+            check(!monitor.update(battery(19, false), 20) && !monitor.update(battery(22, false), 20) && !monitor.update(battery(20, false), 20),
+                "low battery alert fires once until it recovers five points");
+            check(!monitor.update(battery(18, true), 20) && monitor.update(battery(17, false), 20), "external power re-arms the alert");
+            check(!monitor.update(battery(5, false), 0), "threshold zero disables the alert");
+            auto unknown = battery(10, false); unknown.percent.reset();
+            check(!monitor.update(unknown, 20), "unknown percentage never alerts");
+        }
+        check(csvField(L"plain") == L"plain" && csvField(L"a,b") == L"\"a,b\"" && csvField(L"say \"hi\"") == L"\"say \"\"hi\"\"\"",
+            "CSV fields are quoted only when needed");
+        check(csvField(L"=cmd|' /C calc'!A0") == L"'=cmd|' /C calc'!A0" && csvField(L"-x") == L"'-x" && csvField(L"line\nbreak") == L"\"line\nbreak\"",
+            "CSV export neutralizes spreadsheet formulas from process names");
+        check(roundedMinutes(1.5) == 90 && roundedMinutes(.001) == 1 && roundedMinutes(-1) == 0, "durations round up to whole minutes");
         Snapshot opportunity; opportunity.energy.ready = true; opportunity.energy.observedCpuCoverage = .9;
         ProcessRow foreground; foreground.pid = 20; foreground.created = 10; foreground.window = true;
         ProcessRow helper; helper.pid = 21; helper.parentPid = 20; helper.created = 20; helper.actionable = helper.measured = true;
