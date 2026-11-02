@@ -348,6 +348,13 @@ int wmain(int argc, wchar_t** argv) {
             "CSV fields are quoted only when needed");
         check(csvField(L"=cmd|' /C calc'!A0") == L"'=cmd|' /C calc'!A0" && csvField(L"-x") == L"'-x" && csvField(L"line\nbreak") == L"\"line\nbreak\"",
             "CSV export neutralizes spreadsheet formulas from process names");
+        {
+            PowerSample worn = sample(0); worn.fullWh = 45; worn.designWh = 60;
+            check(nearlyEqual(batteryHealth(worn), 75), "battery health is full-charge over design capacity");
+            worn.designWh.reset(); check(!batteryHealth(worn), "unknown design capacity gives no health");
+            worn.designWh = 0; check(!batteryHealth(worn), "zero design capacity never divides");
+            worn.designWh = 40; check(nearlyEqual(batteryHealth(worn), 112.5), "a new battery may report above 100 percent");
+        }
         check(roundedMinutes(1.5) == 90 && roundedMinutes(.001) == 1 && roundedMinutes(-1) == 0, "durations round up to whole minutes");
         Snapshot opportunity; opportunity.energy.ready = true; opportunity.energy.observedCpuCoverage = .9;
         ProcessRow foreground; foreground.pid = 20; foreground.created = 10; foreground.window = true;

@@ -14,7 +14,11 @@ struct PowerSample {
     bool present = false, acKnown = false, onAc = false, charging = false;
     bool saverKnown = false, saverOn = false;
     Value percent, remainingWh, fullWh, watts; // Positive = discharge; negative = charge.
+    Value designWh;                         // design capacity (sum over batteries)
+    std::optional<unsigned> cycleCount;     // single battery with a cycle counter only
 };
+// Full-charge capacity as a percentage of design capacity; may exceed 100 on new batteries.
+Value batteryHealth(const PowerSample& sample);
 struct PowerMetrics {
     Value currentWatts, averageWatts, percentPerHour, hoursRemaining;
     bool estimated = false;

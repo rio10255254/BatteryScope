@@ -11,6 +11,7 @@
 #include <cwctype>
 #include <cstring>
 #include <limits>
+#include <mutex>
 
 namespace bs {
 namespace {
@@ -180,6 +181,51 @@ std::wstring executablePath() {
     DWORD n = GetModuleFileNameW(nullptr, s.data(), DWORD(s.size()));
     s.resize(n); return s;
 }
+namespace {
+// Battery device handles stay open between samples. The device list is rebuilt
+// on any read failure (removal, driver reset), every 5 minutes, or every
+// minute while no battery was found, instead of on every sample.
+class BatteryDevices {
+    std::vector<HANDLE> handles_;
+    uint64_t enumeratedAt_ = 0;
+    bool valid_ = false;
+    void close() {
+        for (HANDLE h : handles_) if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        handles_.clear();
+    }
+public:
+    std::mutex lock;
+    ~BatteryDevices() { close(); }
+    void invalidate() { valid_ = false; }
+    const std::vector<HANDLE>& current(uint64_t now) {
+        const uint64_t age = now - enumeratedAt_;
+        if (valid_ && age < 300000 && (!handles_.empty() || age < 60000)) return handles_;
+        close();
+        enumeratedAt_ = now; valid_ = true;
+        HDEVINFO devices = SetupDiGetClassDevsW(&GUID_DEVCLASS_BATTERY, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        if (devices == INVALID_HANDLE_VALUE) return handles_;
+        for (DWORD i = 0;; ++i) {
+            SP_DEVICE_INTERFACE_DATA iface{}; iface.cbSize = sizeof(iface);
+            if (!SetupDiEnumDeviceInterfaces(devices, nullptr, &GUID_DEVCLASS_BATTERY, i, &iface)) break;
+            DWORD needed = 0;
+            SetupDiGetDeviceInterfaceDetailW(devices, &iface, nullptr, 0, &needed, nullptr);
+            HANDLE handle = INVALID_HANDLE_VALUE;
+            if (needed) {
+                std::vector<BYTE> bytes(needed);
+                auto detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(bytes.data());
+                detail->cbSize = sizeof(*detail);
+                if (SetupDiGetDeviceInterfaceDetailW(devices, &iface, detail, needed, nullptr, nullptr))
+                    handle = CreateFileW(detail->DevicePath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            }
+            handles_.push_back(handle); // A failed entry still marks the reading incomplete.
+        }
+        SetupDiDestroyDeviceInfoList(devices);
+        return handles_;
+    }
+};
+BatteryDevices& batteryDevices() { static BatteryDevices devices; return devices; }
+}
 PowerSample readPower() {
     PowerSample p;
     p.ms = GetTickCount64();
@@ -193,59 +239,52 @@ PowerSample readPower() {
         p.charging = system.BatteryFlag != 255 && (system.BatteryFlag & 8);
         if (p.present && system.BatteryLifePercent <= 100) p.percent = system.BatteryLifePercent;
     }
-    HDEVINFO devices = SetupDiGetClassDevsW(&GUID_DEVCLASS_BATTERY, nullptr, nullptr,
-        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (devices == INVALID_HANDLE_VALUE) return p;
-    double remaining = 0, full = 0, watts = 0;
-    unsigned count = 0;
-    bool capacityOK = true, rateOK = true;
-    for (DWORD i = 0;; ++i) {
-        SP_DEVICE_INTERFACE_DATA iface{}; iface.cbSize = sizeof(iface);
-        if (!SetupDiEnumDeviceInterfaces(devices, nullptr, &GUID_DEVCLASS_BATTERY, i, &iface)) break;
-        DWORD needed = 0;
-        SetupDiGetDeviceInterfaceDetailW(devices, &iface, nullptr, 0, &needed, nullptr);
-        if (!needed) { capacityOK = rateOK = false; continue; }
-        std::vector<BYTE> bytes(needed);
-        auto detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(bytes.data());
-        detail->cbSize = sizeof(*detail);
-        if (!SetupDiGetDeviceInterfaceDetailW(devices, &iface, detail, needed, nullptr, nullptr)) {
-            capacityOK = rateOK = false; continue;
+    auto& cache = batteryDevices();
+    std::lock_guard<std::mutex> guard(cache.lock);
+    double remaining = 0, full = 0, design = 0, watts = 0;
+    unsigned count = 0, cycles = 0;
+    bool capacityOK = true, rateOK = true, designOK = true, chargingSeen = false;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        remaining = full = design = watts = 0; count = cycles = 0;
+        capacityOK = rateOK = designOK = true; chargingSeen = false;
+        bool failed = false;
+        for (HANDLE battery : cache.current(p.ms)) {
+            auto fail = [&] { capacityOK = rateOK = designOK = false; failed = true; };
+            if (battery == INVALID_HANDLE_VALUE) { fail(); continue; }
+            ULONG timeout = 0, tag = 0;
+            DWORD returned = 0;
+            if (!DeviceIoControl(battery, IOCTL_BATTERY_QUERY_TAG, &timeout, sizeof(timeout), &tag, sizeof(tag), &returned, nullptr) || !tag) { fail(); continue; }
+            BATTERY_QUERY_INFORMATION query{}; query.BatteryTag = tag; query.InformationLevel = BatteryInformation;
+            BATTERY_INFORMATION info{};
+            if (!DeviceIoControl(battery, IOCTL_BATTERY_QUERY_INFORMATION, &query, sizeof(query), &info, sizeof(info), &returned, nullptr)) { fail(); continue; }
+            if (!(info.Capabilities & BATTERY_SYSTEM_BATTERY)) continue;
+            ++count;
+            BATTERY_WAIT_STATUS wait{}; wait.BatteryTag = tag;
+            BATTERY_STATUS status{};
+            if (!DeviceIoControl(battery, IOCTL_BATTERY_QUERY_STATUS, &wait, sizeof(wait), &status, sizeof(status), &returned, nullptr)) { fail(); continue; }
+            const bool relative = info.Capabilities & BATTERY_CAPACITY_RELATIVE;
+            if (relative || status.Capacity == BATTERY_UNKNOWN_CAPACITY || info.FullChargedCapacity == BATTERY_UNKNOWN_CAPACITY || !info.FullChargedCapacity)
+                capacityOK = false;
+            else { remaining += status.Capacity / 1000.0; full += info.FullChargedCapacity / 1000.0; }
+            if (relative || info.DesignedCapacity == BATTERY_UNKNOWN_CAPACITY || !info.DesignedCapacity) designOK = false;
+            else design += info.DesignedCapacity / 1000.0;
+            cycles = info.CycleCount; // 0 means the battery has no cycle counter
+            if (relative || ULONG(status.Rate) == BATTERY_UNKNOWN_RATE) rateOK = false;
+            else watts += -double(status.Rate) / 1000.0;
+            if (status.PowerState & BATTERY_CHARGING) chargingSeen = true;
         }
-        Handle battery(CreateFileW(detail->DevicePath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
-        if (!battery) { capacityOK = rateOK = false; continue; }
-        ULONG timeout = 0, tag = 0;
-        DWORD returned = 0;
-        if (!DeviceIoControl(battery, IOCTL_BATTERY_QUERY_TAG, &timeout, sizeof(timeout), &tag, sizeof(tag), &returned, nullptr) || !tag) {
-            capacityOK = rateOK = false; continue;
-        }
-        BATTERY_QUERY_INFORMATION query{}; query.BatteryTag = tag; query.InformationLevel = BatteryInformation;
-        BATTERY_INFORMATION info{};
-        if (!DeviceIoControl(battery, IOCTL_BATTERY_QUERY_INFORMATION, &query, sizeof(query), &info, sizeof(info), &returned, nullptr)) {
-            capacityOK = rateOK = false; continue;
-        }
-        if (!(info.Capabilities & BATTERY_SYSTEM_BATTERY)) continue;
-        ++count;
-        BATTERY_WAIT_STATUS wait{}; wait.BatteryTag = tag;
-        BATTERY_STATUS status{};
-        if (!DeviceIoControl(battery, IOCTL_BATTERY_QUERY_STATUS, &wait, sizeof(wait), &status, sizeof(status), &returned, nullptr)) {
-            capacityOK = rateOK = false; continue;
-        }
-        const bool relative = info.Capabilities & BATTERY_CAPACITY_RELATIVE;
-        if (relative || status.Capacity == BATTERY_UNKNOWN_CAPACITY || info.FullChargedCapacity == BATTERY_UNKNOWN_CAPACITY || !info.FullChargedCapacity)
-            capacityOK = false;
-        else { remaining += status.Capacity / 1000.0; full += info.FullChargedCapacity / 1000.0; }
-        if (relative || ULONG(status.Rate) == BATTERY_UNKNOWN_RATE) rateOK = false;
-        else watts += -double(status.Rate) / 1000.0;
-        if (status.PowerState & BATTERY_CHARGING) p.charging = true;
+        if (!failed) break;
+        cache.invalidate(); // a battery was removed or reset: re-enumerate once now
     }
-    SetupDiDestroyDeviceInfoList(devices);
+    if (chargingSeen) p.charging = true;
     if (count) {
         p.present = true;
         if (capacityOK && full > 0) {
             p.remainingWh = remaining; p.fullWh = full;
             p.percent = std::clamp(remaining / full * 100, 0.0, 100.0);
         }
+        if (designOK && design > 0) p.designWh = design;
+        if (count == 1 && cycles > 0) p.cycleCount = cycles;
         if (rateOK) p.watts = watts;
     }
     return p;
@@ -615,7 +654,8 @@ std::vector<ProcessRow> Collector::collect(size_t& total, size_t& inaccessible, 
         ? (sampleMs_ - previousSampleMs_) / 1000.0 : 0;
     previousSampleMs_ = sampleMs_;
     const uint64_t now = GetTickCount64();
-    if (!servicesAt_ || now - servicesAt_ >= 10000) {
+    // Service list: every 10 s while the panel is open, 30 s while hidden. Actions re-read it live.
+    if (!servicesAt_ || now - servicesAt_ >= (background ? 30000u : 10000u)) {
         services_ = readServices(servicesKnown_); servicesAt_ = now;
     }
     std::map<DWORD, std::vector<ServiceInfo>> serviceMap;

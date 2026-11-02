@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cwctype>
+#include <set>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -32,7 +33,7 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     LedgerId = 118, ExportCsvId = 119, LowBatteryOffId = 120, LowBattery10Id = 121, LowBattery20Id = 122, LowBattery30Id = 123,
     HotkeyToggleId = 124, ThemeSystemId = 125, ThemeDarkId = 126, ThemeLightId = 127, StylePixelId = 128, StyleSmoothId = 129,
     ModeAcEfficiencyId = 140, ModeAcBalancedId = 141, ModeAcPerformanceId = 142,
-    ModeDcEfficiencyId = 143, ModeDcBalancedId = 144, ModeDcPerformanceId = 145, RestoreModesId = 146,
+    ModeDcEfficiencyId = 143, ModeDcBalancedId = 144, ModeDcPerformanceId = 145, RestoreModesId = 146, TrayPercentId = 147,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1;
 const wchar_t* ClassName = L"BatteryScope.Main.v1";
@@ -82,6 +83,9 @@ enum class InlinePage { none, process, power, candidates, ledger, powerMode, con
 unsigned lowBatteryThreshold = 0; // percent; 0 = off
 LowBatteryMonitor lowBattery;
 bool hotkeyEnabled = false, hotkeyRegistered = false;
+bool trayPercent = true;          // show the battery percentage as the notification icon
+HICON trayIcon = nullptr;         // generated percentage icon (owned)
+std::wstring trayIconKey;
 InlinePage inlinePage = InlinePage::none;
 bool inlineClosing = false;
 std::wstring inlineTitle;
@@ -310,12 +314,36 @@ std::wstring trayText() {
     }
     return text;
 }
+// The percentage icon for the latest sample, regenerated only when its
+// number, color state, or size changes. Falls back to the app icon.
+HICON currentTrayIcon(HICON* retired) {
+    if (!trayPercent || current.history.empty() || !current.history.back().present || !current.history.back().percent) return smallIcon;
+    const auto& p = current.history.back();
+    const int percent = int(std::lround(std::clamp(*p.percent, 0.0, 100.0)));
+    const bool plugged = p.acKnown && (p.onAc || p.charging);
+    const int state = plugged ? 1 : percent <= 10 ? 3 : percent <= 20 ? 2 : 0;
+    const int size = GetSystemMetricsForDpi(SM_CXSMICON, dpi);
+    const std::wstring key = std::to_wstring(size) + L":" + std::to_wstring(percent) + L":" + std::to_wstring(state);
+    if (trayIcon && key == trayIconKey) return trayIcon;
+    // Fixed colors: the badge must read on both light and dark taskbars.
+    static const COLORREF badges[] = {RGB(36, 46, 58), RGB(72, 196, 156), RGB(242, 180, 64), RGB(226, 82, 82)};
+    static const COLORREF edges[] = {RGB(120, 134, 148), RGB(28, 110, 86), RGB(150, 100, 20), RGB(140, 36, 36)};
+    static const COLORREF digits[] = {RGB(255, 255, 255), RGB(6, 32, 24), RGB(32, 22, 4), RGB(255, 255, 255)};
+    HICON next = ui::makePercentIcon(size, percent, badges[state], edges[state], digits[state]);
+    if (!next) return smallIcon;
+    if (retired) *retired = trayIcon; else if (trayIcon) DestroyIcon(trayIcon);
+    trayIcon = next; trayIconKey = key;
+    return trayIcon;
+}
 bool updateTray(bool add) {
     if (isolatedPreview) return false;
     NOTIFYICONDATAW data{}; data.cbSize = sizeof(data); data.hWnd = mainWindow; data.uID = 1;
-    data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP; data.uCallbackMessage = TrayMessage; data.hIcon = smallIcon;
+    HICON retired = nullptr;
+    data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP; data.uCallbackMessage = TrayMessage; data.hIcon = currentTrayIcon(&retired);
     wcsncpy_s(data.szTip, trayText().c_str(), _TRUNCATE);
-    if (!Shell_NotifyIconW(add ? NIM_ADD : NIM_MODIFY, &data)) return false;
+    const bool shown = Shell_NotifyIconW(add ? NIM_ADD : NIM_MODIFY, &data) != FALSE;
+    if (retired) DestroyIcon(retired); // the shell keeps its own copy of the new icon
+    if (!shown) return false;
     if (add) { data.uVersion = NOTIFYICON_VERSION_4; trayVersion4 = Shell_NotifyIconW(NIM_SETVERSION, &data) != FALSE; }
     return true;
 }
@@ -948,9 +976,14 @@ void paint(HDC dc, RECT bounds) {
         const int gap = sp(8), half = (right - margin - gap) / 2;
         const RECT rateCard{margin, sp(187), margin + half, sp(228)}, timeCard{margin + half + gap, sp(187), right, sp(228)};
         card(dc, rateCard, Surface, 12); card(dc, timeCard, Surface, 12);
-        drawText(dc, p.charging ? tr(L"充電速度") : plugged ? tr(L"電池狀態") : tr(L"耗電速度"),
+        // Plugged in without charging, battery health is more useful than a rate.
+        const auto health = batteryHealth(p);
+        const bool showHealth = plugged && !p.charging && health;
+        std::wstring healthText = showHealth ? number(*health, 0) + L"%" : L"";
+        if (showHealth && p.cycleCount) healthText += L" · " + std::to_wstring(*p.cycleCount) + tr(L" 次循環");
+        drawText(dc, p.charging ? tr(L"充電速度") : showHealth ? tr(L"電池健康度") : plugged ? tr(L"電池狀態") : tr(L"耗電速度"),
             {rateCard.left + sp(12), rateCard.top + sp(4), rateCard.right - sp(8), rateCard.top + sp(20)}, Muted, smallFont);
-        drawText(dc, plugged && !p.charging ? (p.percent && *p.percent >= 99.5 ? tr(L"已充滿") : tr(L"已接電，暫未充電")) : valueText(p.charging ? charge.percentPerHour : m.percentPerHour, tr(L" 百分點 / 小時")),
+        drawText(dc, showHealth ? healthText : plugged && !p.charging ? (p.percent && *p.percent >= 99.5 ? tr(L"已充滿") : tr(L"已接電，暫未充電")) : valueText(p.charging ? charge.percentPerHour : m.percentPerHour, tr(L" 百分點 / 小時")),
             {rateCard.left + sp(12), rateCard.top + sp(19), rateCard.right - sp(8), rateCard.bottom - sp(3)}, Ink, strongFont);
         std::wstring remaining = tr(L"估計續航 —");
         if (plugged) remaining = p.charging ? tr(L"等待穩定充電資料") : valueText(p.remainingWh, L"", 1) + L" / " + valueText(p.fullWh, L" Wh", 1);
@@ -1059,7 +1092,12 @@ void showPowerDetails() {
     text += tr(L"\n\n電池端充電功率：") + valueText(charge.watts, L" W") +
         tr(L"\n近 2 分鐘充電平均：") + valueText(charge.averageWatts, L" W") +
         tr(L"\n剩餘容量：") + valueText(p.remainingWh, L" Wh") + L" / " + valueText(p.fullWh, L" Wh");
+    const auto health = batteryHealth(p);
+    text += tr(L"\n電池健康度：") + (health ? number(*health, 0) + tr(L"%（滿充 ") + valueText(p.fullWh, L" Wh") +
+        tr(L" / 設計 ") + valueText(p.designWh, L" Wh") + tr(L"）") : std::wstring(tr(L"未提供")));
+    text += tr(L"\n充電循環：") + (p.cycleCount ? std::to_wstring(*p.cycleCount) + tr(L" 次") : std::wstring(tr(L"未提供")));
     text += tr(L"\n至充滿（依目前速度）：") + valueText(charge.hoursToFull, tr(L" 小時"), 2);
+    text += tr(L"\n\n健康度是目前滿充容量占原廠設計容量的比例，會隨使用逐漸下降；新電池可能略高於 100%。");
     text += tr(L"\n\n充電功率是電池吸收的淨功率，不是插座功率、充電器額定功率或 USB PD 合約瓦數。");
     text += tr(L"\n充滿時間需至少 60 秒連續穩定充電資料。接近滿電時會減速；電池保護上限也可能讓充電提前停止，因此不是保證時間。");
     text += tr(L"\n\nWindows 通用電源資訊只回報是否接上外部電源，不能區分圓孔變壓器與 USB-C。偵測到 USB-C 控制器也不能證明目前由它供電。");
@@ -1087,6 +1125,7 @@ void loadSettings() {
     lowBatteryThreshold = threshold == 10 || threshold == 20 || threshold == 30 ? threshold : 0;
     hotkeyEnabled = readSetting(L"Hotkey", 0) == 1;
     pixelStyle = readSetting(L"Style", 1) != 0;
+    trayPercent = readSetting(L"TrayPercent", 1) != 0;
 }
 void showLedger() {
     std::wstring content = tr(L"自 BatteryScope 啟動以來，依 CPU 能源分攤累計各程式的耗能，含已結束的程序。");
@@ -1572,6 +1611,7 @@ void openMenu(POINT point) {
         AppendMenuW(alerts, MF_STRING | (lowBatteryThreshold == level.second ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), level.first,
             level.second ? (std::to_wstring(level.second) + L"%").c_str() : tr(L"關閉"));
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(alerts), tr(L"低電量提醒"));
+    AppendMenuW(menu, MF_STRING | (trayPercent ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), TrayPercentId, tr(L"系統匣顯示電量數字"));
     AppendMenuW(menu, MF_STRING | (hotkeyEnabled ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), HotkeyToggleId, tr(L"快速鍵 Ctrl+Alt+B"));
     AppendMenuW(menu, MF_STRING | (autoStart ? MF_CHECKED : 0) | (demo ? MF_GRAYED : 0), StartupId, tr(L"登入時啟動"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
@@ -1774,6 +1814,13 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             if (!demo && !isolatedPreview) setLowBatteryThreshold(unsigned(id - LowBatteryOffId) * 10);
             return 0;
         }
+        if (id == TrayPercentId) {
+            if (demo || isolatedPreview) return 0;
+            trayPercent = !trayPercent;
+            if (!writeSetting(L"TrayPercent", trayPercent ? 1 : 0)) setNotice(tr(L"無法儲存設定。"));
+            if (trayAdded) updateTray(false);
+            return 0;
+        }
         if (id == HotkeyToggleId) {
             if (demo || isolatedPreview) return 0;
             const bool wanted = !hotkeyEnabled;
@@ -1931,6 +1978,7 @@ Snapshot demoSnapshot() {
         PowerSample p; p.ms = now - uint64_t(360 - i) * 5000; p.present = p.acKnown = true;
         p.watts = 8.5 + std::sin(i / 12.0) * 1.7 + (i > 190 && i < 230 ? 12 : 0);
         p.fullWh = 56; p.remainingWh = 42.6 - i * .007; p.percent = *p.remainingWh / 56 * 100;
+        p.designWh = 60; p.cycleCount = 214u; // synthetic: 93% health
         appendPower(state.history, p);
     }
     state.power = calculatePower(state.history);
@@ -2132,6 +2180,27 @@ bool panelSelfTest(const std::wstring& path) {
     check("session_energy_reuses_panel", inlinePage == InlinePage::ledger && IsWindowVisible(inlineText) &&
         ledgerText.find(L"CloudSync.exe") != std::wstring::npos && ledgerText.find(tr(L" · 已結束")) != std::wstring::npos);
     SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
+    {
+        // The percentage icon: generated for the demo battery, sized for the tray, with opaque digits and badge.
+        HICON icon = currentTrayIcon(nullptr);
+        ICONINFO info{}; BITMAP bitmap{}; size_t opaque = 0, distinct = 0;
+        const bool read = icon && icon != smallIcon && GetIconInfo(icon, &info) && GetObjectW(info.hbmColor, sizeof(bitmap), &bitmap);
+        if (read) {
+            std::vector<DWORD> pixels(size_t(bitmap.bmWidth) * bitmap.bmHeight);
+            BITMAPINFO format{}; format.bmiHeader.biSize = sizeof(format.bmiHeader); format.bmiHeader.biWidth = bitmap.bmWidth;
+            format.bmiHeader.biHeight = -bitmap.bmHeight; format.bmiHeader.biPlanes = 1; format.bmiHeader.biBitCount = 32;
+            HDC screen = GetDC(nullptr);
+            GetDIBits(screen, info.hbmColor, 0, UINT(bitmap.bmHeight), pixels.data(), &format, DIB_RGB_COLORS);
+            ReleaseDC(nullptr, screen);
+            std::set<DWORD> colors;
+            for (DWORD pixel : pixels) if (pixel >> 24) { ++opaque; colors.insert(pixel & 0xFFFFFF); }
+            distinct = colors.size();
+        }
+        if (info.hbmColor) DeleteObject(info.hbmColor);
+        if (info.hbmMask) DeleteObject(info.hbmMask);
+        check("tray_icon_shows_battery_percentage", read && bitmap.bmWidth == GetSystemMetricsForDpi(SM_CXSMICON, dpi) &&
+            opaque > size_t(bitmap.bmWidth * bitmap.bmHeight / 2) && distinct >= 3 && currentTrayIcon(nullptr) == icon);
+    }
     const auto tip = trayText();
     check("tray_tooltip_shows_level_power_and_time", tip.find(L"%") != std::wstring::npos && tip.find(L" W") != std::wstring::npos &&
         tip.find(durationText(current.power.hoursRemaining)) != std::wstring::npos && tip.size() < 128);
@@ -2465,7 +2534,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     for (auto f : {normalFont, smallFont, strongFont, titleFont, valueFont, metricFont}) if (f) DeleteObject(f);
     for (auto f : fallbackOwned) DeleteObject(f);
     ui::unloadPixelFont();
-    DestroyIcon(appIcon); DestroyIcon(smallIcon); if (headerIcon) DestroyIcon(headerIcon);
+    DestroyIcon(appIcon); DestroyIcon(smallIcon); if (headerIcon) DestroyIcon(headerIcon); if (trayIcon) DestroyIcon(trayIcon);
     processIcons.clear();
     ui::stopGraphics();
     return shotOK ? 0 : 4;

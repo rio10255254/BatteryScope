@@ -356,6 +356,48 @@ bool drawPixelDigits(HDC dc, const std::wstring& text, int x, int y, int unit, C
     }
     return true;
 }
+HICON makePercentIcon(int size, int percent, COLORREF badge, COLORREF edge, COLORREF digits) {
+    static const char* glyphs[10][5] = {
+        {"###", "#.#", "#.#", "#.#", "###"}, {".#.", "##.", ".#.", ".#.", "###"}, {"###", "..#", "###", "#..", "###"},
+        {"###", "..#", ".##", "..#", "###"}, {"#.#", "#.#", "###", "..#", "..#"}, {"###", "#..", "###", "..#", "###"},
+        {"###", "#..", "###", "#.#", "###"}, {"###", "..#", ".#.", ".#.", ".#."}, {"###", "#.#", "###", "#.#", "###"},
+        {"###", "#.#", "###", "..#", "###"}};
+    if (size < 8) return nullptr;
+    const std::wstring text = std::to_wstring(std::clamp(percent, 0, 100));
+    const int n = int(text.size());
+    // Largest whole pixel size that fits the digits inside a one-pixel margin.
+    const int unit = std::max(1, std::min((size - 2) / (4 * n - 1), (size - 4) / 5));
+    BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(info.bmiHeader); info.bmiHeader.biWidth = size;
+    info.bmiHeader.biHeight = -size; info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32; info.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP color = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!color || !bits) { if (color) DeleteObject(color); return nullptr; }
+    auto* pixels = static_cast<DWORD*>(bits);
+    auto argb = [](COLORREF c) { return 0xFF000000u | (DWORD(GetRValue(c)) << 16) | (DWORD(GetGValue(c)) << 8) | GetBValue(c); };
+    auto paint = [&](int left, int top, int right, int bottom, DWORD value) {
+        for (int y = std::max(0, top); y < std::min(size, bottom); ++y)
+            for (int x = std::max(0, left); x < std::min(size, right); ++x) pixels[y * size + x] = value;
+    };
+    std::fill(pixels, pixels + size * size, 0u); // transparent
+    const int corner = std::max(1, size / 16);
+    paint(corner, 0, size - corner, size, argb(edge)); paint(0, corner, size, size - corner, argb(edge));
+    paint(corner, corner, size - corner, size - corner, argb(badge));
+    const int width = (4 * n - 1) * unit, x0 = (size - width) / 2, y0 = (size - 5 * unit + 1) / 2;
+    for (int i = 0; i < n; ++i) {
+        const auto& glyph = glyphs[text[size_t(i)] - L'0'];
+        for (int row = 0; row < 5; ++row) for (int column = 0; column < 3; ++column) if (glyph[row][column] == '#') {
+            const int x = x0 + (i * 4 + column) * unit, y = y0 + row * unit;
+            paint(x, y, x + unit, y + unit, argb(digits));
+        }
+    }
+    HBITMAP mask = CreateBitmap(size, size, 1, 1, nullptr);
+    std::vector<BYTE> zeros(size_t((size + 15) / 16 * 2 * size), 0);
+    if (mask) SetBitmapBits(mask, DWORD(zeros.size()), zeros.data());
+    ICONINFO icon{}; icon.fIcon = TRUE; icon.hbmColor = color; icon.hbmMask = mask;
+    HICON result = mask ? CreateIconIndirect(&icon) : nullptr;
+    DeleteObject(color); if (mask) DeleteObject(mask);
+    return result;
+}
 bool loadPixelFont(HMODULE module, int resource) {
     if (pixelFontHandle) return true;
     HRSRC info = FindResourceW(module, MAKEINTRESOURCEW(resource), MAKEINTRESOURCEW(10) /* RT_RCDATA */);

@@ -119,6 +119,10 @@ PowerMetrics calculatePower(const std::deque<PowerSample>& h) {
     }
     return m;
 }
+Value batteryHealth(const PowerSample& p) {
+    if (!p.fullWh || !p.designWh || !std::isfinite(*p.fullWh) || !std::isfinite(*p.designWh) || *p.designWh <= 0 || *p.fullWh <= 0) return {};
+    return *p.fullWh / *p.designWh * 100;
+}
 bool LowBatteryMonitor::update(const PowerSample& s, unsigned threshold) {
     if (!threshold || !s.present || !s.acKnown || !s.percent || !std::isfinite(*s.percent)) return false;
     if (s.onAc || s.charging || *s.percent >= threshold + 5.0) { armed_ = true; return false; }

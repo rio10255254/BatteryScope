@@ -68,6 +68,10 @@ void pixelDottedLine(HDC dc, POINT a, POINT b, COLORREF color, int unit);
 int pixelDigitsWidth(const std::wstring& text, int unit);
 bool drawPixelDigits(HDC dc, const std::wstring& text, int x, int y, int unit, COLORREF color);
 
+// A square notification-area icon showing `percent` (0-100) in 3x5 pixel
+// digits on a badge. The caller owns the icon (DestroyIcon).
+HICON makePercentIcon(int size, int percent, COLORREF badge, COLORREF edge, COLORREF digits);
+
 // The embedded pixel UI font (family name below), loaded privately from a resource.
 constexpr wchar_t PixelFontFace[] = L"BatteryScope Pixel";
 bool loadPixelFont(HMODULE module, int resource);
