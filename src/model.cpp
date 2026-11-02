@@ -266,6 +266,28 @@ std::vector<size_t> reviewCandidates(const Snapshot& state, size_t limit) {
     if (result.size() > limit) result.resize(limit);
     return result;
 }
+std::optional<SleepRecord> evaluateSleep(const PowerSample& before, const PowerSample& after) {
+    auto onBattery = [](const PowerSample& p) { return p.present && p.acKnown && !p.onAc && !p.charging && p.percent && std::isfinite(*p.percent); };
+    if (!onBattery(before) || !onBattery(after) || after.ms <= before.ms || after.ms - before.ms < 600000) return {};
+    SleepRecord sleep;
+    sleep.startMs = before.ms; sleep.endMs = after.ms; sleep.before = *before.percent; sleep.after = *after.percent;
+    if (sleep.drop() < -1) return {}; // charged while asleep: not a battery sleep
+    return sleep;
+}
+bool unusualSleepDrain(const SleepRecord& sleep) { return sleep.drop() >= 3 && sleep.ratePerHour() > 1.5; }
+Value extraMinutesIfStopped(const PowerMetrics& m, const PowerSample& p, double appWatts) {
+    if (!p.present || !p.acKnown || p.onAc || p.charging || !p.remainingWh || !m.averageWatts || !std::isfinite(appWatts)) return {};
+    const double average = *m.averageWatts;
+    if (average <= .5 || appWatts <= 0 || appWatts >= average * .9) return {};
+    const double minutes = (*p.remainingWh / (average - appWatts) - *p.remainingWh / average) * 60;
+    return minutes >= 1 ? Value(std::min(minutes, 24.0 * 60)) : Value{};
+}
+bool ChargeReminder::update(const PowerSample& p, unsigned target) {
+    if (!target || !p.present || !p.acKnown || !p.percent || !std::isfinite(*p.percent)) return false;
+    if (!p.onAc || *p.percent < target - 5.0) { armed_ = true; return false; }
+    if (armed_ && *p.percent >= target - .5) { armed_ = false; return true; }
+    return false;
+}
 std::optional<size_t> drainAlertCandidate(const Snapshot& state, const std::set<std::pair<uint32_t,uint64_t>>& notified,
     double minWatts, double minSeconds) {
     if (state.history.empty()) return {};
@@ -314,8 +336,15 @@ DayStats& DailyHistory::day(int date) {
     for (auto it = days_.rbegin(); it != days_.rend(); ++it) if (it->date == date) return *it;
     return days_.back(); // clock moved backwards: keep counting on the newest day
 }
+void DailyHistory::addSleep(const SleepRecord& sleep, int date) {
+    DayStats& today = day(date);
+    today.sleepMinutes += sleep.hours() * 60;
+    today.sleepDropPercent += std::max(0.0, sleep.drop());
+}
 void DailyHistory::addPower(const PowerSample& sample, int date) {
     DayStats& today = day(date);
+    if (auto health = batteryHealth(sample)) today.healthPercent = health;
+    if (sample.cycleCount) today.cycles = sample.cycleCount;
     if (hasLast_ && sample.ms > last_.ms && sample.ms - last_.ms <= 30000) {
         const double dt = (sample.ms - last_.ms) / 1000.0;
         auto valid = [](const Value& w) { return w && std::isfinite(*w); };
@@ -359,7 +388,7 @@ std::vector<DayStats> DailyHistory::recent(size_t count) const {
 std::wstring DailyHistory::save() const {
     std::wostringstream out;
     out.imbue(std::locale::classic());
-    out << L"date,battery_minutes,discharged_wh,charged_wh,top_apps\n" << std::fixed;
+    out << L"date,battery_minutes,discharged_wh,charged_wh,top_apps,sleep_minutes,sleep_drop_pct,health_pct,cycles\n" << std::fixed;
     for (const auto& d : days_) {
         out << d.date << L',' << std::setprecision(1) << d.batteryMinutes << L',' << std::setprecision(3) << d.dischargedWh
             << L',' << d.chargedWh << L',';
@@ -368,6 +397,10 @@ std::wstring DailyHistory::save() const {
             for (auto& c : name) if (c == L',' || c == L'|' || c == L'=' || c == L'\r' || c == L'\n') c = L' ';
             out << (i ? L"|" : L"") << name << L'=' << std::setprecision(1) << d.apps[i].second;
         }
+        out << L',' << std::setprecision(1) << d.sleepMinutes << L',' << d.sleepDropPercent << L',';
+        if (d.healthPercent) out << *d.healthPercent;
+        out << L',';
+        if (d.cycles) out << *d.cycles;
         out << L'\n';
     }
     return out.str();
@@ -390,12 +423,27 @@ bool DailyHistory::load(const std::wstring& text) {
             fields.push_back(line.substr(from, comma - from)); from = comma + 1;
         }
         if (fields.size() != 4) continue;
-        fields.push_back(line.substr(from));
+        {
+            // Remaining columns: top_apps, then optional sleep/health columns (absent in older files).
+            const std::wstring rest = line.substr(from);
+            size_t start = 0;
+            for (;;) {
+                const size_t comma = rest.find(L',', start);
+                fields.push_back(rest.substr(start, comma == std::wstring::npos ? std::wstring::npos : comma - start));
+                if (comma == std::wstring::npos) break;
+                start = comma + 1;
+            }
+        }
         DayStats d; long date = 0;
         { std::wistringstream in(fields[0]); in.imbue(std::locale::classic()); if (!(in >> date)) continue; }
         if (date < 20000101 || date > 21001231 || !number(fields[1], d.batteryMinutes)
             || !number(fields[2], d.dischargedWh) || !number(fields[3], d.chargedWh)) continue;
         d.date = int(date);
+        double extra = 0;
+        if (fields.size() > 5 && number(fields[5], extra)) d.sleepMinutes = extra;
+        if (fields.size() > 6 && number(fields[6], extra)) d.sleepDropPercent = extra;
+        if (fields.size() > 7 && number(fields[7], extra) && extra > 0 && extra < 200) d.healthPercent = extra;
+        if (fields.size() > 8 && number(fields[8], extra) && extra >= 1 && extra < 100000) d.cycles = unsigned(extra);
         std::wistringstream apps(fields[4]);
         std::wstring app;
         while (std::getline(apps, app, L'|')) {

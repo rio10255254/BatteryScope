@@ -484,6 +484,44 @@ int wmain(int argc, wchar_t** argv) {
             for (int d = 1; d <= 70; ++d) long_.addPower(sample(uint64_t(d) * 100000000), 20260000 + d);
             check(long_.recent(100).size() == DailyHistory::KeepDays, "history keeps a bounded number of days");
         }
+        {
+            auto level = [](uint64_t t, double percent, bool ac) { PowerSample p; p.ms = t; p.present = p.acKnown = true; p.onAc = ac; p.percent = percent; return p; };
+            auto sleep = evaluateSleep(level(0, 85, false), level(7 * 3600000ull, 79, false));
+            check(sleep && nearlyEqual(sleep->hours(), 7) && nearlyEqual(sleep->drop(), 6) && !unusualSleepDrain(*sleep),
+                "a seven hour sleep losing six points is recorded and normal");
+            auto heavy = evaluateSleep(level(0, 80, false), level(4 * 3600000ull, 70, false));
+            check(heavy && unusualSleepDrain(*heavy), "losing ten points in four hours of sleep is unusual");
+            check(!evaluateSleep(level(0, 80, false), level(300000, 79, false)), "gaps under ten minutes are not sleeps");
+            check(!evaluateSleep(level(0, 80, true), level(3600000, 90, true)), "sleep while plugged in is not a battery sleep");
+            PowerMetrics drainNow; drainNow.averageWatts = 10;
+            PowerSample battery = level(0, 50, false); battery.remainingWh = 30;
+            check(nearlyEqual(extraMinutesIfStopped(drainNow, battery, 2), (30.0 / 8 - 30.0 / 10) * 60), "stopping two of ten watts adds the computed minutes");
+            check(!extraMinutesIfStopped(drainNow, battery, 9.5) && !extraMinutesIfStopped(drainNow, battery, .001), "implausible or negligible gains are hidden");
+            battery.onAc = true;
+            check(!extraMinutesIfStopped(drainNow, battery, 2), "no battery gain is shown while plugged in");
+            ChargeReminder reminder;
+            check(!reminder.update(level(0, 70, true), 80) && reminder.update(level(1, 80, true), 80) && !reminder.update(level(2, 82, true), 80),
+                "charge reminder fires once at the target");
+            check(!reminder.update(level(3, 81, false), 80) && reminder.update(level(4, 81, true), 80), "unplugging re-arms the charge reminder");
+            check(!reminder.update(level(5, 90, true), 0), "a zero target disables the charge reminder");
+        }
+        {
+            DailyHistory record;
+            auto worn = sample(0); worn.fullWh = 45; worn.designWh = 50; worn.cycleCount = 300u;
+            record.addPower(worn, 20261102);
+            SleepRecord night; night.startMs = 0; night.endMs = 6 * 3600000ull; night.before = 90; night.after = 85;
+            record.addSleep(night, 20261102);
+            auto day = record.recent(1).front();
+            check(nearlyEqual(day.healthPercent, 90) && day.cycles == 300u && nearlyEqual(day.sleepMinutes, 360) && nearlyEqual(day.sleepDropPercent, 5),
+                "daily history keeps battery health, cycles, and sleep");
+            DailyHistory restored;
+            restored.load(record.save());
+            auto back = restored.recent(1).front();
+            check(nearlyEqual(back.healthPercent, 90) && back.cycles == 300u && nearlyEqual(back.sleepMinutes, 360), "new history columns round-trip");
+            check(restored.load(L"date,battery_minutes,discharged_wh,charged_wh,top_apps\n20261101,30.0,4.000,1.000,Editor.exe=12.0\n") &&
+                restored.recent(1).front().apps.size() == 1 && !restored.recent(1).front().healthPercent,
+                "history files from the previous version still load");
+        }
         Collector cachedCollector;
         size_t total = 0, inaccessible = 0;
         auto warmRows = cachedCollector.collect(total, inaccessible);

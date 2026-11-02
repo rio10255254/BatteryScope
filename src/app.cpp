@@ -36,6 +36,8 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     ModeAcEfficiencyId = 140, ModeAcBalancedId = 141, ModeAcPerformanceId = 142,
     ModeDcEfficiencyId = 143, ModeDcBalancedId = 144, ModeDcPerformanceId = 145, RestoreModesId = 146, TrayPercentId = 147,
     DrainAlertId = 148, HistoryId = 149, HistoryToggleId = 150, ClearHistoryId = 151,
+    ChargeReminderOffId = 152, ChargeReminder80Id = 153, ChargeReminder85Id = 154, ChargeReminder90Id = 155, ChargeReminder100Id = 156,
+    SleepAlertId = 157,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1;
 const wchar_t* ClassName = L"BatteryScope.Main.v1";
@@ -65,6 +67,7 @@ std::atomic<bool> quit{false}, hidden{false}, resetSamples{false};
 // Daily history, owned by the sampler thread; the UI flips these flags.
 std::atomic<bool> historyEnabled{true}, clearHistoryRequest{false};
 int localDate(int daysBack = 0); // yyyymmdd in local time, `daysBack` days ago
+std::wstring healthTrendText();
 std::mutex mailboxMutex, wakeMutex;
 std::condition_variable wake;
 // The sampler hands each process list over by move: mailboxProcesses says the
@@ -92,7 +95,12 @@ bool trayPercent = true;          // show the battery percentage as the notifica
 bool drainAlerts = false;         // notify about sustained high-power background work
 std::set<std::pair<uint32_t, uint64_t>> drainNotified;
 uint64_t lastDrainAlert = 0;
-bool balloonOpensCandidates = false;
+enum class BalloonTarget { none, candidates, powerDetails };
+BalloonTarget balloonTarget = BalloonTarget::none;  // what clicking the last notification opens
+bool sleepAlerts = true;          // notify after a sleep with unusual battery drain
+unsigned seenSleeps = 0;
+unsigned chargeReminderTarget = 0; // percent; 0 = off
+ChargeReminder chargeReminder;
 // Learned charging curve and detected charge limit, saved under HKCU\Software\BatteryScope.
 ChargeCurve chargeCurve;
 std::optional<int> chargeLimit;
@@ -400,12 +408,12 @@ bool updateTray(bool add) {
     if (add) { data.uVersion = NOTIFYICON_VERSION_4; trayVersion4 = Shell_NotifyIconW(NIM_SETVERSION, &data) != FALSE; }
     return true;
 }
-void showBalloon(const std::wstring& title, const std::wstring& body, bool opensCandidates) {
+void showBalloon(const std::wstring& title, const std::wstring& body, BalloonTarget target) {
     NOTIFYICONDATAW data{}; data.cbSize = sizeof(data); data.hWnd = mainWindow; data.uID = 1;
     data.uFlags = NIF_INFO; data.dwInfoFlags = NIIF_WARNING | NIIF_RESPECT_QUIET_TIME;
     wcsncpy_s(data.szInfoTitle, title.c_str(), _TRUNCATE);
     wcsncpy_s(data.szInfo, body.c_str(), _TRUNCATE);
-    if (Shell_NotifyIconW(NIM_MODIFY, &data)) balloonOpensCandidates = opensCandidates;
+    if (Shell_NotifyIconW(NIM_MODIFY, &data)) balloonTarget = target;
 }
 // One Windows notification when the battery reaches the chosen threshold.
 void showLowBatteryNotice() {
@@ -419,7 +427,7 @@ void showLowBatteryNotice() {
             L" (" + valueText(row.averageCpuWatts, L" W", 1) + L")";
         break;
     }
-    showBalloon(tr(L"電量偏低 · ") + valueText(p.percent, L"%", 0), body, false);
+    showBalloon(tr(L"電量偏低 · ") + valueText(p.percent, L"%", 0), body, BalloonTarget::none);
 }
 // One drain notification per process, at most every 10 minutes, on battery only.
 void checkDrainAlert() {
@@ -430,7 +438,26 @@ void checkDrainAlert() {
     drainNotified.insert({row.pid, row.created});
     lastDrainAlert = GetTickCount64();
     showBalloon(tr(L"背景程式持續耗電"), row.name + tr(L" 已在背景持續使用約 ") + valueText(row.averageCpuWatts, L" W", 1) +
-        tr(L" CPU 電力（") + std::to_wstring(int(row.busySeconds / 60)) + tr(L" 分鐘）。點此查看。"), true);
+        tr(L" CPU 電力（") + std::to_wstring(int(row.busySeconds / 60)) + tr(L" 分鐘）。點此查看。"), BalloonTarget::candidates);
+}
+std::wstring sleepText(const SleepRecord& sleep) {
+    return durationText(sleep.hours()).substr(std::wstring(tr(L"約 ")).size()) + tr(L"，電量 ") + number(sleep.before, 0) + L"% → " +
+        number(sleep.after, 0) + L"%" + tr(L"（每小時 ") + number(std::max(0.0, sleep.ratePerHour()), 1) + tr(L"%）");
+}
+// After each detected sleep (a sampling gap of 10+ minutes on battery), warn
+// when the drain was unusual; and remind once when charging reaches the target.
+void checkBatteryNotices() {
+    if (demo || isolatedPreview || !trayAdded || current.history.empty()) return;
+    if (current.sleepCount != seenSleeps) {
+        seenSleeps = current.sleepCount;
+        if (sleepAlerts && current.lastSleep && unusualSleepDrain(*current.lastSleep))
+            showBalloon(tr(L"睡眠期間耗電偏高"), tr(L"睡眠 ") + sleepText(*current.lastSleep) +
+                tr(L"。可能有程式或裝置讓電腦無法進入深度睡眠。"), BalloonTarget::powerDetails);
+    }
+    const bool firmwareLimit = chargeLimit && *chargeLimit <= int(chargeReminderTarget) + 1;
+    if (chargeReminderTarget && !firmwareLimit && chargeReminder.update(current.history.back(), chargeReminderTarget))
+        showBalloon(tr(L"電量已達 ") + std::to_wstring(chargeReminderTarget) + L"%",
+            tr(L"可以拔掉充電器了；長時間維持高電量會加速電池老化。"), BalloonTarget::none);
 }
 void refreshList();
 void positionPanel() {
@@ -1205,6 +1232,8 @@ void showPowerDetails() {
     int learned = 0;
     for (int band = 0; band < ChargeCurve::Bands; ++band) learned += chargeCurve.samples(band) >= 6;
     text += tr(L"\n已學習的充電曲線：") + std::to_wstring(learned * 5) + tr(L"% 的電量區間");
+    text += tr(L"\n上次睡眠：") + (current.lastSleep ? sleepText(*current.lastSleep) : std::wstring(tr(L"尚未偵測到（BatteryScope 執行中且用電池時才會記錄）")));
+    if (auto trend = healthTrendText(); !trend.empty()) text += tr(L"\n健康度趨勢：") + trend;
     text += tr(L"\n\n健康度是目前滿充容量占原廠設計容量的比例，會隨使用逐漸下降；新電池可能略高於 100%。");
     text += tr(L"\n\n充電功率是電池吸收的淨功率，不是插座功率、充電器額定功率或 USB PD 合約瓦數。");
     text += tr(L"\n充滿時間需至少 60 秒連續穩定充電資料。BatteryScope 會記錄這台電腦在各電量區間的實際充電速度；學到的區間涵蓋剩餘路程時，會依充電曲線預估接近滿電時的減速，否則依目前速度估算。偵測到充電上限時改預估到上限。這些都不是保證時間。");
@@ -1256,6 +1285,9 @@ void loadSettings() {
     pixelStyle = readSetting(L"Style", 1) != 0;
     trayPercent = readSetting(L"TrayPercent", 1) != 0;
     drainAlerts = readSetting(L"DrainAlert", 0) == 1;
+    sleepAlerts = readSetting(L"SleepAlert", 1) != 0;
+    const DWORD reminder = readSetting(L"ChargeReminder", 0);
+    chargeReminderTarget = reminder == 80 || reminder == 85 || reminder == 90 || reminder == 100 ? reminder : 0;
     historyEnabled = readSetting(L"History", 1) != 0;
     std::vector<uint8_t> curve(512); DWORD curveBytes = DWORD(curve.size());
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\BatteryScope", L"ChargeCurve", RRF_RT_REG_BINARY, nullptr, curve.data(), &curveBytes) == ERROR_SUCCESS) {
@@ -1388,6 +1420,14 @@ std::wstring powerModeText() {
     text += tr(L"\n\nBatteryScope 第一次變更某一項時會記住原本的設定，可用「還原原本設定」恢復；不會結束任何程式。");
     return text;
 }
+// "89% → 87% over 30 days" from the oldest and newest days with a health reading.
+std::wstring healthTrendText() {
+    const DayStats* first = nullptr; const DayStats* last = nullptr;
+    for (const auto& day : current.days) if (day.healthPercent) { if (!first) first = &day; last = &day; }
+    if (!first || first == last) return {};
+    return number(*first->healthPercent, 0) + L"% → " + number(*last->healthPercent, 0) + L"%" + tr(L"（") + dayLabel(first->date) +
+        L" – " + dayLabel(last->date) + tr(L"）");
+}
 std::wstring historyText() {
     std::wstring text;
     if (current.days.empty()) text = tr(L"還沒有紀錄。BatteryScope 執行時會每天累計用電池的時間、放電與充電量，以及最耗電的程式。");
@@ -1397,6 +1437,10 @@ std::wstring historyText() {
         text += (text.empty() ? L"" : L"\n\n") + dayLabel(day.date) + (day.date == today ? tr(L"（今天）") : L"") +
             tr(L" · 用電池 ") + (day.batteryMinutes >= 1 ? durationText(day.batteryMinutes / 60).substr(std::wstring(tr(L"約 ")).size()) : L"0" + std::wstring(tr(L" 分"))) +
             tr(L" · 放電 ") + number(day.dischargedWh, 1) + L" Wh" + tr(L" · 充電 ") + number(day.chargedWh, 1) + L" Wh";
+        if (day.sleepMinutes >= 10)
+            text += tr(L"\n  睡眠 ") + durationText(day.sleepMinutes / 60).substr(std::wstring(tr(L"約 ")).size()) + tr(L"，掉 ") + number(day.sleepDropPercent, 0) + L"%";
+        if (day.healthPercent) text += tr(L"\n  健康度 ") + number(*day.healthPercent, 0) + L"%" +
+            (day.cycles ? L" · " + std::to_wstring(*day.cycles) + tr(L" 次循環") : L"");
         if (!day.apps.empty()) {
             text += tr(L"\n  CPU 最耗電：");
             for (size_t i = 0; i < day.apps.size() && i < 3; ++i)
@@ -1423,6 +1467,9 @@ void showReviewCandidates() {
         const auto& row = current.processes[index];
         content += L"\n• " + row.name + L" · PID " + std::to_wstring(row.pid) + L" · " +
             valueText(row.averageCpuWatts, L" CPU W", 2) + L" · " + std::to_wstring(int(row.busySeconds)) + tr(L" 秒持續活動");
+        if (!current.history.empty() && row.averageCpuWatts)
+            if (auto gain = extraMinutesIfStopped(current.power, current.history.back(), *row.averageCpuWatts))
+                content += tr(L" · 關閉約可多用 ") + std::to_wstring(int(*gain)) + tr(L" 分");
     }
     content += tr(L"\n\n可能有同步、下載、音訊、未儲存資料或其他程序依賴。請先查看詳情；程式不會自動休眠或關閉候選。" );
     showInlinePage(InlinePage::candidates, tr(L"耗電的背景程式 · 需自行判斷"), content);
@@ -1547,6 +1594,9 @@ void showDetails(const ProcessRow& row) {
         if (!current.history.empty() && current.history.back().fullWh && row.averageCpuWatts)
             content += tr(L"\nCPU 部分估計耗電速度: ") + number(*row.averageCpuWatts / *current.history.back().fullWh * 100, 2) + tr(L" 百分點／小時");
         content += tr(L"\n\n用 EMI 量到的核心能源約束分攤。持續固定在同一核心的執行緒優先按該核心分配；其餘依 CPU 時間估計。範圍反映未知的核心排程位置，並非統計信賴區間；不同指令與 SMT 仍可能產生誤差。");
+        if (!current.history.empty() && row.averageCpuWatts)
+            if (auto gain = extraMinutesIfStopped(current.power, current.history.back(), *row.averageCpuWatts))
+                content += tr(L"\n若關閉此程式：CPU 部分約可多用 ") + std::to_wstring(int(*gain)) + tr(L" 分鐘（依近 5 分鐘耗電估算；不含 GPU、螢幕，非保證）");
         if (current.energy.cycleWeighted)
             content += tr(L"\n本次其餘部分依 CPU 週期加權：同樣的 CPU 時間在較高時脈下會分到較多能源。");
     }
@@ -1633,7 +1683,13 @@ void sampleLoop() {
         }
         bool changed = false;
         if (now >= nextPower) {
-            appendPower(state.history, readPower()); state.power = calculatePower(state.history);
+            const PowerSample sample = readPower();
+            // A gap of 10+ minutes between samples means the system (or this app) was asleep.
+            if (!state.history.empty()) if (auto sleep = evaluateSleep(state.history.back(), sample)) {
+                state.lastSleep = sleep; ++state.sleepCount;
+                if (historyEnabled) { history.addSleep(*sleep, localDate()); historyDirty = true; }
+            }
+            appendPower(state.history, sample); state.power = calculatePower(state.history);
             nextPower = now + (background ? 10000 : 6000); changed = true;
             if (historyEnabled) { history.addPower(state.history.back(), localDate()); historyDirty = true; }
         }
@@ -1844,6 +1900,14 @@ void openMenu(POINT point) {
             level.second ? (std::to_wstring(level.second) + L"%").c_str() : tr(L"關閉"));
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(alerts), tr(L"低電量提醒"));
     AppendMenuW(menu, MF_STRING | (drainAlerts ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), DrainAlertId, tr(L"背景耗電提醒"));
+    AppendMenuW(menu, MF_STRING | (sleepAlerts ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), SleepAlertId, tr(L"睡眠耗電提醒"));
+    HMENU reminders = CreatePopupMenu();
+    const std::pair<int, unsigned> targets[] = {{ChargeReminderOffId, 0}, {ChargeReminder80Id, 80}, {ChargeReminder85Id, 85},
+        {ChargeReminder90Id, 90}, {ChargeReminder100Id, 100}};
+    for (const auto& target : targets)
+        AppendMenuW(reminders, MF_STRING | (chargeReminderTarget == target.second ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), target.first,
+            target.second ? (std::to_wstring(target.second) + L"%").c_str() : tr(L"關閉"));
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(reminders), tr(L"充電提醒"));
     HMENU records = CreatePopupMenu();
     AppendMenuW(records, MF_STRING | (historyEnabled ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), HistoryToggleId, tr(L"記錄每日歷史"));
     AppendMenuW(records, MF_STRING | (preview ? MF_GRAYED : 0), ClearHistoryId, tr(L"清除歷史紀錄…"));
@@ -2053,6 +2117,21 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (id == HistoryId) { showHistoryPage(); return 0; }
+        if (id == SleepAlertId) {
+            if (demo || isolatedPreview) return 0;
+            sleepAlerts = !sleepAlerts;
+            if (!writeSetting(L"SleepAlert", sleepAlerts ? 1 : 0)) setNotice(tr(L"無法儲存設定。"));
+            else setNotice(sleepAlerts ? tr(L"睡眠期間每小時掉電超過 1.5% 時會通知。") : tr(L"已關閉睡眠耗電提醒。"));
+            return 0;
+        }
+        if (id >= ChargeReminderOffId && id <= ChargeReminder100Id) {
+            if (demo || isolatedPreview) return 0;
+            static const unsigned values[] = {0, 80, 85, 90, 100};
+            chargeReminderTarget = values[id - ChargeReminderOffId]; chargeReminder.reset();
+            if (!writeSetting(L"ChargeReminder", chargeReminderTarget)) setNotice(tr(L"無法儲存設定。"));
+            else setNotice(chargeReminderTarget ? tr(L"充電到 ") + std::to_wstring(chargeReminderTarget) + tr(L"% 時會通知。") : tr(L"已關閉充電提醒。"));
+            return 0;
+        }
         if (id == DrainAlertId) {
             if (demo || isolatedPreview) return 0;
             drainAlerts = !drainAlerts; drainNotified.clear();
@@ -2180,6 +2259,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             showLowBatteryNotice();
         learnFromSample();
         checkDrainAlert();
+        checkBatteryNotices();
         return 0;
     }
     case ActionMessage: {
@@ -2212,7 +2292,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case TrayMessage:
         if (trayVersion4 ? LOWORD(lp) == NIN_BALLOONUSERCLICK : lp == NIN_BALLOONUSERCLICK) {
             showMain();
-            if (balloonOpensCandidates) showReviewCandidates();
+            if (balloonTarget == BalloonTarget::candidates) showReviewCandidates();
+            else if (balloonTarget == BalloonTarget::powerDetails) showPowerDetails();
             return 0;
         }
         if ((trayVersion4 && (LOWORD(lp) == NIN_SELECT || LOWORD(lp) == NIN_KEYSELECT)) ||
@@ -2281,8 +2362,12 @@ Snapshot demoSnapshot() {
         if (i == 2) continue; // a day without records
         DayStats day; day.date = localDate(6 - i); day.batteryMinutes = demoDays[i][0]; day.dischargedWh = demoDays[i][1]; day.chargedWh = demoDays[i][2];
         day.apps = {{L"Browser.exe", 820.0 - i * 40}, {L"CloudSync.exe", 410.0 + i * 15}, {L"UpdateWorker.exe", 160}};
+        day.sleepMinutes = 420 + i * 10; day.sleepDropPercent = 5 + (i == 4 ? 7 : 0);
+        day.healthPercent = 94.2 - i * .15; day.cycles = 208u + unsigned(i);
         state.days.push_back(day);
     }
+    SleepRecord sleep; sleep.startMs = now - 8 * 3600000ull; sleep.endMs = now - 3600000ull; sleep.before = 86; sleep.after = 80;
+    state.lastSleep = sleep; state.sleepCount = 1;
     state.servicesKnown = true; state.totalProcesses = 5; state.ms = now; return state;
 }
 bool captureWindow(const std::wstring& path) {
@@ -2439,6 +2524,9 @@ bool panelSelfTest(const std::wstring& path) {
     std::wstring detailText(size_t(textLength) + 1, L'\0');
     GetWindowTextW(inlineText, detailText.data(), int(detailText.size()));
     check("inline_details_keep_paragraphs", detailText.find(L"\r\n") != std::wstring::npos);
+    check("details_estimate_battery_gain_when_closed", after && after->averageCpuWatts &&
+        extraMinutesIfStopped(current.power, current.history.back(), *after->averageCpuWatts).has_value() &&
+        detailText.find(tr(L"\n若關閉此程式：CPU 部分約可多用 ")) != std::wstring::npos);
     applyLanguage(true);
     check("inline_details_switch_language", inlineTitle == tr(L"程序詳情"));
     applyLanguage(false);
@@ -2446,6 +2534,13 @@ bool panelSelfTest(const std::wstring& path) {
     check("escape_returns_to_ranking", inlinePage == InlinePage::none && IsWindowVisible(viewport) && IsWindowVisible(mainWindow));
     showPowerDetails();
     check("power_details_reuse_panel", inlinePage == InlinePage::power && IsWindowVisible(inlineText));
+    auto pageText = [] {
+        std::wstring text(size_t(GetWindowTextLengthW(inlineText)) + 1, L'\0');
+        GetWindowTextW(inlineText, text.data(), int(text.size()));
+        return text;
+    };
+    check("power_details_show_last_sleep_and_health_trend", current.lastSleep && pageText().find(sleepText(*current.lastSleep)) != std::wstring::npos &&
+        pageText().find(healthTrendText()) != std::wstring::npos && !healthTrendText().empty());
     SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
     showReviewCandidates();
     check("candidate_review_reuses_panel", inlinePage == InlinePage::candidates && IsWindowVisible(inlineText));

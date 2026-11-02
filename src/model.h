@@ -99,6 +99,33 @@ struct DayStats {
     int date = 0; // yyyymmdd
     double batteryMinutes = 0, dischargedWh = 0, chargedWh = 0;
     std::vector<std::pair<std::wstring, double>> apps; // top apps by CPU mWh, highest first
+    double sleepMinutes = 0, sleepDropPercent = 0;      // sleep on battery, counted on the wake day
+    Value healthPercent;                                 // last battery health seen that day
+    std::optional<unsigned> cycles;
+};
+// One sleep, measured from the last battery sample before a sampling gap and
+// the first one after it (system sleep, Modern Standby, or a suspended app).
+struct SleepRecord {
+    uint64_t startMs = 0, endMs = 0;
+    double before = 0, after = 0; // battery percent
+    double hours() const { return (endMs - startMs) / 3600000.0; }
+    double drop() const { return before - after; }
+    double ratePerHour() const { return hours() > 0 ? drop() / hours() : 0; }
+};
+// A sleep worth recording: at least 10 minutes, on battery on both sides, levels known.
+std::optional<SleepRecord> evaluateSleep(const PowerSample& before, const PowerSample& after);
+// High standby drain: at least 3 points lost at more than 1.5 points per hour.
+bool unusualSleepDrain(const SleepRecord& sleep);
+// Minutes of battery gained if `appWatts` of the current drain stopped, at the
+// 5-minute average; empty when plugged in or the gain is under a minute.
+Value extraMinutesIfStopped(const PowerMetrics& power, const PowerSample& sample, double appWatts);
+// Fires once when plugged in and the level reaches `target`; re-arms when
+// unplugged or 5 points below the target.
+class ChargeReminder {
+    bool armed_ = true;
+public:
+    void reset() { armed_ = true; }
+    bool update(const PowerSample& sample, unsigned target);
 };
 // Session CPU energy for one executable name, summed over its processes,
 // including processes that have already exited.
@@ -122,6 +149,8 @@ struct Snapshot {
     double ledgerCoreMilliWh = 0;
     uint64_t ledgerStartedMs = 0;
     std::vector<DayStats> days; // last 7 days of history, newest last
+    std::optional<SleepRecord> lastSleep;
+    unsigned sleepCount = 0;    // increments with each detected sleep
     bool gpuKnown = false;      // GPU counters sampled for this process list
 };
 // Review candidates are opportunities to inspect, never a safety verdict or automatic action list.
@@ -176,6 +205,7 @@ public:
     static constexpr size_t KeepDays = 60, TopApps = 5;
     void addPower(const PowerSample& sample, int date);
     void addApps(const std::vector<ProcessRow>& rows, const CpuEnergyReport& report, uint64_t ms, int date);
+    void addSleep(const SleepRecord& sleep, int date);
     std::vector<DayStats> recent(size_t days) const;
     std::wstring save() const;
     // Replaces the history with the parsed days; malformed lines are skipped. False if none parsed.
