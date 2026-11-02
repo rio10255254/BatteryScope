@@ -1,4 +1,5 @@
 #include "platform.h"
+#include "i18n.h"
 #include <winternl.h>
 #include <initguid.h>
 #include <devguid.h>
@@ -6,92 +7,193 @@
 #include <setupapi.h>
 #include <tlhelp32.h>
 #include <psapi.h>
+#include <pdh.h>
+#include <pdhmsg.h>
 #include <set>
 #include <cwctype>
 #include <cstring>
 #include <limits>
+#include <mutex>
 
 namespace bs {
 namespace {
+// Windows power mode overlays (Settings > System > Power > Power mode).
 constexpr GUID BestEfficiency = {0x961cc777, 0x2547, 0x4f9d, {0x81, 0x74, 0x7d, 0x86, 0x18, 0x1b, 0x8a, 0x7a}};
-constexpr wchar_t SaverRegistryPath[] = L"Software\\BatteryScope";
-constexpr wchar_t SaverRegistryName[] = L"PreviousDCMode";
-using GetDcMode = DWORD (WINAPI*)(GUID*);
-using SetDcMode = DWORD (WINAPI*)(const GUID*);
-struct DcModeApi { GetDcMode get = nullptr; SetDcMode set = nullptr; };
-DcModeApi dcModeApi() {
-    static DcModeApi api = [] {
-        DcModeApi result;
+constexpr GUID BalancedOverlay = {0, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0}};
+constexpr GUID BetterPerformance = {0x3af9b8d9, 0x7c97, 0x431d, {0xad, 0x78, 0x34, 0xa8, 0xbf, 0xea, 0x43, 0x9f}}; // Windows 10 slider
+constexpr GUID BestPerformance = {0xded574b5, 0x45a0, 0x4f42, {0x87, 0x37, 0x46, 0x34, 0x5c, 0x09, 0xc2, 0x38}};
+constexpr wchar_t ModeRegistryPath[] = L"Software\\BatteryScope";
+using GetUserMode = DWORD (WINAPI*)(GUID*);
+using SetUserMode = DWORD (WINAPI*)(const GUID*);
+using EffectiveCallback = VOID (WINAPI*)(int mode, VOID* context);
+using RegisterEffective = HRESULT (WINAPI*)(ULONG version, EffectiveCallback callback, VOID* context, VOID** handle);
+using UnregisterEffective = HRESULT (WINAPI*)(VOID* handle);
+struct PowerApi {
+    GetUserMode getAc = nullptr, getDc = nullptr;
+    SetUserMode setAc = nullptr, setDc = nullptr;
+    RegisterEffective registerEffective = nullptr;
+    UnregisterEffective unregisterEffective = nullptr;
+};
+template<class T> void bind(HMODULE module, const char* name, T& target) {
+    FARPROC symbol = module ? GetProcAddress(module, name) : nullptr;
+    static_assert(sizeof(symbol) == sizeof(target));
+    std::memcpy(&target, &symbol, sizeof(target));
+}
+const PowerApi& powerApi() {
+    static PowerApi api = [] {
+        PowerApi result;
         HMODULE module = LoadLibraryW(L"powrprof.dll");
-        if (!module) return result;
-        FARPROC get = GetProcAddress(module, "PowerGetUserConfiguredDCPowerMode");
-        FARPROC set = GetProcAddress(module, "PowerSetUserConfiguredDCPowerMode");
-        static_assert(sizeof(get) == sizeof(result.get) && sizeof(set) == sizeof(result.set));
-        std::memcpy(&result.get, &get, sizeof(get));
-        std::memcpy(&result.set, &set, sizeof(set));
+        bind(module, "PowerGetUserConfiguredACPowerMode", result.getAc);
+        bind(module, "PowerGetUserConfiguredDCPowerMode", result.getDc);
+        bind(module, "PowerSetUserConfiguredACPowerMode", result.setAc);
+        bind(module, "PowerSetUserConfiguredDCPowerMode", result.setDc);
+        bind(module, "PowerRegisterForEffectivePowerModeNotifications", result.registerEffective);
+        bind(module, "PowerUnregisterFromEffectivePowerModeNotifications", result.unregisterEffective);
         return result;
     }();
     return api;
 }
-bool previousDcMode(GUID& value) {
+const wchar_t* previousName(bool pluggedIn) { return pluggedIn ? L"PreviousACMode" : L"PreviousDCMode"; }
+bool previousMode(bool pluggedIn, GUID& value) {
     DWORD size = sizeof(value);
-    return RegGetValueW(HKEY_CURRENT_USER, SaverRegistryPath, SaverRegistryName, RRF_RT_REG_BINARY,
+    return RegGetValueW(HKEY_CURRENT_USER, ModeRegistryPath, previousName(pluggedIn), RRF_RT_REG_BINARY,
         nullptr, &value, &size) == ERROR_SUCCESS && size == sizeof(value);
 }
-DWORD savePreviousDcMode(const GUID& value) {
+DWORD savePreviousMode(bool pluggedIn, const GUID& value) {
     HKEY key = nullptr;
-    DWORD status = RegCreateKeyExW(HKEY_CURRENT_USER, SaverRegistryPath, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr);
+    DWORD status = RegCreateKeyExW(HKEY_CURRENT_USER, ModeRegistryPath, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr);
     if (status) return status;
-    status = RegSetValueExW(key, SaverRegistryName, 0, REG_BINARY, reinterpret_cast<const BYTE*>(&value), sizeof(value));
+    status = RegSetValueExW(key, previousName(pluggedIn), 0, REG_BINARY, reinterpret_cast<const BYTE*>(&value), sizeof(value));
     RegCloseKey(key);
     return status;
 }
-void clearPreviousDcMode() {
+void clearPreviousMode(bool pluggedIn) {
     HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, SaverRegistryPath, 0, KEY_SET_VALUE, &key) == ERROR_SUCCESS) {
-        RegDeleteValueW(key, SaverRegistryName);
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, ModeRegistryPath, 0, KEY_SET_VALUE, &key) == ERROR_SUCCESS) {
+        RegDeleteValueW(key, previousName(pluggedIn));
         RegCloseKey(key);
     }
 }
 bool sameGuid(const GUID& a, const GUID& b) { return std::memcmp(&a, &b, sizeof(GUID)) == 0; }
+const GUID& modeGuid(PowerMode mode) {
+    return mode == PowerMode::efficiency ? BestEfficiency : mode == PowerMode::performance ? BestPerformance : BalancedOverlay;
 }
-SaverMode querySaverMode() {
-    SaverMode state;
-    auto api = dcModeApi();
-    if (!api.get || !api.set) { state.error = ERROR_PROC_NOT_FOUND; return state; }
-    GUID current{};
-    state.error = api.get(&current);
-    if (state.error) return state;
-    state.efficient = sameGuid(current, BestEfficiency);
-    GUID previous{};
-    state.restorable = state.efficient && previousDcMode(previous) && !sameGuid(previous, BestEfficiency);
+}
+PowerMode powerModeFromGuid(const GUID& guid) {
+    if (sameGuid(guid, BestEfficiency)) return PowerMode::efficiency;
+    if (sameGuid(guid, BalancedOverlay) || sameGuid(guid, BetterPerformance)) return PowerMode::balanced;
+    if (sameGuid(guid, BestPerformance)) return PowerMode::performance;
+    return PowerMode::other;
+}
+EffectiveMode effectiveModeFromValue(int value) {
+    switch (value) {
+    case 0: return EffectiveMode::energySaver;
+    case 1: return EffectiveMode::efficiency;
+    case 2: return EffectiveMode::balanced;
+    case 3: return EffectiveMode::performance;
+    case 4: return EffectiveMode::maxPerformance;
+    case 5: return EffectiveMode::game;
+    case 6: return EffectiveMode::mixedReality;
+    default: return EffectiveMode::unknown;
+    }
+}
+PowerModes queryPowerModes() {
+    PowerModes state;
+    const auto& api = powerApi();
+    auto read = [](GetUserMode get, SetUserMode set, bool pluggedIn, PowerMode& mode, bool& known, bool& restorable) {
+        GUID current{};
+        if (!get || !set || get(&current) != ERROR_SUCCESS) return false;
+        mode = powerModeFromGuid(current); known = true;
+        GUID previous{};
+        restorable |= previousMode(pluggedIn, previous) && !sameGuid(previous, current);
+        return true;
+    };
+    const bool ac = read(api.getAc, api.setAc, true, state.ac, state.acKnown, state.restorable);
+    const bool dc = read(api.getDc, api.setDc, false, state.dc, state.dcKnown, state.restorable);
+    if (!ac && !dc) state.error = api.getDc || api.getAc ? ERROR_GEN_FAILURE : ERROR_PROC_NOT_FOUND;
     return state;
 }
-DWORD toggleSaverMode() {
-    auto api = dcModeApi();
-    if (!api.get || !api.set) return ERROR_PROC_NOT_FOUND;
+DWORD setPowerMode(bool pluggedIn, PowerMode mode) {
+    if (mode == PowerMode::other) return ERROR_INVALID_PARAMETER;
+    const auto& api = powerApi();
+    GetUserMode get = pluggedIn ? api.getAc : api.getDc;
+    SetUserMode set = pluggedIn ? api.setAc : api.setDc;
+    if (!get || !set) return ERROR_PROC_NOT_FOUND;
     GUID current{};
-    DWORD status = api.get(&current);
+    DWORD status = get(&current);
     if (status) return status;
-    if (sameGuid(current, BestEfficiency)) {
+    const GUID& target = modeGuid(mode);
+    if (sameGuid(current, target)) return ERROR_SUCCESS;
+    GUID previous{};
+    const bool saved = previousMode(pluggedIn, previous);
+    // Remember only the setting from before BatteryScope's first change.
+    if (!saved && (status = savePreviousMode(pluggedIn, current)) != ERROR_SUCCESS) return status;
+    status = set(&target);
+    if (status) { if (!saved) clearPreviousMode(pluggedIn); return status; }
+    if (saved && sameGuid(previous, target)) clearPreviousMode(pluggedIn); // back at the original
+    return ERROR_SUCCESS;
+}
+DWORD restorePowerModes() {
+    const auto& api = powerApi();
+    DWORD result = ERROR_SUCCESS;
+    for (bool pluggedIn : {true, false}) {
         GUID previous{};
-        if (!previousDcMode(previous) || sameGuid(previous, BestEfficiency)) return ERROR_ALREADY_EXISTS;
-        status = api.set(&previous);
-        if (!status) clearPreviousDcMode();
-        return status;
+        if (!previousMode(pluggedIn, previous)) continue;
+        SetUserMode set = pluggedIn ? api.setAc : api.setDc;
+        const DWORD status = set ? set(&previous) : ERROR_PROC_NOT_FOUND;
+        if (status == ERROR_SUCCESS) clearPreviousMode(pluggedIn);
+        else if (result == ERROR_SUCCESS) result = status;
     }
-    status = savePreviousDcMode(current);
+    return result;
+}
+DWORD overridePowerMode(bool pluggedIn, PowerMode mode, GUID& replaced) {
+    if (mode == PowerMode::other) return ERROR_INVALID_PARAMETER;
+    const auto& api = powerApi();
+    GetUserMode get = pluggedIn ? api.getAc : api.getDc;
+    SetUserMode set = pluggedIn ? api.setAc : api.setDc;
+    if (!get || !set) return ERROR_PROC_NOT_FOUND;
+    DWORD status = get(&replaced);
+    return status ? status : set(&modeGuid(mode));
+}
+DWORD undoPowerModeOverride(bool pluggedIn, PowerMode mode, const GUID& replaced) {
+    const auto& api = powerApi();
+    GetUserMode get = pluggedIn ? api.getAc : api.getDc;
+    SetUserMode set = pluggedIn ? api.setAc : api.setDc;
+    if (!get || !set) return ERROR_PROC_NOT_FOUND;
+    GUID current{};
+    DWORD status = get(&current);
     if (status) return status;
-    status = api.set(&BestEfficiency);
-    if (status) clearPreviousDcMode();
-    return status;
+    if (!sameGuid(current, modeGuid(mode))) return ERROR_SUCCESS; // the user changed it since: leave theirs
+    return set(&replaced);
+}
+void* watchEffectivePowerMode(void (*callback)(EffectiveMode, void*), void* context) {
+    const auto& api = powerApi();
+    if (!api.registerEffective || !api.unregisterEffective || !callback) return nullptr;
+    struct Watch { void (*callback)(EffectiveMode, void*); void* context; void* handle = nullptr; };
+    auto* watch = new Watch{callback, context};
+    // Called on a system thread pool thread: once with the current mode, then on every change.
+    const EffectiveCallback relay = [](int mode, VOID* data) {
+        auto* target = static_cast<Watch*>(data);
+        target->callback(effectiveModeFromValue(mode), target->context);
+    };
+    for (ULONG version : {2ul, 1ul})
+        if (SUCCEEDED(api.registerEffective(version, relay, watch, &watch->handle)) && watch->handle) return watch;
+    delete watch;
+    return nullptr;
+}
+void unwatchEffectivePowerMode(void* token) {
+    if (!token) return;
+    struct Watch { void (*callback)(EffectiveMode, void*); void* context; void* handle = nullptr; };
+    auto* watch = static_cast<Watch*>(token);
+    if (powerApi().unregisterEffective) powerApi().unregisterEffective(watch->handle);
+    delete watch;
 }
 uint64_t fileTime(FILETIME t) { return (uint64_t(t.dwHighDateTime) << 32) | t.dwLowDateTime; }
 std::wstring errorText(DWORD code) {
     wchar_t* buffer = nullptr;
     FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
         nullptr, code, 0, reinterpret_cast<wchar_t*>(&buffer), 0, nullptr);
-    std::wstring s = buffer ? buffer : L"未知錯誤";
+    std::wstring s = buffer ? buffer : tr(L"未知錯誤");
     if (buffer) LocalFree(buffer);
     while (!s.empty() && iswspace(s.back())) s.pop_back();
     return s + L" (" + std::to_wstring(code) + L")";
@@ -100,6 +202,51 @@ std::wstring executablePath() {
     std::wstring s(32768, L'\0');
     DWORD n = GetModuleFileNameW(nullptr, s.data(), DWORD(s.size()));
     s.resize(n); return s;
+}
+namespace {
+// Battery device handles stay open between samples. The device list is rebuilt
+// on any read failure (removal, driver reset), every 5 minutes, or every
+// minute while no battery was found, instead of on every sample.
+class BatteryDevices {
+    std::vector<HANDLE> handles_;
+    uint64_t enumeratedAt_ = 0;
+    bool valid_ = false;
+    void close() {
+        for (HANDLE h : handles_) if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        handles_.clear();
+    }
+public:
+    std::mutex lock;
+    ~BatteryDevices() { close(); }
+    void invalidate() { valid_ = false; }
+    const std::vector<HANDLE>& current(uint64_t now) {
+        const uint64_t age = now - enumeratedAt_;
+        if (valid_ && age < 300000 && (!handles_.empty() || age < 60000)) return handles_;
+        close();
+        enumeratedAt_ = now; valid_ = true;
+        HDEVINFO devices = SetupDiGetClassDevsW(&GUID_DEVCLASS_BATTERY, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        if (devices == INVALID_HANDLE_VALUE) return handles_;
+        for (DWORD i = 0;; ++i) {
+            SP_DEVICE_INTERFACE_DATA iface{}; iface.cbSize = sizeof(iface);
+            if (!SetupDiEnumDeviceInterfaces(devices, nullptr, &GUID_DEVCLASS_BATTERY, i, &iface)) break;
+            DWORD needed = 0;
+            SetupDiGetDeviceInterfaceDetailW(devices, &iface, nullptr, 0, &needed, nullptr);
+            HANDLE handle = INVALID_HANDLE_VALUE;
+            if (needed) {
+                std::vector<BYTE> bytes(needed);
+                auto detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(bytes.data());
+                detail->cbSize = sizeof(*detail);
+                if (SetupDiGetDeviceInterfaceDetailW(devices, &iface, detail, needed, nullptr, nullptr))
+                    handle = CreateFileW(detail->DevicePath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            }
+            handles_.push_back(handle); // A failed entry still marks the reading incomplete.
+        }
+        SetupDiDestroyDeviceInfoList(devices);
+        return handles_;
+    }
+};
+BatteryDevices& batteryDevices() { static BatteryDevices devices; return devices; }
 }
 PowerSample readPower() {
     PowerSample p;
@@ -114,64 +261,87 @@ PowerSample readPower() {
         p.charging = system.BatteryFlag != 255 && (system.BatteryFlag & 8);
         if (p.present && system.BatteryLifePercent <= 100) p.percent = system.BatteryLifePercent;
     }
-    HDEVINFO devices = SetupDiGetClassDevsW(&GUID_DEVCLASS_BATTERY, nullptr, nullptr,
-        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-    if (devices == INVALID_HANDLE_VALUE) return p;
-    double remaining = 0, full = 0, watts = 0;
-    unsigned count = 0;
-    bool capacityOK = true, rateOK = true;
-    for (DWORD i = 0;; ++i) {
-        SP_DEVICE_INTERFACE_DATA iface{}; iface.cbSize = sizeof(iface);
-        if (!SetupDiEnumDeviceInterfaces(devices, nullptr, &GUID_DEVCLASS_BATTERY, i, &iface)) break;
-        DWORD needed = 0;
-        SetupDiGetDeviceInterfaceDetailW(devices, &iface, nullptr, 0, &needed, nullptr);
-        if (!needed) { capacityOK = rateOK = false; continue; }
-        std::vector<BYTE> bytes(needed);
-        auto detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(bytes.data());
-        detail->cbSize = sizeof(*detail);
-        if (!SetupDiGetDeviceInterfaceDetailW(devices, &iface, detail, needed, nullptr, nullptr)) {
-            capacityOK = rateOK = false; continue;
+    auto& cache = batteryDevices();
+    std::lock_guard<std::mutex> guard(cache.lock);
+    double remaining = 0, full = 0, design = 0, watts = 0;
+    unsigned count = 0, cycles = 0;
+    bool capacityOK = true, rateOK = true, designOK = true, chargingSeen = false;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        remaining = full = design = watts = 0; count = cycles = 0;
+        capacityOK = rateOK = designOK = true; chargingSeen = false;
+        bool failed = false;
+        for (HANDLE battery : cache.current(p.ms)) {
+            auto fail = [&] { capacityOK = rateOK = designOK = false; failed = true; };
+            if (battery == INVALID_HANDLE_VALUE) { fail(); continue; }
+            ULONG timeout = 0, tag = 0;
+            DWORD returned = 0;
+            if (!DeviceIoControl(battery, IOCTL_BATTERY_QUERY_TAG, &timeout, sizeof(timeout), &tag, sizeof(tag), &returned, nullptr) || !tag) { fail(); continue; }
+            BATTERY_QUERY_INFORMATION query{}; query.BatteryTag = tag; query.InformationLevel = BatteryInformation;
+            BATTERY_INFORMATION info{};
+            if (!DeviceIoControl(battery, IOCTL_BATTERY_QUERY_INFORMATION, &query, sizeof(query), &info, sizeof(info), &returned, nullptr)) { fail(); continue; }
+            if (!(info.Capabilities & BATTERY_SYSTEM_BATTERY)) continue;
+            ++count;
+            BATTERY_WAIT_STATUS wait{}; wait.BatteryTag = tag;
+            BATTERY_STATUS status{};
+            if (!DeviceIoControl(battery, IOCTL_BATTERY_QUERY_STATUS, &wait, sizeof(wait), &status, sizeof(status), &returned, nullptr)) { fail(); continue; }
+            const bool relative = info.Capabilities & BATTERY_CAPACITY_RELATIVE;
+            if (relative || status.Capacity == BATTERY_UNKNOWN_CAPACITY || info.FullChargedCapacity == BATTERY_UNKNOWN_CAPACITY || !info.FullChargedCapacity)
+                capacityOK = false;
+            else { remaining += status.Capacity / 1000.0; full += info.FullChargedCapacity / 1000.0; }
+            if (relative || info.DesignedCapacity == BATTERY_UNKNOWN_CAPACITY || !info.DesignedCapacity) designOK = false;
+            else design += info.DesignedCapacity / 1000.0;
+            cycles = info.CycleCount; // 0 means the battery has no cycle counter
+            if (relative || ULONG(status.Rate) == BATTERY_UNKNOWN_RATE) rateOK = false;
+            else watts += -double(status.Rate) / 1000.0;
+            if (status.PowerState & BATTERY_CHARGING) chargingSeen = true;
         }
-        Handle battery(CreateFileW(detail->DevicePath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
-        if (!battery) { capacityOK = rateOK = false; continue; }
-        ULONG timeout = 0, tag = 0;
-        DWORD returned = 0;
-        if (!DeviceIoControl(battery, IOCTL_BATTERY_QUERY_TAG, &timeout, sizeof(timeout), &tag, sizeof(tag), &returned, nullptr) || !tag) {
-            capacityOK = rateOK = false; continue;
-        }
-        BATTERY_QUERY_INFORMATION query{}; query.BatteryTag = tag; query.InformationLevel = BatteryInformation;
-        BATTERY_INFORMATION info{};
-        if (!DeviceIoControl(battery, IOCTL_BATTERY_QUERY_INFORMATION, &query, sizeof(query), &info, sizeof(info), &returned, nullptr)) {
-            capacityOK = rateOK = false; continue;
-        }
-        if (!(info.Capabilities & BATTERY_SYSTEM_BATTERY)) continue;
-        ++count;
-        BATTERY_WAIT_STATUS wait{}; wait.BatteryTag = tag;
-        BATTERY_STATUS status{};
-        if (!DeviceIoControl(battery, IOCTL_BATTERY_QUERY_STATUS, &wait, sizeof(wait), &status, sizeof(status), &returned, nullptr)) {
-            capacityOK = rateOK = false; continue;
-        }
-        const bool relative = info.Capabilities & BATTERY_CAPACITY_RELATIVE;
-        if (relative || status.Capacity == BATTERY_UNKNOWN_CAPACITY || info.FullChargedCapacity == BATTERY_UNKNOWN_CAPACITY || !info.FullChargedCapacity)
-            capacityOK = false;
-        else { remaining += status.Capacity / 1000.0; full += info.FullChargedCapacity / 1000.0; }
-        if (relative || ULONG(status.Rate) == BATTERY_UNKNOWN_RATE) rateOK = false;
-        else watts += -double(status.Rate) / 1000.0;
-        if (status.PowerState & BATTERY_CHARGING) p.charging = true;
+        if (!failed) break;
+        cache.invalidate(); // a battery was removed or reset: re-enumerate once now
     }
-    SetupDiDestroyDeviceInfoList(devices);
+    if (chargingSeen) p.charging = true;
     if (count) {
         p.present = true;
         if (capacityOK && full > 0) {
             p.remainingWh = remaining; p.fullWh = full;
             p.percent = std::clamp(remaining / full * 100, 0.0, 100.0);
         }
+        if (designOK && design > 0) p.designWh = design;
+        if (count == 1 && cycles > 0) p.cycleCount = cycles;
         if (rateOK) p.watts = watts;
     }
     return p;
 }
 
+GpuUsage::GpuUsage() {
+    PDH_HQUERY query = nullptr;
+    if (PdhOpenQueryW(nullptr, 0, &query) != ERROR_SUCCESS) return;
+    PDH_HCOUNTER counter = nullptr;
+    if (PdhAddEnglishCounterW(query, L"\\GPU Engine(*)\\Utilization Percentage", 0, &counter) != ERROR_SUCCESS) {
+        PdhCloseQuery(query); return;
+    }
+    query_ = query; counter_ = counter;
+}
+GpuUsage::~GpuUsage() { if (query_) PdhCloseQuery(static_cast<PDH_HQUERY>(query_)); }
+bool GpuUsage::sample(std::unordered_map<uint32_t, double>& usage) {
+    usage.clear();
+    if (!query_) return false;
+    if (PdhCollectQueryData(static_cast<PDH_HQUERY>(query_)) != ERROR_SUCCESS) { primed_ = false; return false; }
+    if (!primed_) { primed_ = true; return false; } // rate counters need two samples
+    DWORD bytes = 0, count = 0;
+    PDH_STATUS status = PdhGetFormattedCounterArrayW(static_cast<PDH_HCOUNTER>(counter_), PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, &bytes, &count, nullptr);
+    if (status != PDH_STATUS(PDH_MORE_DATA) || !bytes) return false;
+    std::vector<BYTE> buffer(bytes);
+    auto items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buffer.data());
+    status = PdhGetFormattedCounterArrayW(static_cast<PDH_HCOUNTER>(counter_), PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, &bytes, &count, items);
+    if (status != ERROR_SUCCESS) return false;
+    std::vector<std::pair<std::wstring, double>> instances;
+    instances.reserve(count);
+    for (DWORD i = 0; i < count; ++i)
+        if (items[i].szName && (items[i].FmtValue.CStatus == PDH_CSTATUS_VALID_DATA || items[i].FmtValue.CStatus == PDH_CSTATUS_NEW_DATA))
+            instances.emplace_back(items[i].szName, items[i].FmtValue.doubleValue);
+    usage = aggregateGpu(instances);
+    return true;
+}
 struct ScHandle {
     SC_HANDLE value = nullptr;
     explicit ScHandle(SC_HANDLE h) : value(h) {}
@@ -273,6 +443,39 @@ DWORD closeProcess(const ProcessRow& expected, bool force) {
     EnumWindows(requestClose, reinterpret_cast<LPARAM>(&request));
     return request.count ? ERROR_SUCCESS : ERROR_NOT_SUPPORTED;
 }
+DWORD setProcessEfficiency(const ProcessRow& expected, bool enable, DWORD& priority) {
+    Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_INFORMATION | SYNCHRONIZE, FALSE, expected.pid));
+    if (!process) return GetLastError();
+    if (!matchesCreation(process, expected.created) || WaitForSingleObject(process, 0) != WAIT_TIMEOUT) return ERROR_NOT_FOUND;
+    if (!safeProcess(process, expected.pid)) return ERROR_ACCESS_DENIED;
+    bool servicesOK = false;
+    auto services = readServices(servicesOK);
+    if (!servicesOK) return ERROR_ACCESS_DENIED;
+    for (const auto& service : services) if (service.pid == expected.pid) return ERROR_ACCESS_DENIED;
+    if (enable) {
+        const DWORD current = GetPriorityClass(process);
+        if (!current) return GetLastError();
+        priority = current == IDLE_PRIORITY_CLASS ? NORMAL_PRIORITY_CLASS : current;
+    }
+    PROCESS_POWER_THROTTLING_STATE state{};
+    state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    // Enabled: always throttle execution speed. Disabled: let Windows decide again.
+    state.ControlMask = enable ? PROCESS_POWER_THROTTLING_EXECUTION_SPEED : 0;
+    state.StateMask = enable ? PROCESS_POWER_THROTTLING_EXECUTION_SPEED : 0;
+    if (!SetProcessInformation(process, ProcessPowerThrottling, &state, sizeof(state))) return GetLastError();
+    if (!SetPriorityClass(process, enable ? IDLE_PRIORITY_CLASS : (priority ? priority : NORMAL_PRIORITY_CLASS))) {
+        const DWORD error = GetLastError();
+        if (enable) { state.ControlMask = state.StateMask = 0; SetProcessInformation(process, ProcessPowerThrottling, &state, sizeof(state)); }
+        return error;
+    }
+    return ERROR_SUCCESS;
+}
+bool processEfficiencyOn(DWORD pid) {
+    Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+    PROCESS_POWER_THROTTLING_STATE state{}; state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    return process && GetProcessInformation(process, ProcessPowerThrottling, &state, sizeof(state)) &&
+        (state.ControlMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) && (state.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED);
+}
 static bool protectedService(const std::wstring& name) {
     static const std::set<std::wstring> deny = {
         L"rpcss", L"rpceptmapper", L"dcomlaunch", L"eventlog", L"plugplay", L"power", L"profsvc", L"samss",
@@ -371,17 +574,38 @@ struct NativeProcessInformation {
     LARGE_INTEGER otherTransferCount;
 };
 
+// SYSTEM_THREAD_INFORMATION entries follow each process entry.
+struct NativeThreadInformation {
+    LARGE_INTEGER kernelTime;
+    LARGE_INTEGER userTime;
+    LARGE_INTEGER createTime;
+    ULONG waitTime;
+    PVOID startAddress;
+    HANDLE uniqueProcess; // CLIENT_ID
+    HANDLE uniqueThread;
+    LONG priority;
+    LONG basePriority;
+    ULONG contextSwitches;
+    ULONG threadState;
+    ULONG waitReason;
+};
+#ifdef _WIN64
+static_assert(sizeof(NativeProcessInformation) == 0x100 && sizeof(NativeThreadInformation) == 0x50,
+    "SystemProcessInformation x64 layout");
+#endif
+
 struct RawProcess {
     DWORD pid = 0;
     DWORD parentPid = 0;
-    uint64_t created = 0, cpu = 0, io = 0;
+    uint64_t created = 0, cpu = 0, io = 0, cycles = 0;
     std::wstring name;
     double memoryMB = 0;
-    bool cpuKnown = false;
+    bool cpuKnown = false, cyclesKnown = false;
     bool ioKnown = false, memoryKnown = false;
 };
 
-bool systemProcessSnapshot(std::vector<RawProcess>& result, uint64_t& sampleMs, double& durationMs) {
+bool systemProcessSnapshot(std::vector<RawProcess>& result, uint64_t& sampleMs, double& durationMs,
+    std::vector<ThreadSample>* threads) {
     using Query = NTSTATUS (NTAPI*)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
     static Query query = [] {
         FARPROC symbol = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation");
@@ -425,6 +649,7 @@ bool systemProcessSnapshot(std::vector<RawProcess>& result, uint64_t& sampleMs, 
             row.created = uint64_t(process->createTime.QuadPart);
             row.cpu = uint64_t(process->kernelTime.QuadPart) + uint64_t(process->userTime.QuadPart);
             row.cpuKnown = true;
+            row.cycles = process->cycleTime; row.cyclesKnown = process->cycleTime != 0;
             row.io = uint64_t(process->readTransferCount.QuadPart) + uint64_t(process->writeTransferCount.QuadPart);
             row.ioKnown = true;
             row.memoryKnown = true;
@@ -435,6 +660,22 @@ bool systemProcessSnapshot(std::vector<RawProcess>& result, uint64_t& sampleMs, 
                     row.name.assign(process->imageName.Buffer, process->imageName.Length / sizeof(wchar_t));
             }
             if (row.name.empty()) row.name = row.pid == 4 ? L"System" : L"PID " + std::to_wstring(row.pid);
+            if (threads) {
+                const size_t first = offset + sizeof(NativeProcessInformation);
+                const size_t limit = process->nextEntryOffset
+                    ? std::min(bytes.size(), offset + size_t(process->nextEntryOffset)) : bytes.size();
+                const size_t count = process->numberOfThreads;
+                if (first <= limit && count <= (limit - first) / sizeof(NativeThreadInformation)) {
+                    for (size_t i = 0; i < count; ++i) {
+                        NativeThreadInformation thread;
+                        std::memcpy(&thread, bytes.data() + first + i * sizeof(thread), sizeof(thread));
+                        const ULONG_PTR tid = reinterpret_cast<ULONG_PTR>(thread.uniqueThread);
+                        if (!tid || tid > std::numeric_limits<DWORD>::max()) continue;
+                        threads->push_back({row.pid, DWORD(tid), uint64_t(thread.createTime.QuadPart),
+                            uint64_t(thread.kernelTime.QuadPart) + uint64_t(thread.userTime.QuadPart)});
+                    }
+                }
+            }
             result.push_back(std::move(row));
         }
         if (!process->nextEntryOffset) break;
@@ -463,6 +704,9 @@ bool toolhelpProcessSnapshot(std::vector<RawProcess>& result, size_t& total,
         if (row.cpuKnown) {
             row.created = fileTime(c);
             row.cpu = fileTime(k) + fileTime(u);
+            ULONG64 cycles = 0;
+            row.cyclesKnown = QueryProcessCycleTime(process, &cycles) && cycles;
+            row.cycles = cycles;
             IO_COUNTERS io{};
             row.ioKnown = GetProcessIoCounters(process, &io) != FALSE;
             row.io = io.ReadTransferCount + io.WriteTransferCount;
@@ -480,21 +724,27 @@ bool toolhelpProcessSnapshot(std::vector<RawProcess>& result, size_t& total,
 }
 
 std::vector<ProcessRow> Collector::collect(size_t& total, size_t& inaccessible, bool background) {
-    (void)background;
     work_ = {};
     total = inaccessible = 0;
     std::vector<RawProcess> raw;
-    systemSnapshot_ = !forceToolhelp_ && systemProcessSnapshot(raw, sampleMs_, snapshotDurationMs_);
+    threads_.threads.clear(); // Keeps capacity across samples.
+    // Thread placement is only sampled while the panel is visible.
+    systemSnapshot_ = !forceToolhelp_ && systemProcessSnapshot(raw, sampleMs_, snapshotDurationMs_,
+        background ? nullptr : &threads_.threads);
+    threadsCaptured_ = systemSnapshot_ && !background;
+    threads_.sampleMs = sampleMs_;
     if (systemSnapshot_) total = raw.size();
     else {
         raw.clear(); // A failed native parse may already have appended some entries.
+        threads_.threads.clear();
         if (!toolhelpProcessSnapshot(raw, total, sampleMs_, snapshotDurationMs_, work_)) return {};
     }
     intervalSeconds_ = previousSampleMs_ && sampleMs_ > previousSampleMs_ && sampleMs_ - previousSampleMs_ <= 30000
         ? (sampleMs_ - previousSampleMs_) / 1000.0 : 0;
     previousSampleMs_ = sampleMs_;
     const uint64_t now = GetTickCount64();
-    if (!servicesAt_ || now - servicesAt_ >= 10000) {
+    // Service list: every 10 s while the panel is open, 30 s while hidden. Actions re-read it live.
+    if (!servicesAt_ || now - servicesAt_ >= (background ? 30000u : 10000u)) {
         services_ = readServices(servicesKnown_); servicesAt_ = now;
     }
     std::map<DWORD, std::vector<ServiceInfo>> serviceMap;
@@ -544,7 +794,9 @@ std::vector<ProcessRow> Collector::collect(size_t& total, size_t& inaccessible, 
         auto old = previous_.find(row.pid);
         if (source.cpuKnown && old != previous_.end() && old->second.created == row.created) {
             auto& p = old->second;
-            const double dt = (now - p.ms) / 1000.0;
+            // CPU and I/O counters were captured at sampleMs_, not after the
+            // service and window enumeration that follows the snapshot.
+            const double dt = sampleMs_ > p.ms ? (sampleMs_ - p.ms) / 1000.0 : 0;
             if (dt > 0 && dt <= 30) {
                 row.measured = true;
                 row.cpu = cpuPercent(p.cpu, cpu, dt, processors);
@@ -553,19 +805,16 @@ std::vector<ProcessRow> Collector::collect(size_t& total, size_t& inaccessible, 
                 row.averageCpu = smooth(p.averageCpu, row.cpu, dt);
                 row.averageIo = smooth(p.averageIo, row.ioMB, dt);
                 row.busySeconds = row.cpu >= 1 || (row.ioKnown && row.ioMB >= 1) ? p.busySeconds + dt : 0;
+                if (source.cyclesKnown && p.cyclesKnown && source.cycles >= p.cycles) row.cycleRate = (source.cycles - p.cycles) / dt;
                 // An activity heuristic, NOT watts or a calibrated energy attribution.
                 row.score = row.averageCpu + std::min(20.0, row.averageIo * 2);
             }
         }
-        next[row.pid] = {row.created, cpu, ioBytes, now, row.averageCpu, row.averageIo, row.busySeconds, rawIoKnown};
-        if (!source.cpuKnown) row.reason = L"統計受限";
-        else if (!row.measured) row.reason = L"採集中";
-        else if (row.averageCpu < .1 && row.averageIo < .1) row.reason = L"活動低";
-        else {
-            row.reason = row.averageCpu >= row.averageIo * 2 ? L"CPU 活動" : L"I/O 活動";
-            if (row.busySeconds >= 30) row.reason += L"・持續 " + std::to_wstring(int(row.busySeconds)) + L" 秒";
-        }
-        if (row.services.size() > 1) row.reason += L"・共用程序";
+        next[row.pid] = {row.created, cpu, ioBytes, sampleMs_, row.averageCpu, row.averageIo, row.busySeconds, rawIoKnown,
+            source.cycles, source.cyclesKnown};
+        row.activity = !source.cpuKnown ? ActivityReason::limited : !row.measured ? ActivityReason::warming
+            : row.averageCpu < .1 && row.averageIo < .1 ? ActivityReason::low
+            : row.averageCpu >= row.averageIo * 2 ? ActivityReason::cpu : ActivityReason::io;
         rows.push_back(std::move(row));
     }
     previous_ = std::move(next);

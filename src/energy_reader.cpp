@@ -119,7 +119,8 @@ struct EnergyReader::Impl {
 EnergyReader::EnergyReader() : impl_(std::make_unique<Impl>()) {}
 EnergyReader::~EnergyReader() = default;
 void EnergyReader::reset() { impl_->baseline=false; impl_->previousCpu.clear(); impl_->previousMs=0; impl_->previousThreads.clear(); }
-void EnergyReader::sampleThreadPlacement(std::vector<ProcessRow>& rows) {
+void EnergyReader::clearThreadPlacement() { impl_->previousThreads.clear(); }
+void EnergyReader::sampleThreadPlacement(std::vector<ProcessRow>& rows, const ThreadSnapshot* snapshot) {
     auto& state=*impl_;
     if(state.topology.empty() || GetActiveProcessorGroupCount()!=1) return;
     std::vector<ProcessRow*> candidates;
@@ -136,10 +137,46 @@ void EnergyReader::sampleThreadPlacement(std::vector<ProcessRow>& rows) {
     for(const auto& core:state.topology) {
         KAFFINITY mask=0; for(auto logical:core) mask|=KAFFINITY(1)<<logical; masks.push_back(mask);
     }
+    // Returns the physical core a thread is confined to, -1 if unconfined, or -2 if unreadable.
+    auto confinedCore=[&](DWORD tid) {
+        Handle handle(OpenThread(THREAD_QUERY_LIMITED_INFORMATION,FALSE,tid));
+        GROUP_AFFINITY affinity{};
+        if(!handle || !GetThreadGroupAffinity(handle,&affinity) || affinity.Group!=0) return -2;
+        for(size_t i=0;i<masks.size();++i) if(affinity.Mask && (affinity.Mask & ~masks[i])==0) return int(i);
+        return -1;
+    };
+    auto contribute=[](ProcessRow& row,const Impl::ThreadReading& old,const Impl::ThreadReading& reading) {
+        if(reading.core<0 || old.pid!=reading.pid || old.created!=reading.created || old.core!=reading.core
+            || reading.cpu<old.cpu || reading.ms<=old.ms || reading.ms-old.ms>30000) return;
+        row.fixedCoreBusy[size_t(reading.core)]+=double(reading.cpu-old.cpu)/1e7/((reading.ms-old.ms)/1000.0);
+    };
     std::map<DWORD,Impl::ThreadReading> next;
-    Handle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0));
-    THREADENTRY32 thread{}; thread.dwSize=sizeof(thread); unsigned opened=0;
-    if(!snapshot || !Thread32First(snapshot,&thread)) { state.previousThreads.clear(); return; }
+    unsigned opened=0;
+    if(snapshot) {
+        // CPU times come from the collector's snapshot, so every thread shares the
+        // process sample's timestamp. Only new threads, or threads that ran since
+        // the previous sample, need a handle to read their affinity.
+        for(const auto& thread:snapshot->threads) {
+            auto row=selected.find(thread.pid);
+            if(row==selected.end()) continue;
+            Impl::ThreadReading reading{thread.created,thread.cpu,snapshot->sampleMs,thread.pid,-1};
+            auto prior=state.previousThreads.find(thread.tid);
+            const bool known=prior!=state.previousThreads.end() && prior->second.pid==reading.pid
+                && prior->second.created==reading.created && reading.ms>prior->second.ms && reading.ms-prior->second.ms<=30000;
+            if(known && reading.cpu==prior->second.cpu) { reading.core=prior->second.core; next[thread.tid]=reading; continue; }
+            if(opened>=2048) continue;
+            ++opened;
+            reading.core=confinedCore(thread.tid);
+            if(reading.core==-2) continue;
+            if(known) contribute(*row->second,prior->second,reading);
+            next[thread.tid]=reading;
+        }
+        state.previousThreads=std::move(next);
+        return;
+    }
+    Handle toolhelp(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0));
+    THREADENTRY32 thread{}; thread.dwSize=sizeof(thread);
+    if(!toolhelp || !Thread32First(toolhelp,&thread)) { state.previousThreads.clear(); return; }
     do {
         auto row=selected.find(thread.th32OwnerProcessID);
         if(row==selected.end() || opened>=2048) continue;
@@ -151,15 +188,9 @@ void EnergyReader::sampleThreadPlacement(std::vector<ProcessRow>& rows) {
         for(size_t i=0;i<masks.size();++i) if(affinity.Mask && (affinity.Mask & ~masks[i])==0) { core=int(i); break; }
         Impl::ThreadReading reading{fileTime(created),fileTime(kernel)+fileTime(user),GetTickCount64(),thread.th32OwnerProcessID,core};
         auto prior=state.previousThreads.find(thread.th32ThreadID);
-        if(core>=0 && prior!=state.previousThreads.end()) {
-            const auto& old=prior->second;
-            if(old.pid==reading.pid && old.created==reading.created && old.core==core && reading.cpu>=old.cpu && reading.ms>old.ms && reading.ms-old.ms<=30000) {
-                double seconds=(reading.ms-old.ms)/1000.0;
-                row->second->fixedCoreBusy[size_t(core)]+=double(reading.cpu-old.cpu)/1e7/seconds;
-            }
-        }
+        if(prior!=state.previousThreads.end()) contribute(*row->second,prior->second,reading);
         next[thread.th32ThreadID]=reading;
-    } while(Thread32Next(snapshot,&thread));
+    } while(Thread32Next(toolhelp,&thread));
     state.previousThreads=std::move(next);
 }
 CpuEnergyReport EnergyReader::sample() {

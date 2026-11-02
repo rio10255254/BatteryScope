@@ -28,13 +28,56 @@ bool safeProcess(HANDLE process, DWORD pid, std::wstring* reason = nullptr);
 DWORD closeProcess(const ProcessRow& expected, bool force);
 DWORD stopService(const std::wstring& name, DWORD expectedPid, uint64_t expectedCreated);
 bool setSamplerEcoQoS(bool enabled);
-struct SaverMode {
-    DWORD error = ERROR_SUCCESS;
-    bool efficient = false;
-    bool restorable = false;
+// Windows power mode (Settings > System > Power > Power mode), configured
+// separately for plugged in and on battery. "other" is an OEM or unknown mode.
+enum class PowerMode { efficiency, balanced, performance, other };
+PowerMode powerModeFromGuid(const GUID& overlay);
+struct PowerModes {
+    DWORD error = ERROR_SUCCESS; // ERROR_PROC_NOT_FOUND when Windows lacks the API
+    PowerMode ac = PowerMode::other, dc = PowerMode::other;
+    bool acKnown = false, dcKnown = false;
+    bool restorable = false; // a mode BatteryScope changed still differs from its original
 };
-SaverMode querySaverMode();
-DWORD toggleSaverMode();
+PowerModes queryPowerModes();
+// The first change to each side saves the original so restorePowerModes can undo it.
+DWORD setPowerMode(bool pluggedIn, PowerMode mode);
+DWORD restorePowerModes();
+// The mode Windows applies right now (documented EFFECTIVE_POWER_MODE).
+enum class EffectiveMode { unknown, energySaver, efficiency, balanced, performance, maxPerformance, game, mixedReality };
+EffectiveMode effectiveModeFromValue(int value);
+// The callback runs on a system thread, first with the current mode. Returns
+// null if unsupported; pass the token to unwatchEffectivePowerMode.
+// Automatic rules change a mode and later undo only their own change, without
+// the Restore-original bookkeeping. overridePowerMode returns the overlay it
+// replaced; undoPowerModeOverride puts it back only if the side is still at
+// `mode` (so a change the user made meanwhile is kept).
+DWORD overridePowerMode(bool pluggedIn, PowerMode mode, GUID& replaced);
+DWORD undoPowerModeOverride(bool pluggedIn, PowerMode mode, const GUID& replaced);
+// Windows 11 "Efficiency mode" for one process, as in Task Manager: EcoQoS
+// execution-speed throttling plus idle priority. The same identity and safety
+// checks as closing apply. Enabling stores the original priority class in
+// `priority`; disabling restores it and hands throttling back to Windows.
+DWORD setProcessEfficiency(const ProcessRow& expected, bool enable, DWORD& priority);
+bool processEfficiencyOn(DWORD pid);
+void* watchEffectivePowerMode(void (*callback)(EffectiveMode, void*), void* context);
+void unwatchEffectivePowerMode(void* token);
+
+// Per-process GPU utilization from the Windows "GPU Engine" performance
+// counters (the source Task Manager uses). Utilization, not watts.
+class GpuUsage {
+    void* query_ = nullptr;
+    void* counter_ = nullptr;
+    bool primed_ = false;
+public:
+    GpuUsage();
+    ~GpuUsage();
+    GpuUsage(const GpuUsage&) = delete;
+    GpuUsage& operator=(const GpuUsage&) = delete;
+    bool available() const { return counter_ != nullptr; }
+    // Usage since the previous call, by PID; false until two samples exist.
+    bool sample(std::unordered_map<uint32_t, double>& usage);
+    void reset() { primed_ = false; }
+};
 
 struct CollectionWork { size_t paths = 0, safety = 0, memory = 0, processOpens = 0; };
 
@@ -43,6 +86,8 @@ class Collector {
         uint64_t created = 0, cpu = 0, io = 0, ms = 0;
         double averageCpu = 0, averageIo = 0, busySeconds = 0;
         bool ioKnown = false;
+        uint64_t cycles = 0;
+        bool cyclesKnown = false;
     };
     std::map<DWORD, Previous> previous_;
     struct Metadata {
@@ -61,6 +106,8 @@ class Collector {
     uint64_t sampleMs_ = 0, previousSampleMs_ = 0;
     double intervalSeconds_ = 0, snapshotDurationMs_ = 0;
     bool systemSnapshot_ = false;
+    ThreadSnapshot threads_;
+    bool threadsCaptured_ = false;
 public:
     explicit Collector(bool cacheEnabled = true, bool forceToolhelp = false)
         : cacheEnabled_(cacheEnabled), forceToolhelp_(forceToolhelp) {}
@@ -71,6 +118,8 @@ public:
     double snapshotDurationMs() const { return snapshotDurationMs_; }
     bool systemSnapshot() const { return systemSnapshot_; }
     bool servicesKnown() const { return servicesKnown_; }
-    void reset() { previous_.clear(); metadata_.clear(); servicesAt_ = sampleMs_ = previousSampleMs_ = 0; intervalSeconds_ = snapshotDurationMs_ = 0; systemSnapshot_ = false; }
+    // Thread CPU times captured with the last foreground system snapshot, or null.
+    const ThreadSnapshot* threadSnapshot() const { return threadsCaptured_ ? &threads_ : nullptr; }
+    void reset() { previous_.clear(); metadata_.clear(); servicesAt_ = sampleMs_ = previousSampleMs_ = 0; intervalSeconds_ = snapshotDurationMs_ = 0; systemSnapshot_ = false; threads_.threads.clear(); threadsCaptured_ = false; }
 };
 }

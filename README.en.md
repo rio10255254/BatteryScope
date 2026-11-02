@@ -14,13 +14,42 @@ A small native Windows battery and background-process monitor built with C++17 a
 4. Use Background and Show filters, the mouse wheel, arrow keys, Home/End, or Page Up/Down. Enter or double-click opens details.
 5. Select a process to inspect it, request a normal close, force quit with confirmation, or stop an eligible hosted service. Protected processes cannot be closed.
 
-The menu also provides battery and charging details, optional launch at sign-in, and Quit. Launch at sign-in is off until you enable it. Windows permission dialogs, standard dialog buttons, and system-provided service names follow the system language.
+The menu also provides power mode, battery and charging details, session energy, finding power-hungry background apps, CSV export, appearance (theme and style), language, a low battery alert, the Ctrl+Alt+B shortcut, optional launch at sign-in, and Quit. Launch at sign-in is off until you enable it. If you move the folder, opening BatteryScope from the new location repoints the entry automatically; an entry for another BatteryScope copy that still exists is left unchanged. Windows permission dialogs, standard dialog buttons, and system-provided service names follow the system language.
 
-The **Save** button sets Windows' battery-side power mode to **Best power efficiency** with one click; **Undo** restores the previous mode, even after restarting BatteryScope. The previous setting is stored under the current user's BatteryScope registry key. While plugged in, this configures the mode for the next battery session. This changes the Windows power mode, not the separate Energy saver switch, and does not close apps or services. The button is unavailable if the Windows API is unsupported or Best efficiency was already selected outside BatteryScope.
+**Appearance and extras**
 
-**⋯ → Windows Energy saver settings** opens the Windows page where you can enable Energy saver or set its automatic threshold. Battery details show the energy-saving status reported by Windows. BatteryScope does not use an undocumented switch to change this separate feature.
+- **Style:** **⋯ → Appearance** offers *Pixel style* (default) or *Smooth style*. Pixel style uses stair-stepped corners, pixel outlines, and buttons that sink into their shadow when pressed; the battery shows level cells, the 30-minute chart becomes pixel bars, process meters become segmented blocks, and large numbers use bitmap digits. Titles, labels, and buttons use an embedded pixel font. Process names, service names, and long detail text from Windows or apps keep the system font: any string with a character the pixel font lacks is drawn entirely in the system font, never as boxes.
+- **Theme:** **⋯ → Appearance** offers *Use Windows setting* (default; follows the Windows app light/dark mode live), *Dark*, or *Light*. When a Windows contrast theme is on, the panel always uses system colors and outlines cards and buttons. Shapes, the chart, and the battery glyph are antialiased with GDI+; ranking rows show each app's icon, with a letter tile for protected processes whose path cannot be read.
+- **Tray tooltip:** shows battery level, discharge watts, and estimated time left; while charging, charging watts and estimated time to full.
+- **Tray percentage:** the notification icon shows the battery percentage in pixel digits (on by default; turn off with **⋯ → Show battery % as tray icon**). The badge color shows the state: green when plugged in or charging, amber at 20% or below, red at 10% or below, dark gray otherwise, readable on dark and light taskbars.
+- **Battery health:** battery and charging details show health (current full-charge capacity ÷ design capacity) and the charge cycle count; while plugged in and not charging, the left card on the main panel shows health too. Values the battery does not report read "Not reported"; cycle counts are not shown for multiple batteries.
+- **Remaining-time range:** when the 5-minute and up-to-30-minute average drain differ by more than 15%, time left shows as a range (for example "~ 3.2–4.1 h"), so a short burst or lull does not make the number jump.
+- **Charging curve and charge limit:** BatteryScope learns this computer's actual charging rate in each 5% band; when the learned bands cover the rest of the way, time to full follows that curve, including the slowdown near full. If the level holds steady between 40% and 96% for 3 minutes or more while plugged in, it is treated as a likely charge limit (battery care): the main panel shows "Charge limit 80%" and charging estimates the time to that limit. The curve and limit are stored under `HKCU\Software\BatteryScope`.
+- **GPU use:** while the panel is open, rows show each app's GPU utilization when it is at least 1% (for example "CPU 4.1% · GPU 18%"), also in details and CSV. It comes from the Windows "GPU Engine" performance counters that Task Manager uses, taking the busiest engine type; it is utilization, not watts.
+- **Background drain alert:** turn on with **⋯ → Background drain alert** (off by default). On battery, an app on the power-hungry background list that keeps averaging about 2 W or more for 10 minutes triggers one notification. Each app is reported once, notifications are at least 10 minutes apart, and clicking one opens the list.
+- **History (7 days):** **⋯ → History (7 days)** shows daily discharge as a bar chart and lists each day's time on battery, energy discharged and charged, and top CPU-energy apps. Records stay on this computer in `%LOCALAPPDATA%\BatteryScope\history.csv` for 60 days, written every 10 minutes and on exit; time when BatteryScope is not running is not recorded. Stop or clear recording under **⋯ → History settings**. Demo and screenshot modes never read or write the file.
+- **Sleep drain:** on battery, a gap of 10+ minutes between battery samples counts as a sleep (traditional sleep and Modern Standby, which pauses apps without a sleep notification). Battery details show the last sleep's length and drop; history keeps daily sleep time and drop. A notification (on by default; **⋯ → Sleep drain alert**) fires when a sleep lost 3+ points at more than 1.5 points per hour; clicking it opens battery details.
+- **Minutes gained if closed:** process details and the background-app list show "If closed: about N more minutes" from the process's CPU watts at the 5-minute drain, excluding GPU and display and not guaranteed; hidden when plugged in or under a minute.
+- **Charge reminder:** **⋯ → Charge reminder** at 80/85/90/100% (off by default) notifies once when plugged in at the target, re-arming on unplug or 5 points below; skipped when a detected charge limit is at or below the target.
+- **Health trend:** daily history keeps battery health and cycle count; battery details and the history page show the change over the recorded days (for example 94% → 93%).
+- **Per-app efficiency mode:** **Efficiency mode** on process details applies the same Efficiency mode as Windows 11 Task Manager (EcoQoS throttling plus idle priority) to the selected app, tagged "eco" in the list. Identity, same-user, critical-process, and service checks match closing an app. Press again to turn it off; everything BatteryScope set is undone when it exits.
+- **Automatic power mode:** under **⋯ → Automatic power mode**, the low-battery saver (20% or 30%) sets On battery to Efficiency at the threshold, restored on external power or 10 points higher; the performance list (add apps from process details) sets both modes to Performance while a listed app runs, restored 30 seconds after they all exit. Automatic changes are undone only if you have not changed that mode since, on exit, and at the next start after a crash.
+- **Battery buddy:** a pixel character beside the title whose body fills with the battery level and whose face follows the state (calm, sleepy, busy, charging, tired, critical, full), blinking now and then. Click it for a one-line status (time left, top app, time to full). Hide it under **⋯ → Appearance**.
+- **Daily grade and achievements:** the history page grades today S–D by comparing the average drain on battery with the median of up to 14 earlier days, and lists six achievements (first record, long runner, power saver, sound sleep, battery care, one week), all computed from local history.
+- **Share today's card:** **⋯ → Share today's card** saves a summary image (buddy, time on battery, energy, grade, top app, 7-day bars, level and health) as PNG and copies it to the clipboard.
+- **Mini floating window:** **⋯ → Mini floating window** opens an always-on-top, non-activating, draggable window with the buddy, level, and watts; double-click opens the panel, right-click opens or hides it; its position is remembered.
+- **Session energy:** CPU energy (mWh) attributed to each app since BatteryScope started, grouping processes with the same name and keeping processes that have exited, with each app's share of total CPU core energy. Requires compatible CPU energy counters.
+- **Low battery alert:** 10%, 20%, 30%, or off (default). On battery, one Windows notification appears when the level reaches the threshold, with current drain, time left, and the top consumer. It re-arms on external power or after recovering 5 points. Clicking it opens the panel.
+- **Export CSV:** saves the current ranking (watts, range, session mWh, memory, path) and the 30-minute battery history (`-power.csv`) as UTF-8 CSV. Names that a spreadsheet would treat as formulas are prefixed with an apostrophe.
+- **Shortcut:** when enabled (off by default), Ctrl+Alt+B shows or hides the panel from anywhere. If another app owns it, BatteryScope says so and leaves it off.
 
-**⋯ → Review power candidates** is an inspection list, not an automatic action. It requires a valid CPU energy estimate and at least 75% observed CPU time, then considers only a verified, same-user, non-service background process with no visible window or visible/service-host ancestor, at least 60 seconds of sustained activity, and at least 0.5 W estimated CPU power. Up to five candidates are sorted by CPU watts. The app cannot infer the importance of sync, downloads, audio, unsaved work, or dependencies, and closing one is not guaranteed to save its displayed watts. It never suspends or closes candidates automatically.
+Style, theme, alert threshold, and shortcut settings are stored under `HKCU\Software\BatteryScope`; demo and screenshot modes never write them.
+
+The power mode button at the top right shows **the Windows power mode in effect right now** (for example *Balanced*, *Efficiency*, or *Performance*; *Saver on* while Energy saver is active), read through the documented `PowerRegisterForEffectivePowerModeNotifications`. Click it, or use **⋯ → Power mode**, to open the power mode page. Windows keeps two separate settings, *Plugged in* and *On battery*; the page lists both with the current choice marked and switches either to *Efficiency*, *Balanced*, or *Performance*. Only the plugged-in setting applies while plugged in, so an on-battery *Efficiency* setting does not slow the computer down on AC power. The first time BatteryScope changes a setting it stores the original under the current user's BatteryScope registry key; **Restore original** brings it back. No apps or services are closed. Options the system does not provide are disabled.
+
+**Energy saver settings** on the power mode page opens the Windows page where you can enable Energy saver or set its automatic threshold. The power mode page and battery details show the energy-saving status reported by Windows. BatteryScope does not use an undocumented switch to change this separate feature.
+
+**⋯ → Find power-hungry background apps** is an inspection list, not an automatic action. It requires a valid CPU energy estimate and at least 75% observed CPU time, then considers only a verified, same-user, non-service background process with no visible window or visible/service-host ancestor, at least 60 seconds of sustained activity, and at least 0.5 W estimated CPU power. Up to five candidates are sorted by CPU watts. The app cannot infer the importance of sync, downloads, audio, unsaved work, or dependencies, and closing one is not guaranteed to save its displayed watts. It never suspends or closes candidates automatically.
 
 ## What the readings mean
 
@@ -42,7 +71,7 @@ The 360 × 640 logical-pixel panel adapts to DPI and smaller work areas. Process
 
 ![In-panel confirmation using synthetic demo data](docs/batteryscope-v9.2-confirm-en.png)
 
-List replacement is deferred during scrolling, presses, and in-panel information pages. Status hints explain which actions are available. Animations honor Windows' reduced-motion preference and stop their timer when idle or hidden. Sampling stays on a background thread: every 2 seconds while open, and 10–20 seconds while hidden with EcoQoS requested for the sampler. The app does not raise the system timer resolution.
+List replacement is deferred during scrolling, presses, and in-panel information pages. Status hints explain which actions are available. Animations honor Windows' reduced-motion preference and stop their timer when idle or hidden. Battery device handles are kept open and re-enumerated only after a read failure, every 5 minutes, or every minute while no battery is found; while hidden, the service list refreshes every 30 seconds (actions still re-check it live). Sampling stays on a background thread: every 2 seconds while open, and 10–20 seconds while hidden with EcoQoS requested for the sampler. The app does not raise the system timer resolution.
 
 Normal close allows the target to offer a save prompt. Force quit can lose unsaved work and affects only the selected process. Every action revalidates process identity and safety. Services with running dependents are not stopped; administrative permission is requested only when needed for an explicitly selected service operation.
 
@@ -56,7 +85,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-To avoid replacing a running executable, use `-OutputDirectory dist/v0.9.2`. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
+To avoid replacing a running executable, use `-OutputDirectory dist/v0.9.2`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
 
 ```powershell
 .\dist\BatteryScope.exe --demo
@@ -65,6 +94,16 @@ To avoid replacing a running executable, use `-OutputDirectory dist/v0.9.2`. The
 .\dist\BatteryScope.exe --tray-test C:\temp\tray-test.txt
 ```
 
-The destination folder must exist. Screenshots use synthetic data only when the demo option is selected. `--compact`, `--minimal`, `--plugged`, `--no-energy`, and `--selected` are available for preview checks.
+The destination folder must exist. Screenshots use synthetic data only when the demo option is selected. `--compact`, `--minimal`, `--plugged`, `--no-energy`, `--selected`, `--pixel`, `--smooth`, `--light`, `--dark`, `--high-contrast` (previews the contrast palette from current system colors), `--ledger`, `--power-mode`, and `--history` are available for preview checks; in demo mode `--card-png <path>` writes the share card.
+
+## Pixel font
+
+`src/assets/pixel-ui.ttf` is a subset of [Cubic 11 (俐方體11號)](https://github.com/ACh-K/Cubic-11) 1.451 containing only the ~490 characters the UI strings use (about 110 KB), renamed "BatteryScope Pixel" and embedded in the EXE for private use; it is never installed system-wide. It is licensed under the SIL Open Font License 1.1; see `src/assets/pixel-ui-OFL.txt`.
+
+After adding or changing UI strings, regenerate the subset (requires Python and `pip install fonttools`). The panel self-test checks that every Chinese and English UI string renders in the pixel font.
+
+```powershell
+python tools/subset-pixel-font.py path\to\Cubic_11.ttf
+```
 
 Power API references: [Battery status](https://learn.microsoft.com/en-us/windows/win32/power/battery-status-str), [system power status](https://learn.microsoft.com/en-us/windows/win32/power/system-power-status).
