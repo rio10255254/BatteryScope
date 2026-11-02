@@ -1,4 +1,5 @@
 #include "platform.h"
+#include "i18n.h"
 #include <winternl.h>
 #include <initguid.h>
 #include <devguid.h>
@@ -91,7 +92,7 @@ std::wstring errorText(DWORD code) {
     wchar_t* buffer = nullptr;
     FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
         nullptr, code, 0, reinterpret_cast<wchar_t*>(&buffer), 0, nullptr);
-    std::wstring s = buffer ? buffer : L"未知錯誤";
+    std::wstring s = buffer ? buffer : tr(L"未知錯誤");
     if (buffer) LocalFree(buffer);
     while (!s.empty() && iswspace(s.back())) s.pop_back();
     return s + L" (" + std::to_wstring(code) + L")";
@@ -371,6 +372,26 @@ struct NativeProcessInformation {
     LARGE_INTEGER otherTransferCount;
 };
 
+// SYSTEM_THREAD_INFORMATION entries follow each process entry.
+struct NativeThreadInformation {
+    LARGE_INTEGER kernelTime;
+    LARGE_INTEGER userTime;
+    LARGE_INTEGER createTime;
+    ULONG waitTime;
+    PVOID startAddress;
+    HANDLE uniqueProcess; // CLIENT_ID
+    HANDLE uniqueThread;
+    LONG priority;
+    LONG basePriority;
+    ULONG contextSwitches;
+    ULONG threadState;
+    ULONG waitReason;
+};
+#ifdef _WIN64
+static_assert(sizeof(NativeProcessInformation) == 0x100 && sizeof(NativeThreadInformation) == 0x50,
+    "SystemProcessInformation x64 layout");
+#endif
+
 struct RawProcess {
     DWORD pid = 0;
     DWORD parentPid = 0;
@@ -381,7 +402,8 @@ struct RawProcess {
     bool ioKnown = false, memoryKnown = false;
 };
 
-bool systemProcessSnapshot(std::vector<RawProcess>& result, uint64_t& sampleMs, double& durationMs) {
+bool systemProcessSnapshot(std::vector<RawProcess>& result, uint64_t& sampleMs, double& durationMs,
+    std::vector<ThreadSample>* threads) {
     using Query = NTSTATUS (NTAPI*)(SYSTEM_INFORMATION_CLASS, PVOID, ULONG, PULONG);
     static Query query = [] {
         FARPROC symbol = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation");
@@ -435,6 +457,22 @@ bool systemProcessSnapshot(std::vector<RawProcess>& result, uint64_t& sampleMs, 
                     row.name.assign(process->imageName.Buffer, process->imageName.Length / sizeof(wchar_t));
             }
             if (row.name.empty()) row.name = row.pid == 4 ? L"System" : L"PID " + std::to_wstring(row.pid);
+            if (threads) {
+                const size_t first = offset + sizeof(NativeProcessInformation);
+                const size_t limit = process->nextEntryOffset
+                    ? std::min(bytes.size(), offset + size_t(process->nextEntryOffset)) : bytes.size();
+                const size_t count = process->numberOfThreads;
+                if (first <= limit && count <= (limit - first) / sizeof(NativeThreadInformation)) {
+                    for (size_t i = 0; i < count; ++i) {
+                        NativeThreadInformation thread;
+                        std::memcpy(&thread, bytes.data() + first + i * sizeof(thread), sizeof(thread));
+                        const ULONG_PTR tid = reinterpret_cast<ULONG_PTR>(thread.uniqueThread);
+                        if (!tid || tid > std::numeric_limits<DWORD>::max()) continue;
+                        threads->push_back({row.pid, DWORD(tid), uint64_t(thread.createTime.QuadPart),
+                            uint64_t(thread.kernelTime.QuadPart) + uint64_t(thread.userTime.QuadPart)});
+                    }
+                }
+            }
             result.push_back(std::move(row));
         }
         if (!process->nextEntryOffset) break;
@@ -480,14 +518,19 @@ bool toolhelpProcessSnapshot(std::vector<RawProcess>& result, size_t& total,
 }
 
 std::vector<ProcessRow> Collector::collect(size_t& total, size_t& inaccessible, bool background) {
-    (void)background;
     work_ = {};
     total = inaccessible = 0;
     std::vector<RawProcess> raw;
-    systemSnapshot_ = !forceToolhelp_ && systemProcessSnapshot(raw, sampleMs_, snapshotDurationMs_);
+    threads_.threads.clear(); // Keeps capacity across samples.
+    // Thread placement is only sampled while the panel is visible.
+    systemSnapshot_ = !forceToolhelp_ && systemProcessSnapshot(raw, sampleMs_, snapshotDurationMs_,
+        background ? nullptr : &threads_.threads);
+    threadsCaptured_ = systemSnapshot_ && !background;
+    threads_.sampleMs = sampleMs_;
     if (systemSnapshot_) total = raw.size();
     else {
         raw.clear(); // A failed native parse may already have appended some entries.
+        threads_.threads.clear();
         if (!toolhelpProcessSnapshot(raw, total, sampleMs_, snapshotDurationMs_, work_)) return {};
     }
     intervalSeconds_ = previousSampleMs_ && sampleMs_ > previousSampleMs_ && sampleMs_ - previousSampleMs_ <= 30000
@@ -544,7 +587,9 @@ std::vector<ProcessRow> Collector::collect(size_t& total, size_t& inaccessible, 
         auto old = previous_.find(row.pid);
         if (source.cpuKnown && old != previous_.end() && old->second.created == row.created) {
             auto& p = old->second;
-            const double dt = (now - p.ms) / 1000.0;
+            // CPU and I/O counters were captured at sampleMs_, not after the
+            // service and window enumeration that follows the snapshot.
+            const double dt = sampleMs_ > p.ms ? (sampleMs_ - p.ms) / 1000.0 : 0;
             if (dt > 0 && dt <= 30) {
                 row.measured = true;
                 row.cpu = cpuPercent(p.cpu, cpu, dt, processors);
@@ -557,15 +602,10 @@ std::vector<ProcessRow> Collector::collect(size_t& total, size_t& inaccessible, 
                 row.score = row.averageCpu + std::min(20.0, row.averageIo * 2);
             }
         }
-        next[row.pid] = {row.created, cpu, ioBytes, now, row.averageCpu, row.averageIo, row.busySeconds, rawIoKnown};
-        if (!source.cpuKnown) row.reason = L"統計受限";
-        else if (!row.measured) row.reason = L"採集中";
-        else if (row.averageCpu < .1 && row.averageIo < .1) row.reason = L"活動低";
-        else {
-            row.reason = row.averageCpu >= row.averageIo * 2 ? L"CPU 活動" : L"I/O 活動";
-            if (row.busySeconds >= 30) row.reason += L"・持續 " + std::to_wstring(int(row.busySeconds)) + L" 秒";
-        }
-        if (row.services.size() > 1) row.reason += L"・共用程序";
+        next[row.pid] = {row.created, cpu, ioBytes, sampleMs_, row.averageCpu, row.averageIo, row.busySeconds, rawIoKnown};
+        row.activity = !source.cpuKnown ? ActivityReason::limited : !row.measured ? ActivityReason::warming
+            : row.averageCpu < .1 && row.averageIo < .1 ? ActivityReason::low
+            : row.averageCpu >= row.averageIo * 2 ? ActivityReason::cpu : ActivityReason::io;
         rows.push_back(std::move(row));
     }
     previous_ = std::move(next);

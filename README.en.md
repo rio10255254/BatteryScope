@@ -14,7 +14,7 @@ A small native Windows battery and background-process monitor built with C++17 a
 4. Use Background and Show filters, the mouse wheel, arrow keys, Home/End, or Page Up/Down. Enter or double-click opens details.
 5. Select a process to inspect it, request a normal close, force quit with confirmation, or stop an eligible hosted service. Protected processes cannot be closed.
 
-The menu also provides battery and charging details, optional launch at sign-in, and Quit. Launch at sign-in is off until you enable it. Windows permission dialogs, standard dialog buttons, and system-provided service names follow the system language.
+The menu also provides battery and charging details, optional launch at sign-in, and Quit. Launch at sign-in is off until you enable it. If you move the folder, opening BatteryScope from the new location repoints the entry automatically; an entry for another BatteryScope copy that still exists is left unchanged. Windows permission dialogs, standard dialog buttons, and system-provided service names follow the system language.
 
 The **Save** button sets Windows' battery-side power mode to **Best power efficiency** with one click; **Undo** restores the previous mode, even after restarting BatteryScope. The previous setting is stored under the current user's BatteryScope registry key. While plugged in, this configures the mode for the next battery session. This changes the Windows power mode, not the separate Energy saver switch, and does not close apps or services. The button is unavailable if the Windows API is unsupported or Best efficiency was already selected outside BatteryScope.
 
@@ -56,7 +56,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-To avoid replacing a running executable, use `-OutputDirectory dist/v0.9.2`. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
+To avoid replacing a running executable, use `-OutputDirectory dist/v0.9.2`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
 
 ```powershell
 .\dist\BatteryScope.exe --demo

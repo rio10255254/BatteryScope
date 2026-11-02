@@ -3,7 +3,10 @@
 #include "../src/motion.h"
 #include "../src/i18n.h"
 #include <shellapi.h>
+#include <cctype>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <stdexcept>
 #include <set>
 
@@ -17,6 +20,45 @@ bool nearlyEqual(Value value, double expected) { return value && std::abs(*value
 PowerSample sample(uint64_t ms, Value watts = 10.0) {
     PowerSample p; p.ms = ms; p.present = p.acKnown = true;
     p.fullWh = 50; p.remainingWh = 25; p.percent = 50; p.watts = watts; return p;
+}
+// Reads a source file from the working directory: the repository root under
+// CTest, or src/ under build.ps1.
+std::string sourceText(const char* name) {
+    for (std::string prefix : {"src/", ""}) {
+        std::ifstream in(prefix + name, std::ios::binary);
+        if (in) return std::string(std::istreambuf_iterator<char>(in), {});
+    }
+    throw std::runtime_error(std::string("source file not found from working directory: ") + name);
+}
+std::wstring widen(const std::string& text) {
+    if (text.empty()) return {};
+    int size = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), int(text.size()), nullptr, 0);
+    if (size <= 0) throw std::runtime_error("invalid UTF-8 in source literal");
+    std::wstring result(size_t(size), L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(), int(text.size()), result.data(), size);
+    return result;
+}
+// Collects the wide string literal after every occurrence of `marker`; counts
+// occurrences that are not a single literal so they cannot be skipped silently.
+std::vector<std::wstring> sourceLiterals(const std::string& text, const std::string& marker, bool requireClose, size_t& unparsed) {
+    std::vector<std::wstring> result;
+    for (size_t at = text.find(marker); at != std::string::npos; at = text.find(marker, at + 1)) {
+        if (at && (std::isalnum(static_cast<unsigned char>(text[at - 1])) || text[at - 1] == '_')) continue;
+        std::string literal; size_t i = at + marker.size(); bool closed = false;
+        for (; i < text.size(); ++i) {
+            const char c = text[i];
+            if (c == '\\' && i + 1 < text.size()) {
+                const char n = text[++i];
+                literal += n == 'n' ? '\n' : n == 'r' ? '\r' : n == 't' ? '\t' : n;
+            } else if (c == '"') { closed = true; break; }
+            else literal += c;
+        }
+        size_t after = i + 1;
+        while (after < text.size() && text[after] == ' ') ++after;
+        if (!closed || (requireClose && (after >= text.size() || text[after] != ')'))) { ++unparsed; continue; }
+        result.push_back(widen(literal));
+    }
+    return result;
 }
 LRESULT CALLBACK childProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     if (message == WM_DESTROY) { PostQuitMessage(0); return 0; }
@@ -91,6 +133,25 @@ int wmain(int argc, wchar_t** argv) {
         easing.move(50, 1382, 0); check(easing.value(1382) == 50 && !easing.active(1382), "reduced motion resolves immediately");
         english = true; check(std::wstring(tr(L"充電功率")) == L"Charging power", "charging strings are localized");
         english = false; check(std::wstring(tr(L"充電功率")) == L"充電功率", "language switch returns to Chinese");
+        {
+            size_t unparsed = 0, keyUnparsed = 0;
+            std::vector<std::wstring> missing;
+            size_t literals = 0;
+            for (const char* file : {"app.cpp", "platform.cpp"}) {
+                for (const auto& literal : sourceLiterals(sourceText(file), "tr(L\"", true, unparsed)) {
+                    ++literals;
+                    if (!translations.count(literal)) missing.push_back(literal);
+                }
+            }
+            for (const auto& literal : missing) {
+                std::string utf8(size_t(WideCharToMultiByte(CP_UTF8, 0, literal.c_str(), int(literal.size()), nullptr, 0, nullptr, nullptr)), '\0');
+                WideCharToMultiByte(CP_UTF8, 0, literal.c_str(), int(literal.size()), utf8.data(), int(utf8.size()), nullptr, nullptr);
+                std::cerr << "untranslated: " << utf8 << '\n';
+            }
+            check(unparsed == 0 && literals > 150 && missing.empty(), "every tr() literal in the UI has an English translation");
+            const auto keys = sourceLiterals(sourceText("i18n.h"), "{L\"", false, keyUnparsed);
+            check(keyUnparsed == 0 && keys.size() == translations.size(), "translation table has no duplicate keys");
+        }
         std::deque<PowerSample> charging;
         for (uint64_t t = 0; t <= 60000; t += 10000) {
             auto p = sample(t, -20); p.onAc = p.charging = true; p.remainingWh = 25 + t / 3600000.0 * 20;

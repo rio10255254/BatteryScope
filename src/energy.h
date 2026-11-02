@@ -20,7 +20,11 @@ public:
     EnergyReader();
     ~EnergyReader();
     CpuEnergyReport sample();
-    void sampleThreadPlacement(std::vector<ProcessRow>& rows);
+    // Uses the collector's thread snapshot when available, which avoids a second
+    // system-wide thread enumeration; falls back to Toolhelp otherwise.
+    void sampleThreadPlacement(std::vector<ProcessRow>& rows, const ThreadSnapshot* threads = nullptr);
+    // Forget thread history, e.g. while hidden placement sampling is skipped.
+    void clearThreadPlacement();
     void reset();
 };
 class CpuAttributor {

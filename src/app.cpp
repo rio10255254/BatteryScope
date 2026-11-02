@@ -2,6 +2,7 @@
 #include "energy.h"
 #include "motion.h"
 #include "i18n.h"
+#include "version.h"
 #include <commctrl.h>
 #include <shellapi.h>
 #include <uxtheme.h>
@@ -26,6 +27,7 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     EnergySaverSettingsId = 114, ReviewCandidatesId = 115, InlineBackId = 116, InlineConfirmId = 117,
     TrayShow = 200, TrayExit = 201;
 const wchar_t* ClassName = L"BatteryScope.Main.v1";
+const wchar_t* const AppTitle = L"BatteryScope " BS_VERSION_STRING;
 const COLORREF Ink = RGB(235, 242, 246), Muted = RGB(146, 161, 174), Green = RGB(104, 225, 188),
     Background = RGB(15, 20, 27), Surface = RGB(24, 32, 42), Border = RGB(41, 53, 65),
     Selected = RGB(30, 57, 57), Danger = RGB(245, 146, 146);
@@ -39,7 +41,10 @@ UINT dpi = 96, taskbarCreated = 0;
 std::atomic<bool> quit{false}, hidden{false}, resetSamples{false};
 std::mutex mailboxMutex, wakeMutex;
 std::condition_variable wake;
+// The sampler hands each process list over by move: mailboxProcesses says the
+// mailbox carries a new list, otherwise the UI keeps the list it already has.
 Snapshot mailbox, current;
+bool mailboxFresh = false, mailboxProcesses = false;
 std::vector<ProcessRow> displayed;
 std::vector<std::wstring> displayedLabels;
 uint64_t listStructuralChanges = 0;
@@ -127,6 +132,20 @@ std::wstring qualityText(ObservationQuality quality) {
     case ObservationQuality::limited: return tr(L"觀測有限");
     default: return tr(L"資料不足");
     }
+}
+std::wstring activityText(const ProcessRow& row) {
+    std::wstring text;
+    switch (row.activity) {
+    case ActivityReason::limited: text = tr(L"統計受限"); break;
+    case ActivityReason::warming: text = tr(L"採集中"); break;
+    case ActivityReason::low: text = tr(L"活動低"); break;
+    case ActivityReason::cpu: text = tr(L"CPU 活動"); break;
+    case ActivityReason::io: text = tr(L"I/O 活動"); break;
+    }
+    const bool active = row.activity == ActivityReason::cpu || row.activity == ActivityReason::io;
+    if (active && row.busySeconds >= 30) text += tr(L"・持續 ") + std::to_wstring(int(row.busySeconds)) + tr(L" 秒");
+    if (row.services.size() > 1) text += tr(L"・共用程序");
+    return text;
 }
 void font(HDC dc, HFONT value) { SelectObject(dc, value); }
 void drawText(HDC dc, const std::wstring& text, RECT r, COLORREF color, HFONT face, UINT format = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS) {
@@ -757,12 +776,33 @@ void showReviewCandidates() {
     showInlinePage(InlinePage::candidates, tr(L"節能候選 · 需人工判斷"), content);
     releaseInteraction();
 }
-bool startupEnabled() {
-    HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) return false;
-    DWORD size = 0; LSTATUS status = RegQueryValueExW(key, L"BatteryScope", nullptr, nullptr, nullptr, &size);
-    RegCloseKey(key); return status == ERROR_SUCCESS;
+// thisCopy: the Run entry launches this executable. otherCopy: another BatteryScope
+// that still exists. missingCopy: the registered executable was moved or deleted.
+enum class StartupState { off, thisCopy, otherCopy, missingCopy };
+bool samePath(const std::wstring& a, const std::wstring& b) {
+    return CompareStringOrdinal(a.c_str(), int(a.size()), b.c_str(), int(b.size()), TRUE) == CSTR_EQUAL;
 }
+StartupState startupState() {
+    constexpr wchar_t runKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    DWORD bytes = 0;
+    if (RegGetValueW(HKEY_CURRENT_USER, runKey, L"BatteryScope", RRF_RT_REG_SZ, nullptr, nullptr, &bytes) != ERROR_SUCCESS)
+        return StartupState::off;
+    std::wstring command(bytes / sizeof(wchar_t) + 1, L'\0');
+    bytes = DWORD(command.size() * sizeof(wchar_t));
+    if (RegGetValueW(HKEY_CURRENT_USER, runKey, L"BatteryScope", RRF_RT_REG_SZ, nullptr, command.data(), &bytes) != ERROR_SUCCESS)
+        return StartupState::off;
+    command.resize(wcsnlen(command.c_str(), command.size()));
+    std::wstring registered;
+    if (!command.empty() && command.front() == L'"') {
+        const size_t close = command.find(L'"', 1);
+        if (close != std::wstring::npos) registered = command.substr(1, close - 1);
+    } else registered = command.substr(0, command.find(L' '));
+    if (!registered.empty() && samePath(registered, executablePath())) return StartupState::thisCopy;
+    const DWORD attributes = registered.empty() ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(registered.c_str());
+    return attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY)
+        ? StartupState::missingCopy : StartupState::otherCopy;
+}
+bool startupEnabled() { return startupState() == StartupState::thisCopy; }
 DWORD setStartup(bool enable) {
     HKEY key = nullptr;
     LSTATUS result = RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr);
@@ -839,7 +879,8 @@ void showDetails(const ProcessRow& row) {
         tr(L"\n路徑：") + (row.path.empty() ? tr(L"未知") : row.path) +
         tr(L"\n\nCPU（全機比例）: ") + number(row.cpu) + tr(L"%\n30 秒平滑 CPU: ") + number(row.averageCpu) +
         L"%\nI/O: " + (row.ioKnown ? number(row.ioMB, 2) + L" MB/s" : tr(L"未知")) +
-        tr(L"\n記憶體: ") + (row.memoryKnown ? number(row.memoryMB) + tr(L" MB（") + number(row.memoryAgeSeconds, 0) + tr(L" 秒前）") : tr(L"未知"));
+        tr(L"\n記憶體: ") + (row.memoryKnown ? number(row.memoryMB) + tr(L" MB（") + number(row.memoryAgeSeconds, 0) + tr(L" 秒前）") : tr(L"未知")) +
+        tr(L"\n活動: ") + activityText(row);
     if (row.cpuWatts) {
         content += tr(L"\n\n本次 CPU 估計: ") + valueText(row.cpuWatts, L" W", 2) +
             tr(L"\n30 秒平滑 CPU 估計: ") + valueText(row.averageCpuWatts, L" W", 2) +
@@ -881,7 +922,7 @@ void sampleLoop() {
     uint64_t nextProcess = 0, nextPower = 0;
     bool previousHidden = false, qosInitialized = false;
     while (!quit) {
-        auto now = GetTickCount64(); bool background = hidden.load();
+        auto now = GetTickCount64(); bool background = hidden.load(), processSampled = false;
         if (resetSamples.exchange(false)) { collector.reset(); energyReader.reset(); policy.reset(); nextProcess = nextPower = 0; }
         if (!qosInitialized || previousHidden != background) {
             state.samplerEcoQoS = setSamplerEcoQoS(background) && background;
@@ -897,7 +938,9 @@ void sampleLoop() {
             state.processes = collector.collect(state.totalProcesses, state.inaccessible, background);
             state.servicesKnown = collector.servicesKnown();
             alignProcessObservation(state.energy, collector.intervalSeconds(), collector.sampleMs(), collector.systemSnapshot());
-            energyReader.sampleThreadPlacement(state.processes);
+            // Per-process watts are not shown while hidden, so skip thread placement there.
+            if (background) energyReader.clearThreadPlacement();
+            else energyReader.sampleThreadPlacement(state.processes, collector.threadSnapshot());
             attributor.apply(state.processes, state.energy, collector.sampleMs(), std::max<DWORD>(1, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)));
             // Package power already includes the cores: never add it to core energy.
             if (state.energy.coreWatts && !state.history.empty()) {
@@ -913,11 +956,22 @@ void sampleLoop() {
             state.samplingSeconds = policy.update(background, now, systemCpu, state.energy.coreWatts);
             nextProcess = now + state.samplingSeconds * 1000;
             if (background) nextPower = nextProcess;
-            changed = true;
+            changed = processSampled = true;
         }
         if (changed) {
             state.ms = now;
-            { std::lock_guard<std::mutex> lock(mailboxMutex); mailbox = state; }
+            {
+                std::lock_guard<std::mutex> lock(mailboxMutex);
+                // Keep an unconsumed process list when only power changed.
+                std::vector<ProcessRow> processes;
+                if (processSampled) processes = std::move(state.processes);
+                else if (mailboxFresh && mailboxProcesses) processes = std::move(mailbox.processes);
+                state.processes.clear();
+                mailbox = state; // Copies only the small power history and energy report.
+                mailbox.processes = std::move(processes);
+                mailboxProcesses = processSampled || (mailboxFresh && mailboxProcesses);
+                mailboxFresh = true;
+            }
             PostMessageW(mainWindow, SampleMessage, 0, 0);
         }
         now = GetTickCount64(); uint64_t next = std::min(nextProcess, nextPower);
@@ -1059,7 +1113,7 @@ void openMenu(POINT point) {
 void applyLanguage(bool useEnglish) {
     english = useEnglish;
     makeFonts();
-    SetWindowTextW(mainWindow, L"BatteryScope 0.9.2");
+    SetWindowTextW(mainWindow, AppTitle);
     const std::pair<HWND, const wchar_t*> labels[] = {{closeButton, tr(L"正常關閉")}, {killButton, tr(L"強制結束…")},
         {serviceButton, tr(L"停止服務…")}, {detailsButton, tr(L"查看詳情")}, {menuButton, tr(L"設定")},
         {hideButton, tr(L"收回")}, {inlineBack, inlinePage == InlinePage::confirm ? tr(L"取消") : tr(L"返回排行")},
@@ -1307,7 +1361,14 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (!hidden && listRefreshPending && !deferListRefresh()) refreshList();
         return 0;
     case SampleMessage: {
-        { std::lock_guard<std::mutex> lock(mailboxMutex); current = mailbox; }
+        {
+            std::lock_guard<std::mutex> lock(mailboxMutex);
+            if (!mailboxFresh) return 0;
+            auto processes = std::move(current.processes);
+            current = std::move(mailbox);
+            if (!mailboxProcesses) current.processes = std::move(processes);
+            mailboxFresh = mailboxProcesses = false;
+        }
         if (!hidden) {
             if (deferListRefresh()) listRefreshPending = true;
             else refreshList();
@@ -1372,7 +1433,7 @@ Snapshot demoSnapshot() {
         row.kind = i == 3 ? L"服務" : i == 1 ? L"應用程式" : L"背景程序";
         row.window = i == 1;
         row.cpu = 8.2 / (i + 1); row.ioMB = 2.5 / (i + 1); row.memoryMB = 180.0 / (i + 1);
-        row.reason = i == 3 ? L"CPU 活動・共用程序" : L"CPU 活動・持續 42 秒";
+        row.activity = ActivityReason::cpu; row.busySeconds = i == 3 ? 0 : 42;
         row.measured = row.ioKnown = row.memoryKnown = true;
         state.processes.push_back(row);
     }
@@ -1418,11 +1479,11 @@ bool captureWindow(const std::wstring& path) {
 int diagnostic(const std::wstring& path) {
     Collector collector; Snapshot state;
     EnergyReader energyReader; CpuAttributor attributor; energyReader.sample();
-    state.processes = collector.collect(state.totalProcesses, state.inaccessible); energyReader.sampleThreadPlacement(state.processes); Sleep(2100);
+    state.processes = collector.collect(state.totalProcesses, state.inaccessible); energyReader.sampleThreadPlacement(state.processes, collector.threadSnapshot()); Sleep(2100);
     state.energy = energyReader.sample();
     state.processes = collector.collect(state.totalProcesses, state.inaccessible);
     alignProcessObservation(state.energy, collector.intervalSeconds(), collector.sampleMs(), collector.systemSnapshot());
-    energyReader.sampleThreadPlacement(state.processes);
+    energyReader.sampleThreadPlacement(state.processes, collector.threadSnapshot());
     attributor.apply(state.processes,state.energy,collector.sampleMs(),GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
     auto power = readPower();
     std::ofstream out{std::filesystem::path(path)};
@@ -1648,11 +1709,23 @@ bool panelSelfTest(const std::wstring& path) {
     hoveredRow = -1; updateRowFeedback(); pump(180);
     check("row_hover_settles_without_idle_timer", !motionTimerRunning);
     const auto rowsBeforeHold = displayed.size();
-    { std::lock_guard<std::mutex> lock(mailboxMutex); mailbox = current; mailbox.processes.pop_back(); }
+    {
+        std::lock_guard<std::mutex> lock(mailboxMutex);
+        mailbox = current; mailbox.processes.pop_back(); mailboxFresh = mailboxProcesses = true;
+    }
     pointerDown = true; SendMessageW(mainWindow, SampleMessage, 0, 0);
     check("sampling_does_not_replace_rows_during_press", displayed.size() == rowsBeforeHold && listRefreshPending);
     releaseInteraction(); pump(320);
     check("deferred_rows_refresh_after_release", displayed.size() + 1 == rowsBeforeHold && !listRefreshPending);
+    const auto processesBeforePowerOnly = current.processes.size();
+    {
+        std::lock_guard<std::mutex> lock(mailboxMutex);
+        mailbox = current; mailbox.processes.clear(); mailboxFresh = true; mailboxProcesses = false;
+    }
+    SendMessageW(mainWindow, SampleMessage, 0, 0);
+    check("power_only_sample_keeps_process_list", processesBeforePowerOnly > 0 && current.processes.size() == processesBeforePowerOnly);
+    SendMessageW(mainWindow, SampleMessage, 0, 0);
+    check("repeated_sample_message_keeps_snapshot", current.processes.size() == processesBeforePowerOnly && !current.history.empty());
     SetWindowTextW(hideButton, L"test"); applyLanguage(false);
     GetWindowTextW(hideButton, label, 128);
     check("icon_button_has_accessible_name", std::wstring(label) == L"收回");
@@ -1743,7 +1816,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &monitor);
     int initialWidth = std::min(bounds.right, monitor.rcWork.right - monitor.rcWork.left - px(20));
     int initialHeight = std::min(bounds.bottom, monitor.rcWork.bottom - monitor.rcWork.top - px(20));
-    HWND window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, ClassName, L"BatteryScope 0.9.2", WS_POPUP | WS_CLIPCHILDREN,
+    HWND window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, ClassName, AppTitle, WS_POPUP | WS_CLIPCHILDREN,
         monitor.rcWork.right - initialWidth - px(10), monitor.rcWork.bottom - initialHeight - px(10), initialWidth, initialHeight, nullptr, nullptr, instance, nullptr);
     if (!window) return 3;
     SetLayeredWindowAttributes(window, 0, 255, LWA_ALPHA);
@@ -1761,6 +1834,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     }
     else worker = std::thread(sampleLoop);
     applyLanguage(english);
+    if (!demo && !isolatedPreview && startupState() == StartupState::missingCopy) {
+        // A portable folder was moved: point launch at sign-in at this copy. An
+        // entry for another copy that still exists is left alone.
+        if (setStartup(true) == ERROR_SUCCESS) setNotice(tr(L"已將登入時啟動更新為目前位置。"));
+        autoStart = startupEnabled();
+    }
     if (screenshot && option(L"--details") && !current.processes.empty()) showDetails(current.processes.front());
     if (screenshot && option(L"--power-details")) showPowerDetails();
     if (screenshot && option(L"--candidates")) showReviewCandidates();

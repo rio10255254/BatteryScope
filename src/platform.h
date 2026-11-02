@@ -61,6 +61,8 @@ class Collector {
     uint64_t sampleMs_ = 0, previousSampleMs_ = 0;
     double intervalSeconds_ = 0, snapshotDurationMs_ = 0;
     bool systemSnapshot_ = false;
+    ThreadSnapshot threads_;
+    bool threadsCaptured_ = false;
 public:
     explicit Collector(bool cacheEnabled = true, bool forceToolhelp = false)
         : cacheEnabled_(cacheEnabled), forceToolhelp_(forceToolhelp) {}
@@ -71,6 +73,8 @@ public:
     double snapshotDurationMs() const { return snapshotDurationMs_; }
     bool systemSnapshot() const { return systemSnapshot_; }
     bool servicesKnown() const { return servicesKnown_; }
-    void reset() { previous_.clear(); metadata_.clear(); servicesAt_ = sampleMs_ = previousSampleMs_ = 0; intervalSeconds_ = snapshotDurationMs_ = 0; systemSnapshot_ = false; }
+    // Thread CPU times captured with the last foreground system snapshot, or null.
+    const ThreadSnapshot* threadSnapshot() const { return threadsCaptured_ ? &threads_ : nullptr; }
+    void reset() { previous_.clear(); metadata_.clear(); servicesAt_ = sampleMs_ = previousSampleMs_ = 0; intervalSeconds_ = snapshotDurationMs_ = 0; systemSnapshot_ = false; threads_.threads.clear(); threadsCaptured_ = false; }
 };
 }

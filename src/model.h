@@ -36,11 +36,14 @@ struct ServiceInfo {
     uint32_t pid = 0;
     bool stoppable = false, shared = false;
 };
+// Why a process ranks where it does; the UI turns this into localized text.
+enum class ActivityReason { limited, warming, low, cpu, io };
 struct ProcessRow {
     uint32_t pid = 0;
     uint32_t parentPid = 0;
     uint64_t created = 0;
-    std::wstring name, path, kind, reason;
+    std::wstring name, path, kind;
+    ActivityReason activity = ActivityReason::warming;
     double cpu = 0, averageCpu = 0, ioMB = 0, averageIo = 0, memoryMB = 0, score = 0;
     bool measured = false, ioKnown = false, memoryKnown = false, window = false;
     bool actionable = false;
@@ -51,6 +54,16 @@ struct ProcessRow {
     std::vector<double> fixedCoreBusy; // Only threads whose observed affinity stays inside one physical core.
     double placementCoverage = 0;
     std::vector<ServiceInfo> services;
+};
+// Per-thread CPU time from the same system snapshot as the process rows.
+// Threads of one process are stored contiguously, in snapshot order.
+struct ThreadSample {
+    uint32_t pid = 0, tid = 0;
+    uint64_t created = 0, cpu = 0;
+};
+struct ThreadSnapshot {
+    uint64_t sampleMs = 0;
+    std::vector<ThreadSample> threads;
 };
 struct CoreEnergy {
     double watts = 0;

@@ -1,9 +1,10 @@
 #include <windows.h>
+#include "version.h"
 101 ICON "assets/batteryscope.ico"
 1 RT_MANIFEST "app.manifest"
 1 VERSIONINFO
-FILEVERSION 0,9,2,0
-PRODUCTVERSION 0,9,2,0
+FILEVERSION BS_VERSION_MAJOR,BS_VERSION_MINOR,BS_VERSION_PATCH,0
+PRODUCTVERSION BS_VERSION_MAJOR,BS_VERSION_MINOR,BS_VERSION_PATCH,0
 FILEFLAGSMASK 0x3fL
 FILEFLAGS 0
 FILEOS VOS_NT_WINDOWS32
@@ -14,9 +15,9 @@ BEGIN
     BLOCK "040904b0"
     BEGIN
       VALUE "FileDescription", "BatteryScope - Native battery monitor\0"
-      VALUE "FileVersion", "0.9.2\0"
+      VALUE "FileVersion", BS_VERSION_STRING
       VALUE "ProductName", "BatteryScope\0"
-      VALUE "ProductVersion", "0.9.2\0"
+      VALUE "ProductVersion", BS_VERSION_STRING
       VALUE "OriginalFilename", "BatteryScope.exe\0"
     END
   END
