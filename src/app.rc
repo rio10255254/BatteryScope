@@ -1,6 +1,8 @@
 #include <windows.h>
 #include "version.h"
 101 ICON "assets/batteryscope.ico"
+// Pixel UI font: subset of Cubic 11 (SIL OFL 1.1, see assets/pixel-ui-OFL.txt).
+102 RCDATA "assets/pixel-ui.ttf"
 1 RT_MANIFEST "app.manifest"
 1 VERSIONINFO
 FILEVERSION BS_VERSION_MAJOR,BS_VERSION_MINOR,BS_VERSION_PATCH,0

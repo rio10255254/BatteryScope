@@ -217,6 +217,188 @@ void drawDots(HDC dc, const RECT& r, COLORREF c, float radius) {
     }
 }
 
+namespace {
+void rectFill(HDC dc, const RECT& r, COLORREF color) {
+    if (r.right <= r.left || r.bottom <= r.top) return;
+    SetDCBrushColor(dc, color); FillRect(dc, &r, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+}
+int fitSteps(const RECT& r, int unit, int steps) {
+    const int room = int(std::min(r.right - r.left, r.bottom - r.top)) / (2 * std::max(1, unit));
+    return std::clamp(steps, 0, std::max(0, room - 1));
+}
+// 5x7 glyphs; each row string uses '#' for a lit cell.
+struct DigitGlyph { wchar_t c; int width; const char* rows[7]; };
+const DigitGlyph digitGlyphs[] = {
+    {L'0', 5, {".###.", "#...#", "#..##", "#.#.#", "##..#", "#...#", ".###."}},
+    {L'1', 5, {"..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###."}},
+    {L'2', 5, {".###.", "#...#", "....#", "...#.", "..#..", ".#...", "#####"}},
+    {L'3', 5, {"#####", "...#.", "..#..", "...#.", "....#", "#...#", ".###."}},
+    {L'4', 5, {"...#.", "..##.", ".#.#.", "#..#.", "#####", "...#.", "...#."}},
+    {L'5', 5, {"#####", "#....", "####.", "....#", "....#", "#...#", ".###."}},
+    {L'6', 5, {"..##.", ".#...", "#....", "####.", "#...#", "#...#", ".###."}},
+    {L'7', 5, {"#####", "....#", "...#.", "..#..", ".#...", ".#...", ".#..."}},
+    {L'8', 5, {".###.", "#...#", "#...#", ".###.", "#...#", "#...#", ".###."}},
+    {L'9', 5, {".###.", "#...#", "#...#", ".####", "....#", "...#.", ".##.."}},
+    {L'W', 5, {"#...#", "#...#", "#...#", "#.#.#", "#.#.#", "##.##", "#...#"}},
+    {L'%', 5, {"##...", "##..#", "...#.", "..#..", ".#...", "#..##", "...##"}},
+    {L'.', 2, {"..", "..", "..", "..", "..", "##", "##"}},
+    {L'-', 4, {"....", "....", "....", "####", "....", "....", "...."}},
+    {L'\u2014', 5, {".....", ".....", ".....", "#####", ".....", ".....", "....."}},
+    {L' ', 2, {"..", "..", "..", "..", "..", "..", ".."}},
+};
+const DigitGlyph* digitGlyph(wchar_t c) {
+    for (const auto& glyph : digitGlyphs) if (glyph.c == c) return &glyph;
+    return nullptr;
+}
+HANDLE pixelFontHandle = nullptr;
+std::vector<bool> pixelCoverage;
+}
+void pixelFill(HDC dc, const RECT& r, COLORREF color, int unit, int steps) {
+    unit = std::max(1, unit); steps = fitSteps(r, unit, steps);
+    for (int i = 0; i < steps; ++i) {
+        const int inset = (steps - i) * unit;
+        rectFill(dc, {r.left + inset, r.top + i * unit, r.right - inset, r.top + (i + 1) * unit}, color);
+        rectFill(dc, {r.left + inset, r.bottom - (i + 1) * unit, r.right - inset, r.bottom - i * unit}, color);
+    }
+    rectFill(dc, {r.left, r.top + steps * unit, r.right, r.bottom - steps * unit}, color);
+}
+void pixelFrame(HDC dc, const RECT& r, COLORREF color, int unit, int steps) {
+    unit = std::max(1, unit); steps = fitSteps(r, unit, steps);
+    const int s = steps * unit;
+    rectFill(dc, {r.left + s, r.top, r.right - s, r.top + unit}, color);
+    rectFill(dc, {r.left + s, r.bottom - unit, r.right - s, r.bottom}, color);
+    rectFill(dc, {r.left, r.top + s, r.left + unit, r.bottom - s}, color);
+    rectFill(dc, {r.right - unit, r.top + s, r.right, r.bottom - s}, color);
+    for (int i = 1; i < steps; ++i) { // stair pixels between the edges
+        const int x = (steps - i) * unit, y = i * unit;
+        rectFill(dc, {r.left + x, r.top + y, r.left + x + unit, r.top + y + unit}, color);
+        rectFill(dc, {r.right - x - unit, r.top + y, r.right - x, r.top + y + unit}, color);
+        rectFill(dc, {r.left + x, r.bottom - y - unit, r.left + x + unit, r.bottom - y}, color);
+        rectFill(dc, {r.right - x - unit, r.bottom - y - unit, r.right - x, r.bottom - y}, color);
+    }
+}
+void pixelBox(HDC dc, const RECT& r, COLORREF fill, COLORREF outline, int unit, int steps, COLORREF shadow) {
+    RECT body = r;
+    if (shadow != CLR_INVALID) {
+        body.bottom -= unit;
+        RECT drop = body; OffsetRect(&drop, 0, unit);
+        pixelFill(dc, drop, shadow, unit, steps);
+    }
+    pixelFill(dc, body, fill, unit, steps);
+    if (outline != CLR_INVALID) pixelFrame(dc, body, outline, unit, steps);
+}
+void pixelSegments(HDC dc, const RECT& r, double fraction, COLORREF on, COLORREF off, int unit) {
+    unit = std::max(1, unit);
+    const int block = unit * 2, pitch = block + unit;
+    const int count = std::max(1, int(r.right - r.left + unit) / pitch);
+    const int lit = fraction > 0 ? std::max(1, int(std::lround(std::clamp(fraction, 0.0, 1.0) * count))) : 0;
+    for (int i = 0; i < count; ++i)
+        rectFill(dc, {r.left + i * pitch, r.top, r.left + i * pitch + block, r.bottom}, i < lit ? on : off);
+}
+void pixelBattery(HDC dc, const RECT& r, double fraction, COLORREF outline, COLORREF level, COLORREF empty,
+    bool bolt, COLORREF boltColor, COLORREF boltEdge, int unit, int cells) {
+    unit = std::max(1, unit);
+    RECT body{r.left, r.top, r.right - 2 * unit, r.bottom};
+    rectFill(dc, {body.right, r.top + (r.bottom - r.top) / 3, r.right, r.bottom - (r.bottom - r.top) / 3}, outline);
+    pixelFrame(dc, body, outline, unit, 1);
+    RECT inner{body.left + 2 * unit, body.top + 2 * unit, body.right - 2 * unit, body.bottom - 2 * unit};
+    const int width = int(inner.right - inner.left);
+    cells = std::max(1, cells);
+    const double clamped = std::clamp(fraction, 0.0, 1.0);
+    const int lit = clamped > 0 ? std::max(1, int(std::ceil(clamped * cells - .001))) : 0;
+    for (int i = 0; i < cells; ++i) {
+        const int left = inner.left + width * i / cells, right = inner.left + width * (i + 1) / cells - (i + 1 < cells ? unit : 0);
+        rectFill(dc, {left, inner.top, right, inner.bottom}, i < lit ? level : empty);
+    }
+    if (!bolt) return;
+    static const char* shape[7] = {"...##", "..##.", ".##..", "#####", "..##.", ".##..", "##..."};
+    const int cell = std::max(1, std::min(unit, int(body.bottom - body.top - 2 * unit) / 7));
+    const int x0 = (body.left + body.right) / 2 - cell * 5 / 2, y0 = (body.top + body.bottom) / 2 - cell * 7 / 2;
+    for (int pass = 0; pass < 2; ++pass)
+        for (int y = 0; y < 7; ++y) for (int x = 0; x < 5; ++x) if (shape[y][x] == '#') {
+            RECT dot{x0 + x * cell, y0 + y * cell, x0 + (x + 1) * cell, y0 + (y + 1) * cell};
+            if (pass == 0) InflateRect(&dot, cell, cell);
+            rectFill(dc, dot, pass == 0 ? boltEdge : boltColor);
+        }
+}
+void pixelChevron(HDC dc, const RECT& r, COLORREF c, int unit) {
+    static const char* shape[3] = {"#...#", ".#.#.", "..#.."};
+    const int x0 = (r.left + r.right) / 2 - unit * 5 / 2, y0 = (r.top + r.bottom) / 2 - unit * 3 / 2;
+    for (int y = 0; y < 3; ++y) for (int x = 0; x < 5; ++x) if (shape[y][x] == '#')
+        rectFill(dc, {x0 + x * unit, y0 + y * unit, x0 + (x + 1) * unit, y0 + (y + 1) * unit}, c);
+}
+void pixelDots(HDC dc, const RECT& r, COLORREF c, int unit) {
+    const int x0 = (r.left + r.right) / 2 - unit * 7 / 2, y0 = (r.top + r.bottom) / 2 - unit / 2;
+    for (int i = 0; i < 3; ++i) rectFill(dc, {x0 + i * 3 * unit, y0, x0 + i * 3 * unit + unit, y0 + unit}, c);
+}
+void pixelDottedLine(HDC dc, POINT a, POINT b, COLORREF c, int unit) {
+    unit = std::max(1, unit);
+    if (a.y == b.y) { for (int x = std::min(a.x, b.x); x < std::max(a.x, b.x); x += unit * 3) rectFill(dc, {x, a.y, x + unit, a.y + unit}, c); }
+    else { for (int y = std::min(a.y, b.y); y < std::max(a.y, b.y); y += unit * 3) rectFill(dc, {a.x, y, a.x + unit, y + unit}, c); }
+}
+int pixelDigitsWidth(const std::wstring& text, int unit) {
+    int width = 0;
+    for (wchar_t c : text) {
+        const auto* glyph = digitGlyph(c);
+        if (!glyph) return 0;
+        width += (glyph->width + 1) * unit;
+    }
+    return width > 0 ? width - unit : 0;
+}
+bool drawPixelDigits(HDC dc, const std::wstring& text, int x, int y, int unit, COLORREF color) {
+    if (text.empty() || !pixelDigitsWidth(text, unit)) return false;
+    for (wchar_t c : text) {
+        const auto* glyph = digitGlyph(c);
+        for (int row = 0; row < 7; ++row) for (int column = 0; column < glyph->width; ++column)
+            if (glyph->rows[row][column] == '#')
+                rectFill(dc, {x + column * unit, y + row * unit, x + (column + 1) * unit, y + (row + 1) * unit}, color);
+        x += (glyph->width + 1) * unit;
+    }
+    return true;
+}
+bool loadPixelFont(HMODULE module, int resource) {
+    if (pixelFontHandle) return true;
+    HRSRC info = FindResourceW(module, MAKEINTRESOURCEW(resource), MAKEINTRESOURCEW(10) /* RT_RCDATA */);
+    HGLOBAL data = info ? LoadResource(module, info) : nullptr;
+    void* bytes = data ? LockResource(data) : nullptr;
+    const DWORD size = info ? SizeofResource(module, info) : 0;
+    DWORD installed = 0;
+    if (!bytes || !size || !(pixelFontHandle = AddFontMemResourceEx(bytes, size, nullptr, &installed)) || !installed) {
+        pixelFontHandle = nullptr; return false;
+    }
+    // Confirm GDI resolves the family to this font, then record which characters it has.
+    HDC dc = CreateCompatibleDC(nullptr);
+    HFONT font = CreateFontW(-12, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS, NONANTIALIASED_QUALITY, DEFAULT_PITCH, PixelFontFace);
+    HGDIOBJ old = SelectObject(dc, font);
+    wchar_t face[LF_FACESIZE]{}; GetTextFaceW(dc, LF_FACESIZE, face);
+    bool ok = CompareStringOrdinal(face, -1, PixelFontFace, -1, TRUE) == CSTR_EQUAL;
+    const DWORD rangeBytes = ok ? GetFontUnicodeRanges(dc, nullptr) : 0;
+    if (rangeBytes) {
+        std::vector<BYTE> buffer(rangeBytes);
+        auto set = reinterpret_cast<GLYPHSET*>(buffer.data());
+        if (GetFontUnicodeRanges(dc, set)) {
+            pixelCoverage.assign(65536, false);
+            for (DWORD i = 0; i < set->cRanges; ++i)
+                for (unsigned c = set->ranges[i].wcLow; c < unsigned(set->ranges[i].wcLow) + set->ranges[i].cGlyphs && c < 65536; ++c)
+                    pixelCoverage[c] = true;
+        } else ok = false;
+    } else ok = false;
+    SelectObject(dc, old); DeleteObject(font); DeleteDC(dc);
+    if (!ok) unloadPixelFont();
+    return ok;
+}
+void unloadPixelFont() {
+    if (pixelFontHandle) RemoveFontMemResourceEx(pixelFontHandle);
+    pixelFontHandle = nullptr; pixelCoverage.clear();
+}
+bool pixelFontLoaded() { return pixelFontHandle != nullptr; }
+bool pixelCovers(const std::wstring& text) {
+    if (pixelCoverage.empty()) return false;
+    for (wchar_t c : text) if (c != L'\r' && c != L'\n' && !pixelCoverage[size_t(c)]) return false;
+    return true;
+}
+
 HICON IconCache::get(const std::wstring& path, int size) {
     if (path.empty() || size <= 0) return nullptr;
     if (size != size_) { clear(); size_ = size; }

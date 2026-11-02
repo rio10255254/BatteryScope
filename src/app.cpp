@@ -29,7 +29,7 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     LanguageZhId = 110, LanguageEnId = 111, PowerDetailsId = 112, SaverModeId = 113,
     EnergySaverSettingsId = 114, ReviewCandidatesId = 115, InlineBackId = 116, InlineConfirmId = 117,
     LedgerId = 118, ExportCsvId = 119, LowBatteryOffId = 120, LowBattery10Id = 121, LowBattery20Id = 122, LowBattery30Id = 123,
-    HotkeyToggleId = 124, ThemeSystemId = 125, ThemeDarkId = 126, ThemeLightId = 127,
+    HotkeyToggleId = 124, ThemeSystemId = 125, ThemeDarkId = 126, ThemeLightId = 127, StylePixelId = 128, StyleSmoothId = 129,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1;
 const wchar_t* ClassName = L"BatteryScope.Main.v1";
@@ -37,6 +37,10 @@ const wchar_t* const AppTitle = L"BatteryScope " BS_VERSION_STRING;
 // Theme palette; the short names below mirror it for the drawing code.
 ui::ThemeChoice themeChoice = ui::ThemeChoice::system;
 bool previewContrast = false; // --high-contrast preview option
+// Pixel style: stepped shapes, cell meters, bitmap digits, and the embedded pixel
+// font for UI text (strings it cannot render fall back to the system font).
+bool pixelStyle = true;
+constexpr int PixelFontResource = 102;
 ui::Palette theme = ui::palette(ui::ThemeChoice::dark);
 COLORREF Ink = theme.ink, Muted = theme.muted, Green = theme.accent, Background = theme.background,
     Surface = theme.surface, Border = theme.border, Selected = theme.selected, Danger = theme.danger;
@@ -45,6 +49,9 @@ HWND mainWindow = nullptr, viewport = nullptr, list = nullptr, closeButton = nul
     detailsButton = nullptr, backgroundCheck = nullptr, allCheck = nullptr, hideButton = nullptr, menuButton = nullptr, saverButton = nullptr,
     inlineText = nullptr, inlineBack = nullptr, inlineConfirm = nullptr;
 HFONT normalFont = nullptr, smallFont = nullptr, strongFont = nullptr, titleFont = nullptr, valueFont = nullptr, metricFont = nullptr;
+HFONT systemFont = nullptr;              // dynamic text: details pages and tooltips
+std::map<HFONT, HFONT> fallbackFonts;    // pixel font -> system font for uncovered text
+std::vector<HFONT> fallbackOwned;
 HICON appIcon = nullptr, smallIcon = nullptr, headerIcon = nullptr;
 bool updateTray(bool add);
 UINT dpi = 96, taskbarCreated = 0;
@@ -158,22 +165,38 @@ std::wstring activityText(const ProcessRow& row) {
     return text;
 }
 void font(HDC dc, HFONT value) { SelectObject(dc, value); }
+HFONT fontFor(HFONT face, const std::wstring& text) {
+    auto fallback = fallbackFonts.find(face);
+    return fallback != fallbackFonts.end() && !ui::pixelCovers(text) ? fallback->second : face;
+}
 void drawText(HDC dc, const std::wstring& text, RECT r, COLORREF color, HFONT face, UINT format = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS) {
-    font(dc, face); SetTextColor(dc, color); SetBkMode(dc, TRANSPARENT);
+    font(dc, fontFor(face, text)); SetTextColor(dc, color); SetBkMode(dc, TRANSPARENT);
     DrawTextW(dc, text.c_str(), -1, &r, format | DT_NOPREFIX);
 }
 void fill(HDC dc, RECT rect, COLORREF color) {
     SetDCBrushColor(dc, color); FillRect(dc, &rect, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
 }
 // `radius` is the corner radius in logical pixels.
-void rounded(HDC dc, RECT rect, COLORREF color, int radius = 12) { ui::fillRound(dc, rect, color, float(sp(radius))); }
-// A surface card; contrast themes add an outline because fills alone may match the background.
+// Pixel grid in device pixels, and corner stair steps for a smooth-style radius.
+int pixelUnit() { return std::max(2, px(2)); }
+int pixelSteps(int radius) { return radius >= 9 ? 2 : 1; }
+void rounded(HDC dc, RECT rect, COLORREF color, int radius = 12) {
+    if (pixelStyle) ui::pixelFill(dc, rect, color, pixelUnit(), pixelSteps(radius));
+    else ui::fillRound(dc, rect, color, float(sp(radius)));
+}
+void outline(HDC dc, RECT rect, COLORREF color, int radius, float width = 1.0f) {
+    if (pixelStyle) ui::pixelFrame(dc, rect, color, pixelUnit(), pixelSteps(radius));
+    else ui::strokeRound(dc, rect, color, float(sp(radius)), width);
+}
+// A surface card. Pixel style always outlines it; contrast themes outline it
+// because fills alone may match the background.
 void card(HDC dc, RECT rect, COLORREF color, int radius) {
+    if (pixelStyle) { ui::pixelBox(dc, rect, color, theme.highContrast ? Border : blend(Border, Background, .15), pixelUnit(), 2); return; }
     rounded(dc, rect, color, radius);
-    if (theme.highContrast) ui::strokeRound(dc, rect, Border, float(sp(radius)), 1.0f);
+    if (theme.highContrast) outline(dc, rect, Border, radius);
 }
 int textWidth(HDC dc, const std::wstring& text, HFONT face) {
-    font(dc, face); SIZE size{}; GetTextExtentPoint32W(dc, text.c_str(), int(text.size()), &size); return size.cx;
+    font(dc, fontFor(face, text)); SIZE size{}; GetTextExtentPoint32W(dc, text.c_str(), int(text.size()), &size); return size.cx;
 }
 // "About 1 h 5 min"; empty when there is no usable estimate.
 std::wstring durationText(Value hours) {
@@ -191,17 +214,43 @@ void setNotice(std::wstring text) {
     SetTimer(mainWindow, NoticeTimer, 15000, nullptr);
     InvalidateRect(mainWindow, nullptr, FALSE);
 }
+// Pixel font size snapped to whole multiples of its 12 px design grid when the
+// DPI-scaled size is within 25%; otherwise the scaled size (uneven pixels).
+int pixelEm(int multiple) {
+    const int target = px(12 * multiple), snapped = std::max(1, (target + 6) / 12) * 12;
+    return std::abs(snapped - target) * 4 <= target ? snapped : target;
+}
 void makeFonts() {
     for (auto f : {normalFont, smallFont, strongFont, titleFont, valueFont, metricFont}) if (f) DeleteObject(f);
-    auto make = [](int height, int weight) {
-        return CreateFontW(-px(height), 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, english ? L"Segoe UI" : L"Microsoft JhengHei UI");
+    for (auto f : fallbackOwned) DeleteObject(f);
+    fallbackOwned.clear(); fallbackFonts.clear();
+    auto make = [](int height, int weight, const wchar_t* face, DWORD quality) {
+        return CreateFontW(-height, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, quality, DEFAULT_PITCH, face);
     };
-    normalFont = make(12, FW_NORMAL); smallFont = make(11, FW_NORMAL); strongFont = make(12, FW_SEMIBOLD);
-    titleFont = make(16, FW_SEMIBOLD); valueFont = make(29, FW_SEMIBOLD); metricFont = make(16, FW_SEMIBOLD);
+    const wchar_t* systemFace = english ? L"Segoe UI" : L"Microsoft JhengHei UI";
+    auto system = [&](int height, int weight) { return make(px(height), weight, systemFace, CLEARTYPE_QUALITY); };
+    if (pixelStyle && ui::pixelFontLoaded()) {
+        auto pixel = [&](int multiple, int weight, int fallbackHeight, int fallbackWeight) {
+            HFONT face = make(pixelEm(multiple), weight, ui::PixelFontFace, NONANTIALIASED_QUALITY);
+            HFONT fallback = system(fallbackHeight, fallbackWeight);
+            fallbackOwned.push_back(fallback); fallbackFonts[face] = fallback;
+            return face;
+        };
+        normalFont = pixel(1, FW_NORMAL, 12, FW_NORMAL); smallFont = pixel(1, FW_NORMAL, 11, FW_NORMAL);
+        strongFont = pixel(1, FW_BOLD, 12, FW_SEMIBOLD); titleFont = pixel(2, FW_NORMAL, 16, FW_SEMIBOLD);
+        valueFont = pixel(2, FW_NORMAL, 29, FW_SEMIBOLD); metricFont = pixel(1, FW_BOLD, 16, FW_SEMIBOLD);
+        systemFont = system(12, FW_NORMAL); fallbackOwned.push_back(systemFont);
+    } else {
+        normalFont = system(12, FW_NORMAL); smallFont = system(11, FW_NORMAL); strongFont = system(12, FW_SEMIBOLD);
+        titleFont = system(16, FW_SEMIBOLD); valueFont = system(29, FW_SEMIBOLD); metricFont = system(16, FW_SEMIBOLD);
+        systemFont = normalFont;
+    }
     for (auto window : {list, closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck,
-        hideButton, menuButton, saverButton, inlineText, inlineBack, inlineConfirm, tooltip})
+        hideButton, menuButton, saverButton, inlineBack, inlineConfirm})
         if (window) SendMessageW(window, WM_SETFONT, reinterpret_cast<WPARAM>(normalFont), TRUE);
+    for (auto window : {inlineText, tooltip})
+        if (window) SendMessageW(window, WM_SETFONT, reinterpret_cast<WPARAM>(systemFont), TRUE);
 }
 void applyTheme() {
     theme = ui::palette(themeChoice, previewContrast);
@@ -665,20 +714,23 @@ void drawButton(const DRAWITEMSTRUCT& item) {
     InflateRect(&r, -inset, -inset);
     wchar_t title[128]{}; GetWindowTextW(item.hwndItem, title, int(std::size(title)));
     const float radius = id == SaverModeId ? (r.bottom - r.top) / 2.0f : float(sp(9));
-    COLORREF face = theme.raised, outline = CLR_INVALID, text = Ink;
+    COLORREF face = theme.raised, edgeColor = CLR_INVALID, text = Ink;
     HFONT faceFont = normalFont;
     if (id == MenuId || id == HideId) {
         face = hover > .01 || pressed ? blend(behind, theme.raised, std::max(hover, pressed ? 1.0 : 0.0)) : behind;
         if (face != behind) rounded(dc, r, face, 9);
-        if (theme.highContrast && hover > .5) ui::strokeRound(dc, r, Border, radius, 1.0f);
+        if (theme.highContrast && hover > .5) outline(dc, r, Border, 9);
         const COLORREF glyph = disabled ? theme.faint : blend(Muted, Ink, hover);
-        if (id == MenuId) ui::drawDots(dc, r, glyph, std::max(1.2f, sp(2) * .8f));
+        if (pixelStyle) {
+            const int glyphUnit = std::max(pixelUnit(), px(3));
+            if (id == MenuId) ui::pixelDots(dc, r, glyph, glyphUnit); else ui::pixelChevron(dc, r, glyph, glyphUnit);
+        } else if (id == MenuId) ui::drawDots(dc, r, glyph, std::max(1.2f, sp(2) * .8f));
         else ui::drawChevron(dc, r, glyph, std::max(1.5f, float(sp(2))));
     } else {
         const bool checked = (id == BackgroundId && backgroundOnly) || (id == AllId && showAll) || (id == SaverModeId && saverActive);
         if (disabled) {
             face = blend(Surface, behind, .35); text = theme.faint;
-            if (theme.highContrast) outline = theme.faint;
+            if (theme.highContrast) edgeColor = theme.faint;
         } else if (theme.highContrast && (id == CloseId || id == InlineConfirmId || checked)) {
             face = theme.selected; text = theme.selectedInk; faceFont = id == CloseId || id == InlineConfirmId ? strongFont : normalFont;
         } else if (id == CloseId) {
@@ -686,30 +738,46 @@ void drawButton(const DRAWITEMSTRUCT& item) {
         } else if (id == InlineConfirmId) {
             face = blend(Danger, Ink, hover * .14); text = theme.dark ? Background : RGB(255, 255, 255); faceFont = strongFont;
         } else if (id == KillId) {
-            face = blend(Surface, theme.raised, hover); outline = blend(Danger, behind, .45); text = Danger;
+            face = blend(Surface, theme.raised, hover); edgeColor = blend(Danger, behind, .45); text = Danger;
         } else if (id == BackgroundId || id == AllId || id == SaverModeId) {
             if (checked) {
                 face = id == SaverModeId ? Green : theme.accentSoft;
-                outline = id == SaverModeId ? CLR_INVALID : blend(Green, behind, .35);
+                edgeColor = id == SaverModeId ? CLR_INVALID : blend(Green, behind, .35);
                 text = id == SaverModeId ? theme.accentInk : Green;
                 if (id == SaverModeId) face = blend(Green, Ink, hover * .14);
             } else {
                 face = blend(id == SaverModeId ? theme.accentSoft : Surface, theme.raised, hover);
-                outline = id == SaverModeId ? CLR_INVALID : Border;
+                edgeColor = id == SaverModeId ? CLR_INVALID : Border;
                 text = id == SaverModeId ? Green : Muted;
             }
         } else {
             face = blend(theme.raised, Border, hover * .6);
         }
         if (pressed) face = blend(face, Ink, .1);
-        ui::fillRound(dc, r, face, radius);
-        if (theme.highContrast && outline == CLR_INVALID) outline = Border;
-        if (outline != CLR_INVALID) ui::strokeRound(dc, r, outline, radius, 1.0f);
-        drawText(dc, title, r, text, faceFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        if (pixelStyle) {
+            // Raised pixel button: one-unit outline and drop shadow; pressing sinks it into the shadow.
+            const int u = pixelUnit();
+            const bool down = pressed || press > .5;
+            RECT body = item.rcItem; body.bottom -= u;
+            if (down) OffsetRect(&body, 0, u);
+            const COLORREF edge = edgeColor != CLR_INVALID ? edgeColor : theme.highContrast ? Border
+                : blend(face, theme.dark ? RGB(0, 0, 0) : Ink, theme.dark ? .45 : .3);
+            if (!down && !disabled) ui::pixelFill(dc, {body.left, body.top + u, body.right, body.bottom + u}, blend(edge, behind, .25), u, 2);
+            ui::pixelFill(dc, body, face, u, 2);
+            ui::pixelFrame(dc, body, edge, u, 2);
+            drawText(dc, title, body, text, faceFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        } else {
+            ui::fillRound(dc, r, face, radius);
+            if (theme.highContrast && edgeColor == CLR_INVALID) edgeColor = Border;
+            if (edgeColor != CLR_INVALID) ui::strokeRound(dc, r, edgeColor, radius, 1.0f);
+            drawText(dc, title, r, text, faceFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        }
     }
     if ((item.itemState & ODS_FOCUS) && !(item.itemState & ODS_NOFOCUSRECT)) {
         RECT ring = item.rcItem;
-        ui::strokeRound(dc, ring, theme.highContrast ? Ink : blend(Green, behind, .15), radius + 1, float(std::max(2, px(2))));
+        const COLORREF color = theme.highContrast ? Ink : blend(Green, behind, .15);
+        if (pixelStyle) ui::pixelFrame(dc, ring, color, pixelUnit(), 2);
+        else ui::strokeRound(dc, ring, color, radius + 1, float(std::max(2, px(2))));
     }
 }
 void drawProcess(const DRAWITEMSTRUCT& item) {
@@ -721,8 +789,11 @@ void drawProcess(const DRAWITEMSTRUCT& item) {
     const double hover = item.itemID < rowMotions.size() ? rowMotions[item.itemID].hover.value(motionNow()) : 0;
     RECT tile = r; tile.bottom -= sp(4);
     const COLORREF tileColor = blend(blend(Surface, theme.raised, hover), Selected, focus);
-    rounded(dc, tile, tileColor, 10);
-    if (theme.highContrast) ui::strokeRound(dc, tile, selected ? Green : Border, float(sp(10)), selected ? 2.0f : 1.0f);
+    if (pixelStyle) ui::pixelBox(dc, tile, tileColor, selected ? Green : theme.highContrast ? Border : blend(Border, tileColor, .3), pixelUnit(), 2);
+    else {
+        rounded(dc, tile, tileColor, 10);
+        if (theme.highContrast) outline(dc, tile, selected ? Green : Border, 10, selected ? 2.0f : 1.0f);
+    }
     if (focus > .01) rounded(dc, {r.left + sp(3), r.top + sp(14), r.left + sp(6), tile.bottom - sp(14)}, blend(tileColor, Green, focus), 2);
     const bool inverted = theme.highContrast && selected;
     const COLORREF ink = inverted ? theme.selectedInk : Ink, sub = inverted ? theme.selectedInk : Muted, accent = inverted ? theme.selectedInk : Green;
@@ -745,7 +816,7 @@ void drawProcess(const DRAWITEMSTRUCT& item) {
     const std::wstring kind = tr(row.kind.c_str());
     RECT chip{left, y + sp(31), left + textWidth(dc, kind, smallFont) + sp(12), y + sp(45)};
     rounded(dc, chip, inverted ? tileColor : blend(tileColor, Ink, theme.dark ? .08 : .06), 5);
-    if (theme.highContrast) ui::strokeRound(dc, chip, sub, float(sp(5)), 1.0f);
+    if (theme.highContrast) outline(dc, chip, sub, 5);
     drawText(dc, kind, chip, sub, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     drawText(dc, L"PID " + std::to_wstring(row.pid), {chip.right + sp(6), y + sp(29), right - sp(100), y + sp(47)}, sub, smallFont);
     std::wstring range = row.cpuWattsLow && row.cpuWattsHigh ?
@@ -755,13 +826,17 @@ void drawProcess(const DRAWITEMSTRUCT& item) {
     if (row.averageCpuWatts && !displayed.empty() && displayed.front().averageCpuWatts && *displayed.front().averageCpuWatts > 0) {
         const double ratio = item.itemID < rowMotions.size() ? rowMotions[item.itemID].bar.value(motionNow()) : 0;
         const int barTop = y + sp(49), barBottom = barTop + std::max(2, sp(3));
-        rounded(dc, {left, barTop, right, barBottom}, blend(tileColor, Border, .9), 2);
-        const int filled = int((right - left) * std::clamp(ratio, 0.0, 1.0));
-        if (filled > 0) rounded(dc, {left, barTop, left + std::max(filled, sp(3)), barBottom}, selected ? accent : theme.accentDim, 2);
+        if (pixelStyle) ui::pixelSegments(dc, {left, barTop, right, barTop + pixelUnit() * 2}, ratio,
+            selected ? accent : theme.accentDim, blend(tileColor, Border, .9), pixelUnit());
+        else {
+            rounded(dc, {left, barTop, right, barBottom}, blend(tileColor, Border, .9), 2);
+            const int filled = int((right - left) * std::clamp(ratio, 0.0, 1.0));
+            if (filled > 0) rounded(dc, {left, barTop, left + std::max(filled, sp(3)), barBottom}, selected ? accent : theme.accentDim, 2);
+        }
     }
     if ((item.itemState & ODS_FOCUS) && GetFocus() == list && !(SendMessageW(list, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS)) {
-        InflateRect(&tile, -sp(1), -sp(1));
-        ui::strokeRound(dc, tile, theme.highContrast ? ink : blend(Green, tileColor, .25), float(sp(10)), float(std::max(2, px(2))));
+        if (!pixelStyle) InflateRect(&tile, -sp(1), -sp(1));
+        outline(dc, tile, theme.highContrast ? ink : blend(Green, tileColor, .25), 10, float(std::max(2, px(2))));
     }
 }
 void paint(HDC dc, RECT bounds) {
@@ -791,13 +866,21 @@ void paint(HDC dc, RECT bounds) {
     // Hero card: power on the left, battery level on the right.
     card(dc, {margin, sp(72), right, sp(180)}, Surface, 16);
     drawText(dc, p.charging ? tr(L"充電功率") : plugged ? tr(L"外部電源") : tr(L"目前耗電"), {margin + sp(16), sp(84), right - sp(122), sp(103)}, Muted, smallFont);
-    drawText(dc, currentW, {margin + sp(14), sp(102), right - sp(119), sp(150)}, Ink, valueFont);
+    const int digitUnit = std::max(3, px(4));
+    if (!pixelStyle || !ui::drawPixelDigits(dc, currentW, margin + sp(16), (sp(102) + sp(150)) / 2 - digitUnit * 7 / 2, digitUnit, Ink))
+        drawText(dc, currentW, {margin + sp(14), sp(102), right - sp(119), sp(150)}, Ink, valueFont);
     drawText(dc, rateLabel, {margin + sp(16), sp(152), right - sp(150), sp(172)}, Muted, smallFont);
     const bool low = p.percent && !plugged && *p.percent <= 20;
     const COLORREF level = !p.percent ? Muted : p.charging ? Green : low && *p.percent <= 10 ? Danger : low ? theme.warn : Green;
-    drawText(dc, valueText(p.percent, L"%", 0), {right - sp(112), sp(84), right - sp(16), sp(116)},
-        p.percent ? Ink : Muted, titleFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
-    ui::drawBattery(dc, {right - sp(16) - sp(60), sp(121), right - sp(16), sp(143)}, p.percent ? *p.percent / 100 : 0,
+    const std::wstring percentText = valueText(p.percent, L"%", 0);
+    const int percentUnit = pixelUnit(), percentWidth = ui::pixelDigitsWidth(percentText, percentUnit);
+    if (!pixelStyle || !ui::drawPixelDigits(dc, percentText, right - sp(16) - percentWidth, (sp(84) + sp(116)) / 2 - percentUnit * 7 / 2,
+        percentUnit, p.percent ? Ink : Muted))
+        drawText(dc, percentText, {right - sp(112), sp(84), right - sp(16), sp(116)},
+            p.percent ? Ink : Muted, titleFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    if (pixelStyle) ui::pixelBattery(dc, {right - sp(16) - sp(64), sp(120), right - sp(16), sp(144)}, p.percent ? *p.percent / 100 : 0,
+        blend(Muted, Surface, .25), level, blend(Surface, Border, .7), p.charging, Ink, Surface, pixelUnit());
+    else ui::drawBattery(dc, {right - sp(16) - sp(60), sp(121), right - sp(16), sp(143)}, p.percent ? *p.percent / 100 : 0,
         blend(Muted, Surface, .25), level, p.charging, Ink, Surface);
     drawText(dc, p.charging ? tr(L"充電中") : plugged ? (p.percent && *p.percent >= 99.5 ? tr(L"已充滿") : tr(L"未充電")) : tr(L"剩餘電量"),
         {right - sp(146), sp(151), right - sp(16), sp(172)}, Muted, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
@@ -831,8 +914,9 @@ void paint(HDC dc, RECT bounds) {
         uint64_t last = current.history.empty() ? GetTickCount64() : current.history.back().ms;
         for (const auto& point : current.history) if (auto watts = chartPower(point)) maximum = std::max(maximum, std::ceil(*watts / 5) * 5);
         const int middle = (plot.top + plot.bottom) / 2;
-        ui::drawDashedLine(dc, {plot.left, middle}, {plot.right, middle}, blend(Border, Surface, .2), 1.0f);
-        fill(dc, {plot.left, plot.bottom, plot.right, plot.bottom + 1}, Border);
+        if (pixelStyle) ui::pixelDottedLine(dc, {plot.left, middle}, {plot.right, middle}, blend(Border, Surface, .1), pixelUnit());
+        else ui::drawDashedLine(dc, {plot.left, middle}, {plot.right, middle}, blend(Border, Surface, .2), 1.0f);
+        fill(dc, {plot.left, plot.bottom, plot.right, plot.bottom + (pixelStyle ? pixelUnit() / 2 : 1)}, Border);
         std::vector<std::vector<POINT>> segments;
         uint64_t previous = 0; bool connected = false;
         for (const auto& point : current.history) {
@@ -845,11 +929,33 @@ void paint(HDC dc, RECT bounds) {
             connected = true; previous = point.ms;
         }
         bool any = false;
-        for (const auto& segment : segments) any |= segment.size() > 1;
-        if (any) ui::drawSeries(dc, plot, segments, Green, std::max(1.5f, float(sp(2))), Green);
+        if (pixelStyle) {
+            // Pixel bar chart: two-unit columns with a one-unit gap, each the mean of its time slice.
+            const int u = pixelUnit(), pitch = u * 3, columns = std::max(1, int(plot.right - plot.left) / pitch);
+            const int start = plot.right - columns * pitch;
+            std::vector<double> sum(size_t(columns), 0), count(size_t(columns), 0);
+            for (const auto& point : current.history) {
+                auto watts = chartPower(point);
+                if (!watts || point.ms > last || last - point.ms > 1800000) continue;
+                const int column = std::clamp(columns - 1 - int((last - point.ms) / 1800000.0 * columns), 0, columns - 1);
+                sum[size_t(column)] += std::min(*watts, maximum); count[size_t(column)] += 1;
+            }
+            for (int column = 0; column < columns; ++column) {
+                if (!count[size_t(column)]) continue;
+                any = true;
+                const int height = std::max(u, int(sum[size_t(column)] / count[size_t(column)] / maximum * (plot.bottom - plot.top)) / u * u);
+                const int x = start + column * pitch;
+                fill(dc, {x, plot.bottom - height, x + 2 * u, plot.bottom}, blend(Green, Surface, theme.highContrast ? 0 : .55));
+                fill(dc, {x, plot.bottom - height, x + 2 * u, plot.bottom - height + u}, Green);
+            }
+        } else {
+            for (const auto& segment : segments) any |= segment.size() > 1;
+            if (any) ui::drawSeries(dc, plot, segments, Green, std::max(1.5f, float(sp(2))), Green);
+        }
         for (auto time : actionMarks) if (!chargingChart && time <= last && last - time <= 1800000) {
             int x = plot.right - int((last - time) / 1800000.0 * (plot.right - plot.left));
-            ui::drawDashedLine(dc, {x, plot.top}, {x, plot.bottom}, theme.warn, 1.0f);
+            if (pixelStyle) ui::pixelDottedLine(dc, {x, plot.top}, {x, plot.bottom}, theme.warn, pixelUnit());
+            else ui::drawDashedLine(dc, {x, plot.top}, {x, plot.bottom}, theme.warn, 1.0f);
         }
         if (!any) drawText(dc, chargingChart ? tr(L"等待充電資料") : plugged ? tr(L"插電期間暫停放電曲線") : tr(L"等待放電資料"), plot, Muted, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
         drawText(dc, L"0–" + number(maximum, 0) + L" W", {chart.right - sp(90), chart.top + sp(5), chart.right - sp(12), chart.top + sp(21)},
@@ -869,7 +975,7 @@ void paint(HDC dc, RECT bounds) {
     drawText(dc, tr(L"CPU 耗電排行"), {margin, top - sp(78), right - chipWidth - sp(8), top - sp(56)}, Ink, strongFont);
     const RECT sortChip{right - chipWidth, top - sp(76), right, top - sp(58)};
     rounded(dc, sortChip, theme.accentSoft, 9);
-    if (theme.highContrast) ui::strokeRound(dc, sortChip, Green, float(sp(9)), 1.0f);
+    if (theme.highContrast) outline(dc, sortChip, Green, 9);
     drawText(dc, sortLabel, sortChip, Green, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     drawText(dc, energyReady ? tr(L"30 秒平滑 · ") + qualityText(current.energy.quality) + L" " + number(current.energy.observedCpuCoverage * 100, 0) + L"%" : tr(L"能源暫不可用，依 CPU / I/O 活動排序"),
         {margin, top - sp(56), right, top - sp(40)}, Muted, smallFont);
@@ -919,6 +1025,7 @@ void loadSettings() {
     const DWORD threshold = readSetting(L"LowBattery", 0);
     lowBatteryThreshold = threshold == 10 || threshold == 20 || threshold == 30 ? threshold : 0;
     hotkeyEnabled = readSetting(L"Hotkey", 0) == 1;
+    pixelStyle = readSetting(L"Style", 1) != 0;
 }
 void showLedger() {
     std::wstring content = tr(L"自 BatteryScope 啟動以來，依 CPU 能源分攤累計各程式的耗能，含已結束的程序。");
@@ -1005,6 +1112,12 @@ bool registerPanelHotkey(bool enable) {
     if (hotkeyRegistered) { UnregisterHotKey(mainWindow, PanelHotkey); hotkeyRegistered = false; }
     if (enable) hotkeyRegistered = RegisterHotKey(mainWindow, PanelHotkey, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, 'B') != FALSE;
     return !enable || hotkeyRegistered;
+}
+void setStyle(bool pixel) {
+    pixelStyle = pixel;
+    makeFonts();
+    RedrawWindow(mainWindow, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    if (!writeSetting(L"Style", pixel ? 1 : 0)) setNotice(tr(L"無法儲存設定。"));
 }
 void setTheme(ui::ThemeChoice choice) {
     themeChoice = choice;
@@ -1351,6 +1464,10 @@ void openMenu(POINT point) {
     AppendMenuW(themes, MF_STRING | (themeChoice == ui::ThemeChoice::dark ? MF_CHECKED : 0), ThemeDarkId, tr(L"深色"));
     AppendMenuW(themes, MF_STRING | (themeChoice == ui::ThemeChoice::light ? MF_CHECKED : 0), ThemeLightId, tr(L"淺色"));
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(themes), tr(L"主題"));
+    HMENU styles = CreatePopupMenu();
+    AppendMenuW(styles, MF_STRING | (pixelStyle ? MF_CHECKED : 0) | (ui::pixelFontLoaded() ? 0 : MF_GRAYED), StylePixelId, tr(L"像素"));
+    AppendMenuW(styles, MF_STRING | (!pixelStyle ? MF_CHECKED : 0), StyleSmoothId, tr(L"平滑"));
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(styles), tr(L"風格"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, PowerDetailsId, tr(L"電池與充電詳情"));
     AppendMenuW(menu, MF_STRING, LedgerId, tr(L"本次累計耗能"));
@@ -1568,6 +1685,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             else setNotice(hotkeyEnabled ? tr(L"已啟用快速鍵 Ctrl+Alt+B。") : tr(L"已停用快速鍵。"));
             return 0;
         }
+        if (id == StylePixelId || id == StyleSmoothId) { setStyle(id == StylePixelId); return 0; }
         if (id == ThemeSystemId || id == ThemeDarkId || id == ThemeLightId) {
             setTheme(id == ThemeSystemId ? ui::ThemeChoice::system : id == ThemeDarkId ? ui::ThemeChoice::dark : ui::ThemeChoice::light);
             return 0;
@@ -1919,6 +2037,23 @@ bool panelSelfTest(const std::wstring& path) {
         (theme.highContrast || theme.dark) && ListView_GetBkColor(list) == Background);
     themeChoice = savedTheme; applyTheme();
     {
+        // Every UI string, Chinese and English, must render in the embedded pixel
+        // font; run tools/subset-pixel-font.py after changing UI text.
+        size_t uncovered = 0;
+        for (const auto& entry : translations) uncovered += !ui::pixelCovers(std::wstring(entry.first)) + !ui::pixelCovers(entry.second);
+        check("pixel_font_covers_all_ui_strings", ui::pixelFontLoaded() && uncovered == 0 &&
+            ui::pixelCovers(L"BatteryScope 0123456789.%W") && !ui::pixelCovers(L"\u0E01"));
+        const bool savedStyle = pixelStyle;
+        SendMessageW(mainWindow, WM_COMMAND, StyleSmoothId, 0);
+        RECT smoothList{}; GetWindowRect(list, &smoothList);
+        const bool smoothFonts = !pixelStyle && fallbackFonts.empty() && systemFont == normalFont;
+        SendMessageW(mainWindow, WM_COMMAND, StylePixelId, 0);
+        RECT pixelList{}; GetWindowRect(list, &pixelList);
+        check("style_switch_swaps_fonts_without_moving_layout", smoothFonts && pixelStyle && fallbackFonts.count(normalFont) &&
+            systemFont != normalFont && EqualRect(&smoothList, &pixelList));
+        if (pixelStyle != savedStyle) setStyle(savedStyle);
+    }
+    {
         wchar_t folder[MAX_PATH]{}; GetTempPathW(MAX_PATH, folder);
         const std::wstring csvPath = std::wstring(folder) + L"BatteryScope-panel-" + std::to_wstring(GetCurrentProcessId()) + L".csv";
         const auto powerPath = exportCsv(csvPath);
@@ -2136,8 +2271,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (option(L"--light")) themeChoice = ui::ThemeChoice::light;
     if (option(L"--dark")) themeChoice = ui::ThemeChoice::dark;
     previewContrast = isolatedPreview && option(L"--high-contrast");
+    if (option(L"--smooth")) pixelStyle = false;
+    if (option(L"--pixel")) pixelStyle = true;
     theme = ui::palette(themeChoice, previewContrast);
     ui::startGraphics();
+    ui::loadPixelFont(instance, PixelFontResource);
     if (isolatedPreview || demo) ClassName = L"BatteryScope.Preview.v3";
     Handle singleton(CreateMutexW(nullptr, FALSE, isolatedPreview || demo ? L"Local\\BatteryScope.Preview.v3" : L"Local\\BatteryScope.Main.v1"));
     if (!singleton) return 1;
@@ -2210,6 +2348,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (worker.joinable()) worker.join();
     if (actionWorker.joinable()) actionWorker.join();
     for (auto f : {normalFont, smallFont, strongFont, titleFont, valueFont, metricFont}) if (f) DeleteObject(f);
+    for (auto f : fallbackOwned) DeleteObject(f);
+    ui::unloadPixelFont();
     DestroyIcon(appIcon); DestroyIcon(smallIcon); if (headerIcon) DestroyIcon(headerIcon);
     processIcons.clear();
     ui::stopGraphics();

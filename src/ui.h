@@ -48,6 +48,34 @@ void drawBattery(HDC dc, const RECT& r, double fraction, COLORREF outline, COLOR
 void drawChevron(HDC dc, const RECT& r, COLORREF color, float width);
 void drawDots(HDC dc, const RECT& r, COLORREF color, float radius);
 
+// Pixel style. Shapes are drawn without antialiasing on a grid of `unit`
+// device pixels; `steps` is the number of stair steps cut into each corner.
+void pixelFill(HDC dc, const RECT& r, COLORREF color, int unit, int steps);
+void pixelFrame(HDC dc, const RECT& r, COLORREF color, int unit, int steps);
+// A filled box with a one-unit outline; a valid `shadow` adds a one-unit drop below.
+void pixelBox(HDC dc, const RECT& r, COLORREF fill, COLORREF outline, int unit, int steps, COLORREF shadow = CLR_INVALID);
+// Horizontal meter of 2x-unit blocks with one-unit gaps.
+void pixelSegments(HDC dc, const RECT& r, double fraction, COLORREF on, COLORREF off, int unit);
+// Battery with `cells` level cells and a pixel lightning bolt when charging.
+void pixelBattery(HDC dc, const RECT& r, double fraction, COLORREF outline, COLORREF level, COLORREF empty,
+    bool bolt, COLORREF boltColor, COLORREF boltEdge, int unit, int cells = 5);
+// 3x5 arrow glyphs for icon buttons.
+void pixelChevron(HDC dc, const RECT& r, COLORREF color, int unit);
+void pixelDots(HDC dc, const RECT& r, COLORREF color, int unit);
+void pixelDottedLine(HDC dc, POINT a, POINT b, COLORREF color, int unit);
+// 5x7 bitmap digits for 0-9 . % W - and space. Returns false (drawing nothing)
+// if `text` holds any other character; width is 0 in that case.
+int pixelDigitsWidth(const std::wstring& text, int unit);
+bool drawPixelDigits(HDC dc, const std::wstring& text, int x, int y, int unit, COLORREF color);
+
+// The embedded pixel UI font (family name below), loaded privately from a resource.
+constexpr wchar_t PixelFontFace[] = L"BatteryScope Pixel";
+bool loadPixelFont(HMODULE module, int resource);
+void unloadPixelFont();
+bool pixelFontLoaded();
+// True if every character of `text` has a glyph in the pixel font.
+bool pixelCovers(const std::wstring& text);
+
 // Executable icons at one pixel size, cached by path (misses are cached too).
 class IconCache {
     std::map<std::wstring, HICON> icons_;
