@@ -105,17 +105,18 @@ struct OwnedChild {
 };
 int wmain(int argc, wchar_t** argv) {
     if (argc == 3 && std::wstring(argv[1]) == L"--child") return child(argv[2]);
-    if (argc == 2 && std::wstring(argv[1]) == L"--saver-cycle") {
+    if (argc == 2 && std::wstring(argv[1]) == L"--power-mode-cycle") {
         // Opt-in local integration check; regular CI tests never change system settings.
-        const auto before = querySaverMode();
-        if (before.error || before.efficient) return 2;
-        const DWORD enable = toggleSaverMode();
-        const auto enabled = querySaverMode();
-        const DWORD restore = enable ? enable : toggleSaverMode();
-        const auto restored = querySaverMode();
-        std::cout << "enable=" << enable << " enabled=" << enabled.efficient << " restorable=" << enabled.restorable
-            << " restore=" << restore << " restored=" << !restored.efficient << '\n';
-        return !enable && enabled.efficient && enabled.restorable && !restore && !restored.error && !restored.efficient ? 0 : 1;
+        const auto before = queryPowerModes();
+        if (before.error || !before.dcKnown || before.restorable || before.dc == PowerMode::other) return 2;
+        const PowerMode original = before.dc, other = original == PowerMode::efficiency ? PowerMode::balanced : PowerMode::efficiency;
+        const DWORD change = setPowerMode(false, other);
+        const auto changed = queryPowerModes();
+        const DWORD restore = restorePowerModes();
+        const auto restored = queryPowerModes();
+        std::cout << "change=" << change << " changed=" << (changed.dc == other) << " restorable=" << changed.restorable
+            << " restore=" << restore << " restored=" << (restored.dc == original) << '\n';
+        return !change && changed.dc == other && changed.restorable && !restore && restored.dc == original && !restored.restorable ? 0 : 1;
     }
     try {
         Transition easing;
@@ -233,6 +234,18 @@ int wmain(int argc, wchar_t** argv) {
         check(std::abs(cpuPercent(0, 10000000, 2, 8) - 6.25) < .0001, "CPU normalized to all logical processors");
         check(cpuPercent(100, 10, 1, 8) == 0 && cpuPercent(0, 100, 0, 0) == 0, "CPU reset and invalid elapsed time");
         check(std::abs(smooth(0, 100, 30) - (1 - std::exp(-1.0)) * 100) < .0001, "time based activity smoothing");
+        {
+            const GUID efficiency{0x961cc777, 0x2547, 0x4f9d, {0x81, 0x74, 0x7d, 0x86, 0x18, 0x1b, 0x8a, 0x7a}};
+            const GUID performance{0xded574b5, 0x45a0, 0x4f42, {0x87, 0x37, 0x46, 0x34, 0x5c, 0x09, 0xc2, 0x38}};
+            const GUID legacy{0x3af9b8d9, 0x7c97, 0x431d, {0xad, 0x78, 0x34, 0xa8, 0xbf, 0xea, 0x43, 0x9f}};
+            const GUID oem{0x12345678, 0x1234, 0x1234, {1, 2, 3, 4, 5, 6, 7, 8}};
+            check(powerModeFromGuid(efficiency) == PowerMode::efficiency && powerModeFromGuid(GUID{}) == PowerMode::balanced &&
+                powerModeFromGuid(performance) == PowerMode::performance && powerModeFromGuid(legacy) == PowerMode::balanced &&
+                powerModeFromGuid(oem) == PowerMode::other, "power mode overlays map to efficiency, balanced, performance, or other");
+            check(effectiveModeFromValue(0) == EffectiveMode::energySaver && effectiveModeFromValue(2) == EffectiveMode::balanced &&
+                effectiveModeFromValue(4) == EffectiveMode::maxPerformance && effectiveModeFromValue(9) == EffectiveMode::unknown,
+                "effective power mode values follow EFFECTIVE_POWER_MODE");
+        }
         check(nearlyEqual(energyDeltaWatts(0,555555556,0,20000000),1), "EMI picowatt-hours and 100ns convert to watts");
         check(!energyDeltaWatts(100,50,0,20000000) && !energyDeltaWatts(0,100,20,10), "EMI resets and reverse time rejected");
         check(!energyDeltaWatts(0,100,0,400000000), "EMI sleep gap rejected");

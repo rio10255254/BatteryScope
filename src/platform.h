@@ -28,13 +28,27 @@ bool safeProcess(HANDLE process, DWORD pid, std::wstring* reason = nullptr);
 DWORD closeProcess(const ProcessRow& expected, bool force);
 DWORD stopService(const std::wstring& name, DWORD expectedPid, uint64_t expectedCreated);
 bool setSamplerEcoQoS(bool enabled);
-struct SaverMode {
-    DWORD error = ERROR_SUCCESS;
-    bool efficient = false;
-    bool restorable = false;
+// Windows power mode (Settings > System > Power > Power mode), configured
+// separately for plugged in and on battery. "other" is an OEM or unknown mode.
+enum class PowerMode { efficiency, balanced, performance, other };
+PowerMode powerModeFromGuid(const GUID& overlay);
+struct PowerModes {
+    DWORD error = ERROR_SUCCESS; // ERROR_PROC_NOT_FOUND when Windows lacks the API
+    PowerMode ac = PowerMode::other, dc = PowerMode::other;
+    bool acKnown = false, dcKnown = false;
+    bool restorable = false; // a mode BatteryScope changed still differs from its original
 };
-SaverMode querySaverMode();
-DWORD toggleSaverMode();
+PowerModes queryPowerModes();
+// The first change to each side saves the original so restorePowerModes can undo it.
+DWORD setPowerMode(bool pluggedIn, PowerMode mode);
+DWORD restorePowerModes();
+// The mode Windows applies right now (documented EFFECTIVE_POWER_MODE).
+enum class EffectiveMode { unknown, energySaver, efficiency, balanced, performance, maxPerformance, game, mixedReality };
+EffectiveMode effectiveModeFromValue(int value);
+// The callback runs on a system thread, first with the current mode. Returns
+// null if unsupported; pass the token to unwatchEffectivePowerMode.
+void* watchEffectivePowerMode(void (*callback)(EffectiveMode, void*), void* context);
+void unwatchEffectivePowerMode(void* token);
 
 struct CollectionWork { size_t paths = 0, safety = 0, memory = 0, processOpens = 0; };
 

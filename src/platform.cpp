@@ -14,78 +14,156 @@
 
 namespace bs {
 namespace {
+// Windows power mode overlays (Settings > System > Power > Power mode).
 constexpr GUID BestEfficiency = {0x961cc777, 0x2547, 0x4f9d, {0x81, 0x74, 0x7d, 0x86, 0x18, 0x1b, 0x8a, 0x7a}};
-constexpr wchar_t SaverRegistryPath[] = L"Software\\BatteryScope";
-constexpr wchar_t SaverRegistryName[] = L"PreviousDCMode";
-using GetDcMode = DWORD (WINAPI*)(GUID*);
-using SetDcMode = DWORD (WINAPI*)(const GUID*);
-struct DcModeApi { GetDcMode get = nullptr; SetDcMode set = nullptr; };
-DcModeApi dcModeApi() {
-    static DcModeApi api = [] {
-        DcModeApi result;
+constexpr GUID BalancedOverlay = {0, 0, 0, {0, 0, 0, 0, 0, 0, 0, 0}};
+constexpr GUID BetterPerformance = {0x3af9b8d9, 0x7c97, 0x431d, {0xad, 0x78, 0x34, 0xa8, 0xbf, 0xea, 0x43, 0x9f}}; // Windows 10 slider
+constexpr GUID BestPerformance = {0xded574b5, 0x45a0, 0x4f42, {0x87, 0x37, 0x46, 0x34, 0x5c, 0x09, 0xc2, 0x38}};
+constexpr wchar_t ModeRegistryPath[] = L"Software\\BatteryScope";
+using GetUserMode = DWORD (WINAPI*)(GUID*);
+using SetUserMode = DWORD (WINAPI*)(const GUID*);
+using EffectiveCallback = VOID (WINAPI*)(int mode, VOID* context);
+using RegisterEffective = HRESULT (WINAPI*)(ULONG version, EffectiveCallback callback, VOID* context, VOID** handle);
+using UnregisterEffective = HRESULT (WINAPI*)(VOID* handle);
+struct PowerApi {
+    GetUserMode getAc = nullptr, getDc = nullptr;
+    SetUserMode setAc = nullptr, setDc = nullptr;
+    RegisterEffective registerEffective = nullptr;
+    UnregisterEffective unregisterEffective = nullptr;
+};
+template<class T> void bind(HMODULE module, const char* name, T& target) {
+    FARPROC symbol = module ? GetProcAddress(module, name) : nullptr;
+    static_assert(sizeof(symbol) == sizeof(target));
+    std::memcpy(&target, &symbol, sizeof(target));
+}
+const PowerApi& powerApi() {
+    static PowerApi api = [] {
+        PowerApi result;
         HMODULE module = LoadLibraryW(L"powrprof.dll");
-        if (!module) return result;
-        FARPROC get = GetProcAddress(module, "PowerGetUserConfiguredDCPowerMode");
-        FARPROC set = GetProcAddress(module, "PowerSetUserConfiguredDCPowerMode");
-        static_assert(sizeof(get) == sizeof(result.get) && sizeof(set) == sizeof(result.set));
-        std::memcpy(&result.get, &get, sizeof(get));
-        std::memcpy(&result.set, &set, sizeof(set));
+        bind(module, "PowerGetUserConfiguredACPowerMode", result.getAc);
+        bind(module, "PowerGetUserConfiguredDCPowerMode", result.getDc);
+        bind(module, "PowerSetUserConfiguredACPowerMode", result.setAc);
+        bind(module, "PowerSetUserConfiguredDCPowerMode", result.setDc);
+        bind(module, "PowerRegisterForEffectivePowerModeNotifications", result.registerEffective);
+        bind(module, "PowerUnregisterFromEffectivePowerModeNotifications", result.unregisterEffective);
         return result;
     }();
     return api;
 }
-bool previousDcMode(GUID& value) {
+const wchar_t* previousName(bool pluggedIn) { return pluggedIn ? L"PreviousACMode" : L"PreviousDCMode"; }
+bool previousMode(bool pluggedIn, GUID& value) {
     DWORD size = sizeof(value);
-    return RegGetValueW(HKEY_CURRENT_USER, SaverRegistryPath, SaverRegistryName, RRF_RT_REG_BINARY,
+    return RegGetValueW(HKEY_CURRENT_USER, ModeRegistryPath, previousName(pluggedIn), RRF_RT_REG_BINARY,
         nullptr, &value, &size) == ERROR_SUCCESS && size == sizeof(value);
 }
-DWORD savePreviousDcMode(const GUID& value) {
+DWORD savePreviousMode(bool pluggedIn, const GUID& value) {
     HKEY key = nullptr;
-    DWORD status = RegCreateKeyExW(HKEY_CURRENT_USER, SaverRegistryPath, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr);
+    DWORD status = RegCreateKeyExW(HKEY_CURRENT_USER, ModeRegistryPath, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr);
     if (status) return status;
-    status = RegSetValueExW(key, SaverRegistryName, 0, REG_BINARY, reinterpret_cast<const BYTE*>(&value), sizeof(value));
+    status = RegSetValueExW(key, previousName(pluggedIn), 0, REG_BINARY, reinterpret_cast<const BYTE*>(&value), sizeof(value));
     RegCloseKey(key);
     return status;
 }
-void clearPreviousDcMode() {
+void clearPreviousMode(bool pluggedIn) {
     HKEY key = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, SaverRegistryPath, 0, KEY_SET_VALUE, &key) == ERROR_SUCCESS) {
-        RegDeleteValueW(key, SaverRegistryName);
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, ModeRegistryPath, 0, KEY_SET_VALUE, &key) == ERROR_SUCCESS) {
+        RegDeleteValueW(key, previousName(pluggedIn));
         RegCloseKey(key);
     }
 }
 bool sameGuid(const GUID& a, const GUID& b) { return std::memcmp(&a, &b, sizeof(GUID)) == 0; }
+const GUID& modeGuid(PowerMode mode) {
+    return mode == PowerMode::efficiency ? BestEfficiency : mode == PowerMode::performance ? BestPerformance : BalancedOverlay;
 }
-SaverMode querySaverMode() {
-    SaverMode state;
-    auto api = dcModeApi();
-    if (!api.get || !api.set) { state.error = ERROR_PROC_NOT_FOUND; return state; }
-    GUID current{};
-    state.error = api.get(&current);
-    if (state.error) return state;
-    state.efficient = sameGuid(current, BestEfficiency);
-    GUID previous{};
-    state.restorable = state.efficient && previousDcMode(previous) && !sameGuid(previous, BestEfficiency);
+}
+PowerMode powerModeFromGuid(const GUID& guid) {
+    if (sameGuid(guid, BestEfficiency)) return PowerMode::efficiency;
+    if (sameGuid(guid, BalancedOverlay) || sameGuid(guid, BetterPerformance)) return PowerMode::balanced;
+    if (sameGuid(guid, BestPerformance)) return PowerMode::performance;
+    return PowerMode::other;
+}
+EffectiveMode effectiveModeFromValue(int value) {
+    switch (value) {
+    case 0: return EffectiveMode::energySaver;
+    case 1: return EffectiveMode::efficiency;
+    case 2: return EffectiveMode::balanced;
+    case 3: return EffectiveMode::performance;
+    case 4: return EffectiveMode::maxPerformance;
+    case 5: return EffectiveMode::game;
+    case 6: return EffectiveMode::mixedReality;
+    default: return EffectiveMode::unknown;
+    }
+}
+PowerModes queryPowerModes() {
+    PowerModes state;
+    const auto& api = powerApi();
+    auto read = [](GetUserMode get, SetUserMode set, bool pluggedIn, PowerMode& mode, bool& known, bool& restorable) {
+        GUID current{};
+        if (!get || !set || get(&current) != ERROR_SUCCESS) return false;
+        mode = powerModeFromGuid(current); known = true;
+        GUID previous{};
+        restorable |= previousMode(pluggedIn, previous) && !sameGuid(previous, current);
+        return true;
+    };
+    const bool ac = read(api.getAc, api.setAc, true, state.ac, state.acKnown, state.restorable);
+    const bool dc = read(api.getDc, api.setDc, false, state.dc, state.dcKnown, state.restorable);
+    if (!ac && !dc) state.error = api.getDc || api.getAc ? ERROR_GEN_FAILURE : ERROR_PROC_NOT_FOUND;
     return state;
 }
-DWORD toggleSaverMode() {
-    auto api = dcModeApi();
-    if (!api.get || !api.set) return ERROR_PROC_NOT_FOUND;
+DWORD setPowerMode(bool pluggedIn, PowerMode mode) {
+    if (mode == PowerMode::other) return ERROR_INVALID_PARAMETER;
+    const auto& api = powerApi();
+    GetUserMode get = pluggedIn ? api.getAc : api.getDc;
+    SetUserMode set = pluggedIn ? api.setAc : api.setDc;
+    if (!get || !set) return ERROR_PROC_NOT_FOUND;
     GUID current{};
-    DWORD status = api.get(&current);
+    DWORD status = get(&current);
     if (status) return status;
-    if (sameGuid(current, BestEfficiency)) {
+    const GUID& target = modeGuid(mode);
+    if (sameGuid(current, target)) return ERROR_SUCCESS;
+    GUID previous{};
+    const bool saved = previousMode(pluggedIn, previous);
+    // Remember only the setting from before BatteryScope's first change.
+    if (!saved && (status = savePreviousMode(pluggedIn, current)) != ERROR_SUCCESS) return status;
+    status = set(&target);
+    if (status) { if (!saved) clearPreviousMode(pluggedIn); return status; }
+    if (saved && sameGuid(previous, target)) clearPreviousMode(pluggedIn); // back at the original
+    return ERROR_SUCCESS;
+}
+DWORD restorePowerModes() {
+    const auto& api = powerApi();
+    DWORD result = ERROR_SUCCESS;
+    for (bool pluggedIn : {true, false}) {
         GUID previous{};
-        if (!previousDcMode(previous) || sameGuid(previous, BestEfficiency)) return ERROR_ALREADY_EXISTS;
-        status = api.set(&previous);
-        if (!status) clearPreviousDcMode();
-        return status;
+        if (!previousMode(pluggedIn, previous)) continue;
+        SetUserMode set = pluggedIn ? api.setAc : api.setDc;
+        const DWORD status = set ? set(&previous) : ERROR_PROC_NOT_FOUND;
+        if (status == ERROR_SUCCESS) clearPreviousMode(pluggedIn);
+        else if (result == ERROR_SUCCESS) result = status;
     }
-    status = savePreviousDcMode(current);
-    if (status) return status;
-    status = api.set(&BestEfficiency);
-    if (status) clearPreviousDcMode();
-    return status;
+    return result;
+}
+void* watchEffectivePowerMode(void (*callback)(EffectiveMode, void*), void* context) {
+    const auto& api = powerApi();
+    if (!api.registerEffective || !api.unregisterEffective || !callback) return nullptr;
+    struct Watch { void (*callback)(EffectiveMode, void*); void* context; void* handle = nullptr; };
+    auto* watch = new Watch{callback, context};
+    // Called on a system thread pool thread: once with the current mode, then on every change.
+    const EffectiveCallback relay = [](int mode, VOID* data) {
+        auto* target = static_cast<Watch*>(data);
+        target->callback(effectiveModeFromValue(mode), target->context);
+    };
+    for (ULONG version : {2ul, 1ul})
+        if (SUCCEEDED(api.registerEffective(version, relay, watch, &watch->handle)) && watch->handle) return watch;
+    delete watch;
+    return nullptr;
+}
+void unwatchEffectivePowerMode(void* token) {
+    if (!token) return;
+    struct Watch { void (*callback)(EffectiveMode, void*); void* context; void* handle = nullptr; };
+    auto* watch = static_cast<Watch*>(token);
+    if (powerApi().unregisterEffective) powerApi().unregisterEffective(watch->handle);
+    delete watch;
 }
 uint64_t fileTime(FILETIME t) { return (uint64_t(t.dwHighDateTime) << 32) | t.dwLowDateTime; }
 std::wstring errorText(DWORD code) {

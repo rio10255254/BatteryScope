@@ -12,7 +12,7 @@
 
 使用 Windows 11 `PowerGetUserConfiguredDCPowerMode` / `PowerSetUserConfiguredDCPowerMode` 切換電池供電時的最佳效率模式。切換前儲存原模式；還原時只在目前仍為最佳效率且留有原模式的情況下操作。示範與 UI 測試停用此按鈕，不更動真實電源模式。此功能不會批次終止程序或停止服務，也不宣稱等同 Windows「節能工具」。
 
-本機以選用的 `BatteryScopeTests.exe --saver-cycle` 實測啟用、確認可還原及還原，三步均成功；測試前後皆為 `ded574b5-45a0-4f42-8737-46345c09c238`（最佳效能），未留在省電模式。一般測試與 CI 不執行這項會改動使用者設定的測試。
+本機以選用的 `BatteryScopeTests.exe --saver-cycle` 實測啟用、確認可還原及還原，三步均成功；測試前後皆為 `ded574b5-45a0-4f42-8737-46345c09c238`（最佳效能），未留在省電模式。一般測試與 CI 不執行這項會改動使用者設定的測試。（之後的版本改為 `--power-mode-cycle`，以新的插電／用電池電源模式介面做相同的變更與還原檢查。）
 
 ## 0.8.2：程序與服務涵蓋核對
 
