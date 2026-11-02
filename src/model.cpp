@@ -290,6 +290,44 @@ AutoMode decideAutoMode(AutoMode current, bool performanceAppActive, const Power
     if (current == AutoMode::saver && *p.percent < threshold + 10.0) return AutoMode::saver;
     return AutoMode::none;
 }
+std::optional<DayGrade> gradeDay(const std::vector<DayStats>& days, int date) {
+    auto average = [](const DayStats& d) -> Value {
+        if (d.batteryMinutes < 30 || d.dischargedWh <= 0) return {};
+        return d.dischargedWh / (d.batteryMinutes / 60);
+    };
+    size_t index = days.size();
+    for (size_t i = 0; i < days.size(); ++i) if (days[i].date == date) index = i;
+    if (index == days.size()) return {};
+    const auto today = average(days[index]);
+    if (!today) return {};
+    std::vector<double> earlier;
+    for (size_t i = index; i-- > 0 && earlier.size() < 14;) if (auto value = average(days[i])) earlier.push_back(*value);
+    if (earlier.size() < 3) return {};
+    std::sort(earlier.begin(), earlier.end());
+    const size_t n = earlier.size();
+    const double median = n % 2 ? earlier[n / 2] : (earlier[n / 2 - 1] + earlier[n / 2]) / 2;
+    DayGrade grade; grade.ratio = *today / median;
+    grade.letter = grade.ratio <= .8 ? L'S' : grade.ratio <= .95 ? L'A' : grade.ratio <= 1.1 ? L'B' : grade.ratio <= 1.3 ? L'C' : L'D';
+    return grade;
+}
+std::vector<bool> achievements(const std::vector<DayStats>& days, bool batteryCare) {
+    std::vector<bool> earned(AchievementCount, false);
+    int streak = 0;
+    size_t recorded = 0;
+    for (const auto& day : days) {
+        const bool any = day.batteryMinutes > 0 || day.chargedWh > 0 || !day.apps.empty();
+        recorded += any;
+        earned[0] = earned[0] || any;
+        earned[1] = earned[1] || day.batteryMinutes >= 240;
+        const auto grade = gradeDay(days, day.date);
+        streak = grade && (grade->letter == L'S' || grade->letter == L'A') ? streak + 1 : 0;
+        earned[2] = earned[2] || streak >= 3;
+        earned[3] = earned[3] || (day.sleepMinutes >= 240 && day.sleepDropPercent / (day.sleepMinutes / 60) < .5);
+    }
+    earned[4] = batteryCare;
+    earned[5] = recorded >= 7;
+    return earned;
+}
 bool ChargeReminder::update(const PowerSample& p, unsigned target) {
     if (!target || !p.present || !p.acKnown || !p.percent || !std::isfinite(*p.percent)) return false;
     if (!p.onAc || *p.percent < target - 5.0) { armed_ = true; return false; }

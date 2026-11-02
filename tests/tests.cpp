@@ -534,6 +534,24 @@ int wmain(int argc, wchar_t** argv) {
                 decideAutoMode(AutoMode::none, false, battery(15, false), 0) == AutoMode::none,
                 "a listed app takes precedence; threshold zero disables the saver rule");
         }
+        {
+            auto day = [](int date, double minutes, double wh) { DayStats d; d.date = date; d.batteryMinutes = minutes; d.dischargedWh = wh; return d; };
+            std::vector<DayStats> days{day(20261101, 60, 10), day(20261102, 60, 12), day(20261103, 60, 8), day(20261104, 60, 7.5)};
+            auto grade = gradeDay(days, 20261104); // 7.5 W against a median of 10 W
+            check(grade && grade->letter == L'S' && nearlyEqual(grade->ratio, .75), "a day 25 percent below the usual drain earns an S");
+            days.back().dischargedWh = 14;
+            check(gradeDay(days, 20261104)->letter == L'D', "a day 40 percent above usual earns a D");
+            check(!gradeDay(days, 20261102), "grades need three earlier days");
+            days.back().batteryMinutes = 10;
+            check(!gradeDay(days, 20261104), "grades need 30 minutes on battery that day");
+            std::vector<DayStats> streak;
+            for (int i = 1; i <= 6; ++i) streak.push_back(day(20261100 + i, i == 1 ? 300 : 60, i == 1 ? 50 : i <= 3 ? 10 : 7)); // 10 W, then 7 W
+            streak[1].sleepMinutes = 420; streak[1].sleepDropPercent = 2;
+            auto earned = achievements(streak, false);
+            check(earned.size() == AchievementCount && earned[0] && earned[1] && earned[2] && earned[3] && !earned[4] && !earned[5],
+                "achievements follow the recorded days");
+            check(achievements(streak, true)[4] && !achievements({}, false)[0], "battery care and empty history are reported correctly");
+        }
         Collector cachedCollector;
         size_t total = 0, inaccessible = 0;
         auto warmRows = cachedCollector.collect(total, inaccessible);

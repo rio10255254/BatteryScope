@@ -39,7 +39,7 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     DrainAlertId = 148, HistoryId = 149, HistoryToggleId = 150, ClearHistoryId = 151,
     ChargeReminderOffId = 152, ChargeReminder80Id = 153, ChargeReminder85Id = 154, ChargeReminder90Id = 155, ChargeReminder100Id = 156,
     SleepAlertId = 157, AutoSaverOffId = 158, AutoSaver20Id = 159, AutoSaver30Id = 160, PerfAppsPageId = 161, ClearPerfAppsId = 162,
-    EcoToggleId = 163, PerfAppToggleId = 164,
+    EcoToggleId = 163, PerfAppToggleId = 164, MascotToggleId = 165, ShareCardId = 166, MiniToggleId = 167, MiniOpenId = 168,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1;
 const wchar_t* ClassName = L"BatteryScope.Main.v1";
@@ -114,6 +114,12 @@ AutoMode autoApplied = AutoMode::none;
 struct AutoOverride { bool active = false; PowerMode mode = PowerMode::balanced; GUID replaced{}; };
 AutoOverride autoAc, autoDc;
 uint64_t performanceSeenAt = 0;
+// Battery mascot in the header, the mini floating window, and the share card.
+bool showMascot = true, miniEnabled = false;
+unsigned sampleTick = 0;
+RECT mascotRect{};
+HWND miniWindow = nullptr;
+const wchar_t* MiniClassName = L"BatteryScope.Mini.v1";
 std::wstring lowerName(std::wstring text) {
     std::transform(text.begin(), text.end(), text.begin(), [](wchar_t c) { return wchar_t(towlower(c)); });
     return text;
@@ -357,6 +363,7 @@ void applyTheme() {
     BOOL dark = theme.dark; DwmSetWindowAttribute(mainWindow, 20, &dark, sizeof(dark));
     COLORREF edge = theme.highContrast ? Ink : Border; DwmSetWindowAttribute(mainWindow, 34, &edge, sizeof(edge));
     RedrawWindow(mainWindow, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
+    if (miniWindow) InvalidateRect(miniWindow, nullptr, FALSE);
 }
 bool refreshIcons() {
     HINSTANCE module = GetModuleHandleW(nullptr);
@@ -377,6 +384,49 @@ bool refreshIcons() {
     headerIcon = static_cast<HICON>(LoadImageW(module, MAKEINTRESOURCEW(101), IMAGE_ICON, sp(22), sp(22), LR_DEFAULTCOLOR));
     processIcons.clear();
     return true;
+}
+ui::Mood currentMood() {
+    if (current.history.empty() || !current.history.back().percent) return ui::Mood::calm;
+    const auto& p = current.history.back();
+    const bool plugged = p.acKnown && (p.onAc || p.charging);
+    if (!plugged && *p.percent <= 10) return ui::Mood::critical;
+    if (!plugged && *p.percent <= 20) return ui::Mood::tired;
+    if (p.charging) return ui::Mood::charging;
+    if (plugged) return *p.percent >= 99.5 ? ui::Mood::full : ui::Mood::calm;
+    const auto& m = current.power;
+    if (m.averageWatts && (*m.averageWatts >= 25 || (m.longAverageWatts && *m.averageWatts > *m.longAverageWatts * 1.8))) return ui::Mood::busy;
+    if (m.averageWatts && *m.averageWatts < 6) return ui::Mood::sleepy;
+    return ui::Mood::calm;
+}
+ui::MascotColors mascotColors(ui::Mood mood) {
+    const COLORREF level = mood == ui::Mood::critical ? Danger : mood == ui::Mood::tired ? theme.warn : Green;
+    return {blend(Muted, Surface, .1), blend(Surface, Border, .6), level, theme.highContrast ? theme.selectedInk : RGB(14, 19, 26),
+        Ink, blend(Danger, Surface, .2), RGB(120, 180, 255), theme.warn};
+}
+std::wstring mascotLine() {
+    const auto mood = currentMood();
+    if (current.history.empty()) return tr(L"我正在讀取電池資料…");
+    const auto& p = current.history.back();
+    const std::wstring percent = valueText(p.percent, L"%", 0), left = remainingText(current.power);
+    switch (mood) {
+    case ui::Mood::critical: return tr(L"只剩 ") + percent + tr(L"，快幫我接上電源！");
+    case ui::Mood::tired: return tr(L"有點累了…剩 ") + percent + (left.empty() ? L"" : tr(L"，") + left);
+    case ui::Mood::charging: {
+        const auto eta = chargeEta(calculateCharging(current.history), p);
+        const auto time = durationText(eta.hours);
+        return tr(L"充電中～") + (time.empty() ? std::wstring(tr(L"正在學習充電速度")) : time + (eta.target < 100 ? tr(L"到上限") : tr(L"充滿")));
+    }
+    case ui::Mood::full: return tr(L"已充滿！可以拔掉電源了。");
+    case ui::Mood::busy: {
+        std::wstring top;
+        for (const auto& row : current.processes) if (row.averageCpuWatts && row.pid > 4) { top = row.name; break; }
+        return tr(L"好忙！現在 ") + valueText(current.power.averageWatts, L" W") + (top.empty() ? L"" : tr(L"，最耗電的是 ") + top);
+    }
+    case ui::Mood::sleepy: return tr(L"好安靜… 只用 ") + valueText(current.power.averageWatts, L" W") + (left.empty() ? L"" : tr(L"，") + left);
+    default:
+        if (p.acKnown && p.onAc) return tr(L"插著電，一切正常。");
+        return tr(L"一切正常：") + valueText(current.power.averageWatts, L" W") + (left.empty() ? L"" : tr(L"，") + left);
+    }
 }
 std::wstring trayText() {
     std::wstring text = L"BatteryScope";
@@ -1051,6 +1101,16 @@ void paint(HDC dc, RECT bounds) {
     const int top = listTop();
     if (headerIcon) DrawIconEx(dc, margin, sp(15), headerIcon, sp(22), sp(22), 0, nullptr, DI_NORMAL);
     drawText(dc, L"BatteryScope", {margin + sp(30), sp(11), w - sp(98), sp(40)}, Ink, titleFont);
+    mascotRect = {};
+    if (showMascot) {
+        const int unit = std::max(2, px(2)), left = margin + sp(30) + textWidth(dc, L"BatteryScope", titleFont) + sp(10);
+        if (left + ui::MascotCells * unit <= w - sp(112)) {
+            const auto mood = currentMood();
+            const double level = current.history.empty() || !current.history.back().percent ? 0 : *current.history.back().percent / 100;
+            ui::drawMascot(dc, left, sp(9), unit, mood, level, sampleTick % 5 == 4 ? 1 : 0, mascotColors(mood));
+            mascotRect = {left, sp(9), left + ui::MascotCells * unit, sp(9) + ui::MascotRows * unit};
+        }
+    }
     drawText(dc, demo ? tr(L"示範資料 · 關閉操作已停用") : tr(L"電池與背景活動"), {margin + sp(30), sp(39), w - sp(96), sp(60)}, Muted, smallFont);
     if (inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history ||
         inlinePage == InlinePage::confirm || inlinePage == InlinePage::error) {
@@ -1372,6 +1432,160 @@ void applyAutoPowerRules() {
         autoApplied == AutoMode::performance ? tr(L"效能清單中的程式正在執行：已切到效能模式。") : tr(L"已還原自動切換前的電源模式。"));
     if (inlinePage == InlinePage::powerMode) refreshPowerModeControls();
 }
+// Today's summary as an image: the mascot, time on battery, energy, grade,
+// top app, and the 7-day discharge bars, in the current theme and style.
+HBITMAP renderShareCard(int& width, int& height) {
+    width = px(600); height = px(320);
+    BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(info.bmiHeader); info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height; info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32;
+    void* bits = nullptr;
+    HDC dc = CreateCompatibleDC(nullptr);
+    HBITMAP bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bitmap) { DeleteDC(dc); return nullptr; }
+    HGDIOBJ old = SelectObject(dc, bitmap);
+    fill(dc, {0, 0, width, height}, Background);
+    const RECT frame{px(16), px(16), width - px(16), height - px(16)};
+    card(dc, frame, Surface, 16);
+    const int left = frame.left + px(24), right = frame.right - px(24);
+    const auto mood = currentMood();
+    const double level = current.history.empty() || !current.history.back().percent ? 0 : *current.history.back().percent / 100;
+    ui::drawMascot(dc, left, frame.top + px(22), px(5), mood, level, 0, mascotColors(mood));
+    const int textLeft = left + ui::MascotCells * px(5) + px(20);
+    const int today = localDate();
+    const DayStats* day = nullptr;
+    for (const auto& d : current.days) if (d.date == today) day = &d;
+    drawText(dc, L"BatteryScope · " + dayLabel(today), {textLeft, frame.top + px(20), right, frame.top + px(48)}, Muted, strongFont);
+    const std::wstring battery = day && day->batteryMinutes >= 1 ? durationText(day->batteryMinutes / 60).substr(std::wstring(tr(L"約 ")).size()) : L"0" + std::wstring(tr(L" 分"));
+    drawText(dc, tr(L"今天用電池 ") + battery, {textLeft, frame.top + px(48), right, frame.top + px(84)}, Ink, titleFont);
+    drawText(dc, tr(L"放電 ") + number(day ? day->dischargedWh : 0, 1) + L" Wh · " + tr(L"充電 ") + number(day ? day->chargedWh : 0, 1) + L" Wh",
+        {textLeft, frame.top + px(86), right, frame.top + px(108)}, Muted, normalFont);
+    std::wstring facts;
+    if (auto grade = gradeDay(current.days, today)) facts += tr(L"評分 ") + std::wstring(1, grade->letter) + L"   ";
+    if (day && !day->apps.empty()) facts += tr(L"最耗電：") + day->apps.front().first;
+    drawText(dc, facts, {textLeft, frame.top + px(110), right, frame.top + px(132)}, Green, strongFont);
+    // 7-day bars along the bottom.
+    const RECT plot{left, frame.top + px(160), right, frame.bottom - px(46)};
+    double peak = 1; int dates[7];
+    for (int i = 0; i < 7; ++i) { dates[i] = localDate(6 - i); for (const auto& d : current.days) if (d.date == dates[i]) peak = std::max(peak, d.dischargedWh); }
+    const int gap = px(10), slot = (int(plot.right - plot.left) - 6 * gap) / 7;
+    for (int i = 0; i < 7; ++i) {
+        double wh = 0; for (const auto& d : current.days) if (d.date == dates[i]) wh = d.dischargedWh;
+        const int x = plot.left + i * (slot + gap), barHeight = wh > 0 ? std::max(px(4), int((plot.bottom - plot.top) * wh / peak)) : 0;
+        fill(dc, {x, plot.bottom, x + slot, plot.bottom + px(2)}, Border);
+        if (barHeight) rounded(dc, {x, plot.bottom - barHeight, x + slot, plot.bottom}, i == 6 ? Green : blend(Green, Surface, .45), 3);
+        drawText(dc, dayLabel(dates[i]), {x - px(8), plot.bottom + px(6), x + slot + px(8), plot.bottom + px(26)}, i == 6 ? Ink : Muted, smallFont,
+            DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    }
+    std::wstring footer = tr(L"電量 ") + (current.history.empty() ? std::wstring(L"—") : valueText(current.history.back().percent, L"%", 0));
+    if (!current.history.empty()) if (auto health = batteryHealth(current.history.back())) footer += tr(L" · 健康度 ") + number(*health, 0) + L"%";
+    drawText(dc, footer, {left, frame.bottom - px(18) - px(4), right, frame.bottom - px(4)}, Muted, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    GdiFlush();
+    SelectObject(dc, old); DeleteDC(dc);
+    return bitmap;
+}
+bool copyBitmapToClipboard(HBITMAP bitmap, int width, int height) {
+    BITMAPINFOHEADER header{}; header.biSize = sizeof(header); header.biWidth = width; header.biHeight = -height;
+    header.biPlanes = 1; header.biBitCount = 32; header.biCompression = BI_RGB;
+    const size_t pixels = size_t(width) * size_t(height) * 4;
+    HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, sizeof(header) + pixels);
+    if (!memory) return false;
+    auto* target = static_cast<BYTE*>(GlobalLock(memory));
+    std::memcpy(target, &header, sizeof(header));
+    BITMAPINFO info{}; info.bmiHeader = header;
+    HDC screen = GetDC(nullptr);
+    const bool read = GetDIBits(screen, bitmap, 0, UINT(height), target + sizeof(header), &info, DIB_RGB_COLORS) == height;
+    ReleaseDC(nullptr, screen);
+    GlobalUnlock(memory);
+    // Clipboard DIBs are bottom-up by convention; a negative height is also accepted by common apps.
+    if (!read || !OpenClipboard(mainWindow)) { GlobalFree(memory); return false; }
+    EmptyClipboard();
+    const bool placed = SetClipboardData(CF_DIB, memory) != nullptr;
+    CloseClipboard();
+    if (!placed) GlobalFree(memory);
+    return placed;
+}
+bool exportShareCard(const std::wstring& path, bool clipboard) {
+    int width = 0, height = 0;
+    HBITMAP bitmap = renderShareCard(width, height);
+    if (!bitmap) return false;
+    const bool saved = path.empty() || ui::saveBitmapPng(bitmap, path);
+    if (clipboard) copyBitmapToClipboard(bitmap, width, height);
+    DeleteObject(bitmap);
+    return saved;
+}
+void chooseShareCard() {
+    wchar_t file[MAX_PATH]{};
+    swprintf_s(file, L"BatteryScope-%d.png", localDate());
+    const std::wstring filter = std::wstring(tr(L"PNG 圖片")) + L" (*.png)" + L'\0' + L"*.png" + L'\0' + L'\0';
+    OPENFILENAMEW dialog{}; dialog.lStructSize = sizeof(dialog); dialog.hwndOwner = mainWindow;
+    dialog.lpstrFilter = filter.c_str(); dialog.lpstrFile = file; dialog.nMaxFile = MAX_PATH; dialog.lpstrDefExt = L"png";
+    dialog.lpstrTitle = tr(L"分享今日卡片");
+    dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
+    if (!GetSaveFileNameW(&dialog)) { releaseInteraction(); return; }
+    setNotice(exportShareCard(file, true) ? tr(L"已存成圖片，也複製到剪貼簿了。") : tr(L"無法建立圖片。"));
+    releaseInteraction();
+}
+// The mini window: battery level, watts, and the mascot, always on top.
+void paintMini(HDC dc, RECT r) {
+    fill(dc, r, Background);
+    card(dc, r, Surface, 10);
+    const int unit = std::max(2, px(2));
+    const auto mood = currentMood();
+    const PowerSample* p = current.history.empty() ? nullptr : &current.history.back();
+    ui::drawMascot(dc, r.left + px(8), r.top + (r.bottom - r.top - ui::MascotRows * unit) / 2, unit, mood,
+        p && p->percent ? *p->percent / 100 : 0, sampleTick % 5 == 4 ? 1 : 0, mascotColors(mood));
+    const int textLeft = r.left + px(8) + ui::MascotCells * unit + px(6);
+    const std::wstring percent = p ? valueText(p->percent, L"%", 0) : L"—";
+    const std::wstring watts = !p ? L"—" : p->charging ? valueText(calculateCharging(current.history).watts, L" W") :
+        p->acKnown && p->onAc ? L"—" : valueText(current.power.currentWatts, L" W");
+    if (!ui::drawPixelDigits(dc, percent, textLeft, r.top + px(9), unit, Ink)) drawText(dc, percent, {textLeft, r.top + px(5), r.right, r.top + px(25)}, Ink, strongFont);
+    if (!ui::drawPixelDigits(dc, watts, textLeft, r.top + px(30), unit, p && p->charging ? Green : Muted))
+        drawText(dc, watts, {textLeft, r.top + px(28), r.right, r.bottom - px(4)}, Muted, smallFont);
+}
+LRESULT CALLBACK miniProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    switch (message) {
+    case WM_NCHITTEST: { LRESULT hit = DefWindowProcW(window, message, wp, lp); return hit == HTCLIENT ? HTCAPTION : hit; }
+    case WM_NCLBUTTONDBLCLK: showMain(); return 0;
+    case WM_NCRBUTTONUP: case WM_CONTEXTMENU: {
+        HMENU menu = CreatePopupMenu();
+        AppendMenuW(menu, MF_STRING, MiniOpenId, tr(L"開啟面板"));
+        AppendMenuW(menu, MF_STRING, MiniToggleId, tr(L"隱藏迷你視窗"));
+        POINT point{}; GetCursorPos(&point); SetForegroundWindow(window);
+        const int chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, window, nullptr);
+        DestroyMenu(menu);
+        if (chosen == MiniOpenId) showMain(); else if (chosen == MiniToggleId) PostMessageW(mainWindow, WM_COMMAND, MiniToggleId, 0);
+        return 0;
+    }
+    case WM_EXITSIZEMOVE: {
+        RECT r{}; GetWindowRect(window, &r);
+        writeSetting(L"MiniX", DWORD(r.left)); writeSetting(L"MiniY", DWORD(r.top));
+        return 0;
+    }
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps{}; HDC target = BeginPaint(window, &ps); RECT r{}; GetClientRect(window, &r);
+        HDC dc = CreateCompatibleDC(target); HBITMAP bitmap = CreateCompatibleBitmap(target, r.right, r.bottom);
+        HGDIOBJ old = SelectObject(dc, bitmap); paintMini(dc, r); BitBlt(target, 0, 0, r.right, r.bottom, dc, 0, 0, SRCCOPY);
+        SelectObject(dc, old); DeleteObject(bitmap); DeleteDC(dc); EndPaint(window, &ps); return 0;
+    }
+    }
+    return DefWindowProcW(window, message, wp, lp);
+}
+void setMiniWindow(bool enable) {
+    if (!enable) { if (miniWindow) DestroyWindow(miniWindow); miniWindow = nullptr; return; }
+    if (miniWindow) return;
+    const int width = px(150), height = px(54);
+    RECT work{}; SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    int x = int(readSetting(L"MiniX", DWORD(work.right - width - px(24)))), y = int(readSetting(L"MiniY", DWORD(work.bottom - height - px(24))));
+    // Keep it on a visible monitor if the saved position is off-screen now.
+    POINT corner{x + width / 2, y + height / 2};
+    if (!MonitorFromPoint(corner, MONITOR_DEFAULTTONULL)) { x = work.right - width - px(24); y = work.bottom - height - px(24); }
+    miniWindow = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE, MiniClassName, L"BatteryScope Mini",
+        WS_POPUP, x, y, width, height, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!miniWindow) return;
+    SetLayeredWindowAttributes(miniWindow, 0, 240, LWA_ALPHA);
+    ShowWindow(miniWindow, SW_SHOWNOACTIVATE);
+}
 void showPerformanceApps() {
     std::wstring text = tr(L"清單中的程式執行時，插電與用電池時都會自動切到效能模式；全部結束 30 秒後還原。在程序詳情頁按「加入效能清單」新增或移除。\n");
     if (performanceApps.empty()) text += tr(L"\n清單是空的。");
@@ -1411,6 +1625,8 @@ void loadSettings() {
     const DWORD saver = readSetting(L"AutoSaver", 0);
     autoSaverThreshold = saver == 20 || saver == 30 ? saver : 0;
     performanceApps = readNames(L"PerformanceApps");
+    showMascot = readSetting(L"Mascot", 1) != 0;
+    miniEnabled = readSetting(L"MiniWindow", 0) == 1;
     historyEnabled = readSetting(L"History", 1) != 0;
     std::vector<uint8_t> curve(512); DWORD curveBytes = DWORD(curve.size());
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\BatteryScope", L"ChargeCurve", RRF_RT_REG_BINARY, nullptr, curve.data(), &curveBytes) == ERROR_SUCCESS) {
@@ -1555,7 +1771,21 @@ std::wstring historyText() {
     std::wstring text;
     if (current.days.empty()) text = tr(L"還沒有紀錄。BatteryScope 執行時會每天累計用電池的時間、放電與充電量，以及最耗電的程式。");
     const int today = localDate();
-    for (auto it = current.days.rbegin(); it != current.days.rend(); ++it) {
+    if (!current.days.empty()) {
+        if (auto grade = gradeDay(current.days, today)) {
+            const int change = int(std::lround((grade->ratio - 1) * 100));
+            text += tr(L"今日評分：") + std::wstring(1, grade->letter) + tr(L"（耗電比平常") + (change <= 0 ? tr(L"少 ") : tr(L"多 ")) +
+                std::to_wstring(std::abs(change)) + L"%" + tr(L"）");
+        } else text += tr(L"今日評分：資料不足（需要今天用電池 30 分鐘以上，以及 3 天以上的紀錄）");
+        static const wchar_t* names[AchievementCount] = {L"初次紀錄", L"長跑者", L"省電達人", L"好眠", L"電池保養", L"一週紀錄"};
+        const auto earned = achievements(current.days, chargeLimit.has_value() || chargeReminderTarget);
+        text += tr(L"\n成就：");
+        for (size_t i = 0; i < AchievementCount; ++i) text += (i ? L"  " : L"") + std::wstring(earned[i] ? L"★" : L"☆") + tr(names[i]);
+        text += tr(L"\n長跑者＝單日用電池 4 小時；省電達人＝連續 3 天 S 或 A；好眠＝睡眠 4 小時以上且每小時掉電不到 0.5%；電池保養＝偵測到充電上限或開啟充電提醒；一週紀錄＝累積 7 天。");
+        if (auto trend = healthTrendText(); !trend.empty()) text += tr(L"\n電池健康度：") + trend;
+    }
+    size_t listed = 0;
+    for (auto it = current.days.rbegin(); it != current.days.rend() && listed < 7; ++it, ++listed) {
         const auto& day = *it;
         text += (text.empty() ? L"" : L"\n\n") + dayLabel(day.date) + (day.date == today ? tr(L"（今天）") : L"") +
             tr(L" · 用電池 ") + (day.batteryMinutes >= 1 ? durationText(day.batteryMinutes / 60).substr(std::wstring(tr(L"約 ")).size()) : L"0" + std::wstring(tr(L" 分"))) +
@@ -1807,7 +2037,7 @@ void sampleLoop() {
     if (historyEnabled) loadHistory(history);
     SamplingPolicy policy;
     Snapshot state;
-    state.days = history.recent(7);
+    state.days = history.recent(14);
     uint64_t nextProcess = 0, nextPower = 0;
     bool previousHidden = false, qosInitialized = false;
     while (!quit) {
@@ -1874,7 +2104,7 @@ void sampleLoop() {
             changed = true;
         }
         if (historyDirty && (now - historySavedAt >= 600000 || quit)) { saveHistory(history); historySavedAt = now; historyDirty = false; }
-        if (changed) state.days = historyEnabled ? history.recent(7) : std::vector<DayStats>{};
+        if (changed) state.days = historyEnabled ? history.recent(14) : std::vector<DayStats>{};
         if (changed) {
             state.ms = now;
             {
@@ -2015,6 +2245,8 @@ void openMenu(POINT point) {
     AppendMenuW(menu, MF_STRING, HistoryId, tr(L"歷史紀錄（7 天）"));
     AppendMenuW(menu, MF_STRING, ReviewCandidatesId, tr(L"找出耗電的背景程式…"));
     AppendMenuW(menu, MF_STRING | (preview ? MF_GRAYED : 0), ExportCsvId, tr(L"匯出 CSV…"));
+    AppendMenuW(menu, MF_STRING | (preview ? MF_GRAYED : 0), ShareCardId, tr(L"分享今日卡片…"));
+    AppendMenuW(menu, MF_STRING | (miniEnabled ? MF_CHECKED : 0), MiniToggleId, tr(L"迷你浮動視窗"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     HMENU appearance = CreatePopupMenu();
     AppendMenuW(appearance, MF_STRING | (themeChoice == ui::ThemeChoice::system ? MF_CHECKED : 0), ThemeSystemId, tr(L"跟隨 Windows"));
@@ -2023,6 +2255,8 @@ void openMenu(POINT point) {
     AppendMenuW(appearance, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(appearance, MF_STRING | (pixelStyle ? MF_CHECKED : 0) | (ui::pixelFontLoaded() ? 0 : MF_GRAYED), StylePixelId, tr(L"像素風格"));
     AppendMenuW(appearance, MF_STRING | (!pixelStyle ? MF_CHECKED : 0), StyleSmoothId, tr(L"平滑風格"));
+    AppendMenuW(appearance, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(appearance, MF_STRING | (showMascot ? MF_CHECKED : 0), MascotToggleId, tr(L"顯示電池小精靈"));
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(appearance), tr(L"外觀"));
     HMENU languages = CreatePopupMenu();
     AppendMenuW(languages, MF_STRING | (!english ? MF_CHECKED : 0), LanguageZhId, L"繁體中文");
@@ -2175,6 +2409,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         trayAdded = updateTray(true);
         if (hotkeyEnabled && !demo && !isolatedPreview && !registerPanelHotkey(true)) hotkeyEnabled = false;
         if (!demo && !isolatedPreview) loadAutoOverrides();
+        if (miniEnabled && !isolatedPreview) setMiniWindow(true);
         if (demo || isolatedPreview) effectiveMode = EffectiveMode::performance; // synthetic preview
         else effectiveWatch = watchEffectivePowerMode([](EffectiveMode mode, void* target) {
             PostMessageW(static_cast<HWND>(target), PowerModeMessage, WPARAM(mode), 0);
@@ -2266,6 +2501,19 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (id == HistoryId) { showHistoryPage(); return 0; }
+        if (id == MascotToggleId) {
+            showMascot = !showMascot;
+            if (!writeSetting(L"Mascot", showMascot ? 1 : 0)) setNotice(tr(L"無法儲存設定。"));
+            InvalidateRect(window, nullptr, FALSE);
+            return 0;
+        }
+        if (id == ShareCardId) { if (!demo && !isolatedPreview) chooseShareCard(); return 0; }
+        if (id == MiniToggleId) {
+            miniEnabled = !miniEnabled;
+            setMiniWindow(miniEnabled);
+            if (!writeSetting(L"MiniWindow", miniEnabled ? 1 : 0)) setNotice(tr(L"無法儲存設定。"));
+            return 0;
+        }
         if (id == PerfAppsPageId) { showPerformanceApps(); return 0; }
         if (id >= AutoSaverOffId && id <= AutoSaver30Id) {
             if (demo || isolatedPreview) return 0;
@@ -2450,6 +2698,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (!demo && !isolatedPreview && !current.history.empty() && lowBattery.update(current.history.back(), lowBatteryThreshold))
             showLowBatteryNotice();
         learnFromSample();
+        ++sampleTick;
+        if (miniWindow) InvalidateRect(miniWindow, nullptr, FALSE);
         checkDrainAlert();
         checkBatteryNotices();
         applyAutoPowerRules();
@@ -2479,6 +2729,11 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (inlinePage == InlinePage::powerMode) refreshPowerModeControls();
         InvalidateRect(window, nullptr, FALSE);
         return 0;
+    case WM_LBUTTONDOWN: {
+        const POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        if (PtInRect(&mascotRect, point)) { setNotice(mascotLine()); ++sampleTick; InvalidateRect(window, nullptr, FALSE); return 0; }
+        break;
+    }
     case WM_HOTKEY:
         if (wp == PanelHotkey) toggleMain();
         return 0;
@@ -2503,6 +2758,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         KillTimer(window, MotionTimer); motionTimerRunning = false;
         KillTimer(window, NoticeTimer);
         registerPanelHotkey(false);
+        setMiniWindow(false);
         unwatchEffectivePowerMode(effectiveWatch); effectiveWatch = nullptr;
         if (curveDirty) writeBinarySetting(L"ChargeCurve", chargeCurve.save());
         if (autoApplied != AutoMode::none) { undoAutoOverrides(); saveAutoOverrides(); }
@@ -2777,9 +3033,31 @@ bool panelSelfTest(const std::wstring& path) {
     std::wstring historyBody(size_t(GetWindowTextLengthW(inlineText)) + 1, L'\0');
     GetWindowTextW(inlineText, historyBody.data(), int(historyBody.size()));
     check("history_page_lists_days_newest_first", inlinePage == InlinePage::history && current.days.size() == 6 &&
-        historyBody.find(dayLabel(current.days.back().date)) < historyBody.find(dayLabel(current.days.front().date)) &&
+        historyBody.find(dayLabel(current.days.back().date) + tr(L"（今天）")) < historyBody.find(dayLabel(current.days.front().date) + tr(L" · 用電池 ")) &&
         historyBody.find(L"Browser.exe") != std::wstring::npos);
     SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
+    {
+        RECT client{}; GetClientRect(mainWindow, &client);
+        HDC screen = GetDC(mainWindow), dc = CreateCompatibleDC(screen);
+        HBITMAP surface = CreateCompatibleBitmap(screen, client.right, client.bottom);
+        HGDIOBJ old = SelectObject(dc, surface); paint(dc, client); SelectObject(dc, old);
+        DeleteObject(surface); DeleteDC(dc); ReleaseDC(mainWindow, screen);
+        check("mascot_drawn_in_header_and_speaks", showMascot && mascotRect.right > mascotRect.left && !mascotLine().empty());
+    }
+    {
+        wchar_t folder[MAX_PATH]{}; GetTempPathW(MAX_PATH, folder);
+        const std::wstring cardPath = std::wstring(folder) + L"BatteryScope-card-" + std::to_wstring(GetCurrentProcessId()) + L".png";
+        const bool exported = exportShareCard(cardPath, false);
+        std::ifstream card(std::filesystem::path(cardPath), std::ios::binary);
+        std::string head(8, '\0'); card.read(head.data(), 8);
+        card.seekg(0, std::ios::end);
+        check("share_card_saves_png", exported && head == "\x89PNG\r\n\x1a\n" && card.tellg() > 2000);
+        card.close(); DeleteFileW(cardPath.c_str());
+    }
+    SendMessageW(mainWindow, WM_COMMAND, MiniToggleId, 0);
+    const bool miniShown = miniWindow && IsWindowVisible(miniWindow) && (GetWindowLongPtrW(miniWindow, GWL_EXSTYLE) & WS_EX_TOPMOST);
+    SendMessageW(mainWindow, WM_COMMAND, MiniToggleId, 0);
+    check("mini_window_toggles", miniShown && !miniWindow);
     const auto tip = trayText();
     check("tray_tooltip_shows_level_power_and_time", tip.find(L"%") != std::wstring::npos && tip.find(L" W") != std::wstring::npos &&
         tip.find(remainingText(current.power)) != std::wstring::npos && tip.size() < 128);
@@ -3052,6 +3330,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     WNDCLASSEXW wc{}; wc.cbSize = sizeof(wc); wc.hInstance = instance; wc.lpfnWndProc = windowProc;
     wc.lpszClassName = ClassName; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     if (!RegisterClassExW(&wc)) return 2;
+    if (isolatedPreview || demo) MiniClassName = L"BatteryScope.MiniPreview.v1";
+    WNDCLASSEXW mini{}; mini.cbSize = sizeof(mini); mini.hInstance = instance; mini.lpfnWndProc = miniProc;
+    mini.lpszClassName = MiniClassName; mini.hCursor = LoadCursorW(nullptr, IDC_SIZEALL);
+    RegisterClassExW(&mini);
     dpi = GetDpiForSystem();
     RECT bounds{0, 0, px(PanelWidth), px(PanelHeight)};
     if (screenshot && option(L"--compact")) bounds.bottom = px(520);
@@ -3094,6 +3376,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (screenshot && option(L"--ledger")) showLedger();
     if (screenshot && option(L"--power-mode")) showPowerModePage();
     if (screenshot && option(L"--history")) showHistoryPage();
+    if (demo) for (size_t i = 0; i + 1 < args.size(); ++i) if (args[i] == L"--card-png") {
+        const bool saved = exportShareCard(args[i + 1], false);
+        DestroyWindow(window);
+        return saved ? 0 : 5;
+    }
     if (screenshot && option(L"--confirm") && !current.processes.empty()) showForceConfirmation(current.processes.front());
     if (screenshot && option(L"--scrolled")) scrollTo(px(17), true);
     if (screenshot && option(L"--selected") && !displayed.empty()) ListView_SetItemState(list, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);

@@ -72,6 +72,16 @@ bool drawPixelDigits(HDC dc, const std::wstring& text, int x, int y, int unit, C
 // digits on a badge. The caller owns the icon (DestroyIcon).
 HICON makePercentIcon(int size, int percent, COLORREF badge, COLORREF edge, COLORREF digits);
 
+// The battery mascot: a 16x14-cell pixel sprite whose body fills with the
+// battery level, with a face for each mood. `frame` 1 blinks.
+enum class Mood { calm, sleepy, busy, charging, tired, critical, full };
+// `face` is used on the filled part of the body, `faceLight` on the empty part.
+struct MascotColors { COLORREF outline, empty, level, face, faceLight, cheek, sweat, accent; };
+constexpr int MascotCells = 16, MascotRows = 14;
+void drawMascot(HDC dc, int x, int y, int unit, Mood mood, double level, int frame, const MascotColors& colors);
+// Saves a bitmap as PNG through GDI+.
+bool saveBitmapPng(HBITMAP bitmap, const std::wstring& path);
+
 // The embedded pixel UI font (family name below), loaded privately from a resource.
 constexpr wchar_t PixelFontFace[] = L"BatteryScope Pixel";
 bool loadPixelFont(HMODULE module, int resource);

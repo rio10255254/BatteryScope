@@ -398,6 +398,87 @@ HICON makePercentIcon(int size, int percent, COLORREF badge, COLORREF edge, COLO
     DeleteObject(color); if (mask) DeleteObject(mask);
     return result;
 }
+void drawMascot(HDC dc, int x, int y, int unit, Mood mood, double level, int frame, const MascotColors& c) {
+    // Cells: o outline, b body (filled to the battery level), e face, c cheek,
+    // s sweat, a accent (Zz or bolt). Columns 12-15 hold effects beside the body.
+    std::string grid[MascotRows] = {
+        "....oooo........", "..oooooooo......", ".obbbbbbbbo.....", ".obbbbbbbbo.....", ".obbbbbbbbo.....",
+        ".obbbbbbbbo.....", ".obbbbbbbbo.....", ".obbbbbbbbo.....", ".obbbbbbbbo.....", ".obbbbbbbbo.....",
+        ".obbbbbbbbo.....", ".obbbbbbbbo.....", "..oooooooo......", "...oo..oo......."};
+    auto put = [&](int row, int column, char cell) { if (row >= 0 && row < MascotRows && column >= 0 && column < MascotCells) grid[row][size_t(column)] = cell; };
+    const bool blink = frame == 1;
+    // Eyes at columns 3-4 and 6-7, rows 5-6; mouth on row 8.
+    auto eyes = [&](const char* top, const char* bottom) {
+        for (int i = 0; i < 6; ++i) { if (top[i] != '.') put(5, 3 + i, top[i]); if (bottom[i] != '.') put(6, 3 + i, bottom[i]); }
+    };
+    auto mouth = [&](const char* row8, const char* row9) {
+        for (int i = 0; i < 6; ++i) { if (row8[i] != '.') put(8, 3 + i, row8[i]); if (row9 && row9[i] != '.') put(9, 3 + i, row9[i]); }
+    };
+    switch (mood) {
+    case Mood::sleepy:
+        for (int column : {3, 4, 6, 7}) put(7, column, 'e'); // closed eyes, one row low
+        put(9, 5, 'e');
+        put(1, 12, 'a'); put(1, 13, 'a'); put(1, 14, 'a'); put(2, 13, 'a'); put(3, 12, 'a'); put(3, 13, 'a'); put(3, 14, 'a');
+        put(4, 11, 'a'); put(4, 12, 'a'); put(5, 11, 'a'); put(6, 11, 'a'); put(6, 12, 'a');
+        break;
+    case Mood::busy:
+        eyes(blink ? "......" : "e..e..", blink ? "ee.ee." : "e..e..");
+        mouth(".ee...", ".ee..."); put(8, 2, 'c'); put(8, 7, 'c');
+        put(3, 12, 's'); put(4, 11, 's'); put(4, 12, 's'); put(4, 13, 's'); put(5, 11, 's'); put(5, 12, 's'); put(5, 13, 's'); put(6, 12, 's');
+        break;
+    case Mood::charging:
+        eyes(".e..e.", "e.ee.e"); mouth("e....e", ".eeee."); put(8, 2, 'c'); put(8, 9, 'c');
+        put(2, 14, 'a'); put(3, 13, 'a'); put(4, 12, 'a'); put(4, 13, 'a'); put(4, 14, 'a'); put(5, 13, 'a'); put(6, 12, 'a');
+        break;
+    case Mood::tired:
+        eyes("ee.ee.", blink ? "ee.ee." : "......"); mouth(".eeee.", nullptr);
+        break;
+    case Mood::critical: // two 3x3 crosses for eyes
+        for (int column : {2, 6}) {
+            put(4, column, 'e'); put(4, column + 2, 'e'); put(5, column + 1, 'e'); put(6, column, 'e'); put(6, column + 2, 'e');
+        }
+        mouth(".eeee.", "e....e"); put(3, 12, 's'); put(4, 12, 's');
+        break;
+    case Mood::full:
+        eyes("eeeeee", "ee.ee."); put(5, 2, 'e'); put(5, 9, 'e'); mouth("e....e", ".eeee.");
+        put(1, 12, 'a'); put(0, 13, 'a'); put(1, 14, 'a'); put(2, 13, 'a');
+        break;
+    case Mood::calm:
+    default:
+        eyes(blink ? "......" : "e..e..", blink ? "ee.ee." : "e..e.."); mouth("e...e.", ".eee.."); put(8, 2, 'c'); put(8, 8, 'c');
+        break;
+    }
+    // Body rows 2-11 (ten rows) fill from the bottom with the battery level.
+    const int filled = std::clamp(int(std::lround(std::clamp(level, 0.0, 1.0) * 10)), level > 0 ? 1 : 0, 10);
+    for (int row = 0; row < MascotRows; ++row) for (int column = 0; column < MascotCells; ++column) {
+        const char cell = grid[row][size_t(column)];
+        COLORREF color;
+        switch (cell) {
+        case 'o': color = c.outline; break;
+        case 'b': color = row >= 12 - filled ? c.level : c.empty; break;
+        case 'e': color = row >= 12 - filled ? c.face : c.faceLight; break;
+        case 'c': color = c.cheek; break;
+        case 's': color = c.sweat; break;
+        case 'a': color = c.accent; break;
+        default: continue;
+        }
+        rectFill(dc, {x + column * unit, y + row * unit, x + (column + 1) * unit, y + (row + 1) * unit}, color);
+    }
+}
+bool saveBitmapPng(HBITMAP bitmap, const std::wstring& path) {
+    if (!graphicsToken || !bitmap) return false;
+    UINT count = 0, bytes = 0;
+    if (Gdiplus::GetImageEncodersSize(&count, &bytes) != Gdiplus::Ok || !bytes) return false;
+    std::vector<BYTE> buffer(bytes);
+    auto encoders = reinterpret_cast<Gdiplus::ImageCodecInfo*>(buffer.data());
+    if (Gdiplus::GetImageEncoders(count, bytes, encoders) != Gdiplus::Ok) return false;
+    for (UINT i = 0; i < count; ++i) {
+        if (CompareStringOrdinal(encoders[i].MimeType, -1, L"image/png", -1, TRUE) != CSTR_EQUAL) continue;
+        Gdiplus::Bitmap image(bitmap, nullptr);
+        return image.Save(path.c_str(), &encoders[i].Clsid, nullptr) == Gdiplus::Ok;
+    }
+    return false;
+}
 bool loadPixelFont(HMODULE module, int resource) {
     if (pixelFontHandle) return true;
     HRSRC info = FindResourceW(module, MAKEINTRESOURCEW(resource), MAKEINTRESOURCEW(10) /* RT_RCDATA */);

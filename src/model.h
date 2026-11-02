@@ -227,6 +227,16 @@ private:
 // battery at or below the threshold, until external power or 10 points above it.
 enum class AutoMode { none, saver, performance };
 AutoMode decideAutoMode(AutoMode current, bool performanceAppActive, const PowerSample& sample, unsigned saverThreshold);
+// Daily grade: the day's average discharge watts against the median of up to
+// 14 earlier days, each with at least 30 minutes on battery (3 needed).
+// S <= 80%, A <= 95%, B <= 110%, C <= 130%, D above.
+struct DayGrade { wchar_t letter = 0; double ratio = 0; };
+std::optional<DayGrade> gradeDay(const std::vector<DayStats>& days, int date);
+// Earned flags, in order: first record; 4 hours on battery in one day; three
+// S/A days in a row; a 4+ hour sleep losing under 0.5 points/hour; battery care
+// (a charge limit or charge reminder); seven recorded days.
+constexpr size_t AchievementCount = 6;
+std::vector<bool> achievements(const std::vector<DayStats>& days, bool batteryCare);
 // Conservative cadence: never exceed the energy model's 30 second continuity limit.
 class SamplingPolicy {
     uint64_t quietSince_ = 0, lastMs_ = 0;
