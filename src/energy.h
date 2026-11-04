@@ -12,6 +12,27 @@ Allocation allocateCpuEnergy(const std::vector<CoreEnergy>& cores, double proces
 void alignProcessObservation(CpuEnergyReport& report, double processIntervalSeconds,
     uint64_t processSampleMs, bool systemProcessSnapshot);
 ObservationQuality classifyObservation(const CpuEnergyReport& report);
+// EMI channel names, e.g. RAPL_Package0_Core3_CORE, RAPL_Package0_PP0, RAPL_Package1_PKG.
+enum class ChannelKind { other, core, cores, package };
+struct ChannelInfo { ChannelKind kind = ChannelKind::other; unsigned package = 0, core = 0; };
+ChannelInfo classifyChannel(const std::wstring& name);
+// Busy logical processors from two GetSystemTimes readings (idle, kernel incl. idle, user).
+Value busyProcessors(uint64_t idle0, uint64_t kernel0, uint64_t user0,
+    uint64_t idle1, uint64_t kernel1, uint64_t user1, unsigned logicalProcessors);
+// The lowest package power seen over a sliding window: the share of package power
+// (uncore, idle, graphics) that is not attributed to processes.
+class PackageFloor {
+    std::vector<std::pair<uint64_t,double>> samples_; // time ms, watts; newest last
+    uint64_t window_;
+public:
+    explicit PackageFloor(uint64_t windowMs = 600000) : window_(windowMs) {}
+    double update(uint64_t ms, double watts);
+    void reset() { samples_.clear(); }
+};
+// Attribution pool for the coreTotal and package sources: one virtual core with
+// the given watts and busy processors, plus the range factors.
+void setAggregatePool(CpuEnergyReport& report, EnergySource source, double poolWatts, double busy,
+    double rangeLow, double rangeHigh);
 
 class EnergyReader {
     struct Impl;
@@ -26,6 +47,8 @@ public:
     // Forget thread history, e.g. while hidden placement sampling is skipped.
     void clearThreadPlacement();
     void reset();
+    // Every EMI channel found, for diagnostics.
+    std::vector<std::wstring> channelNames() const;
 };
 // Integrates each process's attributed CPU watts over the session and keeps
 // exited processes, so short-lived or finished work still counts.

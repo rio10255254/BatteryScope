@@ -31,6 +31,10 @@ using UnregisterEffective = HRESULT (WINAPI*)(VOID* handle);
 struct PowerApi {
     GetUserMode getAc = nullptr, getDc = nullptr;
     SetUserMode setAc = nullptr, setDc = nullptr;
+    // Windows 10 1709+ slider: reads the overlay in effect, sets it for the current source.
+    // The setter takes the GUID by value, which the x64 ABI passes by address.
+    GetUserMode getActual = nullptr;
+    SetUserMode setActive = nullptr;
     RegisterEffective registerEffective = nullptr;
     UnregisterEffective unregisterEffective = nullptr;
 };
@@ -47,6 +51,8 @@ const PowerApi& powerApi() {
         bind(module, "PowerGetUserConfiguredDCPowerMode", result.getDc);
         bind(module, "PowerSetUserConfiguredACPowerMode", result.setAc);
         bind(module, "PowerSetUserConfiguredDCPowerMode", result.setDc);
+        bind(module, "PowerGetActualOverlayScheme", result.getActual);
+        bind(module, "PowerSetActiveOverlayScheme", result.setActive);
         bind(module, "PowerRegisterForEffectivePowerModeNotifications", result.registerEffective);
         bind(module, "PowerUnregisterFromEffectivePowerModeNotifications", result.unregisterEffective);
         return result;
@@ -75,6 +81,50 @@ void clearPreviousMode(bool pluggedIn) {
     }
 }
 bool sameGuid(const GUID& a, const GUID& b) { return std::memcmp(&a, &b, sizeof(GUID)) == 0; }
+bool parseGuid(const wchar_t* text, GUID& value) {
+    // "{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}" or without braces.
+    std::wstring s(text);
+    if (!s.empty() && s.front() == L'{') s = s.substr(1);
+    if (!s.empty() && s.back() == L'}') s.pop_back();
+    if (s.size() != 36 || s[8] != L'-' || s[13] != L'-' || s[18] != L'-' || s[23] != L'-') return false;
+    std::wstring hex;
+    for (wchar_t c : s) if (c != L'-') { if (!iswxdigit(c)) return false; hex += c; }
+    auto field = [&](size_t at, size_t digits) { return std::stoull(hex.substr(at, digits), nullptr, 16); };
+    value.Data1 = static_cast<unsigned long>(field(0, 8)); value.Data2 = static_cast<unsigned short>(field(8, 4)); value.Data3 = static_cast<unsigned short>(field(12, 4));
+    for (int i = 0; i < 8; ++i) value.Data4[i] = static_cast<unsigned char>(field(16 + i * 2, 2));
+    return true;
+}
+bool onExternalPower() {
+    SYSTEM_POWER_STATUS status{};
+    return !GetSystemPowerStatus(&status) || status.ACLineStatus != 0;
+}
+bool modernModes() { const auto& api = powerApi(); return api.getAc && api.getDc && api.setAc && api.setDc; }
+bool legacyModes() { const auto& api = powerApi(); return !modernModes() && api.setActive; }
+// The Windows 10 slider keeps one overlay per power source in the registry.
+DWORD legacyRead(bool pluggedIn, GUID& value) {
+    wchar_t text[64]{}; DWORD size = sizeof(text);
+    DWORD status = RegGetValueW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Power\\User\\PowerSchemes",
+        pluggedIn ? L"ActiveOverlayAcPowerScheme" : L"ActiveOverlayDcPowerScheme", RRF_RT_REG_SZ, nullptr, text, &size);
+    if (status == ERROR_SUCCESS) return parseGuid(text, value) ? ERROR_SUCCESS : ERROR_INVALID_DATA;
+    // Not stored yet: the current source reports the overlay in effect; the other is the default.
+    if (pluggedIn == onExternalPower() && powerApi().getActual) return powerApi().getActual(&value);
+    if (status == ERROR_FILE_NOT_FOUND) { value = BalancedOverlay; return ERROR_SUCCESS; }
+    return status;
+}
+DWORD getMode(bool pluggedIn, GUID& value) {
+    const auto& api = powerApi();
+    if (modernModes()) return (pluggedIn ? api.getAc : api.getDc)(&value);
+    if (legacyModes()) return legacyRead(pluggedIn, value);
+    return ERROR_PROC_NOT_FOUND;
+}
+bool canSet(bool pluggedIn) { return modernModes() || (legacyModes() && pluggedIn == onExternalPower()); }
+DWORD setMode(bool pluggedIn, const GUID& value) {
+    const auto& api = powerApi();
+    if (modernModes()) return (pluggedIn ? api.setAc : api.setDc)(&value);
+    if (!legacyModes()) return ERROR_PROC_NOT_FOUND;
+    if (pluggedIn != onExternalPower()) return ERROR_NOT_SUPPORTED;
+    return api.setActive(&value);
+}
 const GUID& modeGuid(PowerMode mode) {
     return mode == PowerMode::efficiency ? BestEfficiency : mode == PowerMode::performance ? BestPerformance : BalancedOverlay;
 }
@@ -99,28 +149,25 @@ EffectiveMode effectiveModeFromValue(int value) {
 }
 PowerModes queryPowerModes() {
     PowerModes state;
-    const auto& api = powerApi();
-    auto read = [](GetUserMode get, SetUserMode set, bool pluggedIn, PowerMode& mode, bool& known, bool& restorable) {
+    state.legacy = legacyModes();
+    auto read = [&](bool pluggedIn, PowerMode& mode, bool& known, bool& settable) {
         GUID current{};
-        if (!get || !set || get(&current) != ERROR_SUCCESS) return false;
-        mode = powerModeFromGuid(current); known = true;
+        if (getMode(pluggedIn, current) != ERROR_SUCCESS) return false;
+        mode = powerModeFromGuid(current); known = true; settable = canSet(pluggedIn);
         GUID previous{};
-        restorable |= previousMode(pluggedIn, previous) && !sameGuid(previous, current);
+        state.restorable |= previousMode(pluggedIn, previous) && !sameGuid(previous, current) && settable;
         return true;
     };
-    const bool ac = read(api.getAc, api.setAc, true, state.ac, state.acKnown, state.restorable);
-    const bool dc = read(api.getDc, api.setDc, false, state.dc, state.dcKnown, state.restorable);
-    if (!ac && !dc) state.error = api.getDc || api.getAc ? ERROR_GEN_FAILURE : ERROR_PROC_NOT_FOUND;
+    const bool ac = read(true, state.ac, state.acKnown, state.acSettable);
+    const bool dc = read(false, state.dc, state.dcKnown, state.dcSettable);
+    if (!ac && !dc) state.error = modernModes() || legacyModes() ? ERROR_GEN_FAILURE : ERROR_PROC_NOT_FOUND;
     return state;
 }
 DWORD setPowerMode(bool pluggedIn, PowerMode mode) {
     if (mode == PowerMode::other) return ERROR_INVALID_PARAMETER;
-    const auto& api = powerApi();
-    GetUserMode get = pluggedIn ? api.getAc : api.getDc;
-    SetUserMode set = pluggedIn ? api.setAc : api.setDc;
-    if (!get || !set) return ERROR_PROC_NOT_FOUND;
+    if (!canSet(pluggedIn)) return modernModes() || legacyModes() ? ERROR_NOT_SUPPORTED : ERROR_PROC_NOT_FOUND;
     GUID current{};
-    DWORD status = get(&current);
+    DWORD status = getMode(pluggedIn, current);
     if (status) return status;
     const GUID& target = modeGuid(mode);
     if (sameGuid(current, target)) return ERROR_SUCCESS;
@@ -128,19 +175,17 @@ DWORD setPowerMode(bool pluggedIn, PowerMode mode) {
     const bool saved = previousMode(pluggedIn, previous);
     // Remember only the setting from before BatteryScope's first change.
     if (!saved && (status = savePreviousMode(pluggedIn, current)) != ERROR_SUCCESS) return status;
-    status = set(&target);
+    status = setMode(pluggedIn, target);
     if (status) { if (!saved) clearPreviousMode(pluggedIn); return status; }
     if (saved && sameGuid(previous, target)) clearPreviousMode(pluggedIn); // back at the original
     return ERROR_SUCCESS;
 }
 DWORD restorePowerModes() {
-    const auto& api = powerApi();
     DWORD result = ERROR_SUCCESS;
     for (bool pluggedIn : {true, false}) {
         GUID previous{};
-        if (!previousMode(pluggedIn, previous)) continue;
-        SetUserMode set = pluggedIn ? api.setAc : api.setDc;
-        const DWORD status = set ? set(&previous) : ERROR_PROC_NOT_FOUND;
+        if (!previousMode(pluggedIn, previous) || !canSet(pluggedIn)) continue; // Windows 10: restored when on that source
+        const DWORD status = setMode(pluggedIn, previous);
         if (status == ERROR_SUCCESS) clearPreviousMode(pluggedIn);
         else if (result == ERROR_SUCCESS) result = status;
     }
@@ -148,23 +193,17 @@ DWORD restorePowerModes() {
 }
 DWORD overridePowerMode(bool pluggedIn, PowerMode mode, GUID& replaced) {
     if (mode == PowerMode::other) return ERROR_INVALID_PARAMETER;
-    const auto& api = powerApi();
-    GetUserMode get = pluggedIn ? api.getAc : api.getDc;
-    SetUserMode set = pluggedIn ? api.setAc : api.setDc;
-    if (!get || !set) return ERROR_PROC_NOT_FOUND;
-    DWORD status = get(&replaced);
-    return status ? status : set(&modeGuid(mode));
+    if (!canSet(pluggedIn)) return ERROR_NOT_SUPPORTED;
+    DWORD status = getMode(pluggedIn, replaced);
+    return status ? status : setMode(pluggedIn, modeGuid(mode));
 }
 DWORD undoPowerModeOverride(bool pluggedIn, PowerMode mode, const GUID& replaced) {
-    const auto& api = powerApi();
-    GetUserMode get = pluggedIn ? api.getAc : api.getDc;
-    SetUserMode set = pluggedIn ? api.setAc : api.setDc;
-    if (!get || !set) return ERROR_PROC_NOT_FOUND;
+    if (!canSet(pluggedIn)) return ERROR_NOT_SUPPORTED;
     GUID current{};
-    DWORD status = get(&current);
+    DWORD status = getMode(pluggedIn, current);
     if (status) return status;
     if (!sameGuid(current, modeGuid(mode))) return ERROR_SUCCESS; // the user changed it since: leave theirs
-    return set(&replaced);
+    return setMode(pluggedIn, replaced);
 }
 void* watchEffectivePowerMode(void (*callback)(EffectiveMode, void*), void* context) {
     const auto& api = powerApi();

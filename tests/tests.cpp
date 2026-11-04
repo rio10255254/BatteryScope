@@ -274,7 +274,7 @@ int wmain(int argc, wchar_t** argv) {
         double allocatedSum=0;
         for(int i=0;i<3;++i) allocatedSum+=allocateCpuEnergy(heterogeneous,1,3).watts;
         check(nearlyEqual(allocatedSum,5), "sampling skew cannot create more watts than the hardware budget");
-        CpuAttributor estimator; CpuEnergyReport report; report.ready=true; report.coreWatts=5;
+        CpuAttributor estimator; CpuEnergyReport report; report.ready=true; report.source=EnergySource::perCore; report.coreWatts=5;
         report.cores=heterogeneous; report.intervalSeconds=2;
         ProcessRow a,b; a.pid=10; a.created=100; a.measured=true; a.cpu=12.5;
         b.pid=11; b.created=101; b.measured=true; b.cpu=25;
@@ -300,6 +300,34 @@ int wmain(int argc, wchar_t** argv) {
         check(nearlyEqual(energyRows[1].cpuWattsLow,1) && nearlyEqual(energyRows[1].cpuWattsHigh,1), "known placement removes only the placement uncertainty");
         a.fixedCoreBusy={0,3}; energyRows={a,b}; constrained.apply(energyRows,report,3000,4);
         check(*energyRows[0].cpuWatts+*energyRows[1].cpuWatts<=5.00001, "thread sampling skew remains within the hardware budget");
+        // Hardware differences: Intel PP0, multi-package desktops, package-only EMI.
+        auto channel=classifyChannel(L"RAPL_Package0_Core11_CORE");
+        check(channel.kind==ChannelKind::core && channel.package==0 && channel.core==11, "AMD per-core channel is parsed");
+        channel=classifyChannel(L"RAPL_Package1_PP0");
+        check(channel.kind==ChannelKind::cores && channel.package==1, "Intel PP0 channel counts as all cores of its package");
+        check(classifyChannel(L"rapl_package0_pkg").kind==ChannelKind::package, "channel names are case-insensitive");
+        check(classifyChannel(L"RAPL_Package0_PP1").kind==ChannelKind::other && classifyChannel(L"RAPL_Package0_DRAM").kind==ChannelKind::other
+            && classifyChannel(L"CPU_CLUSTER_0").kind==ChannelKind::other && classifyChannel(L"RAPL_PackageX_PKG").kind==ChannelKind::other,
+            "graphics, memory and unknown channels are never treated as CPU energy");
+        check(nearlyEqual(busyProcessors(100,200,300, 150,300,400, 8),6) && !busyProcessors(150,300,400, 100,200,300, 8)
+            && !busyProcessors(0,0,0, 50,40,0, 8), "system-wide busy processors come from GetSystemTimes deltas and reject bad readings");
+        PackageFloor floor(600000);
+        check(nearlyEqual(floor.update(0,9),9) && nearlyEqual(floor.update(1000,4),4) && nearlyEqual(floor.update(2000,7),4),
+            "package idle floor is the lowest recent package power");
+        check(nearlyEqual(floor.update(601500,8),7), "package idle floor forgets readings outside its window");
+        CpuAttributor pooled; CpuEnergyReport allCores;
+        setAggregatePool(allCores,EnergySource::coreTotal,6,2,.8,1.25); allCores.intervalSeconds=2;
+        a.cpu=25; a.fixedCoreBusy={0,1}; b.cpu=25; b.fixedCoreBusy={};
+        energyRows={a,b}; pooled.apply(energyRows,allCores,1000,4);
+        check(nearlyEqual(energyRows[0].cpuWatts,3) && nearlyEqual(energyRows[1].cpuWatts,3),
+            "without per-core energy, core placement hints are ignored and the pool is split by CPU time");
+        check(nearlyEqual(energyRows[0].cpuWattsLow,2.4) && nearlyEqual(energyRows[0].cpuWattsHigh,3.75),
+            "aggregate core energy carries the documented range factors");
+        CpuAttributor packaged; CpuEnergyReport package;
+        setAggregatePool(package,EnergySource::package,4,2,1,2); package.intervalSeconds=2;
+        energyRows={a,b}; packaged.apply(energyRows,package,1000,4);
+        check(nearlyEqual(energyRows[0].cpuWatts,2) && nearlyEqual(energyRows[0].cpuWattsHigh,4) && nearlyEqual(package.unassignedCpuWatts,0),
+            "package-only energy attributes the share above the idle floor, with the floor as the upper range");
         CpuAttributor slowEstimator;
         report.cores = heterogeneous; report.coreWatts = 5; report.ready = true; report.intervalSeconds = 20;
         a.cpu = 25; a.fixedCoreBusy.clear(); b.cpu = 25; energyRows = {a,b};

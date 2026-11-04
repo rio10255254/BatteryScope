@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <cwctype>
 #include <set>
 #include <filesystem>
@@ -685,6 +686,21 @@ const wchar_t* effectiveName(EffectiveMode mode) {
     default: return tr(L"電源模式");
     }
 }
+// Body fill for the mascot: the battery level, or full on a PC without a battery.
+double mascotLevel() {
+    if (current.history.empty()) return 0;
+    const auto& p = current.history.back();
+    return !p.present ? 1.0 : p.percent ? *p.percent / 100 : 0;
+}
+// CPU power from the energy counters over the last 30 minutes, charted on desktops.
+std::deque<std::pair<uint64_t, Value>> cpuPowerHistory;
+void recordCpuPower(uint64_t ms, const CpuEnergyReport& energy) {
+    if (!cpuPowerHistory.empty() && ms <= cpuPowerHistory.back().first) return;
+    const bool live = energy.ready && !energy.timingMismatch;
+    cpuPowerHistory.emplace_back(ms, !live ? Value{} : energy.packageWatts ? energy.packageWatts : energy.coreWatts);
+    while (!cpuPowerHistory.empty() && ms - cpuPowerHistory.front().first > 1800000) cpuPowerHistory.pop_front();
+}
+bool batteryAbsent() { return !current.history.empty() && !current.history.back().present; }
 bool pluggedInNow() { return !current.history.empty() && current.history.back().acKnown && current.history.back().onAc; }
 // The header pill shows the mode Windows applies right now and opens the power mode page.
 void refreshPowerButton() {
@@ -1108,7 +1124,7 @@ void paint(HDC dc, RECT bounds) {
         const int unit = std::max(2, px(2)), left = margin + sp(30) + textWidth(dc, L"BatteryScope", titleFont) + sp(10);
         if (left + ui::MascotCells * unit <= w - sp(112)) {
             const auto mood = currentMood();
-            const double level = current.history.empty() || !current.history.back().percent ? 0 : *current.history.back().percent / 100;
+            const double level = mascotLevel();
             ui::drawMascot(dc, left, sp(9), unit, mood, level, sampleTick % 5 == 4 ? 1 : 0, mascotColors(mood));
             mascotRect = {left, sp(9), left + ui::MascotCells * unit, sp(9) + ui::MascotRows * unit};
         }
@@ -1168,33 +1184,40 @@ void paint(HDC dc, RECT bounds) {
     const auto& m = current.power;
     const auto charge = calculateCharging(current.history);
     const bool plugged = p.acKnown && (p.onAc || p.charging);
-    std::wstring currentW = current.history.empty() ? tr(L"讀取中") : !p.present ? tr(L"無電池") : p.charging ? valueText(charge.watts, L" W") : plugged ? tr(L"插電中") : valueText(m.currentWatts, L" W");
+    // Without a battery (desktops), the hero shows CPU power from the energy counters instead.
+    const bool desktop = !current.history.empty() && !p.present;
+    const bool energyLive = current.energy.ready && !current.energy.timingMismatch;
+    Value desktopWatts;
+    if (energyLive) desktopWatts = current.energy.packageWatts ? current.energy.packageWatts : current.energy.coreWatts;
+    std::wstring currentW = current.history.empty() ? tr(L"讀取中") : desktop ? (desktopWatts ? valueText(desktopWatts, L" W") : tr(L"無電池")) : p.charging ? valueText(charge.watts, L" W") : plugged ? tr(L"插電中") : valueText(m.currentWatts, L" W");
     // Plugged in without charging, the useful fact is which power mode is in effect.
-    std::wstring rateLabel = !p.present ? tr(L"仍可監測程序 CPU") : p.charging ? tr(L"電池實際吸收的功率") :
+    std::wstring rateLabel = desktop ? (desktopWatts ? (current.energy.packageWatts ? tr(L"整顆 CPU，硬體量測") : tr(L"CPU 核心，硬體量測"))
+        : tr(L"仍可監測程序 CPU")) : !p.present ? tr(L"仍可監測程序 CPU") : p.charging ? tr(L"電池實際吸收的功率") :
         plugged ? (effectiveMode != EffectiveMode::unknown ? tr(L"電源模式：") + std::wstring(effectiveName(effectiveMode)) : tr(L"未充電")) :
         m.estimated ? tr(L"依電量變化估算") : tr(L"整台電腦目前的耗電");
     if (minimal && m.percentPerHour) rateLabel = number(*m.percentPerHour) + tr(L" 百分點 / 小時");
     // Hero card: power on the left, battery level on the right.
     card(dc, {margin, sp(72), right, sp(180)}, Surface, 16);
-    drawText(dc, p.charging ? tr(L"充電功率") : plugged ? tr(L"外部電源") : tr(L"目前耗電"), {margin + sp(16), sp(84), right - sp(122), sp(103)}, Muted, smallFont);
+    drawText(dc, desktop ? tr(L"CPU 功率") : p.charging ? tr(L"充電功率") : plugged ? tr(L"外部電源") : tr(L"目前耗電"), {margin + sp(16), sp(84), right - sp(122), sp(103)}, Muted, smallFont);
     const int digitUnit = std::max(3, px(4));
     if (!pixelStyle || !ui::drawPixelDigits(dc, currentW, margin + sp(16), (sp(102) + sp(150)) / 2 - digitUnit * 7 / 2, digitUnit, Ink))
         drawText(dc, currentW, {margin + sp(14), sp(102), right - sp(119), sp(150)}, Ink, valueFont);
     drawText(dc, rateLabel, {margin + sp(16), sp(152), right - sp(150), sp(172)}, Muted, smallFont);
     const bool low = p.percent && !plugged && *p.percent <= 20;
     const COLORREF level = !p.percent ? Muted : p.charging ? Green : low && *p.percent <= 10 ? Danger : low ? theme.warn : Green;
-    const std::wstring percentText = valueText(p.percent, L"%", 0);
+    const std::wstring percentText = desktop ? std::wstring() : valueText(p.percent, L"%", 0);
     const int percentUnit = pixelUnit(), percentWidth = ui::pixelDigitsWidth(percentText, percentUnit);
     if (!pixelStyle || !ui::drawPixelDigits(dc, percentText, right - sp(16) - percentWidth, (sp(84) + sp(116)) / 2 - percentUnit * 7 / 2,
         percentUnit, p.percent ? Ink : Muted))
         drawText(dc, percentText, {right - sp(112), sp(84), right - sp(16), sp(116)},
             p.percent ? Ink : Muted, titleFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
-    if (pixelStyle) ui::pixelBattery(dc, {right - sp(16) - sp(64), sp(120), right - sp(16), sp(144)}, p.percent ? *p.percent / 100 : 0,
+    if (desktop) {} // no battery to draw
+    else if (pixelStyle) ui::pixelBattery(dc, {right - sp(16) - sp(64), sp(120), right - sp(16), sp(144)}, p.percent ? *p.percent / 100 : 0,
         blend(Muted, Surface, .25), level, blend(Surface, Border, .7), p.charging, Ink, Surface, pixelUnit());
     else ui::drawBattery(dc, {right - sp(16) - sp(60), sp(121), right - sp(16), sp(143)}, p.percent ? *p.percent / 100 : 0,
         blend(Muted, Surface, .25), level, p.charging, Ink, Surface);
     const bool atLimit = plugged && !p.charging && chargeLimit && p.percent && std::abs(*p.percent - *chargeLimit) <= 1.5;
-    drawText(dc, p.charging ? tr(L"充電中") : atLimit ? tr(L"充電上限 ") + std::to_wstring(*chargeLimit) + L"%" :
+    drawText(dc, desktop ? tr(L"桌上型電腦") : p.charging ? tr(L"充電中") : atLimit ? tr(L"充電上限 ") + std::to_wstring(*chargeLimit) + L"%" :
         plugged ? (p.percent && *p.percent >= 99.5 ? tr(L"已充滿") : tr(L"未充電")) : tr(L"剩餘電量"),
         {right - sp(146), sp(151), right - sp(16), sp(172)}, Muted, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
     if (!minimal) {
@@ -1206,6 +1229,14 @@ void paint(HDC dc, RECT bounds) {
         const bool showHealth = plugged && !p.charging && health;
         std::wstring healthText = showHealth ? number(*health, 0) + L"%" : L"";
         if (showHealth && p.cycleCount) healthText += L" · " + std::to_wstring(*p.cycleCount) + tr(L" 次循環");
+        if (desktop) { // no battery: show the CPU energy split instead
+            drawText(dc, tr(L"CPU 核心"), {rateCard.left + sp(12), rateCard.top + sp(4), rateCard.right - sp(8), rateCard.top + sp(20)}, Muted, smallFont);
+            drawText(dc, energyLive ? valueText(current.energy.coreWatts, L" W") : std::wstring(L"—"),
+                {rateCard.left + sp(12), rateCard.top + sp(19), rateCard.right - sp(8), rateCard.bottom - sp(3)}, Ink, strongFont);
+            drawText(dc, tr(L"未歸因給程式"), {timeCard.left + sp(12), timeCard.top + sp(4), timeCard.right - sp(8), timeCard.top + sp(20)}, Muted, smallFont);
+            drawText(dc, energyLive ? valueText(current.energy.unassignedCpuWatts, L" W") : std::wstring(L"—"),
+                {timeCard.left + sp(12), timeCard.top + sp(19), timeCard.right - sp(8), timeCard.bottom - sp(3)}, Ink, strongFont);
+        } else {
         drawText(dc, p.charging ? tr(L"充電速度") : showHealth ? tr(L"電池健康度") : plugged ? tr(L"電池狀態") : tr(L"耗電速度"),
             {rateCard.left + sp(12), rateCard.top + sp(4), rateCard.right - sp(8), rateCard.top + sp(20)}, Muted, smallFont);
         drawText(dc, showHealth ? healthText : plugged && !p.charging ? (p.percent && *p.percent >= 99.5 ? tr(L"已充滿") : tr(L"已接電，暫未充電")) : valueText(p.charging ? charge.percentPerHour : m.percentPerHour, tr(L" 百分點 / 小時")),
@@ -1218,6 +1249,7 @@ void paint(HDC dc, RECT bounds) {
         drawText(dc, plugged ? (p.charging ? etaLabel(eta) : tr(L"剩餘容量")) : tr(L"近 5 分鐘 ") + valueText(m.averageWatts, L" W"),
             {timeCard.left + sp(12), timeCard.top + sp(4), timeCard.right - sp(8), timeCard.top + sp(20)}, Muted, smallFont);
         drawText(dc, remaining, {timeCard.left + sp(12), timeCard.top + sp(19), timeCard.right - sp(8), timeCard.bottom - sp(3)}, Ink, strongFont);
+        }
     }
     if (!compact) {
         RECT chart{margin, sp(236), right, sp(284)};
@@ -1228,25 +1260,29 @@ void paint(HDC dc, RECT bounds) {
             if (chargingChart) return point.onAc && point.charging && *point.watts < 0 ? Value(-*point.watts) : Value{};
             return !point.onAc && !point.charging && *point.watts >= 0 ? point.watts : Value{};
         };
-        drawText(dc, chargingChart ? tr(L"30 分鐘 · 充電 W") : tr(L"30 分鐘 · 放電 W"), {chart.left + sp(12), chart.top + sp(5), chart.right - sp(90), chart.top + sp(21)}, Muted, smallFont);
+        // Desktops chart CPU power from the energy counters; laptops chart the battery.
+        std::vector<std::pair<uint64_t, Value>> series;
+        if (desktop) series.assign(cpuPowerHistory.begin(), cpuPowerHistory.end());
+        else for (const auto& point : current.history) series.emplace_back(point.ms, chartPower(point));
+        drawText(dc, desktop ? tr(L"30 分鐘 · CPU W") : chargingChart ? tr(L"30 分鐘 · 充電 W") : tr(L"30 分鐘 · 放電 W"), {chart.left + sp(12), chart.top + sp(5), chart.right - sp(90), chart.top + sp(21)}, Muted, smallFont);
         RECT plot{chart.left + sp(12), chart.top + sp(24), chart.right - sp(12), chart.bottom - sp(6)};
         double maximum = 10;
         uint64_t last = current.history.empty() ? GetTickCount64() : current.history.back().ms;
-        for (const auto& point : current.history) if (auto watts = chartPower(point)) maximum = std::max(maximum, std::ceil(*watts / 5) * 5);
+        if (desktop && !series.empty()) last = std::max(last, series.back().first);
+        for (const auto& point : series) if (const auto& watts = point.second) maximum = std::max(maximum, std::ceil(*watts / 5) * 5);
         const int middle = (plot.top + plot.bottom) / 2;
         if (pixelStyle) ui::pixelDottedLine(dc, {plot.left, middle}, {plot.right, middle}, blend(Border, Surface, .1), pixelUnit());
         else ui::drawDashedLine(dc, {plot.left, middle}, {plot.right, middle}, blend(Border, Surface, .2), 1.0f);
         fill(dc, {plot.left, plot.bottom, plot.right, plot.bottom + (pixelStyle ? pixelUnit() / 2 : 1)}, Border);
         std::vector<std::vector<POINT>> segments;
         uint64_t previous = 0; bool connected = false;
-        for (const auto& point : current.history) {
-            auto watts = chartPower(point);
-            if (!watts) { connected = false; continue; }
-            POINT at{plot.right - int((last - point.ms) / 1800000.0 * (plot.right - plot.left)),
+        for (const auto& [ms, watts] : series) {
+            if (!watts || ms > last) { connected = false; continue; }
+            POINT at{plot.right - int((last - ms) / 1800000.0 * (plot.right - plot.left)),
                 plot.bottom - int(std::min(*watts, maximum) / maximum * (plot.bottom - plot.top))};
-            if (!connected || point.ms - previous > 30000) segments.emplace_back();
+            if (!connected || ms - previous > 30000) segments.emplace_back();
             segments.back().push_back(at);
-            connected = true; previous = point.ms;
+            connected = true; previous = ms;
         }
         bool any = false;
         if (pixelStyle) {
@@ -1254,10 +1290,9 @@ void paint(HDC dc, RECT bounds) {
             const int u = pixelUnit(), pitch = u * 3, columns = std::max(1, int(plot.right - plot.left) / pitch);
             const int start = plot.right - columns * pitch;
             std::vector<double> sum(size_t(columns), 0), count(size_t(columns), 0);
-            for (const auto& point : current.history) {
-                auto watts = chartPower(point);
-                if (!watts || point.ms > last || last - point.ms > 1800000) continue;
-                const int column = std::clamp(columns - 1 - int((last - point.ms) / 1800000.0 * columns), 0, columns - 1);
+            for (const auto& [ms, watts] : series) {
+                if (!watts || ms > last || last - ms > 1800000) continue;
+                const int column = std::clamp(columns - 1 - int((last - ms) / 1800000.0 * columns), 0, columns - 1);
                 sum[size_t(column)] += std::min(*watts, maximum); count[size_t(column)] += 1;
             }
             for (int column = 0; column < columns; ++column) {
@@ -1272,12 +1307,12 @@ void paint(HDC dc, RECT bounds) {
             for (const auto& segment : segments) any |= segment.size() > 1;
             if (any) ui::drawSeries(dc, plot, segments, Green, std::max(1.5f, float(sp(2))), Green);
         }
-        for (auto time : actionMarks) if (!chargingChart && time <= last && last - time <= 1800000) {
+        for (auto time : actionMarks) if (!chargingChart && !desktop && time <= last && last - time <= 1800000) {
             int x = plot.right - int((last - time) / 1800000.0 * (plot.right - plot.left));
             if (pixelStyle) ui::pixelDottedLine(dc, {x, plot.top}, {x, plot.bottom}, theme.warn, pixelUnit());
             else ui::drawDashedLine(dc, {x, plot.top}, {x, plot.bottom}, theme.warn, 1.0f);
         }
-        if (!any) drawText(dc, chargingChart ? tr(L"等待充電資料") : plugged ? tr(L"插電期間暫停放電曲線") : tr(L"等待放電資料"), plot, Muted, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+        if (!any) drawText(dc, desktop ? tr(L"沒有 CPU 能源資料") : chargingChart ? tr(L"等待充電資料") : plugged ? tr(L"插電期間暫停放電曲線") : tr(L"等待放電資料"), plot, Muted, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
         drawText(dc, L"0–" + number(maximum, 0) + L" W", {chart.right - sp(90), chart.top + sp(5), chart.right - sp(12), chart.top + sp(21)},
             Muted, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
     }
@@ -1450,7 +1485,7 @@ HBITMAP renderShareCard(int& width, int& height) {
     card(dc, frame, Surface, 16);
     const int left = frame.left + px(24), right = frame.right - px(24);
     const auto mood = currentMood();
-    const double level = current.history.empty() || !current.history.back().percent ? 0 : *current.history.back().percent / 100;
+    const double level = mascotLevel();
     ui::drawMascot(dc, left, frame.top + px(22), px(5), mood, level, 0, mascotColors(mood));
     const int textLeft = left + ui::MascotCells * px(5) + px(20);
     const int today = localDate();
@@ -1535,7 +1570,7 @@ void paintMini(HDC dc, RECT r) {
     const auto mood = currentMood();
     const PowerSample* p = current.history.empty() ? nullptr : &current.history.back();
     ui::drawMascot(dc, r.left + px(8), r.top + (r.bottom - r.top - ui::MascotRows * unit) / 2, unit, mood,
-        p && p->percent ? *p->percent / 100 : 0, sampleTick % 5 == 4 ? 1 : 0, mascotColors(mood));
+        mascotLevel(), sampleTick % 5 == 4 ? 1 : 0, mascotColors(mood));
     const int textLeft = r.left + px(8) + ui::MascotCells * unit + px(6);
     const std::wstring percent = p ? valueText(p->percent, L"%", 0) : L"—";
     const std::wstring watts = !p ? L"—" : p->charging ? valueText(calculateCharging(current.history).watts, L" W") :
@@ -1740,11 +1775,13 @@ void refreshPowerModeControls() {
     if (editable) powerModes = queryPowerModes();
     else { // Synthetic preview: plugged in at Best performance, on battery at Best efficiency.
         powerModes = {}; powerModes.ac = PowerMode::performance; powerModes.dc = PowerMode::efficiency;
-        powerModes.acKnown = powerModes.dcKnown = true;
+        powerModes.acKnown = powerModes.dcKnown = powerModes.acSettable = powerModes.dcSettable = true;
         refreshPowerButton();
     }
+    const bool noBattery = batteryAbsent();
     for (int i = 0; i < 6; ++i) {
-        EnableWindow(modeButtons[i], editable && (i < 3 ? powerModes.acKnown : powerModes.dcKnown));
+        const bool settable = i < 3 ? powerModes.acKnown && powerModes.acSettable : powerModes.dcKnown && powerModes.dcSettable && !noBattery;
+        EnableWindow(modeButtons[i], editable && settable);
         InvalidateRect(modeButtons[i], nullptr, FALSE);
     }
     EnableWindow(restoreModesButton, editable && powerModes.restorable);
@@ -1758,6 +1795,8 @@ std::wstring powerModeText() {
         text += tr(L"\n\nWindows 節能工具：") + std::wstring(current.history.back().saverOn ? tr(L"已啟用") : tr(L"未啟用")) +
             tr(L"。節能工具會再限制背景活動，請在「Windows 節能設定」調整。");
     if (powerModes.error == ERROR_PROC_NOT_FOUND) text += tr(L"\n\n此 Windows 版本未提供電源模式設定，只能檢視。");
+    else if (batteryAbsent()) text += tr(L"\n\n這台電腦沒有電池，只有「插電時」的設定會生效。");
+    else if (powerModes.legacy) text += tr(L"\n\nWindows 10 只能變更目前供電來源的設定（另一項為灰色）；接上或拔除電源後即可變更另一項。");
     else if (!powerModes.acKnown || !powerModes.dcKnown) text += tr(L"\n\n灰色的選項表示此電腦未提供該設定。");
     text += tr(L"\n\nBatteryScope 第一次變更某一項時會記住原本的設定，可用「還原原本設定」恢復；不會結束任何程式。");
     return text;
@@ -1938,6 +1977,14 @@ void refreshProcessButtons() {
     EnableWindow(perfAppButton, editable && !inlineProcess->name.empty());
     InvalidateRect(ecoButton, nullptr, FALSE); InvalidateRect(perfAppButton, nullptr, FALSE);
 }
+std::wstring energySourceText(const CpuEnergyReport& energy) {
+    switch (energy.source) {
+    case EnergySource::perCore: return tr(L"每核心能源（最精確）");
+    case EnergySource::coreTotal: return tr(L"全部核心總能源");
+    case EnergySource::package: return tr(L"CPU 封裝能源（扣除閒置基準）");
+    default: return tr(L"無，改用 CPU／I/O 活動排行");
+    }
+}
 void showDetails(const ProcessRow& row) {
     if (!inlineProcess || &row != &*inlineProcess) inlineProcess = row;
     std::wstring content = row.name + L"\nPID: " + std::to_wstring(row.pid) +
@@ -1952,14 +1999,23 @@ void showDetails(const ProcessRow& row) {
             tr(L"\n30 秒平滑 CPU 估計: ") + valueText(row.averageCpuWatts, L" W", 2) +
             tr(L"\n30 秒平滑的核心分攤模型範圍: ") + valueText(row.cpuWattsLow, L"", 2) + L"–" + valueText(row.cpuWattsHigh, L" W", 2) +
             tr(L"\n監測期間 CPU 估計能量: ") + valueText(row.cpuMilliWh, L" mWh", 2);
-        content += tr(L"\n本次固定核心資訊覆蓋: ") + number(row.placementCoverage*100,0) + L"%";
+        content += tr(L"\n能源來源: ") + energySourceText(current.energy);
+        if (current.energy.source == EnergySource::perCore)
+            content += tr(L"\n本次固定核心資訊覆蓋: ") + number(row.placementCoverage*100,0) + L"%";
         content += tr(L"\n全機 CPU 時間覆蓋: ") + number(current.energy.observedCpuCoverage*100,0) +
             tr(L"%（可讀程序時間／系統忙碌時間，非準確率）");
         content += tr(L"\n觀測品質: ") + qualityText(current.energy.quality) +
             tr(L" · 採樣端點差 ") + number(current.energy.sampleSkewMs, 0) + L" ms";
         if (!current.history.empty() && current.history.back().fullWh && row.averageCpuWatts)
             content += tr(L"\nCPU 部分估計耗電速度: ") + number(*row.averageCpuWatts / *current.history.back().fullWh * 100, 2) + tr(L" 百分點／小時");
-        content += tr(L"\n\n用 EMI 量到的核心能源約束分攤。持續固定在同一核心的執行緒優先按該核心分配；其餘依 CPU 時間估計。範圍反映未知的核心排程位置，並非統計信賴區間；不同指令與 SMT 仍可能產生誤差。");
+        if (current.energy.source == EnergySource::coreTotal)
+            content += tr(L"\n\n這台電腦的 EMI 只提供全部核心的總能源，沒有每核心資料，因此依 CPU 時間（有週期資料時依週期）分攤。範圍固定為估計值的 0.8–1.25 倍，代表各核心時脈與負載不同造成的不確定性，並非統計信賴區間。");
+        else if (current.energy.source == EnergySource::package)
+            content += tr(L"\n\n這台電腦的 EMI 只提供 CPU 封裝能源（含記憶體控制器、內建顯示等共用部分）。先扣除近 10 分鐘最低的封裝功率作為閒置基準（目前 ") +
+                valueText(current.energy.packageFloorWatts, L" W") +
+                tr(L"），其餘依 CPU 時間分攤；範圍上限是連閒置基準也按比例分攤的值。");
+        else
+            content += tr(L"\n\n用 EMI 量到的核心能源約束分攤。持續固定在同一核心的執行緒優先按該核心分配；其餘依 CPU 時間估計。範圍反映未知的核心排程位置，並非統計信賴區間；不同指令與 SMT 仍可能產生誤差。");
         if (!current.history.empty() && row.averageCpuWatts)
             if (auto gain = extraMinutesIfStopped(current.power, current.history.back(), *row.averageCpuWatts))
                 content += tr(L"\n若關閉此程式：CPU 部分約可多用 ") + std::to_wstring(int(*gain)) + tr(L" 分鐘（依近 5 分鐘耗電估算；不含 GPU、螢幕，非保證）");
@@ -2698,6 +2754,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         }
         if (trayAdded) updateTray(false);
         if (demo || isolatedPreview) refreshPowerButton(); // the preview mode follows the power source
+        if (!current.history.empty()) recordCpuPower(current.history.back().ms, current.energy);
         if (!demo && !isolatedPreview && !current.history.empty() && lowBattery.update(current.history.back(), lowBatteryThreshold))
             showLowBatteryNotice();
         learnFromSample();
@@ -2800,7 +2857,7 @@ Snapshot demoSnapshot() {
         row.measured = row.ioKnown = row.memoryKnown = true;
         state.processes.push_back(row);
     }
-    state.energy.ready = true; state.energy.coreWatts = 3.2; state.energy.packageWatts = 5.0;
+    state.energy.ready = true; state.energy.source = EnergySource::perCore; state.energy.coreWatts = 3.2; state.energy.packageWatts = 5.0;
     state.energy.observedCpuCoverage = .82; // Explicitly synthetic preview data.
     state.energy.systemProcessSnapshot = true; state.energy.quality = ObservationQuality::partial; state.energy.sampleSkewMs = 4;
     state.energy.otherSystemWatts = *state.power.currentWatts - 3.2; state.energy.unassignedCpuWatts = .4;
@@ -2894,7 +2951,21 @@ int diagnostic(const std::wstring& path) {
     unsigned measured = 0, actionable = 0, serviceProcesses = 0;
     for (const auto& row : state.processes) { measured += row.measured; actionable += row.actionable; serviceProcesses += !row.services.empty(); }
     out << "measured_processes=" << measured << "\nactionable_processes=" << actionable << "\nservice_processes=" << serviceProcesses << "\n";
-    out << "emi_channels=" << state.energy.channels << "\nenergy_ready=" << state.energy.ready
+    const char* sourceNames[] = {"none", "per_core", "core_total", "package"};
+    OSVERSIONINFOW os{}; os.dwOSVersionInfoSize = sizeof(os);
+    using RtlGetVersion = LONG (WINAPI*)(OSVERSIONINFOW*);
+    FARPROC versionSymbol = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion");
+    RtlGetVersion getVersion = nullptr; std::memcpy(&getVersion, &versionSymbol, sizeof(getVersion));
+    if (getVersion) getVersion(&os);
+    out << "windows_build=" << os.dwMajorVersion << "." << os.dwMinorVersion << "." << os.dwBuildNumber
+        << "\nlogical_processors=" << GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) << "\nprocessor_groups=" << GetActiveProcessorGroupCount()
+        << "\nenergy_source=" << sourceNames[int(state.energy.source)] << "\nemi_channel_names=";
+    for (const auto& name : energyReader.channelNames()) {
+        std::string utf8(size_t(WideCharToMultiByte(CP_UTF8, 0, name.c_str(), int(name.size()), nullptr, 0, nullptr, nullptr)), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, name.c_str(), int(name.size()), utf8.data(), int(utf8.size()), nullptr, nullptr);
+        out << utf8 << ";";
+    }
+    out << "\nemi_channels=" << state.energy.channels << "\nenergy_ready=" << state.energy.ready
         << "\ncpu_core_watts=" << (state.energy.coreWatts?std::to_string(*state.energy.coreWatts):"unavailable")
         << "\ncpu_package_watts=" << (state.energy.packageWatts?std::to_string(*state.energy.packageWatts):"unavailable")
         << "\nunassigned_cpu_watts=" << (state.energy.unassignedCpuWatts?std::to_string(*state.energy.unassignedCpuWatts):"unavailable")
@@ -3356,6 +3427,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             p.remainingWh = 30 + i * .02; p.percent = *p.remainingWh / *p.fullWh * 100;
         }
         if (option(L"--plugged")) for (auto& p : current.history) { p.onAc = true; p.charging = false; p.watts = 0; }
+        if (option(L"--desktop")) for (auto& p : current.history) { // a PC without a battery
+            p.present = false; p.onAc = true; p.charging = false;
+            p.percent.reset(); p.watts.reset(); p.remainingWh.reset(); p.fullWh.reset(); p.designWh.reset(); p.cycleCount.reset();
+        }
+        if (option(L"--desktop")) for (size_t i = 0; i < current.history.size(); ++i) { // synthetic CPU package power
+            CpuEnergyReport sample; sample.ready = true;
+            sample.packageWatts = 9 + 6 * std::sin(i / 9.0) + (i % 40 < 6 ? 18 : 0);
+            recordCpuPower(current.history[i].ms, sample);
+        }
         if (option(L"--empty")) current.processes.clear();
         if (option(L"--no-energy")) { current.energy.ready = false; for (auto& row : current.processes) { row.averageCpuWatts.reset(); row.cpuWattsLow.reset(); row.cpuWattsHigh.reset(); } }
         current.power = calculatePower(current.history);

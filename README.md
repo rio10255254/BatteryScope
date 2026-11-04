@@ -13,11 +13,20 @@
 
 ## 下載
 
-到 **[Releases 頁面](https://github.com/rio10255254/BatteryScope/releases/latest)** 下載 `BatteryScope-0.10.0-win64.zip`，解壓後執行 `BatteryScope.exe`。
+到 **[Releases 頁面](https://github.com/rio10255254/BatteryScope/releases/latest)** 下載 `BatteryScope-0.11.0-win64.zip`，解壓後執行 `BatteryScope.exe`。
 
 - 需要 Windows 10 1703 以上（建議 Windows 11），64 位元。不用安裝，也不需要管理員權限。
 - 執行檔沒有數位簽章，第一次開啟若出現 SmartScreen，點「其他資訊 → 仍要執行」。
 - 開啟後在右下角系統匣，圖示會顯示電量百分比；點圖示開關面板。
+
+## 支援的電腦
+
+| | 筆電 | 桌機（沒有電池） |
+| --- | --- | --- |
+| Windows 11 | 全部功能 | 主畫面改顯示 CPU 功率與 CPU W 曲線；「用電池時」電源模式停用 |
+| Windows 10（1703 以上） | 全部功能；電源模式只能變更目前供電來源那一項（1709 以上） | 同上 |
+
+每個程式的瓦數準確度取決於 CPU 提供的能源資料（見下方「硬體相容性」）；沒有能源資料的電腦仍可依 CPU／I/O 活動排行。不支援 Windows on ARM 的 Windows 10（無法執行 x64 程式）；Windows 11 on ARM 可透過模擬執行，但通常沒有可用的 CPU 能源通道。
 
 ## 能做什麼
 
@@ -37,7 +46,7 @@
 
 ## 使用方式
 
-1. 從 [GitHub Releases](https://github.com/rio10255254/BatteryScope/releases/latest) 下載 `BatteryScope-0.10.0-win64.zip`，解壓後執行 `BatteryScope.exe`。已編譯版本適用 Windows 11 x64。
+1. 從 [GitHub Releases](https://github.com/rio10255254/BatteryScope/releases/latest) 下載 `BatteryScope-0.11.0-win64.zip`，解壓後執行 `BatteryScope.exe`。已編譯版本適用 Windows 10（1703 以上）與 Windows 11 的 x64 筆電與桌機。
    升級時先從系統匣結束舊版，再執行新版；程式會避免同時啟動多個正式監測視窗。
 2. 目前耗電顯示電池回報的整機放電功率；資料累積後顯示平均功率、耗電速度與預估續航。
 3. 硬體能源資料可用時，下方依「估計 CPU W」由高到低列出前 10 個程序／服務。每張卡片第二行顯示類型、PID 與核心分攤模型範圍。點「僅背景」切換背景篩選，點「顯示」切換前 10 名／全部；滑鼠滾輪或鍵盤上下鍵瀏覽。若能源資料不可用，會明確退回 CPU / I/O 活動排行。
@@ -115,7 +124,7 @@
 - **完整記帳**：PID 4 的 System 以「Windows 核心」列出但不能操作；DPC、Interrupt、快照間已結束程序及其他沒有程序時間的活動留在「CPU 未歸因」。CPU 以外的電量留在「CPU 以外／未歸因」。CPU 封裝能量已包含核心，不會與核心能量重複相加。
 - **估計範圍只涵蓋 CPU**；GPU、螢幕、儲存、網路、核心代辦工作等尚未完整歸因。介面不會把它們依 CPU 使用率硬分配給程序。記憶體僅供參考，不參與能源分攤。
 - **詳情**：可查看當次 CPU W、30 秒平滑 W、估計累積 CPU mWh，以及 CPU 部分對應的電池百分點／小時。累計值只涵蓋有有效讀值的觀測區間。
-- **硬體相容性**：目前核心分攤驗證於這台 Ryzen 9 8945HS（單一處理器群組、單一封裝、8 核心／16 邏輯處理器），使用 `RAPL_Package0_CoreN_CORE` EMI 通道與 Windows 核心拓樸排序。其他通道命名、多封裝、多群組、缺少 EMI 或缺少 CPU 時間資訊時不編造瓦數，退回活動排行。
+- **硬體相容性**：依電腦提供的 EMI 能源通道自動選擇來源，詳情頁會顯示目前使用哪一種：**每核心**（AMD Ryzen，最精確）、**全核心總量**（多數 Intel、多封裝或超過 64 執行緒的電腦，範圍為估計值 0.8–1.25 倍）、**封裝**（只有封裝能源的機型，先扣除閒置基準）。都沒有時不編造瓦數，退回 CPU／I/O 活動排行。每核心模式已在 Ryzen 9 8945HS 實機驗證；其他模式的公式有單元測試，尚未在 Intel 與桌機實機驗證。詳見 [演算法說明](ALGORITHM.md#21-不同電腦的能源來源分級011-起)。
 - **備援活動排行**：依 30 秒平滑 CPU／I/O 活動排序。CPU 百分比以全機邏輯處理器總量為分母。I/O 包含檔案、網路與裝置，不能等同實體磁碟吞吐量。
 - 背景程序係依是否有可見的頂層視窗粗略分類，瀏覽器子程序也會列為背景程序。
 - 單一服務宿主會直接顯示服務名稱；共用同一 PID 的多個服務顯示群組與數量，只估計宿主的 CPU 功率，沒有虛構各服務的獨立瓦數。
@@ -157,7 +166,7 @@
 .\build.ps1 -Test
 ```
 
-舊版仍在執行時，可使用 `./build.ps1 -Test -OutputDirectory dist/v0.10.0` 編譯到獨立目錄，避免覆寫使用中的 EXE。
+舊版仍在執行時，可使用 `./build.ps1 -Test -OutputDirectory dist/v0.11.0` 編譯到獨立目錄，避免覆寫使用中的 EXE。
 
 預設尋找 PATH 上的 `g++.exe`，其次使用 `C:\mingw64\bin\g++.exe`，並使用同目錄的 `windres.exe`。產出 `dist\BatteryScope.exe`。
 
@@ -186,7 +195,7 @@ ctest --test-dir build -C Release --output-on-failure
 .\dist\BatteryScope.exe --tray-test C:\temp\tray-test.txt
 ```
 
-診斷檔與截圖的上層資料夾須已存在。截圖可加 `--pixel`、`--smooth`、`--light`、`--dark`、`--high-contrast`（以目前系統色彩預覽高對比）、`--ledger`（累計耗能頁）、`--power-mode`（電源模式頁）與 `--history`（歷史紀錄頁）；示範模式可用 `--card-png <路徑>` 直接輸出分享卡片。
+診斷檔與截圖的上層資料夾須已存在。截圖可加 `--pixel`、`--smooth`、`--light`、`--dark`、`--high-contrast`（以目前系統色彩預覽高對比）、`--ledger`（累計耗能頁）、`--power-mode`（電源模式頁）、`--history`（歷史紀錄頁）與 `--desktop`（沒有電池的桌機）；示範模式可用 `--card-png <路徑>` 直接輸出分享卡片。
 
 ### 點陣字型
 

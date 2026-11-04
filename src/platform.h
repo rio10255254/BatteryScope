@@ -36,6 +36,10 @@ struct PowerModes {
     DWORD error = ERROR_SUCCESS; // ERROR_PROC_NOT_FOUND when Windows lacks the API
     PowerMode ac = PowerMode::other, dc = PowerMode::other;
     bool acKnown = false, dcKnown = false;
+    // Windows 11 sets either side at any time; the Windows 10 slider only changes
+    // the side that matches the current power source.
+    bool acSettable = false, dcSettable = false;
+    bool legacy = false;     // Windows 10 slider interface
     bool restorable = false; // a mode BatteryScope changed still differs from its original
 };
 PowerModes queryPowerModes();
