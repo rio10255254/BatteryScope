@@ -10,6 +10,11 @@ New-Item -ItemType Directory -Force -Path $pins | Out-Null
 $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 if (-not (Test-Path $run)) { New-Item -Path $run | Out-Null } # a fresh runner account may not have it
 function New-Link($path, $target) { $link = $shell.CreateShortcut($path); $link.TargetPath = $target; $link.Save() }
+# Start-Process -Wait would also wait for the BatteryScope the setup opens, so wait for the setup process only.
+function Invoke-Setup([string[]]$arguments) {
+    $process = Start-Process $Setup -ArgumentList $arguments -PassThru
+    if (-not $process.WaitForExit(180000)) { throw "FAIL: setup did not finish within 3 minutes" }
+}
 function Assert($condition, $message) { if (-not $condition) { throw "FAIL: $message" }; Write-Output "PASS: $message" }
 
 # An older portable copy, running, with a desktop shortcut, a taskbar pin and launch at sign-in.
@@ -23,7 +28,7 @@ New-ItemProperty -Path $run -Name BatteryScope -Value "`"$portable`" --tray" -Fo
 $old = Start-Process $portable -ArgumentList '--tray' -PassThru
 Start-Sleep -Seconds 5
 
-Start-Process $Setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/LOG=install.log' -Wait
+Invoke-Setup @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/LOG=install.log')
 $installed = Join-Path $env:LOCALAPPDATA 'Programs\BatteryScope\BatteryScope.exe'
 Assert (Test-Path $installed) 'installs per user into %LOCALAPPDATA%\Programs\BatteryScope'
 Assert ($old.HasExited) 'the running portable copy was closed before installing'
@@ -38,14 +43,16 @@ Start-Sleep -Seconds 3
 Assert ((Get-Process BatteryScope -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $installed }).Count -ge 1) 'opens the installed copy after installing'
 
 # Updating over a running installed copy keeps the same folder and reopens it.
-Start-Process $Setup -ArgumentList '/SILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
+Invoke-Setup @('/SILENT', '/SUPPRESSMSGBOXES', '/NORESTART')
 Assert (Test-Path $installed) 'reinstall keeps the same folder'
 Start-Sleep -Seconds 3
 Assert ((Get-Process BatteryScope -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $installed }).Count -eq 1) 'exactly one copy runs after an update'
 
 $uninstaller = Join-Path (Split-Path $installed) 'unins000.exe'
-Start-Process $uninstaller -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
-Start-Sleep -Seconds 3
+# The uninstaller hands off to a copy of itself in %TEMP%, so wait for the files to go.
+Start-Process $uninstaller -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' | Out-Null
+for ($i = 0; $i -lt 60 -and (Test-Path $installed); $i++) { Start-Sleep -Seconds 1 }
+Start-Sleep -Seconds 2
 Assert (-not (Test-Path $installed)) 'uninstall removes the program'
 Assert ($null -eq (Get-ItemProperty $run -ErrorAction SilentlyContinue).BatteryScope) 'uninstall removes its launch at sign-in'
 Assert (-not (Test-Path $startMenu)) 'uninstall removes the Start menu shortcut'

@@ -55,6 +55,7 @@ jobs:
           $hash = (Get-FileHash $name -Algorithm SHA256).Hash.ToLower()
           "$hash  $name" | Out-File -Encoding ascii "$name.sha256"
       - name: Test installer end to end
+        timeout-minutes: 10
         shell: pwsh
         run: ./installer/test-installer.ps1 -Setup "BatteryScope-$env:VERSION-setup.exe"
       - name: Publish the release

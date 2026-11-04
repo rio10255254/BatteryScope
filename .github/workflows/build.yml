@@ -24,6 +24,7 @@ jobs:
           $setup = ./installer/build-installer.ps1 | Select-Object -Last 1
           "SETUP=$setup" >> $env:GITHUB_ENV
       - name: Test installer end to end
+        timeout-minutes: 10
         shell: pwsh
         run: ./installer/test-installer.ps1 -Setup $env:SETUP
       - name: Upload installer
