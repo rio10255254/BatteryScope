@@ -8,6 +8,7 @@ $desktop = [Environment]::GetFolderPath('Desktop')
 $pins = Join-Path $env:APPDATA 'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar'
 New-Item -ItemType Directory -Force -Path $pins | Out-Null
 $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+if (-not (Test-Path $run)) { New-Item -Path $run | Out-Null } # a fresh runner account may not have it
 function New-Link($path, $target) { $link = $shell.CreateShortcut($path); $link.TargetPath = $target; $link.Save() }
 function Assert($condition, $message) { if (-not $condition) { throw "FAIL: $message" }; Write-Output "PASS: $message" }
 
