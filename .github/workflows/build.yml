@@ -18,6 +18,21 @@ jobs:
         run: cmake --build build --config Release
       - name: Run tests
         run: ctest --test-dir build -C Release --output-on-failure
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $setup = ./installer/build-installer.ps1 | Select-Object -Last 1
+          "SETUP=$setup" >> $env:GITHUB_ENV
+      - name: Test installer end to end
+        timeout-minutes: 10
+        shell: pwsh
+        run: ./installer/test-installer.ps1 -Setup $env:SETUP
+      - name: Upload installer
+        uses: actions/upload-artifact@v6
+        with:
+          name: BatteryScope-setup
+          path: dist/*-setup.exe
+          if-no-files-found: error
       - name: Upload portable executable
         uses: actions/upload-artifact@v6
         with:

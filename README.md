@@ -13,11 +13,18 @@
 
 ## 下載
 
-到 **[Releases 頁面](https://github.com/rio10255254/BatteryScope/releases/latest)** 下載 `BatteryScope-0.11.0-win64.zip`，解壓後執行 `BatteryScope.exe`。
+到 **[Releases 頁面](https://github.com/rio10255254/BatteryScope/releases/latest)** 下載：
 
-- 需要 Windows 10 1703 以上（建議 Windows 11），64 位元。不用安裝，也不需要管理員權限。
-- 執行檔沒有數位簽章，第一次開啟若出現 SmartScreen，點「其他資訊 → 仍要執行」。
-- 開啟後在右下角系統匣，圖示會顯示電量百分比；點圖示開關面板。
+- **安裝版（建議）**：`BatteryScope-0.12.0-setup.exe`。不需要管理員權限，安裝到 `%LOCALAPPDATA%\Programs\BatteryScope`，會建立開始功能表捷徑，可選擇桌面捷徑與登入時啟動，並可從「設定 → 應用程式」解除安裝。
+- **免安裝版**：`BatteryScope-0.12.0-win64.zip`，解壓後執行 `BatteryScope.exe`。
+
+需要 Windows 10 1703 以上（建議 Windows 11），64 位元。程式沒有數位簽章，第一次開啟若出現 SmartScreen，點「其他資訊 → 仍要執行」。開啟後在右下角系統匣，圖示會顯示電量百分比；點圖示開關面板。
+
+### 安裝與更新
+
+- **自動結束舊版**：安裝前會先關閉正在執行的 BatteryScope（安裝版或免安裝版、任何版本）。先讓它正常結束，以還原它設定的效率模式與電源模式；沒有回應才強制結束。
+- **捷徑與釘選自動指向新版**：每次都安裝到同一個資料夾，所以開始功能表、桌面、工作列釘選與登入時啟動在更新後仍然有效。安裝時也會把仍指向舊位置 `BatteryScope.exe` 的捷徑、工作列釘選、Windows 10 開始釘選與登入啟動，全部改指向安裝版。舊的免安裝資料夾不會被刪除，可自行刪除。
+- **更新提醒**：BatteryScope 每天檢查一次 GitHub 上的最新版本，有新版時跳出一次通知；點通知（或「⋯ → 安裝更新」）會下載安裝程式、比對 SHA-256 校驗碼後自動安裝，完成後重新開啟。校驗不符時不會執行，改開啟下載頁。可在「⋯ → 更新」關閉自動檢查或立即檢查。檢查時只會向 `api.github.com` 讀取版本資訊，不會傳送任何使用資料。
 
 ## 支援的電腦
 
@@ -36,7 +43,7 @@
 - **電池健康**：健康度、充電循環次數與長期趨勢，睡眠期間掉電偵測。
 - **7 天歷史紀錄**：每日放電量長條圖、每日評分與成就，可輸出分享卡片。
 - **貼心提醒**：低電量、背景程式偷耗電、睡眠耗電、充到指定電量時發出通知。
-- **小巧不打擾**：系統匣常駐、迷你浮動視窗、Ctrl+Alt+B 快速鍵、匯出 CSV；沒有網路連線、遙測或常駐服務。
+- **小巧不打擾**：系統匣常駐、迷你浮動視窗、Ctrl+Alt+B 快速鍵、匯出 CSV；除了每天檢查一次新版本外沒有網路連線，沒有遙測或常駐服務。
 
 ![程序詳情與平滑風格](docs/screenshots/more-zh.png)
 
@@ -46,7 +53,7 @@
 
 ## 使用方式
 
-1. 從 [GitHub Releases](https://github.com/rio10255254/BatteryScope/releases/latest) 下載 `BatteryScope-0.11.0-win64.zip`，解壓後執行 `BatteryScope.exe`。已編譯版本適用 Windows 10（1703 以上）與 Windows 11 的 x64 筆電與桌機。
+1. 從 [GitHub Releases](https://github.com/rio10255254/BatteryScope/releases/latest) 下載 `BatteryScope-0.12.0-win64.zip`，解壓後執行 `BatteryScope.exe`。已編譯版本適用 Windows 10（1703 以上）與 Windows 11 的 x64 筆電與桌機。
    升級時先從系統匣結束舊版，再執行新版；程式會避免同時啟動多個正式監測視窗。
 2. 目前耗電顯示電池回報的整機放電功率；資料累積後顯示平均功率、耗電速度與預估續航。
 3. 硬體能源資料可用時，下方依「估計 CPU W」由高到低列出前 10 個程序／服務。每張卡片第二行顯示類型、PID 與核心分攤模型範圍。點「僅背景」切換背景篩選，點「顯示」切換前 10 名／全部；滑鼠滾輪或鍵盤上下鍵瀏覽。若能源資料不可用，會明確退回 CPU / I/O 活動排行。
@@ -110,7 +117,7 @@
 - 時間按剩餘 Wh / 較低的即時與平均充電 W 計算；接近滿電時會減速，韌體的充電保護上限也未知，因此只表示「依目前速度」，不是保證時間。滿電或接電但沒有充電時不編造倒數。
 - 「⋯ → 電池與充電詳情」提供容量、平均充電 W 與限制說明。通用 Windows 電源資訊只能確認外部電源，**此版無法可靠區分圓孔或 USB-C**，接頭類型顯示未提供。USB-C 控制器的存在不能證明目前由它供電。
 
-不需要安裝額外的 C++ 執行階段或網頁引擎。沒有網路請求、遙測、常駐系統服務、驅動程式或資料庫。
+不需要安裝額外的 C++ 執行階段或網頁引擎。除了可關閉的每日更新檢查（只讀取 GitHub 上的版本資訊）外沒有網路請求；沒有遙測、常駐系統服務、驅動程式或資料庫。
 
 ## 量測與限制
 
@@ -166,7 +173,7 @@
 .\build.ps1 -Test
 ```
 
-舊版仍在執行時，可使用 `./build.ps1 -Test -OutputDirectory dist/v0.11.0` 編譯到獨立目錄，避免覆寫使用中的 EXE。
+舊版仍在執行時，可使用 `./build.ps1 -Test -OutputDirectory dist/v0.12.0` 編譯到獨立目錄，避免覆寫使用中的 EXE。
 
 預設尋找 PATH 上的 `g++.exe`，其次使用 `C:\mingw64\bin\g++.exe`，並使用同目錄的 `windres.exe`。產出 `dist\BatteryScope.exe`。
 
@@ -220,6 +227,8 @@ python tools/subset-pixel-font.py path\to\Cubic_11.ttf
 - `src/ui.*`：深色／淺色／高對比色盤、GDI+ 平滑繪圖、像素風格繪圖（階梯形狀、格狀電量、點陣數字）、內嵌點陣字型載入與程式圖示快取。
 - `src/assets/pixel-ui.ttf`、`tools/subset-pixel-font.py`：點陣字型子集與產生腳本。
 - `src/version.h`：版本號唯一來源。
+- `src/update.*`：每日更新檢查（GitHub 最新版本）、安裝程式下載與 SHA-256 校驗、安裝後捷徑／釘選／登入啟動改指向。
+- `installer/`：Inno Setup 安裝腳本、建置腳本與 CI 端到端安裝測試（安裝、結束舊版、捷徑改指向、更新、解除安裝）。
 - `src/app.cpp`：原生 GUI、系統匣、採樣排程、權限輔助及診斷模式。
 - `tests/tests.cpp`：統計與受控程序生命週期測試。
 

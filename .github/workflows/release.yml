@@ -46,6 +46,18 @@ jobs:
           Compress-Archive -Path package/* -DestinationPath "$name.zip"
           $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
           "$hash  $name.zip" | Out-File -Encoding ascii "$name.zip.sha256"
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $setup = ./installer/build-installer.ps1 | Select-Object -Last 1
+          $name = Split-Path $setup -Leaf
+          Copy-Item $setup $name
+          $hash = (Get-FileHash $name -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name" | Out-File -Encoding ascii "$name.sha256"
+      - name: Test installer end to end
+        timeout-minutes: 10
+        shell: pwsh
+        run: ./installer/test-installer.ps1 -Setup "BatteryScope-$env:VERSION-setup.exe"
       - name: Publish the release
         shell: pwsh
         env:
@@ -54,7 +66,7 @@ jobs:
           $name = "BatteryScope-$env:VERSION-win64"
           $notes = "docs/releases/$($env:TAG).md"
           if (Test-Path $notes) {
-            gh release create "$env:TAG" "$name.zip" "$name.zip.sha256" --target "${{ github.sha }}" --title "BatteryScope $env:VERSION" --notes-file $notes
+            gh release create "$env:TAG" "BatteryScope-$env:VERSION-setup.exe" "BatteryScope-$env:VERSION-setup.exe.sha256" "$name.zip" "$name.zip.sha256" --target "${{ github.sha }}" --title "BatteryScope $env:VERSION" --notes-file $notes
           } else {
-            gh release create "$env:TAG" "$name.zip" "$name.zip.sha256" --target "${{ github.sha }}" --title "BatteryScope $env:VERSION" --generate-notes
+            gh release create "$env:TAG" "BatteryScope-$env:VERSION-setup.exe" "BatteryScope-$env:VERSION-setup.exe.sha256" "$name.zip" "$name.zip.sha256" --target "${{ github.sha }}" --title "BatteryScope $env:VERSION" --generate-notes
           }
