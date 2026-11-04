@@ -81,8 +81,19 @@ struct CoreEnergy {
     double busyLogicalCores = 0;
 };
 enum class ObservationQuality { unavailable, limited, partial, strong };
+// Which hardware energy data the CPU attribution is built on, best first.
+// perCore: one EMI channel per physical core (AMD Ryzen); coreTotal: one channel
+// for all cores of each package (Intel PP0, or per-core channels that cannot be
+// matched to the Windows topology); package: whole-package energy only, where
+// the share above the learned idle floor is attributed.
+enum class EnergySource { none, perCore, coreTotal, package };
 struct CpuEnergyReport {
+    EnergySource source = EnergySource::none;
+    // Without per-core data the attribution range is the estimate times these
+    // factors (see ALGORITHM.md); perCore computes its range from core rates.
+    double rangeLow = 1, rangeHigh = 1;
     Value coreWatts, packageWatts, otherSystemWatts, unassignedCpuWatts;
+    Value packageFloorWatts; // package source: learned idle floor, not attributed
     size_t channels = 0;
     double intervalSeconds = 0;
     double processIntervalSeconds = 0, sampleSkewMs = 0;

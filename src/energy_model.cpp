@@ -42,6 +42,48 @@ Allocation allocateCpuEnergy(const std::vector<CoreEnergy>& cores, double demand
     result.high = std::max(result.watts, extreme(true));
     return result;
 }
+ChannelInfo classifyChannel(const std::wstring& raw) {
+    std::wstring name(raw);
+    std::transform(name.begin(), name.end(), name.begin(), [](wchar_t c) { return wchar_t(std::towupper(c)); });
+    ChannelInfo info;
+    const std::wstring prefix = L"RAPL_PACKAGE";
+    if (name.compare(0, prefix.size(), prefix) != 0) return info;
+    size_t at = prefix.size(), digits = 0;
+    unsigned package = 0;
+    while (at < name.size() && std::iswdigit(name[at]) && digits < 3) { package = package * 10 + unsigned(name[at] - L'0'); ++at; ++digits; }
+    if (!digits || at >= name.size() || name[at] != L'_') return info;
+    const std::wstring rest = name.substr(at + 1);
+    info.package = package;
+    if (rest == L"PKG") info.kind = ChannelKind::package;
+    else if (rest == L"PP0" || rest == L"CORES" || rest == L"CORE") info.kind = ChannelKind::cores;
+    else if (rest.size() > 9 && rest.compare(0, 4, L"CORE") == 0 && rest.compare(rest.size() - 5, 5, L"_CORE") == 0) {
+        const std::wstring number = rest.substr(4, rest.size() - 9);
+        if (!number.empty() && number.size() < 5 && number.find_first_not_of(L"0123456789") == number.npos) {
+            info.kind = ChannelKind::core; info.core = unsigned(std::stoul(number));
+        }
+    }
+    return info;
+}
+Value busyProcessors(uint64_t idle0, uint64_t kernel0, uint64_t user0, uint64_t idle1, uint64_t kernel1, uint64_t user1, unsigned processors) {
+    if (idle1 < idle0 || kernel1 < kernel0 || user1 < user0 || !processors) return {};
+    const double idle = double(idle1 - idle0), total = double(kernel1 - kernel0) + double(user1 - user0);
+    if (total <= 0 || idle > total) return {};
+    return (total - idle) / total * processors;
+}
+double PackageFloor::update(uint64_t ms, double watts) {
+    while (!samples_.empty() && (ms < samples_.front().first || ms - samples_.front().first > window_)) samples_.erase(samples_.begin());
+    // Monotonic deque: an older sample at or above a newer one can never be the minimum.
+    while (!samples_.empty() && samples_.back().second >= watts) samples_.pop_back();
+    samples_.emplace_back(ms, watts);
+    return samples_.front().second;
+}
+void setAggregatePool(CpuEnergyReport& report, EnergySource source, double poolWatts, double busy, double low, double high) {
+    report.source = source;
+    report.cores = {{std::max(0.0, poolWatts), std::max(0.0, busy)}};
+    report.coreWatts = std::max(0.0, poolWatts);
+    report.rangeLow = low; report.rangeHigh = high;
+    report.ready = true;
+}
 void alignProcessObservation(CpuEnergyReport& report, double processInterval, uint64_t processSampleMs, bool systemSnapshot) {
     report.processIntervalSeconds = processInterval;
     report.systemProcessSnapshot = systemSnapshot;
@@ -124,7 +166,7 @@ void CpuAttributor::apply(std::vector<ProcessRow>& rows, CpuEnergyReport& report
     for(size_t i=0;i<rows.size();++i) {
         double demand=rows[i].measured?std::max(0.0,rows[i].cpu/100*processors):0;
         double sum=0;
-        for(size_t k=0;k<report.cores.size() && k<rows[i].fixedCoreBusy.size();++k) {
+        for(size_t k=0;report.source==EnergySource::perCore && k<report.cores.size() && k<rows[i].fixedCoreBusy.size();++k) {
             double value=rows[i].fixedCoreBusy[k];
             if(std::isfinite(value) && value>0) { fixed[i][k]=value; sum+=value; }
         }
@@ -183,6 +225,10 @@ void CpuAttributor::apply(std::vector<ProcessRow>& rows, CpuEnergyReport& report
         if (report.ready && row.measured && !report.timingMismatch) {
             auto estimate = allocateCpuEnergy(remainder,unknownDemand[rowIndex],unknownTotal);
             estimate.watts+=fixedPower[rowIndex]; estimate.low+=fixedPower[rowIndex]; estimate.high+=fixedPower[rowIndex];
+            if (report.source != EnergySource::perCore) {
+                estimate.low = estimate.watts * std::min(1.0, report.rangeLow);
+                estimate.high = estimate.watts * std::max(1.0, report.rangeHigh);
+            }
             row.cpuWatts = estimate.watts;
             const double dt = saved.last && ms > saved.last ? (ms - saved.last) / 1000.0 : 0;
             if (saved.last && dt <= 30 && dt > 0) {

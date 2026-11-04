@@ -13,11 +13,20 @@
 
 ## Download
 
-Get `BatteryScope-0.10.0-win64.zip` from the **[Releases page](https://github.com/rio10255254/BatteryScope/releases/latest)**, extract it, and run `BatteryScope.exe`.
+Get `BatteryScope-0.11.0-win64.zip` from the **[Releases page](https://github.com/rio10255254/BatteryScope/releases/latest)**, extract it, and run `BatteryScope.exe`.
 
 - Requires Windows 10 version 1703 or later (Windows 11 recommended), 64-bit. No installer or administrator rights needed.
 - The EXE is not code-signed; if SmartScreen appears the first time, choose **More info → Run anyway**.
 - It lives in the notification area, where the icon shows the battery percentage; click it to show or hide the panel.
+
+## Supported PCs
+
+| | Laptop | Desktop (no battery) |
+| --- | --- | --- |
+| Windows 11 | All features | The main card shows CPU power and a CPU W chart; the On battery power mode is disabled |
+| Windows 10 (1703 or later) | All features; power mode changes only the setting for the current power source (1709 or later) | Same as above |
+
+Per-app watt accuracy depends on the energy data the CPU provides (see below); PCs without it still rank apps by CPU/I/O activity. Windows 10 on ARM cannot run x64 apps; Windows 11 on ARM runs it under emulation but usually has no usable CPU energy channels.
 
 ## Highlights
 
@@ -35,7 +44,7 @@ Details follow.
 
 ## Using it
 
-1. Download `BatteryScope-0.10.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on Windows 11 x64.
+1. Download `BatteryScope-0.11.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
 2. Click its battery icon in the notification area to show or hide the panel. Esc hides it; monitoring continues at a lower frequency.
 3. Open **⋯ → Language / 語言 → English** to switch immediately. The setting persists for your Windows account. Selection and scroll position are retained.
 4. Use Background and Show filters, the mouse wheel, arrow keys, Home/End, or Page Up/Down. Enter or double-click opens details.
@@ -90,7 +99,7 @@ The power mode button at the top right shows **the Windows power mode in effect 
 - **Monitoring scope:** every live process with a PID in the system snapshot is collected, including protected and other-user processes. Running Win32 services are mapped to their host PIDs. Drivers and kernel work may have no separate process and remain in System or unattributed energy. Processes that start and exit between samples cannot be listed individually. If the system snapshot fails, the Toolhelp fallback keeps processes it cannot open and marks their statistics unavailable.
 - **No compatible energy counters:** the list falls back to CPU/I/O activity and leaves watt estimates unavailable.
 
-The CPU model has been exercised on a Ryzen 9 8945HS with compatible EMI counters. Other hardware may fall back to activity ranking. See [algorithm details](ALGORITHM.md) and [validation records](VALIDATION.md).
+The energy source is chosen automatically from the EMI channels the PC provides, and the details page shows which one is in use: **per-core** (AMD Ryzen, most precise), **all-core total** (most Intel PCs, multi-package systems, and PCs with more than 64 logical processors; the range is 0.8–1.25 times the estimate), or **package** (package energy only; the idle floor is subtracted first). Without any of them no watts are invented and the list ranks by CPU/I/O activity. Per-core mode has been verified on a Ryzen 9 8945HS; the other modes are unit-tested but not yet verified on Intel or desktop hardware. See [algorithm details](ALGORITHM.md) and [validation records](VALIDATION.md).
 
 ## Interaction and resource use
 
@@ -111,7 +120,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-To avoid replacing a running executable, use `-OutputDirectory dist/v0.10.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
+To avoid replacing a running executable, use `-OutputDirectory dist/v0.11.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
 
 ```powershell
 .\dist\BatteryScope.exe --demo
@@ -120,7 +129,7 @@ To avoid replacing a running executable, use `-OutputDirectory dist/v0.10.0`. Th
 .\dist\BatteryScope.exe --tray-test C:\temp\tray-test.txt
 ```
 
-The destination folder must exist. Screenshots use synthetic data only when the demo option is selected. `--compact`, `--minimal`, `--plugged`, `--no-energy`, `--selected`, `--pixel`, `--smooth`, `--light`, `--dark`, `--high-contrast` (previews the contrast palette from current system colors), `--ledger`, `--power-mode`, and `--history` are available for preview checks; in demo mode `--card-png <path>` writes the share card.
+The destination folder must exist. Screenshots use synthetic data only when the demo option is selected. `--compact`, `--minimal`, `--plugged`, `--no-energy`, `--selected`, `--pixel`, `--smooth`, `--light`, `--dark`, `--high-contrast` (previews the contrast palette from current system colors), `--ledger`, `--power-mode`, `--history`, and `--desktop` (a PC without a battery) are available for preview checks; in demo mode `--card-png <path>` writes the share card.
 
 ## Pixel font
 

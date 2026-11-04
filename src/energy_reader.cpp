@@ -71,6 +71,10 @@ struct EnergyReader::Impl {
     uint64_t previousMs = 0;
     size_t openFailures = 0;
     bool baseline = false;
+    bool previousSystemOK = false;
+    uint64_t previousIdle = 0, previousKernel = 0, previousUser = 0;
+    PackageFloor packageFloor;
+    EnergySource lastSource = EnergySource::none;
     struct ThreadReading { uint64_t created=0, cpu=0, ms=0; DWORD pid=0; int core=-1; };
     std::map<DWORD,ThreadReading> previousThreads;
     Impl() { discover(); }
@@ -118,11 +122,23 @@ struct EnergyReader::Impl {
 };
 EnergyReader::EnergyReader() : impl_(std::make_unique<Impl>()) {}
 EnergyReader::~EnergyReader() = default;
-void EnergyReader::reset() { impl_->baseline=false; impl_->previousCpu.clear(); impl_->previousMs=0; impl_->previousThreads.clear(); }
+void EnergyReader::reset() {
+    impl_->baseline=false; impl_->previousCpu.clear(); impl_->previousMs=0; impl_->previousThreads.clear();
+    impl_->previousSystemOK=false; impl_->packageFloor.reset();
+}
+std::vector<std::wstring> EnergyReader::channelNames() const {
+    std::vector<std::wstring> names;
+    for(const auto& device:impl_->devices) names.insert(names.end(),device.names.begin(),device.names.end());
+    return names;
+}
 void EnergyReader::clearThreadPlacement() { impl_->previousThreads.clear(); }
 void EnergyReader::sampleThreadPlacement(std::vector<ProcessRow>& rows, const ThreadSnapshot* snapshot) {
     auto& state=*impl_;
     if(state.topology.empty() || GetActiveProcessorGroupCount()!=1) return;
+    if(state.lastSource!=EnergySource::perCore) { // placement only refines per-core energy
+        for(auto& row:rows) row.fixedCoreBusy.clear();
+        state.previousThreads.clear(); return;
+    }
     std::vector<ProcessRow*> candidates;
     for(auto& row:rows) {
         row.fixedCoreBusy.assign(state.topology.size(),0);
@@ -199,10 +215,13 @@ CpuEnergyReport EnergyReader::sample() {
     if(state.devices.empty()) { report.status=state.openFailures?L"能源介面無法存取":L"硬體未提供可用的 EMI 能源介面"; return report; }
     const uint64_t sampleBegin=GetTickCount64();
     std::vector<ProcessorTimes> cpu;
-    bool cpuOK=readProcessorTimes(cpu);
-    std::map<unsigned,double> corePower;
-    bool packageSeen=false, channelsOK=true;
-    double packagePower=0, dtSum=0; size_t dtCount=0;
+    const bool cpuOK=readProcessorTimes(cpu);
+    FILETIME idleTime{}, kernelTime{}, userTime{};
+    const bool systemOK=GetSystemTimes(&idleTime,&kernelTime,&userTime)!=FALSE;
+    std::map<std::pair<unsigned,unsigned>,double> corePower; // (package, core)
+    std::map<unsigned,double> coresPower, packagePower;
+    bool channelsOK=true;
+    double dtSum=0; size_t dtCount=0;
     std::set<std::wstring> seen;
     for(auto& device:state.devices) {
         std::vector<Reading> readings(device.names.size()); DWORD returned=0;
@@ -212,52 +231,104 @@ CpuEnergyReport EnergyReader::sample() {
             const auto& name=device.names[channel];
             if(device.units[channel]!=0 || !seen.insert(name).second) continue;
             ++report.channels;
+            const auto info=classifyChannel(name);
+            if(info.kind==ChannelKind::other) continue; // GPU, DRAM, SoC and other planes are not CPU work
             auto watts=state.baseline?energyDeltaWatts(device.before[channel].energy,readings[channel].energy,device.before[channel].time,readings[channel].time):Value{};
             if(!watts) { channelsOK=false; continue; }
             dtSum+=(readings[channel].time-device.before[channel].time)/1e7; ++dtCount;
-            if(name==L"RAPL_Package0_PKG") { packagePower=*watts; packageSeen=true; }
-            const std::wstring prefix=L"RAPL_Package0_Core", suffix=L"_CORE";
-            if(name.compare(0,prefix.size(),prefix)==0 && name.size()>prefix.size()+suffix.size()
-                && name.compare(name.size()-suffix.size(),suffix.size(),suffix)==0) {
-                auto number=name.substr(prefix.size(),name.size()-prefix.size()-suffix.size());
-                if(number.find_first_not_of(L"0123456789")==number.npos && number.size()<5) corePower[unsigned(std::stoul(number))]=*watts;
-            }
+            if(info.kind==ChannelKind::package) packagePower[info.package]=*watts;
+            else if(info.kind==ChannelKind::cores) coresPower[info.package]=*watts;
+            else corePower[{info.package,info.core}]=*watts;
         }
         device.before=std::move(readings);
     }
     const uint64_t sampleEnd=GetTickCount64();
     const uint64_t now=sampleBegin+(sampleEnd-sampleBegin)/2;
     report.sampleMs=now;
-    if(packageSeen) report.packageWatts=packagePower;
+    if(!packagePower.empty()) {
+        double sum=0; for(auto& item:packagePower) sum+=item.second;
+        report.packageWatts=sum;
+    }
     report.intervalSeconds=dtCount?dtSum/dtCount:0;
     bool timeOK=state.previousMs && now>state.previousMs && now-state.previousMs<=30000;
     if(timeOK && report.intervalSeconds>0) {
         double wall=(now-state.previousMs)/1000.0;
         timeOK=std::abs(report.intervalSeconds-wall)<=std::max(.1,wall*.1);
     }
-    bool topologyOK=corePower.size()==state.topology.size() && !state.topology.empty() && cpu.size()==state.previousCpu.size();
-    if(topologyOK && channelsOK && cpuOK && timeOK) {
-        double sum=0;
-        for(size_t core=0;core<state.topology.size();++core) {
-            if(!corePower.count(unsigned(core))) { topologyOK=false; break; }
-            double busy=0;
-            for(auto logical:state.topology[core]) {
-                if(logical>=cpu.size()) { topologyOK=false; break; }
-                auto& a=state.previousCpu[logical]; auto& b=cpu[logical];
-                LONGLONG total=(b.kernel.QuadPart-a.kernel.QuadPart)+(b.user.QuadPart-a.user.QuadPart);
-                LONGLONG idle=b.idle.QuadPart-a.idle.QuadPart;
-                if(total<=0 || idle<0 || idle>total) { topologyOK=false; break; }
-                busy+=double(total-idle)/total;
+    const uint64_t idleNow=fileTime(idleTime), kernelNow=fileTime(kernelTime), userNow=fileTime(userTime);
+    const unsigned logical=std::max<DWORD>(1,GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
+    const Value busyReading=systemOK && state.previousSystemOK
+        ? busyProcessors(state.previousIdle,state.previousKernel,state.previousUser,idleNow,kernelNow,userNow,logical) : Value{};
+    const bool busyKnown=busyReading.has_value();
+    const double systemBusy=busyReading.value_or(0);
+    if(channelsOK && timeOK) {
+        // 1. One channel per physical core that matches the Windows topology.
+        std::set<unsigned> packagesWithCores;
+        for(auto& item:corePower) packagesWithCores.insert(item.first.first);
+        bool perCore=cpuOK && packagesWithCores.size()==1 && *packagesWithCores.begin()==0
+            && corePower.size()==state.topology.size() && !state.topology.empty() && cpu.size()==state.previousCpu.size();
+        if(perCore) {
+            double sum=0;
+            for(size_t core=0;perCore && core<state.topology.size();++core) {
+                auto found=corePower.find({0u,unsigned(core)});
+                if(found==corePower.end()) { perCore=false; break; }
+                double busy=0;
+                for(auto logicalIndex:state.topology[core]) {
+                    if(logicalIndex>=cpu.size()) { perCore=false; break; }
+                    auto& a=state.previousCpu[logicalIndex]; auto& b=cpu[logicalIndex];
+                    LONGLONG total=(b.kernel.QuadPart-a.kernel.QuadPart)+(b.user.QuadPart-a.user.QuadPart);
+                    LONGLONG idle=b.idle.QuadPart-a.idle.QuadPart;
+                    if(total<=0 || idle<0 || idle>total) { perCore=false; break; }
+                    busy+=double(total-idle)/total;
+                }
+                sum+=found->second; report.cores.push_back({found->second,busy});
             }
-            double watts=corePower[unsigned(core)]; sum+=watts; report.cores.push_back({watts,busy});
+            if(perCore) {
+                report.source=EnergySource::perCore; report.coreWatts=sum; report.ready=true;
+                report.status=L"EMI 每核心能源＋Windows CPU 時間";
+            } else report.cores.clear();
         }
-        if(topologyOK) {
-            report.coreWatts=sum; report.ready=true;
-            report.status=L"EMI 核心能源＋Windows CPU 時間";
+        // 2. Energy of all cores per package: a PP0/cores channel, or the sum of
+        //    per-core channels that could not be matched to the topology.
+        if(!report.ready && busyKnown) {
+            std::set<unsigned> packages;
+            for(auto& item:coresPower) packages.insert(item.first);
+            for(auto& item:corePower) packages.insert(item.first.first);
+            for(auto& item:packagePower) packages.insert(item.first);
+            double total=0; bool complete=!packages.empty();
+            for(unsigned package:packages) {
+                auto whole=coresPower.find(package);
+                if(whole!=coresPower.end()) { total+=whole->second; continue; }
+                double sum=0; bool any=false;
+                for(auto& item:corePower) if(item.first.first==package) { sum+=item.second; any=true; }
+                if(any) total+=sum; else complete=false;
+            }
+            if(complete) {
+                // Cores differ in clock and load; without per-core energy the
+                // split between processes carries this fixed uncertainty.
+                setAggregatePool(report,EnergySource::coreTotal,total,systemBusy,.8,1.25);
+                report.status=L"EMI 全核心能源＋Windows CPU 時間";
+            }
+        }
+        // 3. Package energy only: attribute what is above the learned idle floor.
+        if(!report.ready && busyKnown && report.packageWatts) {
+            const double package=*report.packageWatts;
+            const double floor=std::min(package,state.packageFloor.update(now,package));
+            const double dynamic=std::max(0.0,package-floor);
+            const double high=dynamic>.05?std::min(4.0,package/dynamic):4.0;
+            setAggregatePool(report,EnergySource::package,dynamic,systemBusy,1,high);
+            report.packageFloorWatts=floor;
+            report.status=L"EMI 封裝能源（扣除閒置基準）＋Windows CPU 時間";
         }
     }
-    if(!report.ready) report.status=!state.baseline?L"硬體能源計數器暖機中":L"能源／CPU 拓樸資料不足，本次不估算瓦數";
-    state.previousCpu=std::move(cpu); state.previousMs=now; state.baseline=cpuOK;
+    if(!report.ready) {
+        if(!state.baseline) report.status=L"硬體能源計數器暖機中";
+        else if(corePower.empty() && coresPower.empty() && packagePower.empty()) report.status=L"能源介面沒有 CPU 通道，改用活動排行";
+        else report.status=L"能源／CPU 資料不足，本次不估算瓦數";
+    }
+    state.previousCpu=std::move(cpu); state.previousMs=now; state.baseline=cpuOK || systemOK;
+    state.previousSystemOK=systemOK; state.previousIdle=idleNow; state.previousKernel=kernelNow; state.previousUser=userNow;
+    state.lastSource=report.source;
     return report;
 }
 }
