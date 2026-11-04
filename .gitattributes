@@ -13,3 +13,5 @@
 *.ico binary
 *.svg text eol=lf
 *.ttf binary
+*.iss text eol=crlf
+*.isl text eol=crlf

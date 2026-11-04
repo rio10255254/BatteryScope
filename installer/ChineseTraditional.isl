@@ -1,4 +1,4 @@
-; *** Inno Setup version 6.5.0+ Chinese Traditional messages ***
+﻿; *** Inno Setup version 6.5.0+ Chinese Traditional messages ***
 ; Name: GoneTone, gonetone@reh.tw
 ;
 ; Based on translations by: Anbang LI, anbangli@outlook.com

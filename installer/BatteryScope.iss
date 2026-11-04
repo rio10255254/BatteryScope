@@ -1,4 +1,4 @@
-; BatteryScope installer (Inno Setup 6.5 or later).
+﻿; BatteryScope installer (Inno Setup 6.5 or later).
 ;
 ; Installs per user, without administrator rights, always into the same folder
 ; (%LOCALAPPDATA%\Programs\BatteryScope). Because the path never changes between
