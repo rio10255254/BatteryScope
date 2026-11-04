@@ -1,5 +1,6 @@
 #include "../src/platform.h"
 #include "../src/energy.h"
+#include "../src/update.h"
 #include "../src/motion.h"
 #include "../src/i18n.h"
 #include <shellapi.h>
@@ -328,6 +329,28 @@ int wmain(int argc, wchar_t** argv) {
         energyRows={a,b}; packaged.apply(energyRows,package,1000,4);
         check(nearlyEqual(energyRows[0].cpuWatts,2) && nearlyEqual(energyRows[0].cpuWattsHigh,4) && nearlyEqual(package.unassignedCpuWatts,0),
             "package-only energy attributes the share above the idle floor, with the floor as the upper range");
+        // Updates and installer handoff.
+        check(update::isNewer(L"v0.12.0", L"0.11.0") && update::isNewer(L"0.11.1", L"0.11.0") && update::isNewer(L"1.0", L"0.99.9")
+            && !update::isNewer(L"v0.11.0", L"0.11.0") && !update::isNewer(L"0.10.9", L"0.11.0") && !update::isNewer(L"0.11.0.0", L"0.11.0"),
+            "release versions compare numerically, not as text");
+        check(!update::isNewer(L"v0.12.0-beta", L"0.11.0") && !update::isNewer(L"", L"0.11.0") && !update::isNewer(L"latest", L"0.11.0"),
+            "unparsable release tags never count as updates");
+        const std::string feed = R"({"html_url":"https://github.com/rio10255254/BatteryScope/releases/tag/v0.12.0","tag_name":"v0.12.0",
+            "assets":[{"name":"BatteryScope-0.12.0-win64.zip","browser_download_url":"https://github.com/rio10255254/BatteryScope/releases/download/v0.12.0/BatteryScope-0.12.0-win64.zip"},
+            {"name":"BatteryScope-0.12.0-setup.exe","browser_download_url":"https://github.com/rio10255254/BatteryScope/releases/download/v0.12.0/BatteryScope-0.12.0-setup.exe"},
+            {"name":"BatteryScope-0.12.0-setup.exe.sha256","browser_download_url":"https://github.com/rio10255254/BatteryScope/releases/download/v0.12.0/BatteryScope-0.12.0-setup.exe.sha256"}]})";
+        auto release = update::parseRelease(feed);
+        check(release && release->version == L"0.12.0" && release->setupUrl.size() > 20
+            && release->setupHashUrl.substr(release->setupHashUrl.size() - 7) == L".sha256" && release->page.find(L"v0.12.0") != std::wstring::npos,
+            "release feed yields the version, page and setup assets");
+        auto foreign = update::parseRelease(R"({"tag_name":"v0.12.0","html_url":"http://example.com/x","assets":[{"browser_download_url":"https://evil.example/BatteryScope-0.12.0-setup.exe"}]})");
+        check(foreign && foreign->setupUrl.empty() && foreign->page == update::ReleasesPage,
+            "setup downloads and pages are only taken from github.com over HTTPS");
+        check(!update::parseRelease(R"({"message":"Not Found"})"), "a feed without a release tag is ignored");
+        const std::string digest(64, 'a');
+        check(update::parseSha256File(digest + "  BatteryScope-0.12.0-setup.exe\n") == digest && update::parseSha256File(std::string(64, 'A')) == digest
+            && update::parseSha256File("abc").empty() && update::parseSha256File(std::string(63, 'a') + "g").empty() && update::parseSha256File(digest + "a").empty(),
+            "checksum files must start with exactly 64 hex digits");
         CpuAttributor slowEstimator;
         report.cores = heterogeneous; report.coreWatts = 5; report.ready = true; report.intervalSeconds = 20;
         a.cpu = 25; a.fixedCoreBusy.clear(); b.cpu = 25; energyRows = {a,b};

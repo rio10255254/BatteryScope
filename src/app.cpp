@@ -3,6 +3,7 @@
 #include "motion.h"
 #include "i18n.h"
 #include "version.h"
+#include "update.h"
 #include "ui.h"
 #include <commctrl.h>
 #include <shellapi.h>
@@ -28,7 +29,7 @@
 namespace {
 using namespace bs;
 constexpr UINT SampleMessage = WM_APP + 1, TrayMessage = WM_APP + 2, ActionMessage = WM_APP + 3, RefreshMessage = WM_APP + 4,
-    PowerModeMessage = WM_APP + 5;
+    PowerModeMessage = WM_APP + 5, UpdateMessage = WM_APP + 6, UpdateDownloadedMessage = WM_APP + 7;
 constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, DetailsId = 104,
     BackgroundId = 105, AllId = 106, StartupId = 107, HideId = 108, MenuId = 109,
     LanguageZhId = 110, LanguageEnId = 111, PowerDetailsId = 112, PowerModeId = 113,
@@ -41,6 +42,7 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     ChargeReminderOffId = 152, ChargeReminder80Id = 153, ChargeReminder85Id = 154, ChargeReminder90Id = 155, ChargeReminder100Id = 156,
     SleepAlertId = 157, AutoSaverOffId = 158, AutoSaver20Id = 159, AutoSaver30Id = 160, PerfAppsPageId = 161, ClearPerfAppsId = 162,
     EcoToggleId = 163, PerfAppToggleId = 164, MascotToggleId = 165, ShareCardId = 166, MiniToggleId = 167, MiniOpenId = 168,
+    UpdateCheckId = 169, UpdateNowId = 170, UpdateInstallId = 171,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1;
 const wchar_t* ClassName = L"BatteryScope.Main.v1";
@@ -98,7 +100,8 @@ bool trayPercent = true;          // show the battery percentage as the notifica
 bool drainAlerts = false;         // notify about sustained high-power background work
 std::set<std::pair<uint32_t, uint64_t>> drainNotified;
 uint64_t lastDrainAlert = 0;
-enum class BalloonTarget { none, candidates, powerDetails };
+enum class BalloonTarget { none, candidates, powerDetails, update };
+bool updateChecks = true; // daily update check, on unless turned off
 BalloonTarget balloonTarget = BalloonTarget::none;  // what clicking the last notification opens
 bool sleepAlerts = true;          // notify after a sleep with unusual battery drain
 unsigned seenSleeps = 0;
@@ -146,7 +149,7 @@ std::optional<ProcessRow> pendingForceRow;
 std::wstring notice = tr(L"正在讀取電池與程序資料…");
 uint64_t noticeUntil = 0;
 std::deque<uint64_t> actionMarks;
-constexpr UINT_PTR MotionTimer = 92, NoticeTimer = 93;
+constexpr UINT_PTR MotionTimer = 92, NoticeTimer = 93, UpdateTimer = 94;
 constexpr int PanelWidth = 360, PanelHeight = 640, RowHeight = 51;
 bool motionEnabled = true, suppressMotion = false, panelTargetShown = false, motionTimerRunning = false;
 double motionNow() {
@@ -1665,6 +1668,7 @@ void loadSettings() {
     showMascot = readSetting(L"Mascot", 1) != 0;
     miniEnabled = readSetting(L"MiniWindow", 0) == 1;
     historyEnabled = readSetting(L"History", 1) != 0;
+    updateChecks = readSetting(L"UpdateCheck", 1) != 0;
     std::vector<uint8_t> curve(512); DWORD curveBytes = DWORD(curve.size());
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\BatteryScope", L"ChargeCurve", RRF_RT_REG_BINARY, nullptr, curve.data(), &curveBytes) == ERROR_SUCCESS) {
         curve.resize(curveBytes); chargeCurve.load(curve);
@@ -2295,9 +2299,104 @@ LRESULT CALLBACK inlineTextProc(HWND window, UINT message, WPARAM wp, LPARAM lp,
     if (message == WM_NCDESTROY) RemoveWindowSubclass(window, inlineTextProc, 1);
     return DefSubclassProc(window, message, wp, lp);
 }
+// Update checks: once a day against the public GitHub release feed (only the
+// version JSON is fetched), and a notification once per new version.
+bool updateBusy = false, updateManual = false;
+std::optional<bs::update::Release> availableUpdate;
+const std::wstring UserAgent = L"BatteryScope/" BS_VERSION_STRING;
+uint64_t unixNow() {
+    FILETIME now{}; GetSystemTimeAsFileTime(&now);
+    return (fileTime(now) - 116444736000000000ull) / 10000000ull;
+}
+void checkForUpdate(bool manual) {
+    if (updateBusy || demo || isolatedPreview) return;
+    updateBusy = true; updateManual = manual;
+    HWND target = mainWindow;
+    std::thread([target] {
+        auto release = bs::update::fetchLatest(UserAgent);
+        auto* result = release ? new bs::update::Release(std::move(*release)) : nullptr;
+        if (!PostMessageW(target, UpdateMessage, 0, reinterpret_cast<LPARAM>(result))) delete result;
+    }).detach();
+}
+void maybeCheckForUpdate() {
+    if (!updateChecks) return;
+    DWORD bytes = sizeof(uint64_t); uint64_t last = 0;
+    RegGetValueW(HKEY_CURRENT_USER, L"Software\\BatteryScope", L"LastUpdateCheck", RRF_RT_REG_QWORD, nullptr, &last, &bytes);
+    const uint64_t now = unixNow();
+    if (last && now >= last && now - last < 86400) return;
+    checkForUpdate(false);
+}
+void handleUpdateResult(bs::update::Release* raw) {
+    std::unique_ptr<bs::update::Release> release(raw);
+    updateBusy = false;
+    if (!release) { if (updateManual) setNotice(tr(L"無法檢查更新，請確認網路連線。")); return; }
+    const uint64_t now = unixNow();
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\BatteryScope", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS) {
+        RegSetValueExW(key, L"LastUpdateCheck", 0, REG_QWORD, reinterpret_cast<const BYTE*>(&now), sizeof(now));
+        RegCloseKey(key);
+    }
+    if (!bs::update::isNewer(release->version, L"" BS_VERSION_STRING)) {
+        availableUpdate.reset();
+        if (updateManual) setNotice(tr(L"已是最新版本（") + std::wstring(L"" BS_VERSION_STRING) + tr(L"）。"));
+        return;
+    }
+    availableUpdate = *release;
+    std::wstring notified(32, L'\0'); DWORD bytes = DWORD(notified.size() * sizeof(wchar_t));
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\BatteryScope", L"NotifiedVersion", RRF_RT_REG_SZ, nullptr, notified.data(), &bytes) == ERROR_SUCCESS)
+        notified.resize(wcsnlen(notified.c_str(), notified.size()));
+    else notified.clear();
+    if (updateManual) setNotice(tr(L"有新版本 ") + release->version + tr(L"，可從「⋯ → 安裝更新」安裝。"));
+    else if (notified != release->version && trayAdded) {
+        showBalloon(tr(L"BatteryScope ") + release->version + tr(L" 可以更新"),
+            tr(L"點這裡下載並安裝。安裝後捷徑與工作列釘選會沿用同一個位置。"), BalloonTarget::update);
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\BatteryScope", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) == ERROR_SUCCESS) {
+            RegSetValueExW(key, L"NotifiedVersion", 0, REG_SZ, reinterpret_cast<const BYTE*>(release->version.c_str()),
+                DWORD((release->version.size() + 1) * sizeof(wchar_t)));
+            RegCloseKey(key);
+        }
+    }
+}
+void openReleasePage() {
+    const std::wstring page = availableUpdate ? availableUpdate->page : std::wstring(bs::update::ReleasesPage);
+    ShellExecuteW(nullptr, L"open", page.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+// Downloads the setup, checks its SHA-256 against the published file, and runs it.
+// The setup closes this copy, installs over the same folder, and starts it again.
+std::wstring pendingSetup;
+void installUpdate() {
+    if (!availableUpdate || updateBusy) return;
+    if (availableUpdate->setupUrl.empty() || availableUpdate->setupHashUrl.empty()) { openReleasePage(); return; }
+    wchar_t temp[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, temp);
+    pendingSetup = std::wstring(temp) + L"BatteryScope-" + availableUpdate->version + L"-setup.exe";
+    updateBusy = true;
+    setNotice(tr(L"正在下載更新 ") + availableUpdate->version + L"…");
+    HWND target = mainWindow; auto release = *availableUpdate; auto path = pendingSetup;
+    std::thread([target, release, path] {
+        PostMessageW(target, UpdateDownloadedMessage, bs::update::downloadVerified(release, path, UserAgent), 0);
+    }).detach();
+}
+void finishUpdateDownload(DWORD status) {
+    updateBusy = false;
+    if (status != ERROR_SUCCESS) {
+        setNotice(status == ERROR_INVALID_DATA ? tr(L"更新檔校驗不符，已刪除並改開啟下載頁。") : tr(L"下載更新失敗，已改開啟下載頁。"));
+        DeleteFileW(pendingSetup.c_str());
+        openReleasePage();
+        return;
+    }
+    SHELLEXECUTEINFOW run{}; run.cbSize = sizeof(run); run.fMask = SEE_MASK_NOASYNC;
+    run.lpFile = pendingSetup.c_str(); run.lpParameters = L"/SILENT /SUPPRESSMSGBOXES /NORESTART"; run.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&run)) { setNotice(tr(L"無法啟動安裝程式，已改開啟下載頁。")); openReleasePage(); }
+    else setNotice(tr(L"正在安裝更新，BatteryScope 會自動重新開啟。"));
+}
 void openMenu(POINT point) {
     const bool preview = demo || isolatedPreview;
     HMENU menu = CreatePopupMenu();
+    if (availableUpdate) {
+        AppendMenuW(menu, MF_STRING | (updateBusy ? MF_GRAYED : 0), UpdateInstallId, (tr(L"安裝更新 ") + availableUpdate->version + L"…").c_str());
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    }
     AppendMenuW(menu, MF_STRING, PowerModeId, tr(L"電源模式…"));
     AppendMenuW(menu, MF_STRING, PowerDetailsId, tr(L"電池與充電詳情"));
     AppendMenuW(menu, MF_STRING, LedgerId, tr(L"本次累計耗能"));
@@ -2353,6 +2452,10 @@ void openMenu(POINT point) {
     AppendMenuW(menu, MF_STRING | (trayPercent ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), TrayPercentId, tr(L"系統匣顯示電量數字"));
     AppendMenuW(menu, MF_STRING | (hotkeyEnabled ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), HotkeyToggleId, tr(L"快速鍵 Ctrl+Alt+B"));
     AppendMenuW(menu, MF_STRING | (autoStart ? MF_CHECKED : 0) | (demo ? MF_GRAYED : 0), StartupId, tr(L"登入時啟動"));
+    HMENU updates = CreatePopupMenu();
+    AppendMenuW(updates, MF_STRING | (updateChecks ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), UpdateCheckId, tr(L"每天自動檢查"));
+    AppendMenuW(updates, MF_STRING | (preview || updateBusy ? MF_GRAYED : 0), UpdateNowId, tr(L"立即檢查更新"));
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(updates), tr(L"更新"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, TrayShow, tr(L"顯示面板"));
     AppendMenuW(menu, MF_STRING | (pendingAction ? MF_GRAYED : 0), TrayExit, tr(L"結束 BatteryScope"));
@@ -2473,6 +2576,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             PostMessageW(static_cast<HWND>(target), PowerModeMessage, WPARAM(mode), 0);
         }, window);
         refreshPowerButton();
+        if (!demo && !isolatedPreview) SetTimer(window, UpdateTimer, 60 * 1000, nullptr); // first check a minute after start
         return 0;
     }
     case WM_MEASUREITEM:
@@ -2495,6 +2599,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
         if (wp == MotionTimer) { stepMotion(motionNow()); return 0; }
         if (wp == NoticeTimer) { KillTimer(window, NoticeTimer); noticeUntil = 0; InvalidateRect(window, nullptr, FALSE); return 0; }
+        if (wp == UpdateTimer) { SetTimer(window, UpdateTimer, 6 * 3600 * 1000, nullptr); maybeCheckForUpdate(); return 0; }
         break;
     case WM_SYSCOLORCHANGE:
     case WM_THEMECHANGED:
@@ -2709,6 +2814,14 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (id == IDCANCEL || id == HideId) { hideMain(); return 0; }
         if (id == MenuId) { RECT r{}; GetWindowRect(menuButton, &r); openMenu({r.left, r.bottom}); return 0; }
         if (id == TrayShow) { showMain(); return 0; }
+        if (id == UpdateCheckId) {
+            updateChecks = !updateChecks;
+            if (!writeSetting(L"UpdateCheck", updateChecks ? 1 : 0)) setNotice(tr(L"無法儲存設定。"));
+            if (updateChecks) maybeCheckForUpdate();
+            return 0;
+        }
+        if (id == UpdateNowId) { checkForUpdate(true); setNotice(tr(L"正在檢查更新…")); return 0; }
+        if (id == UpdateInstallId) { installUpdate(); return 0; }
         if (id == TrayExit) { if (!pendingAction) DestroyWindow(window); else setNotice(tr(L"請等待目前操作完成後再結束。")); return 0; }
         if (id == BackgroundId || id == AllId) {
             stopScroll(); scrollPosition = 0; listRefreshPending = false;
@@ -2797,11 +2910,18 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_HOTKEY:
         if (wp == PanelHotkey) toggleMain();
         return 0;
+    case UpdateMessage:
+        handleUpdateResult(reinterpret_cast<bs::update::Release*>(lp));
+        return 0;
+    case UpdateDownloadedMessage:
+        finishUpdateDownload(DWORD(wp));
+        return 0;
     case TrayMessage:
         if (trayVersion4 ? LOWORD(lp) == NIN_BALLOONUSERCLICK : lp == NIN_BALLOONUSERCLICK) {
             showMain();
             if (balloonTarget == BalloonTarget::candidates) showReviewCandidates();
             else if (balloonTarget == BalloonTarget::powerDetails) showPowerDetails();
+            else if (balloonTarget == BalloonTarget::update) installUpdate();
             return 0;
         }
         if ((trayVersion4 && (LOWORD(lp) == NIN_SELECT || LOWORD(lp) == NIN_KEYSELECT)) ||
@@ -2816,7 +2936,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_CLOSE: hideMain(); return 0;
     case WM_DESTROY: {
         KillTimer(window, MotionTimer); motionTimerRunning = false;
-        KillTimer(window, NoticeTimer);
+        KillTimer(window, NoticeTimer); KillTimer(window, UpdateTimer);
         registerPanelHotkey(false);
         setMiniWindow(false);
         unwatchEffectivePowerMode(effectiveWatch); effectiveWatch = nullptr;
@@ -3372,6 +3492,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         } catch (...) { return ERROR_INVALID_PARAMETER; }
     }
     if (args.size() == 2 && args[0] == L"--diagnose") return diagnostic(args[1]);
+    // Used by the installer: close any running copy (any version) cleanly, so its
+    // efficiency mode and power mode changes are undone before files are replaced.
+    if (args.size() == 1 && args[0] == L"--quit-running") {
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            HWND running = FindWindowW(L"BatteryScope.Main.v1", nullptr);
+            if (!running) return 0;
+            DWORD pid = 0; GetWindowThreadProcessId(running, &pid);
+            Handle process(OpenProcess(SYNCHRONIZE, FALSE, pid));
+            PostMessageW(running, WM_COMMAND, TrayExit, 0);
+            if (process) WaitForSingleObject(process, 5000); else Sleep(1000);
+        }
+        return FindWindowW(L"BatteryScope.Main.v1", nullptr) ? 1 : 0;
+    }
+    // Used by the installer after copying files: shortcuts, pins and sign-in launch
+    // that point to an older BatteryScope.exe now open this one.
+    if (args.size() == 1 && args[0] == L"--migrate-shortcuts") { bs::update::migrateShortcuts(executablePath()); return 0; }
     bool screenshot = args.size() >= 2 && (args[0] == L"--screenshot" || args[0] == L"--demo-screenshot");
     bool trayTest = args.size() == 2 && args[0] == L"--tray-test";
     bool uiTest = trayTest || (args.size() == 2 && args[0] == L"--ui-test");

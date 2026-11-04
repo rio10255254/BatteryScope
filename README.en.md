@@ -13,11 +13,18 @@
 
 ## Download
 
-Get `BatteryScope-0.11.0-win64.zip` from the **[Releases page](https://github.com/rio10255254/BatteryScope/releases/latest)**, extract it, and run `BatteryScope.exe`.
+From the **[Releases page](https://github.com/rio10255254/BatteryScope/releases/latest)**:
 
-- Requires Windows 10 version 1703 or later (Windows 11 recommended), 64-bit. No installer or administrator rights needed.
-- The EXE is not code-signed; if SmartScreen appears the first time, choose **More info → Run anyway**.
-- It lives in the notification area, where the icon shows the battery percentage; click it to show or hide the panel.
+- **Installer (recommended):** `BatteryScope-0.12.0-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
+- **Portable:** `BatteryScope-0.12.0-win64.zip`; extract it and run `BatteryScope.exe`.
+
+Requires Windows 10 version 1703 or later (Windows 11 recommended), 64-bit. The program is not code-signed; if SmartScreen appears the first time, choose **More info → Run anyway**. It lives in the notification area, where the icon shows the battery percentage; click it to show or hide the panel.
+
+### Installing and updating
+
+- **Older copies are closed first:** the installer closes any running BatteryScope (installed or portable, any version), cleanly first so it undoes its efficiency mode and power mode changes, and by force if it does not respond.
+- **Shortcuts and pins follow the latest version:** every install goes to the same folder, so Start menu and desktop shortcuts, taskbar pins, and launch at sign-in keep working after updates. Installing also repoints shortcuts, taskbar pins, Windows 10 Start pins, and launch at sign-in that still open an older `BatteryScope.exe` elsewhere. The old portable folder is not deleted.
+- **Update reminders:** once a day BatteryScope checks GitHub for a newer release and shows one notification per new version. Clicking it (or **⋯ → Install update**) downloads the installer, checks its SHA-256 against the published checksum, installs, and reopens BatteryScope; on a mismatch nothing runs and the download page opens instead. Turn off daily checks or check now under **⋯ → Updates**. A check only reads version information from `api.github.com` and sends no usage data.
 
 ## Supported PCs
 
@@ -36,7 +43,7 @@ Per-app watt accuracy depends on the energy data the CPU provides (see below); P
 - **Battery health:** health, cycle count, and their trend, plus sleep drain detection.
 - **7-day history:** daily discharge chart, a daily grade and achievements, and a shareable summary card.
 - **Helpful alerts:** low battery, background drain, sleep drain, and charge-level reminders.
-- **Small and quiet:** tray resident, a mini floating window, the Ctrl+Alt+B shortcut, CSV export; no network access, telemetry, or background service.
+- **Small and quiet:** tray resident, a mini floating window, the Ctrl+Alt+B shortcut, CSV export; no network access except the daily update check, no telemetry or background service.
 
 ![Share today's card](docs/screenshots/card-en.png)
 
@@ -44,7 +51,7 @@ Details follow.
 
 ## Using it
 
-1. Download `BatteryScope-0.11.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
+1. Download `BatteryScope-0.12.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
 2. Click its battery icon in the notification area to show or hide the panel. Esc hides it; monitoring continues at a lower frequency.
 3. Open **⋯ → Language / 語言 → English** to switch immediately. The setting persists for your Windows account. Selection and scroll position are retained.
 4. Use Background and Show filters, the mouse wheel, arrow keys, Home/End, or Page Up/Down. Enter or double-click opens details.
@@ -120,7 +127,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-To avoid replacing a running executable, use `-OutputDirectory dist/v0.11.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
+To avoid replacing a running executable, use `-OutputDirectory dist/v0.12.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
 
 ```powershell
 .\dist\BatteryScope.exe --demo
