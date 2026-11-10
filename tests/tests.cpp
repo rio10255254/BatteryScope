@@ -1,6 +1,7 @@
 #include "../src/platform.h"
 #include "../src/energy.h"
 #include "../src/update.h"
+#include "../src/lab.h"
 #include "../src/motion.h"
 #include "../src/i18n.h"
 #include <shellapi.h>
@@ -351,6 +352,126 @@ int wmain(int argc, wchar_t** argv) {
         check(update::parseSha256File(digest + "  BatteryScope-0.12.0-setup.exe\n") == digest && update::parseSha256File(std::string(64, 'A')) == digest
             && update::parseSha256File("abc").empty() && update::parseSha256File(std::string(63, 'a') + "g").empty() && update::parseSha256File(digest + "a").empty(),
             "checksum files must start with exactly 64 hex digits");
+        // Power lab: activity, schedule, blocks and paired comparison.
+        lab::Signals signals; signals.idleSeconds = 300;
+        check(lab::classify(signals) == lab::Context::idle, "no input for minutes is idle");
+        signals.audio = true;
+        check(lab::classify(signals) == lab::Context::media, "sound without input is watching or listening");
+        signals.call = true;
+        check(lab::classify(signals) == lab::Context::call, "an active microphone or camera is a call, ahead of media");
+        lab::Signals working; working.idleSeconds = 2; working.systemCpu = 40.0;
+        check(lab::classify(working) == lab::Context::heavy, "sustained CPU load is heavy work");
+        working.systemCpu = 5.0;
+        check(lab::classify(working) == lab::Context::interactive, "recent input with light load is interactive");
+        working.fullscreenGame = true;
+        check(lab::classify(working) == lab::Context::game, "a full-screen Direct3D app is a game");
+        lab::Schedule schedule(12345);
+        bool balanced = true, bothOrders[2] = {false, false};
+        for (int pair = 0; pair < 40; ++pair) {
+            const int a = schedule.armFor(pair * 2), b = schedule.armFor(pair * 2 + 1);
+            balanced &= a != b && (a == 0 || a == 1);
+            bothOrders[a] = true;
+        }
+        check(balanced && bothOrders[0] && bothOrders[1] && schedule.armFor(7) == lab::Schedule(12345).armFor(7),
+            "every pair runs both arms once, in a reproducible random order");
+        auto labSample = [](uint64_t ms, double battery, double package, double core, lab::Context context) {
+            lab::Sample s; s.ms = ms; s.onBattery = true; s.batteryWatts = battery; s.packageWatts = package; s.coreWatts = core;
+            s.systemCpu = 10.0; s.context = context; s.framesDropped = 1; s.framesComposed = 60; return s;
+        };
+        lab::BlockRecorder recorder; recorder.begin(3, 1, 100000);
+        check(!recorder.add(labSample(110000, 50, 5, 2, lab::Context::interactive), 2), "the first 20 seconds of a block are warm-up");
+        for (uint64_t t = 120000; t < 220000; t += 2000) recorder.add(labSample(t, 8, 3, 1, t < 170000 ? lab::Context::interactive : lab::Context::idle), 2);
+        lab::Block block;
+        check(recorder.finish(block) && block.pair == 3 && block.arm == 1 && std::abs(block.battery - 8) < 1e-9 && std::abs(block.rest - 5) < 1e-9
+            && std::abs(block.dropsPerMinute - 30) < 1e-9 && std::abs(block.contextShare[size_t(lab::Context::idle)] - .5) < 1e-9,
+            "a block averages power after warm-up and records drops and activity mix");
+        lab::Sample pluggedSample = labSample(230000, 8, 3, 1, lab::Context::idle); pluggedSample.onBattery = false;
+        check(!recorder.add(pluggedSample, 2), "plugged-in samples never count");
+        recorder.invalidate(); lab::Block rejected;
+        check(!recorder.finish(rejected), "a block changed by another program is discarded");
+        lab::BlockRecorder brief; brief.begin(0, 0, 0);
+        for (uint64_t t = 20000; t < 60000; t += 2000) brief.add(labSample(t, 8, 3, 1, lab::Context::idle), 2);
+        check(!brief.finish(rejected), "a block needs a minute of battery data");
+        block.experiment = L"cpu-boost"; block.run = 77; block.armName = L"Boost 關"; block.started = L"2026-11-10 10:00:00";
+        lab::Block parsed;
+        check(lab::Block::parse(block.csv(), parsed) && parsed.armName == L"Boost 關" && parsed.run == 77 && std::abs(parsed.battery - 8) < 1e-6
+            && !lab::Block::parse(lab::Block::csvHeader(), parsed), "blocks round-trip through their CSV file, Chinese names included");
+        auto comparison = lab::comparePairs({{10, 9}, {11, 10}, {9.5, 8.5}, {10.5, 9.5}});
+        check(std::abs(comparison.difference + 1) < 1e-9 && comparison.halfWidth < 1e-9 && comparison.significant(),
+            "identical savings in every pair are a certain difference");
+        comparison = lab::comparePairs({{10, 9}, {10, 11}, {10, 9.5}, {10, 10.5}});
+        check(std::abs(comparison.difference) < 1e-9 && !comparison.significant(), "savings that cancel out are not a difference");
+        comparison = lab::comparePairs({{10, 9}, {10, 9.4}, {10, 8.8}});
+        check(std::abs(comparison.difference + 2.8 / 3) < 1e-9 && std::abs(comparison.halfWidth - 4.303 * .3055050463 / std::sqrt(3.0)) < 1e-4,
+            "the interval uses Student's t for the number of pairs");
+        check(!lab::comparePairs({{10, 9}}).significant(), "one pair is never enough");
+        std::vector<lab::Block> blocks;
+        for (int pair = 0; pair < 3; ++pair) for (int arm = 0; arm < 2; ++arm) {
+            lab::Block b; b.experiment = L"refresh"; b.run = 1; b.pair = pair; b.arm = arm; b.armName = arm ? L"60 Hz" : L"120 Hz";
+            b.battery = arm ? 7 : 8; b.seconds = 100; blocks.push_back(b);
+        }
+        lab::Block orphan = blocks.front(); orphan.pair = 9; blocks.push_back(orphan);
+        auto results = lab::analyze(blocks);
+        check(results.size() == 1 && results[0].battery.pairs == 3 && std::abs(results[0].battery.difference + 1) < 1e-9
+            && results[0].arm1 == L"60 Hz", "results pair blocks by run and pair, skipping incomplete pairs");
+        lab::Breakdown breakdown;
+        auto onBattery = labSample(0, 9, 4, 1.5, lab::Context::interactive); onBattery.dgpuState = 0; onBattery.dgpuApps = L"game.exe;chrome.exe";
+        breakdown.add(onBattery, 10); breakdown.add(pluggedSample, 10);
+        check(std::abs(breakdown.totals(lab::Context::interactive).rest / breakdown.totals(lab::Context::interactive).restSeconds - 5) < 1e-9
+            && breakdown.batterySeconds() == 10 && breakdown.dgpuAwakeSeconds() == 10 && breakdown.dgpuApps(5).size() == 2,
+            "the breakdown splits battery power on battery only and tracks the discrete GPU");
+        const std::string row = lab::csvRow(onBattery);
+        check(lab::csvHeader().find("rest_w") != std::string::npos && row.find("game.exe;chrome.exe") != std::string::npos && row.find("5.000") != std::string::npos,
+            "trace rows carry the derived rest-of-system power and GPU apps");
+        // The experiment controller against a fake setting: alternation, pause on AC, outside changes, restore.
+        struct FakeActuator : lab::Actuator {
+            DWORD value = 2, applied = 0; bool remembered = false;
+            lab::KnobPlan plan(lab::Knob) override {
+                lab::KnobPlan p; p.available = true; p.original = value; p.values = {2, 0}; p.names = {L"Boost 開", L"Boost 關"}; return p;
+            }
+            DWORD apply(lab::Knob, DWORD v) override { value = v; ++applied; return ERROR_SUCCESS; }
+            DWORD read(lab::Knob, DWORD& v) override { v = value; return ERROR_SUCCESS; }
+            void remember(lab::Knob, DWORD) override { remembered = true; }
+            void forget() override { remembered = false; }
+        };
+        auto fake = std::make_shared<FakeActuator>();
+        lab::Controller controller(L"", fake);
+        check(controller.start(lab::Knob::cpuBoost) == ERROR_SUCCESS && fake->remembered && controller.active(),
+            "starting an experiment records the original setting for crash recovery");
+        uint64_t clock = 1000;
+        auto feedLab = [&](bool battery, double seconds) {
+            for (double elapsed = 0; elapsed < seconds; elapsed += 2) {
+                lab::Sample s = labSample(clock, 8, 3, 1, lab::Context::interactive); s.onBattery = battery;
+                if (!battery) s.batteryWatts.reset();
+                controller.onSample(s, 2); clock += 2000;
+            }
+        };
+        feedLab(true, 2);
+        const DWORD firstArm = fake->value;
+        feedLab(true, 124);
+        check(fake->value != firstArm && controller.status().pairsDone == 0 && controller.status().block == 1,
+            "after a two-minute block the other setting is applied");
+        feedLab(false, 10);
+        check(fake->value == 2 && controller.status().paused, "plugging in pauses and restores the original setting");
+        feedLab(true, 2);
+        check(fake->value != firstArm, "unplugging redoes the interrupted block with the same setting");
+        fake->value = fake->value ? 0 : 2; // another program flips it
+        feedLab(true, 2);
+        check(controller.status().externalChanges == 1 && fake->value != firstArm, "an outside change is counted and the setting is put back");
+        feedLab(true, 130);
+        check(controller.status().block == 1, "a block changed from outside is repeated, not counted");
+        for (int i = 0; i < 20 && controller.status().running; ++i) feedLab(true, 126);
+        check(!controller.status().running && controller.status().finished && controller.status().pairsDone == lab::Controller::TargetPairs
+            && fake->value == 2 && !fake->remembered, "eight complete pairs finish the run and restore the original");
+        auto labResults = controller.status().results;
+        check(labResults.size() == 1 && labResults[0].battery.pairs == lab::Controller::TargetPairs && std::abs(labResults[0].battery.difference) < 1e-9,
+            "the finished run is analyzed as paired blocks");
+        lab::Controller stopped(L"", fake);
+        stopped.start(lab::Knob::cpuBoost);
+        fake->value = 2; clock += 1000;
+        lab::Sample s1 = labSample(clock, 8, 3, 1, lab::Context::idle); stopped.onSample(s1, 2);
+        stopped.stop();
+        check(fake->value == 2 && !stopped.active() && !fake->remembered, "stopping restores the original at once");
         CpuAttributor slowEstimator;
         report.cores = heterogeneous; report.coreWatts = 5; report.ready = true; report.intervalSeconds = 20;
         a.cpu = 25; a.fixedCoreBusy.clear(); b.cpu = 25; energyRows = {a,b};
