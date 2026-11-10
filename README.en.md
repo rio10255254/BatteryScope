@@ -15,8 +15,8 @@
 
 From the **[Releases page](https://github.com/rio10255254/BatteryScope/releases/latest)**:
 
-- **Installer (recommended):** `BatteryScope-0.13.0-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
-- **Portable:** `BatteryScope-0.13.0-win64.zip`; extract it and run `BatteryScope.exe`.
+- **Installer (recommended):** `BatteryScope-0.13.1-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
+- **Portable:** `BatteryScope-0.13.1-win64.zip`; extract it and run `BatteryScope.exe`.
 
 Requires Windows 10 version 1703 or later (Windows 11 recommended), 64-bit. The program is not code-signed; if SmartScreen appears the first time, choose **More info → Run anyway**. It lives in the notification area, where the icon shows the battery percentage; click it to show or hide the panel.
 
@@ -52,7 +52,7 @@ Details follow.
 
 ## Using it
 
-1. Download `BatteryScope-0.13.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
+1. Download `BatteryScope-0.13.1-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
 2. Click its battery icon in the notification area to show or hide the panel. Esc hides it; monitoring continues at a lower frequency.
 3. Open **⋯ → Language / 語言 → English** to switch immediately. The setting persists for your Windows account. Selection and scroll position are retained.
 4. Use Background and Show filters, the mouse wheel, arrow keys, Home/End, or Page Up/Down. Enter or double-click opens details.
@@ -103,6 +103,7 @@ The power mode button at the top right shows **the Windows power mode in effect 
 - **Power by activity:** battery time is split into idle, interactive, video or music, calls, heavy work, and full-screen games, each with the average power and its parts, plus how often the discrete GPU was awake.
 - **A/B experiments:** one setting at a time: CPU Boost on/off, processor energy preference, top refresh rate/60 Hz, power mode balanced/efficiency. On battery the setting alternates every 2 minutes in pairs of blocks in random order; the first 20 seconds of each block are skipped, and a block in which another program (such as G-Helper) changed the setting is discarded and repeated. After 8 pairs it stops and restores the setting; results compare the pairs for battery, CPU cores, display/dGPU/rest, CPU use, and dropped frames, with 95% ranges.
 - **Safety:** settings change only on battery, pause and restore when plugged in, and are restored after a stop, quit, or crash at the next start. The refresh rate change is temporary and not saved, so a restart also undoes it. CPU Boost and energy preference live in the active power plan; if Windows requires administrator rights the lab says so and never elevates itself.
+- **One-click export:** **Export (zip + copy summary)** zips the whole lab folder (daily CSVs, experiment blocks, G-Helper config copies and a summary) to the desktop and copies the summary text to the clipboard, ready to paste into a message. It uses the `tar.exe` built into Windows 10 1803 and later, and opens the folder instead when that is unavailable.
 - **Limits:** sampling every 2 seconds uses a little power itself, equally for both settings. Doing different things during the two settings adds noise, so results carry a range and say when there is no clear difference. Dropped frames come from the compositor; some full-screen or variable-refresh content may not be counted.
 
 ## What the readings mean
@@ -138,7 +139,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-To avoid replacing a running executable, use `-OutputDirectory dist/v0.13.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
+To avoid replacing a running executable, use `-OutputDirectory dist/v0.13.1`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
 
 ```powershell
 .\dist\BatteryScope.exe --demo
