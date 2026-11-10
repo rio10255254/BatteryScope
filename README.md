@@ -15,8 +15,8 @@
 
 到 **[Releases 頁面](https://github.com/rio10255254/BatteryScope/releases/latest)** 下載：
 
-- **安裝版（建議）**：`BatteryScope-0.13.0-setup.exe`。不需要管理員權限，安裝到 `%LOCALAPPDATA%\Programs\BatteryScope`，會建立開始功能表捷徑，可選擇桌面捷徑與登入時啟動，並可從「設定 → 應用程式」解除安裝。
-- **免安裝版**：`BatteryScope-0.13.0-win64.zip`，解壓後執行 `BatteryScope.exe`。
+- **安裝版（建議）**：`BatteryScope-0.13.1-setup.exe`。不需要管理員權限，安裝到 `%LOCALAPPDATA%\Programs\BatteryScope`，會建立開始功能表捷徑，可選擇桌面捷徑與登入時啟動，並可從「設定 → 應用程式」解除安裝。
+- **免安裝版**：`BatteryScope-0.13.1-win64.zip`，解壓後執行 `BatteryScope.exe`。
 
 需要 Windows 10 1703 以上（建議 Windows 11），64 位元。程式沒有數位簽章，第一次開啟若出現 SmartScreen，點「其他資訊 → 仍要執行」。開啟後在右下角系統匣，圖示會顯示電量百分比；點圖示開關面板。
 
@@ -54,7 +54,7 @@
 
 ## 使用方式
 
-1. 從 [GitHub Releases](https://github.com/rio10255254/BatteryScope/releases/latest) 下載 `BatteryScope-0.13.0-win64.zip`，解壓後執行 `BatteryScope.exe`。已編譯版本適用 Windows 10（1703 以上）與 Windows 11 的 x64 筆電與桌機。
+1. 從 [GitHub Releases](https://github.com/rio10255254/BatteryScope/releases/latest) 下載 `BatteryScope-0.13.1-win64.zip`，解壓後執行 `BatteryScope.exe`。已編譯版本適用 Windows 10（1703 以上）與 Windows 11 的 x64 筆電與桌機。
    升級時先從系統匣結束舊版，再執行新版；程式會避免同時啟動多個正式監測視窗。
 2. 目前耗電顯示電池回報的整機放電功率；資料累積後顯示平均功率、耗電速度與預估續航。
 3. 硬體能源資料可用時，下方依「估計 CPU W」由高到低列出前 10 個程序／服務。每張卡片第二行顯示類型、PID 與核心分攤模型範圍。點「僅背景」切換背景篩選，點「顯示」切換前 10 名／全部；滑鼠滾輪或鍵盤上下鍵瀏覽。若能源資料不可用，會明確退回 CPU / I/O 活動排行。
@@ -83,6 +83,7 @@
 - **依活動拆解耗電**：把用電池的時間分成閒置、一般操作、看影片／聽音樂、視訊／通話、高負載、全螢幕遊戲，各自顯示平均耗電由哪幾塊組成，以及獨顯醒著的時間比例。
 - **A/B 實驗**：一次測一個設定：CPU Boost 開／關、處理器能源偏好、螢幕最高更新率／60 Hz、電源模式平衡／效率。用電池時每 2 分鐘輪流切換，每兩段為一組、組內順序隨機；每段前 20 秒不計，被其他程式（例如 G-Helper）改動過的段落會排除並重做。完成 8 組後自動停止並還原，結果以成對比較顯示電池、CPU 核心、螢幕／獨顯／其他、CPU 使用率與掉格的差異和 95% 範圍。
 - **安全**：只在用電池時切換；插電時暫停並還原；停止、結束或當機後下次啟動都會還原原本的設定。螢幕更新率使用不寫入登錄的暫時切換，重新開機也會恢復。CPU Boost 與能源偏好寫在目前的電源計畫，若 Windows 要求系統管理員權限，實驗室會說明，不會自行提升權限。
+- **一鍵匯出**：「一鍵匯出（壓縮檔＋複製摘要）」把整個實驗室資料夾（每日 CSV、實驗區段、G-Helper 設定備份與摘要）壓縮到桌面，並把摘要文字複製到剪貼簿，可直接貼到訊息裡。壓縮使用 Windows 10 1803 起內建的 `tar.exe`；不可用時改為開啟資料夾。
 - **限制**：記錄本身每 2 秒取樣也會用一點電（兩種設定相同，不影響比較）。實驗期間你做的事不同會增加誤差，所以結果附有範圍，差異不明確時會直接說明。掉格數來自畫面合成器，部分全螢幕或可變更新率畫面可能不計入。
 
 ### 語言與操作提示
@@ -184,7 +185,7 @@
 .\build.ps1 -Test
 ```
 
-舊版仍在執行時，可使用 `./build.ps1 -Test -OutputDirectory dist/v0.13.0` 編譯到獨立目錄，避免覆寫使用中的 EXE。
+舊版仍在執行時，可使用 `./build.ps1 -Test -OutputDirectory dist/v0.13.1` 編譯到獨立目錄，避免覆寫使用中的 EXE。
 
 預設尋找 PATH 上的 `g++.exe`，其次使用 `C:\mingw64\bin\g++.exe`，並使用同目錄的 `windres.exe`。產出 `dist\BatteryScope.exe`。
 

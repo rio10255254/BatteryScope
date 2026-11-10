@@ -476,6 +476,7 @@ void Controller::finishRun(bool completed) {
 void Controller::stop() { std::lock_guard<std::mutex> guard(lock_); finishRun(false); }
 bool Controller::active() const { std::lock_guard<std::mutex> guard(lock_); return recording_ || running_; }
 void Controller::shutdown() { std::lock_guard<std::mutex> guard(lock_); finishRun(false); flush(); }
+void Controller::flushNow() { std::lock_guard<std::mutex> guard(lock_); flush(); }
 void Controller::flush() {
     if (pendingRows_.empty()) return;
     if (!folder_.empty()) appendFile(std::filesystem::path(folder_) / (L"trace-" + traceDate_ + L".csv"), csvHeader(), pendingRows_);

@@ -44,7 +44,7 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     SleepAlertId = 157, AutoSaverOffId = 158, AutoSaver20Id = 159, AutoSaver30Id = 160, PerfAppsPageId = 161, ClearPerfAppsId = 162,
     EcoToggleId = 163, PerfAppToggleId = 164, MascotToggleId = 165, ShareCardId = 166, MiniToggleId = 167, MiniOpenId = 168,
     UpdateCheckId = 169, UpdateNowId = 170, UpdateInstallId = 171,
-    LabPageId = 172, LabRecordId = 173, LabExperimentId = 174 /* ..177, one per knob */, LabStopId = 178, LabFolderId = 179,
+    LabPageId = 172, LabRecordId = 173, LabExperimentId = 174 /* ..177, one per knob */, LabStopId = 178, LabFolderId = 179, LabExportId = 180,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1;
 const wchar_t* ClassName = L"BatteryScope.Main.v1";
@@ -1877,13 +1877,9 @@ std::wstring labArm(const std::wstring& name) {
     return tr(name.c_str());
 }
 uint64_t labPageShownAt = 0;
-void showLabPage() {
+std::wstring labPageText() {
     std::wstring c = tr(L"在你這台電腦上實際量測：耗電花在哪裡，以及每個設定能省多少電、會不會變卡。資料只存在本機。");
-    if (!labController) {
-        c += tr(L"\n\n示範與預覽模式不提供實驗室。");
-        showInlinePage(InlinePage::lab, tr(L"省電實驗室"), c);
-        return;
-    }
+    if (!labController) return c + tr(L"\n\n示範與預覽模式不提供實驗室。");
     const auto st = labController->status();
     c += tr(L"\n\n記錄：") + std::wstring(st.recording ? tr(L"開啟") : tr(L"關閉"));
     if (st.recordedSeconds >= 60) c += tr(L"（已記錄用電池 ") + durationText(st.recordedSeconds / 3600) + tr(L"）");
@@ -1941,6 +1937,73 @@ void showLabPage() {
         }
     }
     c += tr(L"\n\n說明：記錄時每 2 秒取樣一次，本身也會用一點電，但兩種設定都一樣，不影響比較。螢幕更新率實驗每 2 分鐘切換一次，畫面會短暫閃一下。掉格數來自 Windows 畫面合成器，部分全螢幕或可變更新率畫面可能不計入。");
+    return c;
+}
+// One click: the lab folder plus a summary as a zip on the desktop, and the
+// summary on the clipboard so it can be pasted straight into a chat.
+void exportLab() {
+    if (!labController) return;
+    labController->flushNow();
+    const std::wstring folder = bs::lab::labFolder();
+    if (folder.empty()) { setNotice(tr(L"找不到實驗室資料夾。")); return; }
+    std::wstring summary = L"BatteryScope " BS_VERSION_STRING L"\r\n" + labPageText();
+    OSVERSIONINFOW os{}; os.dwOSVersionInfoSize = sizeof(os);
+    using RtlGetVersion = LONG (WINAPI*)(OSVERSIONINFOW*);
+    FARPROC versionSymbol = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion");
+    RtlGetVersion getVersion = nullptr; std::memcpy(&getVersion, &versionSymbol, sizeof(getVersion));
+    if (getVersion) getVersion(&os);
+    summary += L"\n\nWindows " + std::to_wstring(os.dwMajorVersion) + L"." + std::to_wstring(os.dwMinorVersion) + L"." + std::to_wstring(os.dwBuildNumber) +
+        L" · " + std::to_wstring(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)) + L" logical processors";
+    std::wstring crlf;
+    for (size_t i = 0; i < summary.size(); ++i) { if (summary[i] == L'\n' && (i == 0 || summary[i - 1] != L'\r')) crlf += L'\r'; crlf += summary[i]; }
+    {
+        const int bytes = WideCharToMultiByte(CP_UTF8, 0, crlf.c_str(), int(crlf.size()), nullptr, 0, nullptr, nullptr);
+        std::string utf8(size_t(bytes), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, crlf.c_str(), int(crlf.size()), utf8.data(), bytes, nullptr, nullptr);
+        std::ofstream out(std::filesystem::path(folder) / L"summary.txt", std::ios::binary | std::ios::trunc);
+        out << "\xEF\xBB\xBF" << utf8;
+    }
+    // Copy the summary for pasting.
+    if (OpenClipboard(mainWindow)) {
+        EmptyClipboard();
+        const size_t size = (crlf.size() + 1) * sizeof(wchar_t);
+        if (HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, size)) {
+            if (void* data = GlobalLock(memory)) { std::memcpy(data, crlf.c_str(), size); GlobalUnlock(memory); }
+            if (!SetClipboardData(CF_UNICODETEXT, memory)) GlobalFree(memory);
+        }
+        CloseClipboard();
+    }
+    // Zip with the tar.exe that ships with Windows 10 1803 and later.
+    PWSTR desktop = nullptr;
+    constexpr GUID DesktopFolder = {0xB4BFCC3A, 0xDB2C, 0x424C, {0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41}};
+    std::wstring target;
+    if (SUCCEEDED(SHGetKnownFolderPath(DesktopFolder, 0, nullptr, &desktop)) && desktop) target = desktop;
+    CoTaskMemFree(desktop);
+    SYSTEMTIME t{}; GetLocalTime(&t);
+    wchar_t name[64]; swprintf(name, 64, L"\\BatteryScope-lab-%04u%02u%02u-%02u%02u.zip", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute);
+    target += name;
+    wchar_t system[MAX_PATH]{}; GetSystemDirectoryW(system, MAX_PATH);
+    std::wstring command = L"\"" + std::wstring(system) + L"\\tar.exe\" -a -c -f \"" + target + L"\" -C \"" + folder + L"\" .";
+    STARTUPINFOW startup{}; startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    bool zipped = false;
+    if (CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+        DWORD code = 1;
+        if (WaitForSingleObject(process.hProcess, 30000) == WAIT_OBJECT_0) GetExitCodeProcess(process.hProcess, &code);
+        CloseHandle(process.hThread); CloseHandle(process.hProcess);
+        zipped = code == 0 && GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES;
+    }
+    if (zipped) {
+        const std::wstring select = L"/select,\"" + target + L"\"";
+        ShellExecuteW(nullptr, L"open", L"explorer.exe", select.c_str(), nullptr, SW_SHOWNORMAL);
+        setNotice(tr(L"已匯出到桌面，摘要也已複製，可直接貼上。"));
+    } else {
+        ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        setNotice(tr(L"無法建立壓縮檔，已開啟資料夾；摘要已複製，可直接貼上。"));
+    }
+}
+void showLabPage() {
+    const std::wstring c = labPageText();
     // Keep the reader's place when the page refreshes itself.
     const LRESULT firstLine = inlinePage == InlinePage::lab ? SendMessageW(inlineText, EM_GETFIRSTVISIBLELINE, 0, 0) : 0;
     showInlinePage(InlinePage::lab, tr(L"省電實驗室"), c);
@@ -2581,6 +2644,7 @@ void openMenu(POINT point) {
             (labStatus.running && int(labStatus.knob) == i ? MF_CHECKED : 0), LabExperimentId + i, experimentNames[i]);
     AppendMenuW(labMenu, MF_STRING | (labStatus.running ? 0 : MF_GRAYED), LabStopId, tr(L"停止實驗並還原"));
     AppendMenuW(labMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(labMenu, MF_STRING | (preview ? MF_GRAYED : 0), LabExportId, tr(L"一鍵匯出（壓縮檔＋複製摘要）"));
     AppendMenuW(labMenu, MF_STRING | (preview ? MF_GRAYED : 0), LabFolderId, tr(L"開啟資料夾"));
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(labMenu), tr(L"省電實驗室"));
     HMENU updates = CreatePopupMenu();
@@ -2963,6 +3027,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (id == LabStopId && labController) { labController->stop(); setNotice(tr(L"實驗已停止，設定已還原。")); showLabPage(); return 0; }
+        if (id == LabExportId) { exportLab(); return 0; }
         if (id == LabFolderId) {
             const std::wstring folder = bs::lab::labFolder();
             if (!folder.empty()) ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);

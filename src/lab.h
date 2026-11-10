@@ -208,6 +208,7 @@ public:
     void onSample(Sample& sample, double seconds);
     Status status() const;
     void shutdown(); // restores the setting under test and writes pending rows
+    void flushNow(); // writes pending trace rows, e.g. before an export
 private:
     void finishRun(bool completed);
     void flush();
