@@ -379,6 +379,7 @@ bool GpuUsage::sample(std::unordered_map<uint32_t, double>& usage) {
         if (items[i].szName && (items[i].FmtValue.CStatus == PDH_CSTATUS_VALID_DATA || items[i].FmtValue.CStatus == PDH_CSTATUS_NEW_DATA))
             instances.emplace_back(items[i].szName, items[i].FmtValue.doubleValue);
     usage = aggregateGpu(instances);
+    instances_ = std::move(instances);
     return true;
 }
 struct ScHandle {

@@ -15,8 +15,8 @@
 
 From the **[Releases page](https://github.com/rio10255254/BatteryScope/releases/latest)**:
 
-- **Installer (recommended):** `BatteryScope-0.12.0-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
-- **Portable:** `BatteryScope-0.12.0-win64.zip`; extract it and run `BatteryScope.exe`.
+- **Installer (recommended):** `BatteryScope-0.13.0-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
+- **Portable:** `BatteryScope-0.13.0-win64.zip`; extract it and run `BatteryScope.exe`.
 
 Requires Windows 10 version 1703 or later (Windows 11 recommended), 64-bit. The program is not code-signed; if SmartScreen appears the first time, choose **More info → Run anyway**. It lives in the notification area, where the icon shows the battery percentage; click it to show or hide the panel.
 
@@ -43,6 +43,7 @@ Per-app watt accuracy depends on the energy data the CPU provides (see below); P
 - **Battery health:** health, cycle count, and their trend, plus sleep drain detection.
 - **7-day history:** daily discharge chart, a daily grade and achievements, and a shareable summary card.
 - **Helpful alerts:** low battery, background drain, sleep drain, and charge-level reminders.
+- **Power lab (experimental):** records where battery power goes (CPU cores, the rest of the CPU, display/dGPU/rest) per activity, and runs alternating A/B experiments that measure how much CPU Boost, processor energy preference, screen refresh rate, and power mode actually save on this PC, and whether they cost smoothness.
 - **Small and quiet:** tray resident, a mini floating window, the Ctrl+Alt+B shortcut, CSV export; no network access except the daily update check, no telemetry or background service.
 
 ![Share today's card](docs/screenshots/card-en.png)
@@ -51,7 +52,7 @@ Details follow.
 
 ## Using it
 
-1. Download `BatteryScope-0.12.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
+1. Download `BatteryScope-0.13.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
 2. Click its battery icon in the notification area to show or hide the panel. Esc hides it; monitoring continues at a lower frequency.
 3. Open **⋯ → Language / 語言 → English** to switch immediately. The setting persists for your Windows account. Selection and scroll position are retained.
 4. Use Background and Show filters, the mouse wheel, arrow keys, Home/End, or Page Up/Down. Enter or double-click opens details.
@@ -94,6 +95,16 @@ The power mode button at the top right shows **the Windows power mode in effect 
 
 **⋯ → Find power-hungry background apps** is an inspection list, not an automatic action. It requires a valid CPU energy estimate and at least 75% observed CPU time, then considers only a verified, same-user, non-service background process with no visible window or visible/service-host ancestor, at least 60 seconds of sustained activity, and at least 0.5 W estimated CPU power. Up to five candidates are sorted by CPU watts. The app cannot infer the importance of sync, downloads, audio, unsaved work, or dependencies, and closing one is not guaranteed to save its displayed watts. It never suspends or closes candidates automatically.
 
+## Power lab (experimental)
+
+**⋯ → Power lab** measures on your own PC instead of guessing which settings help. All data stays in `%LOCALAPPDATA%\BatteryScope\lab`.
+
+- **Record detailed data:** every 2 seconds, also while the panel is hidden: battery watts, CPU package and core watts, their difference as "display, dGPU and the rest", system CPU use, time since the last input, whether sound is playing, whether the microphone or camera is in use, full-screen games, the foreground app, the refresh rate, whether the discrete GPU is awake and which apps use it, dropped frames reported by the Windows compositor, the power plan's CPU Boost and energy preference, and whether G-Helper runs (its config file is copied when it changes). One CSV per day, kept for 14 days.
+- **Power by activity:** battery time is split into idle, interactive, video or music, calls, heavy work, and full-screen games, each with the average power and its parts, plus how often the discrete GPU was awake.
+- **A/B experiments:** one setting at a time: CPU Boost on/off, processor energy preference, top refresh rate/60 Hz, power mode balanced/efficiency. On battery the setting alternates every 2 minutes in pairs of blocks in random order; the first 20 seconds of each block are skipped, and a block in which another program (such as G-Helper) changed the setting is discarded and repeated. After 8 pairs it stops and restores the setting; results compare the pairs for battery, CPU cores, display/dGPU/rest, CPU use, and dropped frames, with 95% ranges.
+- **Safety:** settings change only on battery, pause and restore when plugged in, and are restored after a stop, quit, or crash at the next start. The refresh rate change is temporary and not saved, so a restart also undoes it. CPU Boost and energy preference live in the active power plan; if Windows requires administrator rights the lab says so and never elevates itself.
+- **Limits:** sampling every 2 seconds uses a little power itself, equally for both settings. Doing different things during the two settings adds noise, so results carry a range and say when there is no clear difference. Dropped frames come from the compositor; some full-screen or variable-refresh content may not be counted.
+
 ## What the readings mean
 
 - **Discharge W:** whole-machine battery drain reported by the battery. If unavailable, a sufficiently long absolute-capacity trend may provide a clearly identified estimate.
@@ -127,7 +138,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-To avoid replacing a running executable, use `-OutputDirectory dist/v0.12.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
+To avoid replacing a running executable, use `-OutputDirectory dist/v0.13.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
 
 ```powershell
 .\dist\BatteryScope.exe --demo

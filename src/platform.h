@@ -80,7 +80,11 @@ public:
     bool available() const { return counter_ != nullptr; }
     // Usage since the previous call, by PID; false until two samples exist.
     bool sample(std::unordered_map<uint32_t, double>& usage);
-    void reset() { primed_ = false; }
+    void reset() { primed_ = false; instances_.clear(); }
+    // Every engine instance of the last sample (name, percent), for per-adapter use.
+    const std::vector<std::pair<std::wstring, double>>& instances() const { return instances_; }
+private:
+    std::vector<std::pair<std::wstring, double>> instances_;
 };
 
 struct CollectionWork { size_t paths = 0, safety = 0, memory = 0, processOpens = 0; };

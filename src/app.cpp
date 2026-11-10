@@ -4,6 +4,7 @@
 #include "i18n.h"
 #include "version.h"
 #include "update.h"
+#include "lab.h"
 #include "ui.h"
 #include <commctrl.h>
 #include <shellapi.h>
@@ -43,6 +44,7 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     SleepAlertId = 157, AutoSaverOffId = 158, AutoSaver20Id = 159, AutoSaver30Id = 160, PerfAppsPageId = 161, ClearPerfAppsId = 162,
     EcoToggleId = 163, PerfAppToggleId = 164, MascotToggleId = 165, ShareCardId = 166, MiniToggleId = 167, MiniOpenId = 168,
     UpdateCheckId = 169, UpdateNowId = 170, UpdateInstallId = 171,
+    LabPageId = 172, LabRecordId = 173, LabExperimentId = 174 /* ..177, one per knob */, LabStopId = 178, LabFolderId = 179,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1;
 const wchar_t* ClassName = L"BatteryScope.Main.v1";
@@ -92,7 +94,7 @@ void* effectiveWatch = nullptr;
 PowerModes powerModes;
 HWND modeButtons[6] = {}, restoreModesButton = nullptr, energySettingsButton = nullptr;
 bool isolatedPreview = false;
-enum class InlinePage { none, process, power, candidates, ledger, powerMode, history, perfApps, confirm, error };
+enum class InlinePage { none, process, power, candidates, ledger, powerMode, history, perfApps, lab, confirm, error };
 unsigned lowBatteryThreshold = 0; // percent; 0 = off
 LowBatteryMonitor lowBattery;
 bool hotkeyEnabled = false, hotkeyRegistered = false;
@@ -134,6 +136,9 @@ bool isEfficient(const ProcessRow& row) {
 }
 bool performanceListed(const ProcessRow& row) { return !row.name.empty() && performanceApps.count(lowerName(row.name)) != 0; }
 void refreshPowerModeControls();
+void showLabPage();
+// The power lab; absent in demo and preview modes.
+std::unique_ptr<bs::lab::Controller> labController;
 // Learned charging curve and detected charge limit, saved under HKCU\Software\BatteryScope.
 ChargeCurve chargeCurve;
 std::optional<int> chargeLimit;
@@ -877,7 +882,7 @@ void layout() {
     MoveWindow(powerButton, w - sp(108), sp(47), sp(88), sp(22), TRUE);
     MoveWindow(menuButton, w - sp(92), sp(16), sp(32), sp(30), TRUE);
     MoveWindow(hideButton, w - sp(52), sp(16), sp(32), sp(30), TRUE);
-    const bool fullPage = inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history ||
+    const bool fullPage = inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history || inlinePage == InlinePage::lab ||
         inlinePage == InlinePage::confirm || inlinePage == InlinePage::error;
     const int textTop = inlinePage == InlinePage::powerMode ? sp(318) : inlinePage == InlinePage::history ? sp(262) : fullPage ? sp(128) : top - sp(37);
     {
@@ -925,7 +930,7 @@ void showInlinePage(InlinePage page, const std::wstring& title, const std::wstri
     }
     SetWindowTextW(inlineText, lines.c_str());
     ShowScrollBar(inlineText, SB_VERT, page == InlinePage::process || page == InlinePage::power || page == InlinePage::ledger ||
-        page == InlinePage::powerMode || page == InlinePage::history ||
+        page == InlinePage::powerMode || page == InlinePage::history || page == InlinePage::lab ||
         (page == InlinePage::candidates && lines.size() > 500));
     SendMessageW(inlineText, EM_SETSEL, 0, 0);
     SendMessageW(inlineText, EM_SCROLLCARET, 0, 0);
@@ -1134,7 +1139,7 @@ void paint(HDC dc, RECT bounds) {
     }
     drawText(dc, demo ? tr(L"示範資料 · 關閉操作已停用") : tr(L"電池與背景活動"), {margin + sp(30), sp(39), w - sp(96), sp(60)}, Muted, smallFont);
     if (inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history ||
-        inlinePage == InlinePage::confirm || inlinePage == InlinePage::error) {
+        inlinePage == InlinePage::lab || inlinePage == InlinePage::confirm || inlinePage == InlinePage::error) {
         card(dc, {margin, sp(74), right, h - sp(14)}, Surface, 14);
         drawText(dc, inlineTitle, {margin + sp(14), sp(84), right - sp(14), sp(114)}, Ink, titleFont);
         fill(dc, {margin + sp(14), sp(119), right - sp(14), sp(119) + 1}, Border);
@@ -1853,6 +1858,95 @@ void showHistoryPage() {
     showInlinePage(InlinePage::history, tr(L"歷史紀錄 · 7 天"), historyText());
     releaseInteraction();
 }
+// The power lab page: where battery power goes per activity, the running
+// experiment, and every experiment's paired result so far.
+const wchar_t* labKnobTitle(const std::wstring& key) {
+    if (key == L"cpu-boost") return tr(L"CPU Boost");
+    if (key == L"epp") return tr(L"處理器能源偏好");
+    if (key == L"refresh") return tr(L"螢幕更新率");
+    if (key == L"power-mode") return tr(L"電源模式");
+    return L"";
+}
+std::wstring signedNumber(double value, int precision) {
+    return (value >= 0 ? L"+" : L"−") + number(std::abs(value), precision);
+}
+// Arm names come from the lab in Chinese; numbers in them stay as they are.
+std::wstring labArm(const std::wstring& name) {
+    const std::wstring prefix = L"能源偏好 ";
+    if (name.rfind(prefix, 0) == 0) return tr(L"能源偏好 ") + name.substr(prefix.size());
+    return tr(name.c_str());
+}
+uint64_t labPageShownAt = 0;
+void showLabPage() {
+    std::wstring c = tr(L"在你這台電腦上實際量測：耗電花在哪裡，以及每個設定能省多少電、會不會變卡。資料只存在本機。");
+    if (!labController) {
+        c += tr(L"\n\n示範與預覽模式不提供實驗室。");
+        showInlinePage(InlinePage::lab, tr(L"省電實驗室"), c);
+        return;
+    }
+    const auto st = labController->status();
+    c += tr(L"\n\n記錄：") + std::wstring(st.recording ? tr(L"開啟") : tr(L"關閉"));
+    if (st.recordedSeconds >= 60) c += tr(L"（已記錄用電池 ") + durationText(st.recordedSeconds / 3600) + tr(L"）");
+    c += tr(L"\n資料夾：") + bs::lab::labFolder();
+    if (st.ghelper) c += tr(L"\nG-Helper 執行中：它的設定變更時會另存一份；若它改動了實驗中的設定，那一段會排除並重做。");
+    c += tr(L"\n\n用電池時的耗電拆解");
+    bool any = false;
+    for (int i = 0; i < int(bs::lab::Context::count); ++i) {
+        const auto context = bs::lab::Context(i);
+        const auto& t = st.breakdown.totals(context);
+        if (t.seconds < 60) continue;
+        any = true;
+        const double battery = t.battery / t.seconds, core = t.core / t.seconds, package = t.package / t.seconds;
+        c += L"\n" + std::wstring(tr(bs::lab::contextKey(context))) + L" " + durationText(t.seconds / 3600) + tr(L"：電池 ") + number(battery, 1) +
+            tr(L" W ＝ CPU 核心 ") + number(core, 1) + tr(L" ＋ CPU 其他 ") + number(std::max(0.0, package - core), 1);
+        if (t.restSeconds > 0) c += tr(L" ＋ 螢幕／獨顯／其他 ") + number(t.rest / t.restSeconds, 1);
+        c += L" W";
+    }
+    if (!any) c += tr(L"\n還沒有資料：開啟記錄後用電池使用一段時間，每種情境至少 1 分鐘才會列出。");
+    if (st.breakdown.batterySeconds() >= 60) {
+        c += tr(L"\n獨顯醒著的時間：") + number(st.breakdown.dgpuAwakeSeconds() / st.breakdown.batterySeconds() * 100, 0) + L"%";
+        const auto apps = st.breakdown.dgpuApps(5);
+        if (!apps.empty()) {
+            c += tr(L"；期間使用獨顯：");
+            for (size_t i = 0; i < apps.size(); ++i) c += (i ? L"、" : L"") + apps[i].first;
+        }
+    }
+    c += tr(L"\n\n實驗");
+    if (st.running) {
+        c += L"\n" + std::wstring(labKnobTitle(bs::lab::knobKey(st.knob))) + L"：" + labArm(st.armNames[0]) + L" vs " + labArm(st.armNames[1]);
+        if (st.paused) c += tr(L"\n插電中，已暫停並還原；拔掉電源後繼續。");
+        else if (st.arm >= 0) c += tr(L"\n目前：") + labArm(st.armNames[size_t(st.arm)]) + tr(L" · 這段還剩 ") +
+            std::to_wstring(int(std::max(0.0, bs::lab::Controller::BlockSeconds - st.blockElapsed))) + tr(L" 秒");
+        c += tr(L"\n已完成 ") + std::to_wstring(st.pairsDone) + L" / " + std::to_wstring(bs::lab::Controller::TargetPairs) +
+            tr(L" 組（每組是兩種設定各 2 分鐘，順序隨機）");
+        if (st.externalChanges) c += tr(L"\n設定被其他程式改動 ") + std::to_wstring(st.externalChanges) + tr(L" 次，那幾段已排除並重做。");
+    } else {
+        if (st.finished) c += tr(L"\n上一個實驗已完成，設定已還原。");
+        if (st.lastError) {
+            c += tr(L"\n上次無法開始：") + errorText(st.lastError);
+            if (st.lastError == ERROR_ACCESS_DENIED) c += tr(L"。這項設定需要系統管理員權限：以系統管理員身分執行 BatteryScope 後再開始。");
+            if (st.lastError == ERROR_NOT_SUPPORTED) c += tr(L"。這台電腦或目前的設定不支援這項實驗。");
+        }
+        c += tr(L"\n從「⋯ → 省電實驗室」選一項開始。實驗只在用電池時進行，插電時自動暫停並還原；中途結束或當機，下次啟動時也會還原。");
+    }
+    if (!st.results.empty()) {
+        c += tr(L"\n\n實驗結果（兩種設定成對比較，± 為 95% 範圍）");
+        for (const auto& r : st.results) {
+            c += L"\n" + std::wstring(labKnobTitle(r.experiment)) + L"：" + labArm(r.arm1) + tr(L" 相對於 ") + labArm(r.arm0);
+            if (r.battery.pairs < 2) { c += tr(L"\n  資料不足：至少要 2 組完整的比較。"); continue; }
+            c += tr(L"\n  電池 ") + signedNumber(r.battery.difference, 2) + L" W（±" + number(r.battery.halfWidth, 2) + L"，" +
+                std::to_wstring(r.battery.pairs) + tr(L" 組）") + (r.battery.significant() ? tr(L" · 差異明確") : tr(L" · 差異不明確"));
+            c += tr(L"\n  CPU 核心 ") + signedNumber(r.core.difference, 2) + tr(L" W · 螢幕／獨顯／其他 ") + signedNumber(r.rest.difference, 2) + L" W";
+            c += tr(L"\n  CPU 使用率 ") + signedNumber(r.cpu.difference, 1) + tr(L"% · 掉格 ") + signedNumber(r.drops.difference, 1) + tr(L" 次／分");
+        }
+    }
+    c += tr(L"\n\n說明：記錄時每 2 秒取樣一次，本身也會用一點電，但兩種設定都一樣，不影響比較。螢幕更新率實驗每 2 分鐘切換一次，畫面會短暫閃一下。掉格數來自 Windows 畫面合成器，部分全螢幕或可變更新率畫面可能不計入。");
+    // Keep the reader's place when the page refreshes itself.
+    const LRESULT firstLine = inlinePage == InlinePage::lab ? SendMessageW(inlineText, EM_GETFIRSTVISIBLELINE, 0, 0) : 0;
+    showInlinePage(InlinePage::lab, tr(L"省電實驗室"), c);
+    if (firstLine > 0) SendMessageW(inlineText, EM_LINESCROLL, 0, firstLine);
+    labPageShownAt = GetTickCount64();
+}
 void showPowerModePage() {
     refreshPowerModeControls();
     showInlinePage(InlinePage::powerMode, tr(L"電源模式"), powerModeText());
@@ -2103,8 +2197,13 @@ void sampleLoop() {
     state.days = history.recent(14);
     uint64_t nextProcess = 0, nextPower = 0;
     bool previousHidden = false, qosInitialized = false;
+    // Power lab: undo a setting left changed by a crash, then sample every two seconds while it is on.
+    if (labController) bs::lab::restoreInterrupted();
+    std::unique_ptr<bs::lab::Probe> labProbe;
+    uint64_t labLast = 0;
     while (!quit) {
         auto now = GetTickCount64(); bool background = hidden.load(), processSampled = false;
+        const bool labActive = labController && labController->active();
         if (resetSamples.exchange(false)) { collector.reset(); energyReader.reset(); policy.reset(); nextProcess = nextPower = 0; }
         if (!qosInitialized || previousHidden != background) {
             state.samplerEcoQoS = setSamplerEcoQoS(background) && background;
@@ -2135,7 +2234,7 @@ void sampleLoop() {
             if (historyEnabled) { history.addApps(state.processes, state.energy, collector.sampleMs(), localDate()); historyDirty = true; }
             // GPU utilization is only shown in the panel, so it is sampled only while visible.
             state.gpuKnown = false;
-            if (background) gpu.reset();
+            if (background && !labActive) gpu.reset();
             else if (gpu.available()) {
                 std::unordered_map<uint32_t, double> usage;
                 if (gpu.sample(usage)) {
@@ -2156,8 +2255,26 @@ void sampleLoop() {
                 systemCpu = busy * 100 / std::max<DWORD>(1, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
             }
             state.samplingSeconds = policy.update(background, now, systemCpu, state.energy.coreWatts);
+            if (labActive) state.samplingSeconds = 2;
             nextProcess = now + state.samplingSeconds * 1000;
-            if (background) nextPower = nextProcess;
+            if (background || labActive) nextPower = nextProcess;
+            if (labActive) {
+                if (!labProbe) labProbe = std::make_unique<bs::lab::Probe>();
+                bs::lab::Sample sample; sample.ms = now;
+                SYSTEMTIME t{}; GetLocalTime(&t);
+                wchar_t stamp[32]; swprintf(stamp, 32, L"%04u-%02u-%02u %02u:%02u:%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+                sample.time = stamp;
+                if (!state.history.empty()) {
+                    const auto& b = state.history.back();
+                    sample.onBattery = b.present && b.acKnown && !b.onAc && !b.charging && b.watts && *b.watts > 0;
+                    if (sample.onBattery) sample.batteryWatts = b.watts;
+                }
+                if (state.energy.ready && !state.energy.timingMismatch) { sample.packageWatts = state.energy.packageWatts; sample.coreWatts = state.energy.coreWatts; }
+                sample.systemCpu = systemCpu;
+                labProbe->read(sample, gpu.instances(), state.processes);
+                labController->onSample(sample, labLast && now > labLast ? (now - labLast) / 1000.0 : 0);
+                labLast = now;
+            } else labLast = 0;
             changed = processSampled = true;
         }
         if (clearHistoryRequest.exchange(false)) {
@@ -2189,6 +2306,7 @@ void sampleLoop() {
         wake.wait_for(lock, std::chrono::milliseconds(next > now ? next - now : 1));
     }
     if (historyDirty && historyEnabled) saveHistory(history);
+    if (labController) labController->shutdown(); // restores the setting under test
 }
 
 LRESULT CALLBACK listProc(HWND window, UINT message, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
@@ -2452,6 +2570,19 @@ void openMenu(POINT point) {
     AppendMenuW(menu, MF_STRING | (trayPercent ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), TrayPercentId, tr(L"系統匣顯示電量數字"));
     AppendMenuW(menu, MF_STRING | (hotkeyEnabled ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), HotkeyToggleId, tr(L"快速鍵 Ctrl+Alt+B"));
     AppendMenuW(menu, MF_STRING | (autoStart ? MF_CHECKED : 0) | (demo ? MF_GRAYED : 0), StartupId, tr(L"登入時啟動"));
+    HMENU labMenu = CreatePopupMenu();
+    const auto labStatus = labController ? labController->status() : bs::lab::Controller::Status{};
+    AppendMenuW(labMenu, MF_STRING, LabPageId, tr(L"查看實驗室…"));
+    AppendMenuW(labMenu, MF_STRING | (labStatus.recording ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), LabRecordId, tr(L"記錄詳細資料"));
+    AppendMenuW(labMenu, MF_SEPARATOR, 0, nullptr);
+    const wchar_t* experimentNames[] = {tr(L"實驗：CPU Boost 開／關"), tr(L"實驗：處理器能源偏好"), tr(L"實驗：螢幕更新率"), tr(L"實驗：電源模式 平衡／效率")};
+    for (int i = 0; i < int(bs::lab::Knob::count); ++i)
+        AppendMenuW(labMenu, MF_STRING | (preview || labStatus.running ? MF_GRAYED : 0) |
+            (labStatus.running && int(labStatus.knob) == i ? MF_CHECKED : 0), LabExperimentId + i, experimentNames[i]);
+    AppendMenuW(labMenu, MF_STRING | (labStatus.running ? 0 : MF_GRAYED), LabStopId, tr(L"停止實驗並還原"));
+    AppendMenuW(labMenu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(labMenu, MF_STRING | (preview ? MF_GRAYED : 0), LabFolderId, tr(L"開啟資料夾"));
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(labMenu), tr(L"省電實驗室"));
     HMENU updates = CreatePopupMenu();
     AppendMenuW(updates, MF_STRING | (updateChecks ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), UpdateCheckId, tr(L"每天自動檢查"));
     AppendMenuW(updates, MF_STRING | (preview || updateBusy ? MF_GRAYED : 0), UpdateNowId, tr(L"立即檢查更新"));
@@ -2487,6 +2618,7 @@ void applyLanguage(bool useEnglish) {
     if (inlinePage == InlinePage::powerMode) showPowerModePage();
     if (inlinePage == InlinePage::history) showHistoryPage();
     if (inlinePage == InlinePage::perfApps) showPerformanceApps();
+    if (inlinePage == InlinePage::lab) showLabPage();
     if (inlinePage == InlinePage::confirm && pendingForceRow) showForceConfirmation(*pendingForceRow);
     notice = tr(L"正在讀取電池與程序資料…"); noticeUntil = 0;
     if (tooltip) SendMessageW(tooltip, TTM_POP, 0, 0);
@@ -2814,6 +2946,28 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (id == IDCANCEL || id == HideId) { hideMain(); return 0; }
         if (id == MenuId) { RECT r{}; GetWindowRect(menuButton, &r); openMenu({r.left, r.bottom}); return 0; }
         if (id == TrayShow) { showMain(); return 0; }
+        if (id == LabPageId) { showLabPage(); return 0; }
+        if (id == LabRecordId && labController) {
+            const bool on = !labController->status().recording;
+            labController->setRecording(on);
+            if (!writeSetting(L"LabRecording", on ? 1 : 0)) setNotice(tr(L"無法儲存設定。"));
+            wake.notify_one(); // switch to the two-second cadence now
+            showLabPage();
+            return 0;
+        }
+        if (id >= LabExperimentId && id < LabExperimentId + int(bs::lab::Knob::count) && labController) {
+            const DWORD result = labController->start(bs::lab::Knob(id - LabExperimentId));
+            setNotice(result ? tr(L"無法開始實驗：") + errorText(result) : std::wstring(tr(L"實驗開始：用電池時每 2 分鐘輪流切換設定。")));
+            wake.notify_one();
+            showLabPage();
+            return 0;
+        }
+        if (id == LabStopId && labController) { labController->stop(); setNotice(tr(L"實驗已停止，設定已還原。")); showLabPage(); return 0; }
+        if (id == LabFolderId) {
+            const std::wstring folder = bs::lab::labFolder();
+            if (!folder.empty()) ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            return 0;
+        }
         if (id == UpdateCheckId) {
             updateChecks = !updateChecks;
             if (!writeSetting(L"UpdateCheck", updateChecks ? 1 : 0)) setNotice(tr(L"無法儲存設定。"));
@@ -2867,6 +3021,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         }
         if (trayAdded) updateTray(false);
         if (demo || isolatedPreview) refreshPowerButton(); // the preview mode follows the power source
+        if (inlinePage == InlinePage::lab && !hidden && GetTickCount64() - labPageShownAt >= 10000) showLabPage();
         if (!current.history.empty()) recordCpuPower(current.history.back().ms, current.energy);
         if (!demo && !isolatedPreview && !current.history.empty() && lowBattery.update(current.history.back(), lowBatteryThreshold))
             showLowBatteryNotice();
@@ -3581,7 +3736,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             for (int i = 0; i < 8; ++i) chargeCurve.add(band * 5 + 2, band < 16 ? 24 : 9);
         refreshList();
     }
-    else worker = std::thread(sampleLoop);
+    else {
+        if (!isolatedPreview) {
+            labController = std::make_unique<bs::lab::Controller>();
+            if (readSetting(L"LabRecording", 0) == 1) labController->setRecording(true);
+        }
+        worker = std::thread(sampleLoop);
+    }
     applyLanguage(english);
     if (!demo && !isolatedPreview && startupState() == StartupState::missingCopy) {
         // A portable folder was moved: point launch at sign-in at this copy. An
