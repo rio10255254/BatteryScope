@@ -721,6 +721,21 @@ int wmain(int argc, wchar_t** argv) {
             check(fast.activity() == Activity::reading, "and saves once it has held");
             fi.actual[size_t(Setting::powerMode)] = 2; // the user picks best performance
             auto overridden = feed(Activity::reading, 1);
+            // A value the user chose in BatteryScope is held for the battery session, then handed back.
+            {
+                gov::Governor h; gov::Input hi; hi.onBattery = true; hi.actual = {DWORD(2), DWORD(60), DWORD(0), DWORD(120)}; hi.detected = Activity::reading; hi.ms = 1000;
+                auto apply = [&](const gov::Decision& d) { for (size_t i = 0; i < d.apply.size(); ++i) if (d.apply[i]) hi.actual[i] = *d.apply[i]; };
+                apply(h.update(hi));
+                check(hi.actual[size_t(Setting::powerMode)] == DWORD(0), "reading saves power");
+                hi.actual[size_t(Setting::powerMode)] = 1; h.hold(Setting::powerMode); // the user picks balanced
+                for (int i = 0; i < 30; ++i) { hi.ms += 60000; apply(h.update(hi)); }
+                check(hi.actual[size_t(Setting::powerMode)] == DWORD(1) && h.held(Setting::powerMode), "a held setting is left alone, even after half an hour");
+                h.release(Setting::powerMode); hi.ms += 60000; apply(h.update(hi));
+                check(hi.actual[size_t(Setting::powerMode)] == DWORD(0), "handed back, it is managed again at once");
+                h.hold(Setting::powerMode); hi.actual[size_t(Setting::powerMode)] = 1;
+                hi.onBattery = false; hi.ms += 1000; auto plugged = h.update(hi);
+                check(!plugged.apply[size_t(Setting::powerMode)] && !h.held(Setting::powerMode), "plugging in keeps the held value and ends the hold");
+            }
             // Bursts, low battery and a vetoed efficiency mode.
             {
                 gov::Detector burstDetector; gov::Observation bo; bo.ms = 1000; bo.idleSeconds = 0; bo.activeSeconds = 0.5; bo.lastInput = gov::InputKind::click;

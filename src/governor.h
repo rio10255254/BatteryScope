@@ -106,6 +106,14 @@ public:
     // The settings as found before the governor first changed them.
     const std::array<std::optional<DWORD>, size_t(Setting::count)>& originals() const { return originals_; }
     bool managing(Setting setting, uint64_t ms) const { return ms >= pausedUntil_[size_t(setting)]; }
+    // The user chose this setting's value in BatteryScope: leave it for the rest of this
+    // battery session (until plugged in) or until handed back. It is not restored either.
+    void hold(Setting setting);
+    void release(Setting setting);
+    void releaseAll() { for (size_t s = 0; s < held_.size(); ++s) if (held_[s]) release(Setting(s)); }
+    bool held(Setting setting) const { return held_[size_t(setting)]; }
+    // A background app the user put in (or out of) efficiency mode themselves: not managed.
+    void forget(uint32_t pid, uint64_t created) { throttled_.erase({pid, created}); busySince_.erase({pid, created}); }
     std::deque<std::wstring> log; // newest last, at most 30 entries
 private:
     static double minimumGap(Setting setting);
@@ -121,6 +129,7 @@ private:
     std::array<std::optional<DWORD>, size_t(Setting::count)> originals_{}, lastSet_{};
     std::array<uint64_t, size_t(Setting::count)> changedAt_{}, pausedUntil_{};
     std::array<int, size_t(Setting::count)> rankAtChange_{};
+    std::array<bool, size_t(Setting::count)> held_{};
     std::set<std::pair<uint32_t, uint64_t>> throttled_;
     std::map<std::pair<uint32_t, uint64_t>, uint64_t> busySince_;
 };

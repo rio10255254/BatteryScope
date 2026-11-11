@@ -135,6 +135,15 @@ int Governor::direction(Setting s, DWORD a, DWORD b) {
     }
     return b > a ? 1 : -1;                                     // power mode, boost, refresh rate
 }
+void Governor::hold(Setting s) {
+    held_[size_t(s)] = true;
+    pausedUntil_[size_t(s)] = UINT64_MAX;
+    lastSet_[size_t(s)].reset(); // the user's value is kept when plugging in
+}
+void Governor::release(Setting s) {
+    held_[size_t(s)] = false;
+    pausedUntil_[size_t(s)] = 0; changedAt_[size_t(s)] = 0;
+}
 void Governor::note(const std::wstring& text) {
     log.push_back(text);
     while (log.size() > 30) log.pop_front();
@@ -187,6 +196,7 @@ Decision Governor::update(const Input& in) {
             for (size_t s = 0; s < Settings; ++s) if (lastSet_[s] && originals_[s]) d.apply[s] = originals_[s];
             for (const auto& app : throttled_) d.ecoOff.push_back(app);
             throttled_.clear(); busySince_.clear(); lastSet_ = {};
+            held_ = {}; pausedUntil_ = {}; // holds and pauses last one battery session
             active_ = false; d.restore = true; d.reason = L"插電：已還原";
             note(d.reason);
         }

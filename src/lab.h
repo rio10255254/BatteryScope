@@ -211,6 +211,9 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+// Programs using the discrete GPU in these "GPU Engine" counter instances (by process
+// name), or empty; checked before the discrete GPU is switched off.
+std::vector<std::wstring> discreteGpuUsers(const std::vector<std::pair<std::wstring, double>>& gpu, const std::vector<ProcessRow>& processes);
 // EcoQoS for one process (no priority change), checked against its start time.
 DWORD setProcessEco(uint32_t pid, uint64_t created, bool on);
 

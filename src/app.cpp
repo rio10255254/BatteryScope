@@ -33,7 +33,8 @@ namespace {
 using namespace bs;
 constexpr UINT SampleMessage = WM_APP + 1, TrayMessage = WM_APP + 2, ActionMessage = WM_APP + 3, RefreshMessage = WM_APP + 4,
     PowerModeMessage = WM_APP + 5, UpdateMessage = WM_APP + 6, UpdateDownloadedMessage = WM_APP + 7, LabExportMessage = WM_APP + 8,
-    GovernorNowMessage = WM_APP + 9; // input or a program switch: re-run the governor now
+    GovernorNowMessage = WM_APP + 9, // input or a program switch: re-run the governor now
+    GpuUsersMessage = WM_APP + 10;   // programs found on the discrete GPU (before switching it off)
 constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, DetailsId = 104,
     BackgroundId = 105, AllId = 106, StartupId = 107, HideId = 108, MenuId = 109,
     LanguageZhId = 110, LanguageEnId = 111, PowerDetailsId = 112, PowerModeId = 113,
@@ -50,7 +51,7 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     LabPageId = 172, LabRecordId = 173, LabExperimentId = 174 /* ..177, one per knob */, LabStopId = 178, LabFolderId = 179, LabExportId = 180, LabAutoId = 181, LabAutoStartId = 182,
     DynamicToggleId = 183, DynamicPageId = 184, DynamicRefreshId = 185, DynamicEcoId = 186, DynamicTargetId = 187, SettingsPageId = 188, GoalPageId = 189, GoalCycleId = 190, LabQuickId = 191, LabQuickStartId = 192, UpdateAutoId = 193, UpdateNotifyId = 194, UpdateOffId = 195, UpdatePageId = 196,
     HardwarePageId = 197, AsusSilentId = 198, AsusBalancedId = 199, AsusTurboId = 202, GpuEcoId = 203, GpuStandardId = 204,
-    Charge60Id = 205, Charge80Id = 206, Charge100Id = 207, OverdriveId = 208,
+    Charge60Id = 205, Charge80Id = 206, Charge100Id = 207, OverdriveId = 208, AsusAutoId = 209, GpuAutoId = 210, ReleaseHoldsId = 211,
     SettingsListId = 300,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1;
@@ -113,6 +114,8 @@ enum class BalloonTarget { none, candidates, powerDetails, update };
 bool updateChecks = true; // daily update check, on unless turned off
 bool updateAuto = true;    // install a new version by itself (after any running test)
 bool updateDeferred = false;
+bool gpuAuto = false;          // ASUS: discrete GPU in Eco on battery, standard when plugged in
+unsigned chargeLimitWanted = 0; // ASUS: the charge limit chosen here, re-applied after a restart or sleep (0: not managed)
 // Dynamic power saving (the governor), opt-in. Target 0 means no battery target.
 bool dynamicEnabled = false, dynamicRefresh = false, dynamicEco = true;
 unsigned dynamicTarget = 0;
@@ -154,7 +157,9 @@ void refreshPowerModeControls();
 void showLabPage();
 void showSettingsPage();
 void showDynamicPage();
+bool powerModeHeld();      // dynamic saving is leaving the battery power mode to the user
 void showGoalPage();
+void showHardwarePage();
 // The power lab; absent in demo and preview modes.
 std::unique_ptr<bs::lab::Controller> labController;
 std::unique_ptr<bs::lab::WorkloadEngine> labEngine; // the automatic test's loads and window
@@ -167,6 +172,15 @@ uint64_t governorGpuAt = 0;
 bs::gov::DetectionTally detectionTally; // activity detection scored during the automatic test
 bs::gov::Detector detector;           // dynamic saving's activity detector (and its program rules)
 uint64_t goalPageShownAt = 0;
+// ASUS firmware state, read at most every 2 seconds.
+bool asusAvailable = false;
+bs::asus::Snapshot asusState;
+uint64_t asusReadAt = 0;
+const bs::asus::Snapshot& asusNow() {
+    const uint64_t now = GetTickCount64();
+    if (!asusReadAt || now - asusReadAt >= 2000) { asusState = bs::asus::read(); asusReadAt = now; }
+    return asusState;
+}
 void flushDetectionLog();
 std::string utf8(const std::wstring& text);
 void exportLab();
@@ -1959,6 +1973,12 @@ void loadAutoOverrides() {
 // Efficiency. Each change is undone only if the user has not changed it since.
 void applyAutoPowerRules() {
     if (demo || isolatedPreview || current.history.empty()) return;
+    // One owner at a time: with dynamic saving on, it covers the performance list (as app rules)
+    // and low battery (as extra saving); while the lab measures, the lab owns the settings.
+    if (dynamicEnabled || (labController && labController->status().running)) {
+        if (autoApplied != AutoMode::none) { undoAutoOverrides(); autoApplied = AutoMode::none; saveAutoOverrides(); }
+        return;
+    }
     const uint64_t now = GetTickCount64();
     for (const auto& row : current.processes) if (performanceListed(row)) { performanceSeenAt = now; break; }
     const bool performanceActive = performanceSeenAt && now - performanceSeenAt < 30000;
@@ -2172,6 +2192,8 @@ void loadSettings() {
     historyEnabled = readSetting(L"History", 1) != 0;
     updateChecks = readSetting(L"UpdateCheck", 1) != 0;
     updateAuto = readSetting(L"UpdateAuto", 1) != 0;
+    gpuAuto = readSetting(L"GpuAuto", 0) != 0;
+    chargeLimitWanted = readSetting(L"ChargeLimit", 0);
     dynamicEnabled = readSetting(L"Dynamic", 0) == 1;
     dynamicRefresh = readSetting(L"DynamicRefresh", 0) == 1;
     dynamicEco = readSetting(L"DynamicEco", 1) != 0;
@@ -2296,7 +2318,10 @@ void refreshPowerModeControls() {
         EnableWindow(modeButtons[i], editable && settable);
         InvalidateRect(modeButtons[i], nullptr, FALSE);
     }
-    EnableWindow(restoreModesButton, editable && powerModes.restorable);
+    // With dynamic saving on, the second button hands a battery mode chosen here back to it.
+    const bool handBack = powerModeHeld();
+    SetWindowTextW(restoreModesButton, handBack ? tr(L"交給動態省電") : tr(L"還原原本設定"));
+    EnableWindow(restoreModesButton, editable && (handBack || (powerModes.restorable && !dynamicEnabled)));
     EnableWindow(energySettingsButton, editable);
     InvalidateRect(mainWindow, nullptr, FALSE);
 }
@@ -3575,7 +3600,8 @@ void governorTick() {
     DWORD foreground = 0;
     if (HWND window = GetForegroundWindow()) GetWindowThreadProcessId(window, &foreground);
     for (const auto& row : current.processes)
-        if (row.measured && row.actionable && row.services.empty() && row.pid != GetCurrentProcessId())
+        if (row.measured && row.actionable && row.services.empty() && row.pid != GetCurrentProcessId() &&
+            std::none_of(efficientProcesses.begin(), efficientProcesses.end(), [&](const EfficientProcess& e) { return e.pid == row.pid && e.created == row.created; }))
             in.apps.push_back({row.pid, row.created, row.name, row.averageCpu, row.pid == foreground || row.pid == o.foregroundPid});
     const auto decision = governor.update(in);
     applyDecision(decision);
@@ -3587,8 +3613,14 @@ void setDynamic(bool on) {
     dynamicEnabled = on;
     if (!writeSetting(L"Dynamic", on ? 1 : 0)) setNotice(tr(L"無法儲存設定。"));
     updateSensing();
-    if (on) { governorTick(); setNotice(tr(L"動態省電已開啟：用電池時依你正在做的事自動調整。")); }
-    else { stopGovernor(); setNotice(tr(L"動態省電已關閉，設定已還原。")); }
+    if (on) { applyAutoPowerRules(); governorTick(); setNotice(tr(L"動態省電已開啟：用電池時依你正在做的事自動調整。")); }
+    else { stopGovernor(); governor.releaseAll(); applyAutoPowerRules(); setNotice(tr(L"動態省電已關閉，設定已還原。")); }
+}
+bool powerModeHeld() { return dynamicEnabled && governor.held(bs::gov::Setting::powerMode); }
+size_t heldCount() {
+    size_t n = 0;
+    for (size_t i = 0; i < size_t(bs::gov::Setting::count); ++i) n += governor.held(bs::gov::Setting(i));
+    return n;
 }
 std::wstring settingValueName(bs::gov::Setting setting, DWORD value) {
     switch (setting) {
@@ -3713,21 +3745,45 @@ Measured measuredSaving(const wchar_t* knob) {
 }
 // The ways to save, ranked by watts. Measured ones come from the lab on this PC.
 struct Tip { double watts = 0; std::wstring label, detail; bool measured = false; };
+// What dynamic saving already takes care of, so the tips never suggest it twice.
+std::wstring handledByDynamic() {
+    std::wstring list = tr(L"電源模式、CPU Boost");
+    if (asusAvailable) list += tr(L"、華碩效能模式");
+    if (dynamicRefresh) list += tr(L"、螢幕更新率");
+    if (dynamicEco) list += tr(L"、背景程式效率模式");
+    return list;
+}
 std::vector<Tip> savingTips() {
     std::vector<Tip> tips;
-    auto measuredTip = [&](const wchar_t* knob, const std::wstring& label, const std::wstring& detail, double guess) {
+    auto saving = [](const wchar_t* knob, double guess, bool& measured) {
         const auto m = measuredSaving(knob);
-        if (m.count) tips.push_back({m.high, label, detail, true});
-        else tips.push_back({guess, label, detail, false});
+        measured = m.count > 0;
+        return m.count ? m.high : guess;
+    };
+    auto measuredTip = [&](const wchar_t* knob, const std::wstring& label, const std::wstring& detail, double guess) {
+        bool measured = false; const double watts = saving(knob, guess, measured);
+        tips.push_back({watts, label, detail, measured});
     };
     const auto modes = queryPowerModes();
-    if (modes.dcKnown && modes.dc != PowerMode::efficiency)
-        measuredTip(L"power-mode", tr(L"電源模式改「最佳電源效率」"), tr(L"⋯ → 電源模式 → 用電池時 · 目前：") + std::wstring(modeName(modes.dc)), 1.5);
     DWORD value = 0;
-    if (bs::lab::readKnob(bs::lab::Knob::refreshRate, value) == ERROR_SUCCESS && value > 60)
-        measuredTip(L"refresh", tr(L"螢幕改 60 Hz"), tr(L"Windows 設定 → 顯示器 → 進階顯示 · 目前：") + std::to_wstring(value) + L" Hz", .7);
-    if (bs::lab::readKnob(bs::lab::Knob::cpuBoost, value) == ERROR_SUCCESS && value != 0)
-        measuredTip(L"cpu-boost", tr(L"用電池時關閉 CPU Boost"), tr(L"動態省電或 G-Helper 可設定"), 3);
+    const auto* hw = asusAvailable ? &asusNow() : nullptr;
+    if (!dynamicEnabled) {
+        // The settings dynamic saving would manage, as one suggestion instead of several.
+        double watts = 0; bool allMeasured = true, any = false; std::wstring what;
+        auto add = [&](const wchar_t* knob, double guess, const wchar_t* name) {
+            bool m = false; watts += saving(knob, guess, m); allMeasured &= m; any = true;
+            what += (what.empty() ? L"" : std::wstring(tr(L"、"))) + tr(name);
+        };
+        if (modes.dcKnown && modes.dc != PowerMode::efficiency) add(L"power-mode", 1.5, L"電源模式");
+        if (bs::lab::readKnob(bs::lab::Knob::cpuBoost, value) == ERROR_SUCCESS && value != 0) add(L"cpu-boost", 3, L"CPU Boost");
+        if (hw && hw->mode && *hw->mode != bs::asus::Mode::silent) add(L"asus-mode", .8, L"華碩效能模式");
+        if (any) tips.push_back({watts, tr(L"開啟動態省電"), tr(L"自動處理") + what + tr(L"：平常省電，需要時才給效能（⋯ → 動態省電）"), allMeasured});
+    } else if (!dynamicEco) measuredTip(L"background-eco", tr(L"開啟背景程式效率模式"), tr(L"設定 → 背景程式自動效率模式"), .4);
+    if (bs::lab::readKnob(bs::lab::Knob::refreshRate, value) == ERROR_SUCCESS && value > 60 && !(dynamicEnabled && dynamicRefresh))
+        measuredTip(L"refresh", tr(L"螢幕改 60 Hz"), dynamicEnabled ? tr(L"或在設定開啟「動態切換螢幕更新率」，只在閱讀與閒置時用 60 Hz") :
+            tr(L"Windows 設定 → 顯示器 → 進階顯示 · 目前：") + std::to_wstring(value) + L" Hz", .7);
+    if (hw && hw->gpuEco && !*hw->gpuEco && !gpuAuto)
+        tips.push_back({.8, tr(L"獨顯改用自動（用電池時 Eco）"), tr(L"⋯ → 華碩硬體 → 獨顯 → 自動；有程式喚醒獨顯時最多可省數瓦"), false});
     if (bs::lab::readKnob(bs::lab::Knob::darkMode, value) == ERROR_SUCCESS && value == 0)
         measuredTip(L"dark-mode", tr(L"改用深色模式（OLED）"), tr(L"Windows 設定 → 個人化 → 色彩"), .8);
     measuredTip(L"brightness", tr(L"螢幕亮度降 40%"), tr(L"OLED 上白底畫面影響最大"), .6);
@@ -3802,6 +3858,16 @@ std::vector<VBlock> goalBlocks() {
         if (bs::lab::readKnob(bs::lab::Knob::refreshRate, value) == ERROR_SUCCESS) chips.push_back({std::to_wstring(value) + L" Hz", value <= 60 ? Green : COLORREF(0)});
         if (bs::lab::readKnob(bs::lab::Knob::cpuBoost, value) == ERROR_SUCCESS) chips.push_back({value ? tr(L"Boost 開") : tr(L"Boost 關"), value ? theme.warn : Green});
         if (bs::lab::readKnob(bs::lab::Knob::darkMode, value) == ERROR_SUCCESS) chips.push_back({value ? tr(L"深色模式") : tr(L"淺色模式"), value ? Green : COLORREF(0)});
+        if (asusAvailable) {
+            const auto& h = asusNow();
+            if (h.mode) chips.push_back({tr(L"華碩 ") + std::wstring(tr(bs::asus::modeKey(*h.mode))), *h.mode == bs::asus::Mode::silent ? Green : *h.mode == bs::asus::Mode::turbo ? theme.warn : COLORREF(0)});
+            if (h.gpuEco) chips.push_back({(*h.gpuEco ? tr(L"獨顯 Eco") : tr(L"獨顯 標準")) + std::wstring(gpuAuto ? tr(L"（自動）") : L""), *h.gpuEco ? Green : COLORREF(0)});
+        }
+        // Settings the user chose by hand this battery session.
+        const wchar_t* heldNames[] = {L"電源模式", L"處理器能源偏好", L"CPU Boost", L"螢幕更新率", L"華碩效能模式"};
+        if (dynamicEnabled)
+            for (size_t i = 0; i < size_t(bs::gov::Setting::count); ++i)
+                if (governor.held(bs::gov::Setting(i))) chips.push_back({tr(L"手動：") + std::wstring(tr(heldNames[i])), theme.warn});
         v.push_back(vChips(std::move(chips)));
     }
     const auto tips = savingTips();
@@ -3814,6 +3880,7 @@ std::vector<VBlock> goalBlocks() {
         v.push_back(vLegend({{tr(L"這台實測"), Green}, {tr(L"估計（跑快速測試後換成實測）"), blend(Muted, Surface, .35)}}));
         std::wstring how;
         for (const auto& t : tips) how += (how.empty() ? L"" : L"\n") + t.label + (english ? L": " : L"：") + t.detail;
+        if (dynamicEnabled) how += tr(L"\n動態省電已自動處理：") + handledByDynamic() + (heldCount() ? tr(L"（手動設定的項目除外，可從「⋯」交回）") : L"");
         v.push_back(vNote(how));
     }
     if (const auto busy = busyPrograms(6); !busy.empty()) {
@@ -4069,13 +4136,60 @@ void activateSettingRow(int index) {
 // The firmware settings G-Helper and Armoury Crate change, through the same ATKACPI
 // driver. Reads are cheap; every write is read back, and dynamic saving also manages
 // the performance mode (silent for light use) when it is on.
-bool asusAvailable = false;
-bs::asus::Snapshot asusState;
-uint64_t asusReadAt = 0;
-const bs::asus::Snapshot& asusNow() {
-    const uint64_t now = GetTickCount64();
-    if (!asusReadAt || now - asusReadAt >= 2000) { asusState = bs::asus::read(); asusReadAt = now; }
-    return asusState;
+// The discrete GPU goes to Eco only when no program is using it: the check samples
+// the GPU engines for a second on a worker thread, then posts the users found.
+bool gpuCheckBusy = false, gpuCheckManual = false;
+int gpuAutoDone = -1;          // the power source the automatic switch last handled (0 battery, 1 plugged in)
+uint64_t gpuRetryAt = 0;
+void requestGpuEco(bool manual, bool) {
+    if (gpuCheckBusy) return;
+    gpuCheckBusy = true; gpuCheckManual = manual;
+    HWND target = mainWindow; auto processes = current.processes;
+    std::thread([target, processes] {
+        GpuUsage gpu; std::unordered_map<uint32_t, double> usage;
+        gpu.sample(usage); Sleep(1000); gpu.sample(usage);
+        auto* users = new std::vector<std::wstring>(bs::lab::discreteGpuUsers(gpu.instances(), processes));
+        if (!PostMessageW(target, GpuUsersMessage, 0, reinterpret_cast<LPARAM>(users))) delete users;
+    }).detach();
+}
+void finishGpuEco(std::vector<std::wstring>* raw) {
+    std::unique_ptr<std::vector<std::wstring>> users(raw);
+    gpuCheckBusy = false;
+    std::wstring names;
+    for (const auto& name : *users) names += (names.empty() ? L"" : std::wstring(tr(L"、"))) + name;
+    if (!names.empty()) {
+        if (!gpuCheckManual) { // automatic: try again in a minute
+            gpuRetryAt = GetTickCount64() + 60000;
+            setNotice(tr(L"獨顯正被使用（") + names + tr(L"），關閉後會自動切到 Eco。"));
+            return;
+        }
+        if (MessageBoxW(mainWindow, (tr(L"這些程式正在用獨顯：") + names + tr(L"\n切到 Eco 前請先關閉它們，否則可能失敗或讓它們出錯。仍要切換嗎？")).c_str(),
+            L"BatteryScope", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
+    }
+    const DWORD status = bs::asus::setGpuEco(true);
+    asusReadAt = 0;
+    setNotice(status == ERROR_SUCCESS ? std::wstring(tr(L"獨顯已切到 Eco（斷電）")) : tr(L"韌體沒有接受這個設定：") + errorText(status));
+    if (inlinePage == InlinePage::hardware) showHardwarePage();
+}
+// G-Helper's "optimized" GPU mode: Eco on battery, standard when plugged in.
+void applyGpuAuto() {
+    if (!gpuAuto || !asusAvailable || demo || isolatedPreview || current.history.empty() || gpuCheckBusy) return;
+    if (labController && labController->status().running) return; // never during a measurement
+    const auto& p = current.history.back();
+    if (!p.acKnown) return;
+    const int source = p.onAc ? 1 : 0;
+    const auto& h = asusNow();
+    if (!h.gpuEco) return;
+    if (source == gpuAutoDone && (source == 1 || *h.gpuEco || GetTickCount64() < gpuRetryAt)) return;
+    gpuAutoDone = source;
+    if (source == 1 && *h.gpuEco) { if (bs::asus::setGpuEco(false) == ERROR_SUCCESS) setNotice(tr(L"插電：獨顯已切到標準。")); asusReadAt = 0; }
+    else if (source == 0 && !*h.gpuEco) requestGpuEco(false, true);
+}
+// Some models forget the charge limit at a restart; put back the one chosen here.
+void reapplyChargeLimit() {
+    if (!chargeLimitWanted || !asusAvailable || demo || isolatedPreview) return;
+    const auto& h = asusNow();
+    if (h.chargeLimit && *h.chargeLimit != chargeLimitWanted && bs::asus::setChargeLimit(chargeLimitWanted) == ERROR_SUCCESS) asusReadAt = 0;
 }
 std::vector<MenuItem> hardwareMenuItems() {
     const auto& h = asusNow();
@@ -4083,16 +4197,21 @@ std::vector<MenuItem> hardwareMenuItems() {
     std::vector<MenuItem> items;
     items.push_back(menuItem(HardwarePageId, tr(L"硬體狀態")));
     items.push_back(menuSeparator());
-    std::vector<MenuItem> modes{
-        menuItem(AsusSilentId, tr(L"靜音（最省電）"), h.mode == bs::asus::Mode::silent, preview || !h.mode),
-        menuItem(AsusBalancedId, tr(L"平衡"), h.mode == bs::asus::Mode::balanced, preview || !h.mode),
-        menuItem(AsusTurboId, tr(L"Turbo"), h.mode == bs::asus::Mode::turbo, preview || !h.mode)};
+    // "Automatic" hands the mode to dynamic saving; picking a mode holds it for this battery session.
+    const bool autoMode = dynamicEnabled && !governor.held(bs::gov::Setting::firmwareMode);
+    auto automatic = menuItem(AsusAutoId, tr(L"自動（動態省電）"), autoMode, preview || !h.mode || !dynamicEnabled);
+    if (!dynamicEnabled) automatic.hint = tr(L"需開啟動態省電");
+    std::vector<MenuItem> modes{automatic, menuSeparator(),
+        menuItem(AsusSilentId, tr(L"靜音（最省電）"), !autoMode && h.mode == bs::asus::Mode::silent, preview || !h.mode),
+        menuItem(AsusBalancedId, tr(L"平衡"), !autoMode && h.mode == bs::asus::Mode::balanced, preview || !h.mode),
+        menuItem(AsusTurboId, tr(L"Turbo"), !autoMode && h.mode == bs::asus::Mode::turbo, preview || !h.mode)};
     auto modeMenu = submenu(tr(L"效能模式"), modes, !h.mode);
-    if (h.mode) modeMenu.hint = tr(bs::asus::modeKey(*h.mode));
+    if (h.mode) modeMenu.hint = autoMode ? tr(L"自動") + std::wstring(L" · ") + tr(bs::asus::modeKey(*h.mode)) : std::wstring(tr(bs::asus::modeKey(*h.mode)));
     items.push_back(modeMenu);
     if (h.gpuEco) {
-        auto gpu = submenu(tr(L"獨顯"), {menuItem(GpuEcoId, tr(L"Eco（斷電，最省電）"), *h.gpuEco, preview), menuItem(GpuStandardId, tr(L"標準（需要時使用）"), !*h.gpuEco, preview)});
-        gpu.hint = *h.gpuEco ? L"Eco" : tr(L"標準");
+        auto gpu = submenu(tr(L"獨顯"), {menuItem(GpuAutoId, tr(L"自動（用電池 Eco、插電標準）"), gpuAuto, preview), menuSeparator(),
+            menuItem(GpuEcoId, tr(L"Eco（斷電，最省電）"), !gpuAuto && *h.gpuEco, preview), menuItem(GpuStandardId, tr(L"標準（需要時使用）"), !gpuAuto && !*h.gpuEco, preview)});
+        gpu.hint = (gpuAuto ? tr(L"自動") + std::wstring(L" · ") : std::wstring()) + (*h.gpuEco ? L"Eco" : tr(L"標準"));
         items.push_back(gpu);
     }
     if (h.chargeLimit) {
@@ -4175,6 +4294,11 @@ std::vector<MenuItem> mainMenuItems() {
     auto dynamic = menuItem(DynamicToggleId, tr(L"動態省電"), dynamicEnabled, preview);
     if (!dynamicEnabled) dynamic.hint = tr(L"關");
     items.push_back(dynamic);
+    if (dynamicEnabled && heldCount()) {
+        auto handBack = menuItem(ReleaseHoldsId, tr(L"把手動設定交回動態省電"));
+        handBack.hint = std::to_wstring(heldCount()) + tr(L" 項");
+        items.push_back(handBack);
+    }
     items.push_back(menuItem(PowerModeId, tr(L"電源模式")));
     if (asusAvailable) items.push_back(submenu(tr(L"華碩硬體"), hardwareMenuItems()));
     items.push_back(menuSeparator());
@@ -4346,7 +4470,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         }, window);
         refreshPowerButton();
         if (!demo && !isolatedPreview) SetTimer(window, UpdateTimer, 60 * 1000, nullptr); // first check a minute after start
-        if (!demo && !isolatedPreview) { asusAvailable = bs::asus::Acpi().available(); restoreGovernorAfterCrash(); loadAppRules(); refreshDetectorRules(); updateSensing(); }
+        if (!demo && !isolatedPreview) { asusAvailable = bs::asus::Acpi().available(); reapplyChargeLimit(); restoreGovernorAfterCrash(); loadAppRules(); refreshDetectorRules(); updateSensing(); }
         if (demo || isolatedPreview) asusAvailable = true; // the preview shows the hardware menu
         return 0;
     }
@@ -4485,6 +4609,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             const DWORD result = setProcessEfficiency(row, enable, priority);
             if (result == ERROR_SUCCESS || (!enable && result == ERROR_NOT_FOUND)) {
                 if (enable) efficientProcesses.push_back({row.pid, row.created, priority}); else efficientProcesses.erase(found);
+                governor.forget(row.pid, row.created); // the user's choice: dynamic saving leaves this program alone
                 setNotice(enable ? tr(L"已開啟效率模式：降低優先順序並以省電方式執行。") : tr(L"已取消效率模式。"));
             } else setNotice(tr(L"無法變更效率模式：") + errorText(result));
             showDetails(row); refreshList();
@@ -4582,12 +4707,21 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             const auto mode = PowerMode((id - ModeAcEfficiencyId) % 3);
             const DWORD result = setPowerMode(pluggedIn, mode);
             if (result) setNotice(tr(L"無法變更電源模式：") + errorText(result));
-            else setNotice((pluggedIn ? tr(L"已將「插電時」設為") : tr(L"已將「用電池時」設為")) + std::wstring(modeName(mode)) + tr(L"。"));
+            else if (!pluggedIn && dynamicEnabled) {
+                // A choice made here wins over dynamic saving for the rest of this battery session.
+                governor.hold(bs::gov::Setting::powerMode);
+                setNotice(tr(L"已將「用電池時」設為") + std::wstring(modeName(mode)) + tr(L"；這次用電池期間動態省電不會改它，按「交給動態省電」可交回。"));
+            } else setNotice((pluggedIn ? tr(L"已將「插電時」設為") : tr(L"已將「用電池時」設為")) + std::wstring(modeName(mode)) + tr(L"。"));
             refreshPowerModeControls();
             return 0;
         }
+        if (id == RestoreModesId && powerModeHeld()) {
+            governor.release(bs::gov::Setting::powerMode); governorTick();
+            setNotice(tr(L"電源模式已交給動態省電。")); refreshPowerModeControls();
+            return 0;
+        }
         if (id == RestoreModesId) {
-            if (demo || isolatedPreview) return 0;
+            if (demo || isolatedPreview || dynamicEnabled) return 0;
             const DWORD result = restorePowerModes();
             setNotice(result ? tr(L"無法還原電源模式：") + errorText(result) : tr(L"已還原 BatteryScope 變更前的電源模式。"));
             refreshPowerModeControls();
@@ -4607,25 +4741,32 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (id == DynamicPageId) { showMain(); showDynamicPage(); return 0; }
         if (id == GoalPageId) { showMain(); showGoalPage(); return 0; }
         if (id == HardwarePageId) { showMain(); showHardwarePage(); return 0; }
-        if (id == AsusSilentId || id == AsusBalancedId || id == AsusTurboId || id == GpuEcoId || id == GpuStandardId ||
+        if (id == AsusAutoId || id == AsusSilentId || id == AsusBalancedId || id == AsusTurboId || id == GpuAutoId || id == GpuEcoId || id == GpuStandardId ||
             id == Charge60Id || id == Charge80Id || id == Charge100Id || id == OverdriveId) {
             if (demo || isolatedPreview || !asusAvailable) return 0;
             DWORD status = ERROR_SUCCESS; std::wstring done;
-            if (id == AsusSilentId || id == AsusBalancedId || id == AsusTurboId) {
+            if (id == AsusAutoId) {
+                governor.release(bs::gov::Setting::firmwareMode); governorTick();
+                done = tr(L"效能模式交給動態省電：輕度使用靜音，需要時平衡。");
+            } else if (id == AsusSilentId || id == AsusBalancedId || id == AsusTurboId) {
                 const auto mode = id == AsusSilentId ? bs::asus::Mode::silent : id == AsusTurboId ? bs::asus::Mode::turbo : bs::asus::Mode::balanced;
                 status = bs::asus::setMode(mode); done = tr(L"效能模式：") + std::wstring(tr(bs::asus::modeKey(mode)));
+                if (status == ERROR_SUCCESS && dynamicEnabled) { governor.hold(bs::gov::Setting::firmwareMode); done += tr(L"（這次用電池期間動態省電不改它）"); }
+            } else if (id == GpuAutoId) {
+                gpuAuto = !gpuAuto; writeSetting(L"GpuAuto", gpuAuto ? 1 : 0);
+                done = gpuAuto ? tr(L"獨顯自動：用電池時 Eco，插電時標準。") : tr(L"獨顯自動已關閉。");
+                gpuAutoDone = -1; applyGpuAuto();
             } else if (id == GpuEcoId) {
-                // The discrete GPU cannot switch off while a program uses it.
-                std::wstring users;
-                for (const auto& row : current.processes) if (row.gpuPercent && *row.gpuPercent >= 1 && row.name != L"dwm.exe") users += (users.empty() ? L"" : L"、") + row.name;
-                if (!users.empty() && MessageBoxW(mainWindow, (tr(L"這些程式可能正在用獨顯：") + users + tr(L"\n切到 Eco 前請先關閉它們，否則可能失敗或讓它們出錯。仍要切換嗎？")).c_str(),
-                    L"BatteryScope", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return 0;
-                status = bs::asus::setGpuEco(true); done = tr(L"獨顯已切到 Eco（斷電）");
-            } else if (id == GpuStandardId) { status = bs::asus::setGpuEco(false); done = tr(L"獨顯已切到標準"); }
-            else if (id == OverdriveId) { const bool on = !(asusNow().overdrive.value_or(false)); status = bs::asus::setOverdrive(on); done = on ? tr(L"螢幕 Overdrive 已開啟") : tr(L"螢幕 Overdrive 已關閉"); }
+                gpuAuto = false; writeSetting(L"GpuAuto", 0);
+                requestGpuEco(true, false); return 0; // finishes after checking which programs use it
+            } else if (id == GpuStandardId) {
+                gpuAuto = false; writeSetting(L"GpuAuto", 0);
+                status = bs::asus::setGpuEco(false); done = tr(L"獨顯已切到標準");
+            } else if (id == OverdriveId) { const bool on = !(asusNow().overdrive.value_or(false)); status = bs::asus::setOverdrive(on); done = on ? tr(L"螢幕 Overdrive 已開啟") : tr(L"螢幕 Overdrive 已關閉"); }
             else {
                 const unsigned percent = id == Charge60Id ? 60 : id == Charge80Id ? 80 : 100;
                 status = bs::asus::setChargeLimit(percent); done = tr(L"充電上限：") + std::to_wstring(percent) + L"%";
+                if (status == ERROR_SUCCESS) { chargeLimitWanted = percent; writeSetting(L"ChargeLimit", percent); } // re-applied after restarts
             }
             asusReadAt = 0;
             setNotice(status == ERROR_SUCCESS ? done : tr(L"韌體沒有接受這個設定：") + errorText(status));
@@ -4640,6 +4781,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             writeSetting(L"GoalUse", goalUse); writeSetting(L"GoalStill", goalStill);
             return 0;
         }
+        if (id == ReleaseHoldsId) { governor.releaseAll(); governorTick(); setNotice(tr(L"手動設定已交回動態省電。")); return 0; }
         if (id == DynamicToggleId) { if (!demo && !isolatedPreview) setDynamic(!dynamicEnabled); return 0; }
         if (id == DynamicRefreshId || id == DynamicEcoId || id == DynamicTargetId) {
             if (demo || isolatedPreview) return 0;
@@ -4787,6 +4929,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         checkBatteryNotices();
         applyAutoPowerRules();
         recordGoalSample();
+        applyGpuAuto();
         if (inlinePage == InlinePage::hardware && !hidden) showHardwarePage();
         if (inlinePage == InlinePage::goal && !hidden && GetTickCount64() - goalPageShownAt >= 10000) showGoalPage();
         return 0;
@@ -4812,6 +4955,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         return DefWindowProcW(window, message, wp, lp);
     }
     case GovernorNowMessage: governorTick(); return 0;
+    case GpuUsersMessage: finishGpuEco(reinterpret_cast<std::vector<std::wstring>*>(lp)); return 0;
     case WM_POWERBROADCAST:
         if (wp == PBT_POWERSETTINGCHANGE && lp) {
             const auto* setting = reinterpret_cast<const POWERBROADCAST_SETTING*>(lp);
@@ -4823,6 +4967,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             return TRUE;
         }
         if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND || wp == PBT_APMPOWERSTATUSCHANGE) { resetSamples = true; wake.notify_one(); }
+        if (wp == PBT_APMRESUMEAUTOMATIC) { asusReadAt = 0; reapplyChargeLimit(); }
         return TRUE;
     case PowerModeMessage:
         effectiveMode = EffectiveMode(wp);

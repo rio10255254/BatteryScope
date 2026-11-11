@@ -686,6 +686,18 @@ Signals SignalReader::read(Value systemCpu) {
     s.systemCpu = systemCpu;
     return s;
 }
+std::vector<std::wstring> discreteGpuUsers(const std::vector<std::pair<std::wstring, double>>& gpu, const std::vector<ProcessRow>& processes) {
+    Probe::Impl adapters;
+    adapters.findAdapters(GetTickCount64());
+    std::set<std::wstring> names;
+    if (adapters.discreteLuid.empty()) return {};
+    for (const auto& [name, percent] : gpu) {
+        if (!std::isfinite(percent) || percent < .5 || name.find(adapters.discreteLuid) == std::wstring::npos || name.compare(0, 4, L"pid_") != 0) continue;
+        const uint32_t pid = uint32_t(wcstoul(name.c_str() + 4, nullptr, 10));
+        for (const auto& row : processes) if (row.pid == pid && !lowerEquals(row.name, L"dwm.exe")) { names.insert(row.name); break; }
+    }
+    return {names.begin(), names.end()};
+}
 gov::Observation SignalReader::observe(Value systemCpu) {
     auto& p = *impl_;
     const Signals s = read(systemCpu);
