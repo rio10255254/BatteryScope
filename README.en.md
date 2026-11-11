@@ -15,8 +15,8 @@
 
 From the **[Releases page](https://github.com/rio10255254/BatteryScope/releases/latest)**:
 
-- **Installer (recommended):** `BatteryScope-0.13.1-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
-- **Portable:** `BatteryScope-0.13.1-win64.zip`; extract it and run `BatteryScope.exe`.
+- **Installer (recommended):** `BatteryScope-0.14.0-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
+- **Portable:** `BatteryScope-0.14.0-win64.zip`; extract it and run `BatteryScope.exe`.
 
 Requires Windows 10 version 1703 or later (Windows 11 recommended), 64-bit. The program is not code-signed; if SmartScreen appears the first time, choose **More info → Run anyway**. It lives in the notification area, where the icon shows the battery percentage; click it to show or hide the panel.
 
@@ -52,13 +52,13 @@ Details follow.
 
 ## Using it
 
-1. Download `BatteryScope-0.13.1-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
+1. Download `BatteryScope-0.14.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
 2. Click its battery icon in the notification area to show or hide the panel. Esc hides it; monitoring continues at a lower frequency.
 3. Open **⋯ → Language / 語言 → English** to switch immediately. The setting persists for your Windows account. Selection and scroll position are retained.
 4. Use Background and Show filters, the mouse wheel, arrow keys, Home/End, or Page Up/Down. Enter or double-click opens details.
 5. Select a process to inspect it, request a normal close, force quit with confirmation, or stop an eligible hosted service. Protected processes cannot be closed.
 
-The menu also provides power mode, battery and charging details, session energy, finding power-hungry background apps, CSV export, appearance (theme and style), language, a low battery alert, the Ctrl+Alt+B shortcut, optional launch at sign-in, and Quit. Launch at sign-in is off until you enable it. If you move the folder, opening BatteryScope from the new location repoints the entry automatically; an entry for another BatteryScope copy that still exists is left unchanged. Windows permission dialogs, standard dialog buttons, and system-provided service names follow the system language.
+The ⋯ menu keeps only the common items: power mode, dynamic power saving and its status page, battery and charging details, history, session energy, finding power-hungry background apps, the power lab, tools (CSV export, share card, mini window), settings, and Quit. Every other option is on the **⋯ → Settings** page, grouped into power saving, alerts, appearance, and general; each row shows its value and switches with one click. Launch at sign-in is off until you enable it. If you move the folder, opening BatteryScope from the new location repoints the entry automatically; an entry for another BatteryScope copy that still exists is left unchanged. Windows permission dialogs, standard dialog buttons, and system-provided service names follow the system language.
 
 **Appearance and extras**
 
@@ -95,12 +95,25 @@ The power mode button at the top right shows **the Windows power mode in effect 
 
 **⋯ → Find power-hungry background apps** is an inspection list, not an automatic action. It requires a valid CPU energy estimate and at least 75% observed CPU time, then considers only a verified, same-user, non-service background process with no visible window or visible/service-host ancestor, at least 60 seconds of sustained activity, and at least 0.5 W estimated CPU power. Up to five candidates are sorted by CPU watts. The app cannot infer the importance of sync, downloads, audio, unsaved work, or dependencies, and closing one is not guaranteed to save its displayed watts. It never suspends or closes candidates automatically.
 
+## Dynamic power saving (experimental, off by default)
+
+Turn it on from **⋯ → Dynamic power saving** or the settings page. On battery it adjusts power mode, processor energy preference, and CPU Boost to what you are doing (refresh rate switching is a separate option because the screen blinks when it switches):
+
+- **Activity:** idle, reading (10 s without input), in use (3 s after input), interactive, video or music, calls, heavy work, and full-screen games, from input time, sound, microphone/camera, full screen, and CPU use only.
+- **Fast up, slow down:** moves toward performance are immediate; moves toward saving wait until the activity has held for 6 s, and each setting has a minimum gap between changes.
+- **Respects others:** a setting changed by G-Helper or you is left alone for 10 minutes.
+- **Learns from the lab:** a saving is used only after an experiment on this PC proved it saves power without more late frames or slower responses; a proven cost vetoes it.
+- **Battery target:** with a 3, 5, or 8 hour target, each activity uses the next more saving profile when the estimate falls short.
+- **Background apps** busy for 30 s get efficiency mode (EcoQoS) until they come to the front.
+- **Restore:** plugging in, a full-screen game, turning it off, or quitting restores your settings, as does the next start after a crash. It pauses while the lab measures.
+
 ## Power lab (experimental)
 
 **⋯ → Power lab** measures on your own PC instead of guessing which settings help. All data stays in `%LOCALAPPDATA%\BatteryScope\lab`.
 
 - **Record detailed data:** every 2 seconds, also while the panel is hidden: battery watts, CPU package and core watts, their difference as "display, dGPU and the rest", system CPU use, time since the last input, whether sound is playing, whether the microphone or camera is in use, full-screen games, the foreground app, the refresh rate, whether the discrete GPU is awake and which apps use it, dropped frames reported by the Windows compositor, the power plan's CPU Boost and energy preference, and whether G-Helper runs (its config file is copied when it changes). One CSV per day, kept for 14 days.
 - **Power by activity:** battery time is split into idle, interactive, video or music, calls, heavy work, and full-screen games, each with the average power and its parts, plus how often the discrete GPU was awake.
+- **Automatic test (about 1.5 hours):** unplug and click once; it restores everything and exports to the desktop when done. Realistic, repeatable activities run in a separate full-screen Edge (or Chrome) profile: web browsing (article loads, smooth scrolling), 1080p VP9 video with sound, typing with spell check and autosave, a static page, plus sustained compute, so both settings of a pair face exactly the same work. It tests power mode, refresh rate, CPU Boost, energy preference, background-app efficiency mode, brightness, and finally screen off (display power directly), 3 pairs of 45-second blocks each, measuring late frames, dropped video frames, page-load and keystroke response times, work rate, and energy per unit of work. A snapshot of power plans, the battery report, hardware and drivers, brightness, processes, startup apps, running tasks, and services is saved at the end. Esc or closing the browser stops it. Without a browser it uses built-in loads. `BatteryScope.exe --autotest` also starts it.
 - **A/B experiments:** one setting at a time: CPU Boost on/off, processor energy preference, top refresh rate/60 Hz, power mode balanced/efficiency. On battery the setting alternates every 2 minutes in pairs of blocks in random order; the first 20 seconds of each block are skipped, and a block in which another program (such as G-Helper) changed the setting is discarded and repeated. After 8 pairs it stops and restores the setting; results compare the pairs for battery, CPU cores, display/dGPU/rest, CPU use, and dropped frames, with 95% ranges.
 - **Safety:** settings change only on battery, pause and restore when plugged in, and are restored after a stop, quit, or crash at the next start. The refresh rate change is temporary and not saved, so a restart also undoes it. CPU Boost and energy preference live in the active power plan; if Windows requires administrator rights the lab says so and never elevates itself.
 - **One-click export:** **Export (zip + copy summary)** zips the whole lab folder (daily CSVs, experiment blocks, G-Helper config copies and a summary) to the desktop and copies the summary text to the clipboard, ready to paste into a message. It uses the `tar.exe` built into Windows 10 1803 and later, and opens the folder instead when that is unavailable.
@@ -139,7 +152,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-To avoid replacing a running executable, use `-OutputDirectory dist/v0.13.1`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
+To avoid replacing a running executable, use `-OutputDirectory dist/v0.14.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
 
 ```powershell
 .\dist\BatteryScope.exe --demo

@@ -2,6 +2,7 @@
 #include "../src/energy.h"
 #include "../src/update.h"
 #include "../src/lab.h"
+#include "../src/governor.h"
 #include "../src/motion.h"
 #include "../src/i18n.h"
 #include <shellapi.h>
@@ -472,6 +473,116 @@ int wmain(int argc, wchar_t** argv) {
         lab::Sample s1 = labSample(clock, 8, 3, 1, lab::Context::idle); stopped.onSample(s1, 2);
         stopped.stop();
         check(fake->value == 2 && !stopped.active() && !fake->remembered, "stopping restores the original at once");
+        // Automatic test plan and its preparation phase.
+        const auto browserPlan = lab::automaticPlan(true), builtInPlan = lab::automaticPlan(false);
+        check(browserPlan.size() == 17 && browserPlan.back().knob == lab::Knob::display && builtInPlan.back().knob == lab::Knob::display
+            && std::all_of(browserPlan.begin(), browserPlan.end(), [](const lab::Step& step) { return step.pairs == 3 && step.blockSeconds == 45; }),
+            "the automatic test covers every setting, with screen-off last");
+        check(std::any_of(browserPlan.begin(), browserPlan.end(), [](const lab::Step& step) { return step.workload == lab::Workload::video && step.prepareSeconds >= 15; })
+            && std::none_of(builtInPlan.begin(), builtInPlan.end(), [](const lab::Step& step) { return step.workload == lab::Workload::video; }),
+            "real video runs only with a browser, after time to record the clip");
+        check(lab::experimentKey(lab::Knob::cpuBoost, lab::Workload::browse) == L"cpu-boost@browse" && lab::experimentKey(lab::Knob::refreshRate, lab::Workload::none) == L"refresh",
+            "experiment keys name the setting and the activity");
+        auto planned = std::make_shared<FakeActuator>();
+        lab::Controller sequence(L"", planned);
+        lab::Step first; first.knob = lab::Knob::cpuBoost; first.workload = lab::Workload::browse; first.pairs = 1; first.blockSeconds = 40;
+        first.warmupSeconds = 5; first.minimumSeconds = 20; first.prepareSeconds = 10;
+        lab::Step second = first; second.workload = lab::Workload::sustained; second.prepareSeconds = 0;
+        check(sequence.startPlan({first, second}) == ERROR_SUCCESS && sequence.workload() == lab::Workload::browse, "a plan starts with its first activity");
+        planned->value = 2; const DWORD appliedBefore = planned->applied;
+        uint64_t at = 50000;
+        auto feedPlan = [&](double secondsToFeed) {
+            for (double elapsed = 0; elapsed < secondsToFeed; elapsed += 2) {
+                lab::Sample s = labSample(at, 8, 3, 1, lab::Context::interactive);
+                s.workload.bursts = 1; s.workload.burstMs = 7;
+                sequence.onSample(s, 2); at += 2000;
+            }
+        };
+        feedPlan(8);
+        check(planned->applied == appliedBefore && sequence.status().arm == -1, "nothing is switched while the activity starts up");
+        feedPlan(4);
+        check(planned->applied > appliedBefore && sequence.status().arm >= 0, "blocks begin after the preparation time");
+        feedPlan(90);
+        check(sequence.workload() == lab::Workload::sustained && sequence.status().step == 1, "after its pairs, the next step's activity starts");
+        feedPlan(90);
+        const auto planStatus = sequence.status();
+        check(!planStatus.running && planStatus.finished && planned->value == 2 && !planned->remembered, "the plan ends with every setting restored");
+        bool burstsRecorded = false;
+        for (const auto& r : planStatus.results) burstsRecorded |= r.experiment == L"cpu-boost@browse" && r.bursts && std::abs(r.burstMs.mean0 - 7) < 1e-9;
+        check(burstsRecorded, "blocks keep the activity's response times");
+        // Dynamic power governor.
+        {
+            using gov::Setting;
+            gov::Governor governor;
+            gov::Input in; in.onBattery = true; in.context = lab::Context::interactive; in.idleSeconds = 1;
+            in.actual = {DWORD(2), DWORD(60), DWORD(0), DWORD(120)}; // best performance, EPP 60, boost off, 120 Hz
+            uint64_t now = 1000000;
+            auto step = [&](double seconds, lab::Context context, double idle) {
+                gov::Decision last;
+                for (double t = 0; t < seconds; t += 2) {
+                    in.ms = now; in.context = context; in.idleSeconds = idle + t;
+                    last = governor.update(in);
+                    for (size_t s = 0; s < last.apply.size(); ++s) if (last.apply[s]) in.actual[s] = *last.apply[s]; // the actuator obeys
+                    now += 2000;
+                }
+                return last;
+            };
+            step(2, lab::Context::interactive, 1);
+            check(governor.activity() == gov::Activity::responsive && in.actual[size_t(Setting::powerMode)] == DWORD(1) && in.actual[size_t(Setting::energyPreference)] == DWORD(40),
+                "right after input the governor gives a responsive profile");
+            check(in.actual[size_t(Setting::refreshRate)] == DWORD(120) && governor.originals()[size_t(Setting::powerMode)] == DWORD(2),
+                "refresh switching is off by default and the originals are kept");
+            step(4, lab::Context::interactive, 10);
+            check(governor.activity() == gov::Activity::responsive, "a move toward saving waits until the activity has settled");
+            step(10, lab::Context::interactive, 14);
+            check(governor.activity() == gov::Activity::reading && in.actual[size_t(Setting::powerMode)] == DWORD(0) && in.actual[size_t(Setting::energyPreference)] == DWORD(80),
+                "after settling, reading uses efficiency");
+            step(2, lab::Context::heavy, 0);
+            check(governor.activity() == gov::Activity::heavy && in.actual[size_t(Setting::powerMode)] == DWORD(2), "a move toward performance is immediate");
+            step(2, lab::Context::idle, 300);
+            check(governor.activity() == gov::Activity::heavy, "a short idle moment does not drop performance at once");
+            step(20, lab::Context::idle, 302);
+            check(governor.activity() == gov::Activity::idle && in.actual[size_t(Setting::energyPreference)] == DWORD(90), "a settled idle uses the most saving profile");
+            in.actual[size_t(Setting::energyPreference)] = 33; // G-Helper or the user changes it
+            step(2, lab::Context::idle, 330);
+            check(!governor.managing(Setting::energyPreference, now) && in.actual[size_t(Setting::energyPreference)] == DWORD(33),
+                "a setting changed by someone else is left alone for a while");
+            step(60, lab::Context::interactive, 1);
+            check(in.actual[size_t(Setting::energyPreference)] == DWORD(33) && in.actual[size_t(Setting::powerMode)] == DWORD(0),
+                "other settings keep being managed meanwhile");
+            in.onBattery = false;
+            const auto unplugged = governor.update(in);
+            check(unplugged.restore && unplugged.apply[size_t(Setting::powerMode)] == DWORD(2) && !unplugged.apply[size_t(Setting::energyPreference)],
+                "plugging in restores what the governor changed, and only that");
+            // Background apps.
+            gov::Governor apps; in.onBattery = true; in.context = lab::Context::interactive; in.idleSeconds = 30;
+            gov::BackgroundApp busy; busy.pid = 7; busy.created = 70; busy.name = L"sync.exe"; busy.cpu = 4;
+            gov::BackgroundApp front = busy; front.pid = 8; front.created = 80; front.foreground = true;
+            in.apps = {busy, front};
+            std::vector<std::pair<uint32_t, uint64_t>> throttledNow;
+            for (int i = 0; i < 20; ++i) { in.ms = now; now += 2000; auto d = apps.update(in); throttledNow.insert(throttledNow.end(), d.ecoOn.begin(), d.ecoOn.end()); }
+            check(throttledNow.size() == 1 && throttledNow[0].first == 7, "a background app busy for 30 seconds gets efficiency mode, the foreground app never");
+            in.apps[0].foreground = true; in.ms = now;
+            auto released = apps.update(in);
+            check(released.ecoOff.size() == 1 && released.ecoOff[0].first == 7, "an app brought to the front is released at once");
+            // Battery target and lab evidence.
+            gov::Options options; options.targetHours = 5.0;
+            gov::Governor target; target.setOptions(options);
+            check(target.profileFor(gov::Activity::interactive, true).values[size_t(Setting::energyPreference)] == DWORD(80),
+                "when the battery will not last to the target, activities use the next more saving profile");
+            lab::ExperimentResult saving; saving.experiment = L"cpu-boost@browse"; saving.arm0 = L"Boost 開"; saving.arm1 = L"Boost 關";
+            saving.battery = lab::comparePairs({{12, 11}, {12.2, 11.1}, {11.9, 10.9}}); saving.frames = true;
+            saving.drops = lab::comparePairs({{0, .2}, {0, 0}, {.1, .2}});
+            lab::ExperimentResult costly = saving; costly.experiment = L"epp@browse"; costly.arm0 = L"能源偏好 60"; costly.arm1 = L"能源偏好 85";
+            costly.drops = lab::comparePairs({{0, 3}, {0, 4}, {.5, 3}});
+            auto evidence = gov::learn({saving, costly});
+            check(evidence.size() == 4 && evidence[0].approved && evidence[0].savingValue == 0 && !evidence[2].approved,
+                "lab results become evidence: savings without cost are approved, savings with late frames are not");
+            gov::Governor learned; learned.setEvidence(evidence);
+            const auto learnedProfile = learned.profileFor(gov::Activity::interactive, false);
+            check(learnedProfile.values[size_t(Setting::cpuBoost)] == DWORD(0) && !learnedProfile.values[size_t(Setting::energyPreference)],
+                "an approved saving is used and a costly one is left to the user");
+        }
         CpuAttributor slowEstimator;
         report.cores = heterogeneous; report.coreWatts = 5; report.ready = true; report.intervalSeconds = 20;
         a.cpu = 25; a.fixedCoreBusy.clear(); b.cpu = 25; energyRows = {a,b};

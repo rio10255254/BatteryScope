@@ -91,6 +91,30 @@ const wchar_t* contextKey(Context context) {
     default: return L"";
     }
 }
+const wchar_t* workloadKey(Workload workload) {
+    switch (workload) {
+    case Workload::idle: return L"idle";
+    case Workload::scroll: return L"scroll";
+    case Workload::bursts: return L"bursts";
+    case Workload::sustained: return L"sustained";
+    case Workload::browse: return L"browse";
+    case Workload::video: return L"video";
+    case Workload::office: return L"office";
+    default: return L"";
+    }
+}
+const wchar_t* workloadName(Workload workload) {
+    switch (workload) {
+    case Workload::idle: return L"靜止畫面";
+    case Workload::scroll: return L"捲動頁面";
+    case Workload::bursts: return L"短暫運算";
+    case Workload::sustained: return L"持續運算";
+    case Workload::browse: return L"瀏覽網頁";
+    case Workload::video: return L"看影片";
+    case Workload::office: return L"打字文書";
+    default: return L"";
+    }
+}
 Value Sample::restWatts() const {
     if (!batteryWatts || !packageWatts || *batteryWatts < *packageWatts) return {};
     return *batteryWatts - *packageWatts;
@@ -98,7 +122,7 @@ Value Sample::restWatts() const {
 std::string csvHeader() {
     return "time,on_battery,battery_w,package_w,core_w,rest_w,system_cpu,idle_s,audio,call,fullscreen_game,context,"
            "foreground,refresh_hz,dgpu_percent,igpu_percent,dgpu_state,dgpu_apps,frames_composed,frames_dropped,refreshes,"
-           "boost_dc,epp_dc,ghelper,experiment,arm,block,counted\r\n";
+           "boost_dc,epp_dc,ghelper,experiment,arm,block,counted,top_processes,test_frames,test_late_frames,test_bursts,test_burst_ms,test_work\r\n";
 }
 std::string csvRow(const Sample& s) {
     static const char* contexts[] = {"idle", "interactive", "media", "call", "heavy", "game"};
@@ -109,7 +133,9 @@ std::string csvRow(const Sample& s) {
         << field(s.foreground) << ',' << s.refreshHz << ',' << number(s.dgpuPercent, 1) << ',' << number(s.igpuPercent, 1) << ','
         << s.dgpuState << ',' << field(s.dgpuApps) << ',' << number(s.framesComposed, 0) << ',' << number(s.framesDropped, 0) << ','
         << number(s.refreshes, 0) << ',' << s.boostDc << ',' << s.eppDc << ',' << s.ghelper << ',' << field(s.experiment) << ','
-        << s.arm << ',' << s.block << ',' << s.counted << "\r\n";
+        << s.arm << ',' << s.block << ',' << s.counted << ',' << field(s.topProcesses) << ',' << number(s.workload.frames, 0) << ','
+        << number(s.workload.lateFrames, 0) << ',' << number(s.workload.bursts, 0) << ',' << number(s.workload.burstMs, 1) << ','
+        << number(s.workload.work, 0) << "\r\n";
     return out.str();
 }
 
@@ -146,13 +172,13 @@ int Schedule::armFor(int block) const {
     return block % 2 == 0 ? first : 1 - first;
 }
 
-void BlockRecorder::begin(int pair, int arm, uint64_t ms) {
+void BlockRecorder::begin(int pair, int arm, uint64_t ms, double warmup, double minimum) {
     *this = BlockRecorder{};
-    pair_ = pair; arm_ = arm; start_ = ms;
+    pair_ = pair; arm_ = arm; start_ = ms; warmup_ = warmup; minimum_ = minimum;
 }
 bool BlockRecorder::add(const Sample& s, double seconds) {
     if (invalid_ || seconds <= 0 || seconds > 30 || s.ms < start_) return false;
-    if ((s.ms - start_) / 1000.0 < WarmupSeconds) return false; // the setting is still settling
+    if ((s.ms - start_) / 1000.0 < warmup_) return false; // the setting is still settling
     if (!s.onBattery || !s.batteryWatts) return false;
     seconds_ += seconds;
     battery_ += *s.batteryWatts * seconds;
@@ -161,22 +187,28 @@ bool BlockRecorder::add(const Sample& s, double seconds) {
     if (auto rest = s.restWatts()) { rest_ += *rest * seconds; restSeconds_ += seconds; }
     if (s.systemCpu) { cpu_ += *s.systemCpu * seconds; cpuSeconds_ += seconds; }
     drops_ += s.framesDropped; composed_ += s.framesComposed;
+    workload_.frames += s.workload.frames; workload_.lateFrames += s.workload.lateFrames;
+    workload_.bursts += s.workload.bursts; workload_.burstMs += s.workload.burstMs; workload_.work += s.workload.work;
     contexts_[size_t(s.context)] += seconds;
     return true;
 }
 bool BlockRecorder::finish(Block& b) const {
-    if (invalid_ || seconds_ < MinimumSeconds) return false;
+    if (invalid_ || seconds_ < minimum_) return false;
     b.pair = pair_; b.arm = arm_; b.seconds = seconds_;
     b.battery = battery_ / seconds_; b.package = package_ / seconds_; b.core = core_ / seconds_;
     b.rest = restSeconds_ > 0 ? rest_ / restSeconds_ : 0;
     b.cpu = cpuSeconds_ > 0 ? cpu_ / cpuSeconds_ : 0;
     b.dropsPerMinute = drops_ / (seconds_ / 60); b.composedPerSecond = composed_ / seconds_;
+    // The test window's own late frames are a better smoothness measure than the compositor's counters.
+    if (workload_.frames > 0) { b.dropsPerMinute = workload_.lateFrames / (seconds_ / 60); b.framesPerSecond = workload_.frames / seconds_; }
+    b.burstMs = workload_.bursts > 0 ? workload_.burstMs / workload_.bursts : 0;
+    b.workPerSecond = workload_.work / seconds_;
     for (size_t i = 0; i < contexts_.size(); ++i) b.contextShare[i] = contexts_[i] / seconds_;
     return true;
 }
 std::string Block::csvHeader() {
     return "experiment,run,pair,arm,arm_name,started,seconds,battery_w,package_w,core_w,rest_w,cpu_percent,"
-           "drops_per_min,composed_per_s,idle,interactive,media,call,heavy,game\r\n";
+           "drops_per_min,composed_per_s,idle,interactive,media,call,heavy,game,burst_ms,work_per_s,frames_per_s\r\n";
 }
 std::string Block::csv() const {
     std::ostringstream out;
@@ -184,7 +216,7 @@ std::string Block::csv() const {
         << number(seconds, 0) << ',' << number(battery) << ',' << number(package) << ',' << number(core) << ',' << number(rest) << ','
         << number(cpu, 1) << ',' << number(dropsPerMinute, 2) << ',' << number(composedPerSecond, 2);
     for (double share : contextShare) out << ',' << number(share, 3);
-    out << "\r\n";
+    out << ',' << number(burstMs, 3) << ',' << number(workPerSecond, 1) << ',' << number(framesPerSecond, 2) << "\r\n";
     return out.str();
 }
 bool Block::parse(const std::string& line, Block& b) {
@@ -196,6 +228,7 @@ bool Block::parse(const std::string& line, Block& b) {
         b.battery = std::stod(f[7]); b.package = std::stod(f[8]); b.core = std::stod(f[9]); b.rest = std::stod(f[10]);
         b.cpu = std::stod(f[11]); b.dropsPerMinute = std::stod(f[12]); b.composedPerSecond = std::stod(f[13]);
         for (size_t i = 0; i < b.contextShare.size(); ++i) b.contextShare[i] = std::stod(f[14 + i]);
+        if (f.size() >= 23) { b.burstMs = std::stod(f[20]); b.workPerSecond = std::stod(f[21]); b.framesPerSecond = std::stod(f[22]); }
     } catch (...) { return false; }
     return (b.arm == 0 || b.arm == 1) && b.seconds > 0 && !b.experiment.empty();
 }
@@ -226,16 +259,25 @@ std::vector<ExperimentResult> analyze(const std::vector<Block>& blocks) {
     for (const auto& [experiment, pairs] : grouped) {
         ExperimentResult r; r.experiment = experiment;
         r.arm0 = names[experiment][0]; r.arm1 = names[experiment][1];
-        std::vector<std::pair<double, double>> battery, package, core, rest, cpu, drops;
+        std::vector<std::pair<double, double>> battery, package, core, rest, cpu, drops, burst, work, perWork;
         for (const auto& item : pairs) {
             const Block* a = item.second[0]; const Block* b = item.second[1];
             if (!a || !b) continue; // only complete pairs
             battery.emplace_back(a->battery, b->battery); package.emplace_back(a->package, b->package);
             core.emplace_back(a->core, b->core); rest.emplace_back(a->rest, b->rest);
             cpu.emplace_back(a->cpu, b->cpu); drops.emplace_back(a->dropsPerMinute, b->dropsPerMinute);
+            r.frames |= a->framesPerSecond > 0 && b->framesPerSecond > 0;
+            if (a->burstMs > 0 && b->burstMs > 0) { burst.emplace_back(a->burstMs, b->burstMs); r.bursts = true; }
+            if (a->workPerSecond > 0 && b->workPerSecond > 0) {
+                work.emplace_back(a->workPerSecond, b->workPerSecond);
+                // Energy per unit of work: watts divided by work per second.
+                perWork.emplace_back(a->battery / a->workPerSecond * 1e6, b->battery / b->workPerSecond * 1e6);
+                r.work = true;
+            }
         }
         r.battery = comparePairs(battery); r.package = comparePairs(package); r.core = comparePairs(core);
         r.rest = comparePairs(rest); r.cpu = comparePairs(cpu); r.drops = comparePairs(drops);
+        r.burstMs = comparePairs(burst); r.workRate = comparePairs(work); r.energyPerWork = comparePairs(perWork);
         results.push_back(std::move(r));
     }
     return results;

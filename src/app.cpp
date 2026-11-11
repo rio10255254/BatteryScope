@@ -5,6 +5,7 @@
 #include "version.h"
 #include "update.h"
 #include "lab.h"
+#include "governor.h"
 #include "ui.h"
 #include <commctrl.h>
 #include <shellapi.h>
@@ -30,7 +31,7 @@
 namespace {
 using namespace bs;
 constexpr UINT SampleMessage = WM_APP + 1, TrayMessage = WM_APP + 2, ActionMessage = WM_APP + 3, RefreshMessage = WM_APP + 4,
-    PowerModeMessage = WM_APP + 5, UpdateMessage = WM_APP + 6, UpdateDownloadedMessage = WM_APP + 7;
+    PowerModeMessage = WM_APP + 5, UpdateMessage = WM_APP + 6, UpdateDownloadedMessage = WM_APP + 7, LabExportMessage = WM_APP + 8;
 constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, DetailsId = 104,
     BackgroundId = 105, AllId = 106, StartupId = 107, HideId = 108, MenuId = 109,
     LanguageZhId = 110, LanguageEnId = 111, PowerDetailsId = 112, PowerModeId = 113,
@@ -44,7 +45,9 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     SleepAlertId = 157, AutoSaverOffId = 158, AutoSaver20Id = 159, AutoSaver30Id = 160, PerfAppsPageId = 161, ClearPerfAppsId = 162,
     EcoToggleId = 163, PerfAppToggleId = 164, MascotToggleId = 165, ShareCardId = 166, MiniToggleId = 167, MiniOpenId = 168,
     UpdateCheckId = 169, UpdateNowId = 170, UpdateInstallId = 171,
-    LabPageId = 172, LabRecordId = 173, LabExperimentId = 174 /* ..177, one per knob */, LabStopId = 178, LabFolderId = 179, LabExportId = 180,
+    LabPageId = 172, LabRecordId = 173, LabExperimentId = 174 /* ..177, one per knob */, LabStopId = 178, LabFolderId = 179, LabExportId = 180, LabAutoId = 181, LabAutoStartId = 182,
+    DynamicToggleId = 183, DynamicPageId = 184, DynamicRefreshId = 185, DynamicEcoId = 186, DynamicTargetId = 187, SettingsPageId = 188,
+    SettingsListId = 300,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1;
 const wchar_t* ClassName = L"BatteryScope.Main.v1";
@@ -94,7 +97,7 @@ void* effectiveWatch = nullptr;
 PowerModes powerModes;
 HWND modeButtons[6] = {}, restoreModesButton = nullptr, energySettingsButton = nullptr;
 bool isolatedPreview = false;
-enum class InlinePage { none, process, power, candidates, ledger, powerMode, history, perfApps, lab, confirm, error };
+enum class InlinePage { none, process, power, candidates, ledger, powerMode, history, perfApps, lab, settings, dynamic, confirm, error };
 unsigned lowBatteryThreshold = 0; // percent; 0 = off
 LowBatteryMonitor lowBattery;
 bool hotkeyEnabled = false, hotkeyRegistered = false;
@@ -104,6 +107,10 @@ std::set<std::pair<uint32_t, uint64_t>> drainNotified;
 uint64_t lastDrainAlert = 0;
 enum class BalloonTarget { none, candidates, powerDetails, update };
 bool updateChecks = true; // daily update check, on unless turned off
+// Dynamic power saving (the governor), opt-in. Target 0 means no battery target.
+bool dynamicEnabled = false, dynamicRefresh = false, dynamicEco = true;
+unsigned dynamicTarget = 0;
+HWND settingsList = nullptr;
 BalloonTarget balloonTarget = BalloonTarget::none;  // what clicking the last notification opens
 bool sleepAlerts = true;          // notify after a sleep with unusual battery drain
 unsigned seenSleeps = 0;
@@ -137,8 +144,13 @@ bool isEfficient(const ProcessRow& row) {
 bool performanceListed(const ProcessRow& row) { return !row.name.empty() && performanceApps.count(lowerName(row.name)) != 0; }
 void refreshPowerModeControls();
 void showLabPage();
+void showSettingsPage();
+void showDynamicPage();
 // The power lab; absent in demo and preview modes.
 std::unique_ptr<bs::lab::Controller> labController;
+std::unique_ptr<bs::lab::WorkloadEngine> labEngine; // the automatic test's loads and window
+bool autoTestActive = false;
+void exportLab();
 // Learned charging curve and detected charge limit, saved under HKCU\Software\BatteryScope.
 ChargeCurve chargeCurve;
 std::optional<int> chargeLimit;
@@ -154,7 +166,7 @@ std::optional<ProcessRow> pendingForceRow;
 std::wstring notice = tr(L"正在讀取電池與程序資料…");
 uint64_t noticeUntil = 0;
 std::deque<uint64_t> actionMarks;
-constexpr UINT_PTR MotionTimer = 92, NoticeTimer = 93, UpdateTimer = 94;
+constexpr UINT_PTR MotionTimer = 92, NoticeTimer = 93, UpdateTimer = 94, GovernorTimer = 95;
 constexpr int PanelWidth = 360, PanelHeight = 640, RowHeight = 51;
 bool motionEnabled = true, suppressMotion = false, panelTargetShown = false, motionTimerRunning = false;
 double motionNow() {
@@ -270,6 +282,238 @@ void card(HDC dc, RECT rect, COLORREF color, int radius) {
 int textWidth(HDC dc, const std::wstring& text, HFONT face) {
     font(dc, fontFor(face, text)); SIZE size{}; GetTextExtentPoint32W(dc, text.c_str(), int(text.size()), &size); return size.cx;
 }
+// ----- Menus -----
+// One menu look for the whole app instead of the Windows popup menu: the same
+// surface, borders, fonts and pixel or smooth style as the panel, larger rows,
+// a check pill for options that are on, and submenus that open in place with a
+// back row (no flyouts drifting off the panel). Works with the mouse, the
+// keyboard (arrows, Enter, Esc, Left/Backspace for back) and touch.
+struct MenuItem {
+    int id = 0;                       // command sent on choose; 0 for separators and submenus
+    std::wstring label, hint;         // hint: a short value on the right, e.g. "開"
+    bool checked = false, disabled = false, separator = false;
+    std::vector<MenuItem> children;   // non-empty: a submenu
+};
+MenuItem menuItem(int id, const std::wstring& label, bool checked = false, bool disabled = false) {
+    MenuItem item; item.id = id; item.label = label; item.checked = checked; item.disabled = disabled; return item;
+}
+MenuItem menuSeparator() { MenuItem item; item.separator = true; return item; }
+MenuItem submenu(const std::wstring& label, std::vector<MenuItem> children, bool disabled = false) {
+    MenuItem item; item.label = label; item.children = std::move(children); item.disabled = disabled; return item;
+}
+struct MenuState {
+    std::vector<const std::vector<MenuItem>*> levels; // the open level is last
+    std::vector<std::wstring> titles;
+    int hover = -1, chosen = 0;
+    bool done = false;
+    const std::vector<MenuItem>& items() const { return *levels.back(); }
+    bool nested() const { return levels.size() > 1; }
+};
+constexpr wchar_t PopupClass[] = L"BatteryScope.Menu.v1";
+int menuRowHeight(const MenuItem& item) { return item.separator ? sp(11) : sp(36); }
+int menuHeaderHeight(const MenuState& state) { return state.nested() ? sp(38) : 0; }
+int menuPadding() { return sp(6); }
+SIZE menuSize(HDC dc, const MenuState& state) {
+    int width = sp(212), height = menuPadding() * 2 + menuHeaderHeight(state);
+    for (const auto& item : state.items()) {
+        height += menuRowHeight(item);
+        if (!item.separator) width = std::max(width, textWidth(dc, item.label, normalFont) + sp(item.children.empty() ? 92 : 64));
+    }
+    if (state.nested()) width = std::max(width, textWidth(dc, state.titles.back(), strongFont) + sp(64));
+    return {std::min(width, sp(340)), height};
+}
+// Row rectangles in client coordinates; index -1 is the back header.
+RECT menuRow(const MenuState& state, int index, int width) {
+    int y = menuPadding();
+    if (index < 0) return {menuPadding(), y, width - menuPadding(), y + menuHeaderHeight(state)};
+    y += menuHeaderHeight(state);
+    for (int i = 0; i < index; ++i) y += menuRowHeight(state.items()[size_t(i)]);
+    return {menuPadding(), y, width - menuPadding(), y + menuRowHeight(state.items()[size_t(index)])};
+}
+void drawMenuArrow(HDC dc, int x, int y, int size, COLORREF color, bool left) {
+    // A small chevron; pixel style draws it from square cells.
+    if (pixelStyle) {
+        const int u = std::max(2, size / 4);
+        for (int i = 0; i < 3; ++i) {
+            const int cx = left ? x + (2 - i) * u : x + i * u;
+            fill(dc, {cx, y + i * u, cx + u, y + i * u + u}, color);
+            fill(dc, {cx, y + (4 - i) * u, cx + u, y + (4 - i) * u + u}, color);
+        }
+        return;
+    }
+    HPEN pen = CreatePen(PS_SOLID, std::max(1, sp(2)), color); HGDIOBJ old = SelectObject(dc, pen);
+    const int h = size / 2;
+    if (left) { MoveToEx(dc, x + h, y, nullptr); LineTo(dc, x, y + h); LineTo(dc, x + h + 1, y + size + 1); }
+    else { MoveToEx(dc, x, y, nullptr); LineTo(dc, x + h, y + h); LineTo(dc, x - 1, y + size + 1); }
+    SelectObject(dc, old); DeleteObject(pen);
+}
+void paintMenu(HDC dc, const MenuState& state, RECT client) {
+    const int width = client.right - client.left;
+    fill(dc, client, Background);
+    card(dc, client, Surface, 12);
+    if (!pixelStyle) outline(dc, client, blend(Border, Surface, .2), 12);
+    if (state.nested()) {
+        const RECT header = menuRow(state, -1, width);
+        if (state.hover == -2) rounded(dc, header, blend(Surface, Selected, .55), 8);
+        drawMenuArrow(dc, header.left + sp(12), (header.top + header.bottom) / 2 - sp(5), sp(10), Muted, true);
+        drawText(dc, state.titles.back(), {header.left + sp(30), header.top, header.right - sp(10), header.bottom}, Ink, pixelStyle ? normalFont : strongFont);
+        fill(dc, {header.left + sp(4), header.bottom - 1, header.right - sp(4), header.bottom}, Border);
+    }
+    for (int i = 0; i < int(state.items().size()); ++i) {
+        const auto& item = state.items()[size_t(i)];
+        const RECT row = menuRow(state, i, width);
+        if (item.separator) { fill(dc, {row.left + sp(8), (row.top + row.bottom) / 2, row.right - sp(8), (row.top + row.bottom) / 2 + 1}, Border); continue; }
+        const bool hot = i == state.hover && !item.disabled;
+        if (hot) rounded(dc, {row.left, row.top + sp(1), row.right, row.bottom - sp(1)}, theme.highContrast ? Selected : blend(Surface, Selected, .6), 8);
+        const COLORREF text = item.disabled ? blend(Muted, Surface, .35) : hot && theme.highContrast ? theme.selectedInk : Ink;
+        int right = row.right - sp(12);
+        if (!item.children.empty()) { drawMenuArrow(dc, right - sp(6), (row.top + row.bottom) / 2 - sp(5), sp(10), item.disabled ? text : Muted, false); right -= sp(18); }
+        else if (item.checked || !item.hint.empty()) {
+            // An "on" pill for checked options, or the item's value.
+            const std::wstring value = !item.hint.empty() ? item.hint : std::wstring(tr(L"開"));
+            const int pillWidth = std::max(sp(34), textWidth(dc, value, smallFont) + sp(16));
+            const RECT pill{right - pillWidth, row.top + sp(8), right, row.bottom - sp(8)};
+            rounded(dc, pill, item.checked ? blend(Green, Surface, theme.highContrast ? 0 : .25) : blend(Surface, Border, .9), 6);
+            drawText(dc, value, pill, item.checked ? theme.accentInk : Muted, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            right = pill.left - sp(8);
+        }
+        drawText(dc, item.label, {row.left + sp(12), row.top, right, row.bottom}, text, normalFont);
+    }
+}
+LRESULT CALLBACK menuProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    auto* state = reinterpret_cast<MenuState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    auto hitTest = [&](POINT pt) {
+        RECT client{}; GetClientRect(window, &client);
+        if (state->nested()) { const RECT header = menuRow(*state, -1, client.right); if (PtInRect(&header, pt)) return -2; }
+        for (int i = 0; i < int(state->items().size()); ++i) { const RECT row = menuRow(*state, i, client.right); if (PtInRect(&row, pt)) return i; }
+        return -1;
+    };
+    switch (message) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps{}; HDC target = BeginPaint(window, &ps); RECT r{}; GetClientRect(window, &r);
+        HDC dc = CreateCompatibleDC(target); HBITMAP bitmap = CreateCompatibleBitmap(target, r.right, r.bottom);
+        HGDIOBJ old = SelectObject(dc, bitmap);
+        if (state) paintMenu(dc, *state, r);
+        BitBlt(target, 0, 0, r.right, r.bottom, dc, 0, 0, SRCCOPY);
+        SelectObject(dc, old); DeleteObject(bitmap); DeleteDC(dc); EndPaint(window, &ps); return 0;
+    }
+    case WM_MOUSEMOVE: {
+        if (!state) break;
+        const int hit = hitTest({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+        if (hit != state->hover) { state->hover = hit; InvalidateRect(window, nullptr, FALSE); }
+        TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0}; TrackMouseEvent(&tracking);
+        return 0;
+    }
+    case WM_MOUSELEAVE: if (state && state->hover >= 0) { state->hover = -1; InvalidateRect(window, nullptr, FALSE); } return 0;
+    case WM_LBUTTONUP: case WM_RBUTTONUP: {
+        if (!state) break;
+        const int hit = hitTest({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+        if (hit == -2) { PostMessageW(window, WM_KEYDOWN, VK_LEFT, 0); return 0; }
+        if (hit >= 0) { state->hover = hit; PostMessageW(window, WM_KEYDOWN, VK_RETURN, 0); }
+        return 0;
+    }
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: {
+        // With the mouse captured, a press outside the menu arrives here too and closes it.
+        RECT client{}; GetClientRect(window, &client);
+        const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        if (state && !PtInRect(&client, pt)) { state->done = true; PostMessageW(window, WM_NULL, 0, 0); }
+        return 0;
+    }
+    case WM_ACTIVATE: case WM_CAPTURECHANGED: // switched to another window, or capture lost
+        if (state && (message == WM_CAPTURECHANGED ? HWND(lp) != window : LOWORD(wp) == WA_INACTIVE)) {
+            state->done = true; PostMessageW(window, WM_NULL, 0, 0);
+        }
+        return 0;
+    case WM_KEYDOWN: {
+        if (!state) break;
+        const auto& items = state->items();
+        auto move = [&](int step) {
+            for (int n = 0, i = state->hover; n < int(items.size()); ++n) {
+                i = (i + step + int(items.size())) % int(items.size());
+                if (!items[size_t(i)].separator && !items[size_t(i)].disabled) { state->hover = i; break; }
+            }
+        };
+        if (wp == VK_DOWN) move(1);
+        else if (wp == VK_UP) move(state->hover < 0 ? 0 : -1);
+        else if (wp == VK_ESCAPE && !state->nested()) state->done = true;
+        else if ((wp == VK_LEFT || wp == VK_BACK || wp == VK_ESCAPE) && state->nested()) {
+            state->levels.pop_back(); state->titles.pop_back(); state->hover = -1;
+        } else if ((wp == VK_RETURN || wp == VK_SPACE || wp == VK_RIGHT) && state->hover >= 0 && state->hover < int(items.size())) {
+            const auto& item = items[size_t(state->hover)];
+            if (item.disabled || item.separator) return 0;
+            if (!item.children.empty()) { state->levels.push_back(&item.children); state->titles.push_back(item.label); state->hover = -1; }
+            else if (wp != VK_RIGHT) { state->chosen = item.id; state->done = true; }
+        } else return 0;
+        // Resize for the level now open, keeping the top-left corner in place.
+        RECT bounds{}; GetWindowRect(window, &bounds);
+        HDC dc = GetDC(window); const SIZE size = menuSize(dc, *state); ReleaseDC(window, dc);
+        MONITORINFO monitor{}; monitor.cbSize = sizeof(monitor);
+        GetMonitorInfoW(MonitorFromRect(&bounds, MONITOR_DEFAULTTONEAREST), &monitor);
+        const int top = std::min(bounds.top, monitor.rcWork.bottom - size.cy), left = std::min(bounds.left, monitor.rcWork.right - size.cx);
+        SetWindowPos(window, nullptr, left, top, size.cx, size.cy, SWP_NOZORDER | SWP_NOACTIVATE);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    }
+    }
+    return DefWindowProcW(window, message, wp, lp);
+}
+// Shows the menu at a screen point (opening upward or leftward to stay on
+// screen) and returns the chosen command, or 0. Runs its own message loop.
+int showMenu(const std::vector<MenuItem>& items, POINT at, HWND owner) {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{}; wc.cbSize = sizeof(wc); wc.lpfnWndProc = menuProc; wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = PopupClass; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.style = CS_DROPSHADOW;
+        registered = RegisterClassExW(&wc) != 0;
+    }
+    MenuState state; state.levels.push_back(&items); state.titles.push_back(L"");
+    HDC screen = GetDC(nullptr); const SIZE size = menuSize(screen, state); ReleaseDC(nullptr, screen);
+    MONITORINFO monitor{}; monitor.cbSize = sizeof(monitor);
+    GetMonitorInfoW(MonitorFromPoint(at, MONITOR_DEFAULTTONEAREST), &monitor);
+    const RECT work = monitor.rcWork;
+    int x = at.x, y = at.y;
+    if (x + size.cx > work.right) x = std::max(work.left, at.x - size.cx);
+    if (y + size.cy > work.bottom) y = std::max(work.top, at.y - size.cy);
+    HWND window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, PopupClass, L"", WS_POPUP, x, y, size.cx, size.cy, owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!window) return 0;
+    SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&state));
+    if (!pixelStyle) { DWORD corners = 2; DwmSetWindowAttribute(window, 33, &corners, sizeof(corners)); }
+    ShowWindow(window, SW_SHOW); SetForegroundWindow(window); SetFocus(window); SetCapture(window);
+    MSG message;
+    while (!state.done && GetMessageW(&message, nullptr, 0, 0)) {
+        // A click anywhere else closes the menu without passing the click on.
+        if ((message.message == WM_LBUTTONDOWN || message.message == WM_RBUTTONDOWN || message.message == WM_NCLBUTTONDOWN) && message.hwnd != window) { state.done = true; break; }
+        if (message.message == WM_KEYDOWN && message.hwnd != window) message.hwnd = window;
+        TranslateMessage(&message); DispatchMessageW(&message);
+        if (message.message == WM_QUIT) { PostQuitMessage(int(message.wParam)); break; }
+    }
+    SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+    if (GetCapture() == window) ReleaseCapture();
+    DestroyWindow(window);
+    return state.chosen;
+}
+// The same rendering into a bitmap file, for screenshots and checks.
+bool captureMenu(const std::vector<MenuItem>& items, const std::wstring& path, int open) {
+    MenuState state; state.levels.push_back(&items); state.titles.push_back(L"");
+    if (open >= 0 && open < int(items.size()) && !items[size_t(open)].children.empty()) {
+        state.levels.push_back(&items[size_t(open)].children); state.titles.push_back(items[size_t(open)].label);
+    }
+    state.hover = 1;
+    HDC screen = GetDC(nullptr); const SIZE size = menuSize(screen, state);
+    HDC dc = CreateCompatibleDC(screen);
+    BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(info.bmiHeader); info.bmiHeader.biWidth = size.cx; info.bmiHeader.biHeight = size.cy;
+    info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32;
+    void* pixels = nullptr; HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+    HGDIOBJ old = SelectObject(dc, bitmap);
+    paintMenu(dc, state, {0, 0, size.cx, size.cy}); GdiFlush();
+    BITMAPFILEHEADER file{}; file.bfType = 0x4d42; file.bfOffBits = sizeof(file) + sizeof(BITMAPINFOHEADER); file.bfSize = file.bfOffBits + size.cx * size.cy * 4;
+    std::ofstream output(std::filesystem::path(path), std::ios::binary);
+    output.write(reinterpret_cast<char*>(&file), sizeof(file)); output.write(reinterpret_cast<char*>(&info.bmiHeader), sizeof(info.bmiHeader));
+    output.write(static_cast<char*>(pixels), size.cx * size.cy * 4);
+    const bool ok = output.good();
+    SelectObject(dc, old); DeleteObject(bitmap); DeleteDC(dc); ReleaseDC(nullptr, screen);
+    return ok;
+}
 // "About 1 h 5 min"; empty when there is no usable estimate.
 std::wstring durationText(Value hours) {
     if (!hours || *hours >= 100) return {};
@@ -366,7 +610,7 @@ void applyTheme() {
     Surface = theme.surface; Border = theme.border; Selected = theme.selected; Danger = theme.danger;
     if (!mainWindow) return;
     const wchar_t* controls = theme.highContrast ? nullptr : theme.dark ? L"DarkMode_Explorer" : L"Explorer";
-    for (HWND control : {viewport, list, inlineText}) if (control) SetWindowTheme(control, controls, nullptr);
+    for (HWND control : {viewport, list, inlineText, settingsList}) if (control) SetWindowTheme(control, controls, nullptr);
     if (list) { ListView_SetBkColor(list, Background); ListView_SetTextBkColor(list, Background); ListView_SetTextColor(list, Ink); }
     if (tooltip) { SendMessageW(tooltip, TTM_SETTIPBKCOLOR, Surface, 0); SendMessageW(tooltip, TTM_SETTIPTEXTCOLOR, Ink, 0); }
     BOOL dark = theme.dark; DwmSetWindowAttribute(mainWindow, 20, &dark, sizeof(dark));
@@ -883,6 +1127,7 @@ void layout() {
     MoveWindow(menuButton, w - sp(92), sp(16), sp(32), sp(30), TRUE);
     MoveWindow(hideButton, w - sp(52), sp(16), sp(32), sp(30), TRUE);
     const bool fullPage = inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history || inlinePage == InlinePage::lab ||
+        inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic ||
         inlinePage == InlinePage::confirm || inlinePage == InlinePage::error;
     const int textTop = inlinePage == InlinePage::powerMode ? sp(318) : inlinePage == InlinePage::history ? sp(262) : fullPage ? sp(128) : top - sp(37);
     {
@@ -895,6 +1140,7 @@ void layout() {
     }
     const int textBottom = inlinePage == InlinePage::process ? h - sp(140) : h - sp(94);
     MoveWindow(inlineText, margin + sp(12), textTop, inner - sp(24), std::max(sp(55), textBottom - textTop), TRUE);
+    if (settingsList) MoveWindow(settingsList, margin + sp(8), textTop - sp(4), inner - sp(16), std::max(sp(55), textBottom - textTop + sp(4)), TRUE);
     {
         const int pageLeft = margin + sp(12), pageWidth = inner - sp(24), pageHalf = (pageWidth - sp(8)) / 2;
         MoveWindow(ecoButton, pageLeft, h - sp(103), pageHalf, sp(32), TRUE);
@@ -930,19 +1176,20 @@ void showInlinePage(InlinePage page, const std::wstring& title, const std::wstri
     }
     SetWindowTextW(inlineText, lines.c_str());
     ShowScrollBar(inlineText, SB_VERT, page == InlinePage::process || page == InlinePage::power || page == InlinePage::ledger ||
-        page == InlinePage::powerMode || page == InlinePage::history || page == InlinePage::lab ||
+        page == InlinePage::powerMode || page == InlinePage::history || page == InlinePage::lab || page == InlinePage::dynamic ||
         (page == InlinePage::candidates && lines.size() > 500));
     SendMessageW(inlineText, EM_SETSEL, 0, 0);
     SendMessageW(inlineText, EM_SCROLLCARET, 0, 0);
     for (auto control : {viewport, closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck}) ShowWindow(control, SW_HIDE);
-    ShowWindow(inlineText, SW_SHOW); ShowWindow(inlineBack, SW_SHOW);
+    ShowWindow(inlineText, page == InlinePage::settings ? SW_HIDE : SW_SHOW); ShowWindow(inlineBack, SW_SHOW);
+    if (settingsList) ShowWindow(settingsList, page == InlinePage::settings ? SW_SHOW : SW_HIDE);
     ShowWindow(inlineConfirm, page == InlinePage::confirm ? SW_SHOW : SW_HIDE);
     for (HWND control : modeButtons) ShowWindow(control, page == InlinePage::powerMode ? SW_SHOW : SW_HIDE);
     for (HWND control : {ecoButton, perfAppButton}) ShowWindow(control, page == InlinePage::process ? SW_SHOW : SW_HIDE);
     for (HWND control : {restoreModesButton, energySettingsButton}) ShowWindow(control, page == InlinePage::powerMode ? SW_SHOW : SW_HIDE);
     SetWindowTextW(inlineBack, page == InlinePage::confirm ? tr(L"取消") : tr(L"返回排行"));
     layout();
-    HWND focus = page == InlinePage::confirm ? inlineBack : inlineText;
+    HWND focus = page == InlinePage::confirm ? inlineBack : page == InlinePage::settings ? settingsList : inlineText;
     if (page == InlinePage::powerMode) {
         focus = inlineBack;
         for (HWND control : modeButtons) if (IsWindowEnabled(control)) { focus = control; break; }
@@ -953,6 +1200,7 @@ void finishInlineClose() {
     inlinePage = InlinePage::none; inlineTitle.clear(); inlineProcess.reset(); pendingForceRow.reset();
     inlineClosing = false;
     ShowWindow(inlineText, SW_HIDE); ShowWindow(inlineBack, SW_HIDE); ShowWindow(inlineConfirm, SW_HIDE);
+    if (settingsList) ShowWindow(settingsList, SW_HIDE);
     for (HWND control : modeButtons) ShowWindow(control, SW_HIDE);
     ShowWindow(restoreModesButton, SW_HIDE); ShowWindow(energySettingsButton, SW_HIDE);
     ShowWindow(ecoButton, SW_HIDE); ShowWindow(perfAppButton, SW_HIDE);
@@ -1139,7 +1387,8 @@ void paint(HDC dc, RECT bounds) {
     }
     drawText(dc, demo ? tr(L"示範資料 · 關閉操作已停用") : tr(L"電池與背景活動"), {margin + sp(30), sp(39), w - sp(96), sp(60)}, Muted, smallFont);
     if (inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history ||
-        inlinePage == InlinePage::lab || inlinePage == InlinePage::confirm || inlinePage == InlinePage::error) {
+        inlinePage == InlinePage::lab || inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic ||
+        inlinePage == InlinePage::confirm || inlinePage == InlinePage::error) {
         card(dc, {margin, sp(74), right, h - sp(14)}, Surface, 14);
         drawText(dc, inlineTitle, {margin + sp(14), sp(84), right - sp(14), sp(114)}, Ink, titleFont);
         fill(dc, {margin + sp(14), sp(119), right - sp(14), sp(119) + 1}, Border);
@@ -1592,12 +1841,8 @@ LRESULT CALLBACK miniProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_NCHITTEST: { LRESULT hit = DefWindowProcW(window, message, wp, lp); return hit == HTCLIENT ? HTCAPTION : hit; }
     case WM_NCLBUTTONDBLCLK: showMain(); return 0;
     case WM_NCRBUTTONUP: case WM_CONTEXTMENU: {
-        HMENU menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING, MiniOpenId, tr(L"開啟面板"));
-        AppendMenuW(menu, MF_STRING, MiniToggleId, tr(L"隱藏迷你視窗"));
-        POINT point{}; GetCursorPos(&point); SetForegroundWindow(window);
-        const int chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, window, nullptr);
-        DestroyMenu(menu);
+        POINT point{}; GetCursorPos(&point);
+        const int chosen = showMenu({menuItem(MiniOpenId, tr(L"開啟面板")), menuItem(MiniToggleId, tr(L"隱藏迷你視窗"))}, point, window);
         if (chosen == MiniOpenId) showMain(); else if (chosen == MiniToggleId) PostMessageW(mainWindow, WM_COMMAND, MiniToggleId, 0);
         return 0;
     }
@@ -1674,6 +1919,11 @@ void loadSettings() {
     miniEnabled = readSetting(L"MiniWindow", 0) == 1;
     historyEnabled = readSetting(L"History", 1) != 0;
     updateChecks = readSetting(L"UpdateCheck", 1) != 0;
+    dynamicEnabled = readSetting(L"Dynamic", 0) == 1;
+    dynamicRefresh = readSetting(L"DynamicRefresh", 0) == 1;
+    dynamicEco = readSetting(L"DynamicEco", 1) != 0;
+    dynamicTarget = readSetting(L"DynamicTarget", 0);
+    if (dynamicTarget != 3 && dynamicTarget != 5 && dynamicTarget != 8) dynamicTarget = 0;
     std::vector<uint8_t> curve(512); DWORD curveBytes = DWORD(curve.size());
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\BatteryScope", L"ChargeCurve", RRF_RT_REG_BINARY, nullptr, curve.data(), &curveBytes) == ERROR_SUCCESS) {
         curve.resize(curveBytes); chargeCurve.load(curve);
@@ -1860,12 +2110,25 @@ void showHistoryPage() {
 }
 // The power lab page: where battery power goes per activity, the running
 // experiment, and every experiment's paired result so far.
+std::wstring labExperimentTitle(const std::wstring& key);
 const wchar_t* labKnobTitle(const std::wstring& key) {
     if (key == L"cpu-boost") return tr(L"CPU Boost");
     if (key == L"epp") return tr(L"處理器能源偏好");
     if (key == L"refresh") return tr(L"螢幕更新率");
     if (key == L"power-mode") return tr(L"電源模式");
+    if (key == L"brightness") return tr(L"螢幕亮度");
+    if (key == L"display") return tr(L"螢幕開關");
+    if (key == L"background-eco") return tr(L"背景程式效率模式");
     return L"";
+}
+// "cpu-boost@scroll" -> "CPU Boost · 捲動頁面".
+std::wstring labExperimentTitle(const std::wstring& key) {
+    const size_t at = key.find(L'@');
+    std::wstring title = labKnobTitle(key.substr(0, at));
+    if (at != std::wstring::npos)
+        for (int i = 1; i < int(bs::lab::Workload::count); ++i)
+            if (key.substr(at + 1) == bs::lab::workloadKey(bs::lab::Workload(i))) title += L" · " + std::wstring(tr(bs::lab::workloadName(bs::lab::Workload(i))));
+    return title;
 }
 std::wstring signedNumber(double value, int precision) {
     return (value >= 0 ? L"+" : L"−") + number(std::abs(value), precision);
@@ -1874,6 +2137,8 @@ std::wstring signedNumber(double value, int precision) {
 std::wstring labArm(const std::wstring& name) {
     const std::wstring prefix = L"能源偏好 ";
     if (name.rfind(prefix, 0) == 0) return tr(L"能源偏好 ") + name.substr(prefix.size());
+    const std::wstring brightness = L"亮度 ";
+    if (name.rfind(brightness, 0) == 0) return tr(L"亮度 ") + name.substr(brightness.size());
     return tr(name.c_str());
 }
 uint64_t labPageShownAt = 0;
@@ -1908,7 +2173,12 @@ std::wstring labPageText() {
         }
     }
     c += tr(L"\n\n實驗");
-    if (st.running) {
+    if (st.running && st.plan) {
+        c += tr(L"\n自動測試進行中：第 ") + std::to_wstring(st.step + 1) + L" / " + std::to_wstring(st.steps) + tr(L" 項 · ") +
+            labKnobTitle(bs::lab::knobKey(st.knob)) + L" · " + tr(bs::lab::workloadName(st.workload)) +
+            tr(L"\n剩約 ") + std::to_wstring(int(std::ceil(st.remainingSeconds / 60))) + tr(L" 分鐘（只計用電池的時間）");
+        if (st.paused) c += tr(L"\n插電中，已暫停並還原；拔掉電源後繼續。");
+    } else if (st.running) {
         c += L"\n" + std::wstring(labKnobTitle(bs::lab::knobKey(st.knob))) + L"：" + labArm(st.armNames[0]) + L" vs " + labArm(st.armNames[1]);
         if (st.paused) c += tr(L"\n插電中，已暫停並還原；拔掉電源後繼續。");
         else if (st.arm >= 0) c += tr(L"\n目前：") + labArm(st.armNames[size_t(st.arm)]) + tr(L" · 這段還剩 ") +
@@ -1928,12 +2198,17 @@ std::wstring labPageText() {
     if (!st.results.empty()) {
         c += tr(L"\n\n實驗結果（兩種設定成對比較，± 為 95% 範圍）");
         for (const auto& r : st.results) {
-            c += L"\n" + std::wstring(labKnobTitle(r.experiment)) + L"：" + labArm(r.arm1) + tr(L" 相對於 ") + labArm(r.arm0);
+            c += L"\n" + labExperimentTitle(r.experiment) + L"：" + labArm(r.arm1) + tr(L" 相對於 ") + labArm(r.arm0);
             if (r.battery.pairs < 2) { c += tr(L"\n  資料不足：至少要 2 組完整的比較。"); continue; }
             c += tr(L"\n  電池 ") + signedNumber(r.battery.difference, 2) + L" W（±" + number(r.battery.halfWidth, 2) + L"，" +
                 std::to_wstring(r.battery.pairs) + tr(L" 組）") + (r.battery.significant() ? tr(L" · 差異明確") : tr(L" · 差異不明確"));
             c += tr(L"\n  CPU 核心 ") + signedNumber(r.core.difference, 2) + tr(L" W · 螢幕／獨顯／其他 ") + signedNumber(r.rest.difference, 2) + L" W";
-            c += tr(L"\n  CPU 使用率 ") + signedNumber(r.cpu.difference, 1) + tr(L"% · 掉格 ") + signedNumber(r.drops.difference, 1) + tr(L" 次／分");
+            c += tr(L"\n  CPU 使用率 ") + signedNumber(r.cpu.difference, 1) + L"%";
+            if (r.frames) c += tr(L" · 延遲畫格 ") + signedNumber(r.drops.difference, 1) + tr(L" 次／分");
+            if (r.bursts && r.burstMs.mean0 > 0) c += tr(L"\n  短暫運算耗時 ") + number(r.burstMs.mean0, 1) + L" → " + number(r.burstMs.mean1, 1) + L" ms";
+            if (r.work && r.workRate.mean0 > 0 && r.energyPerWork.mean0 > 0)
+                c += tr(L"\n  運算速度 ") + signedNumber(r.workRate.difference / r.workRate.mean0 * 100, 0) + tr(L"% · 每單位工作耗電 ") +
+                    signedNumber(r.energyPerWork.difference / r.energyPerWork.mean0 * 100, 0) + L"%";
         }
     }
     c += tr(L"\n\n說明：記錄時每 2 秒取樣一次，本身也會用一點電，但兩種設定都一樣，不影響比較。螢幕更新率實驗每 2 分鐘切換一次，畫面會短暫閃一下。掉格數來自 Windows 畫面合成器，部分全螢幕或可變更新率畫面可能不計入。");
@@ -2335,6 +2610,7 @@ void sampleLoop() {
                 if (state.energy.ready && !state.energy.timingMismatch) { sample.packageWatts = state.energy.packageWatts; sample.coreWatts = state.energy.coreWatts; }
                 sample.systemCpu = systemCpu;
                 labProbe->read(sample, gpu.instances(), state.processes);
+                if (labEngine) sample.workload = labEngine->take();
                 labController->onSample(sample, labLast && now > labLast ? (now - labLast) / 1000.0 : 0);
                 labLast = now;
             } else labLast = 0;
@@ -2571,92 +2847,326 @@ void finishUpdateDownload(DWORD status) {
     if (!ShellExecuteExW(&run)) { setNotice(tr(L"無法啟動安裝程式，已改開啟下載頁。")); openReleasePage(); }
     else setNotice(tr(L"正在安裝更新，BatteryScope 會自動重新開啟。"));
 }
-void openMenu(POINT point) {
-    const bool preview = demo || isolatedPreview;
-    HMENU menu = CreatePopupMenu();
-    if (availableUpdate) {
-        AppendMenuW(menu, MF_STRING | (updateBusy ? MF_GRAYED : 0), UpdateInstallId, (tr(L"安裝更新 ") + availableUpdate->version + L"…").c_str());
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+// ----- Dynamic power saving -----
+// The governor runs on a one-second timer on the UI thread from cheap signals
+// (input, sound, calls, full screen) and the latest sample, and writes power
+// settings through the lab's actuators. The originals of what it changed are
+// kept in the registry until restored, so a crash is undone at the next start.
+bs::gov::Governor governor;
+std::unique_ptr<bs::lab::SignalReader> signalReader;
+uint64_t evidenceAt = 0;
+int topRefreshSeen = 0;
+constexpr wchar_t GovernorKey[] = L"Software\\BatteryScope\\Governor";
+void saveGovernorOriginals() {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, GovernorKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) return;
+    for (size_t i = 0; i < governor.originals().size(); ++i) {
+        const std::wstring name = L"Original" + std::to_wstring(i);
+        if (const auto& value = governor.originals()[i]) { const DWORD v = *value; RegSetValueExW(key, name.c_str(), 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v), sizeof(v)); }
     }
-    AppendMenuW(menu, MF_STRING, PowerModeId, tr(L"電源模式…"));
-    AppendMenuW(menu, MF_STRING, PowerDetailsId, tr(L"電池與充電詳情"));
-    AppendMenuW(menu, MF_STRING, LedgerId, tr(L"本次累計耗能"));
-    AppendMenuW(menu, MF_STRING, HistoryId, tr(L"歷史紀錄（7 天）"));
-    AppendMenuW(menu, MF_STRING, ReviewCandidatesId, tr(L"找出耗電的背景程式…"));
-    AppendMenuW(menu, MF_STRING | (preview ? MF_GRAYED : 0), ExportCsvId, tr(L"匯出 CSV…"));
-    AppendMenuW(menu, MF_STRING | (preview ? MF_GRAYED : 0), ShareCardId, tr(L"分享今日卡片…"));
-    AppendMenuW(menu, MF_STRING | (miniEnabled ? MF_CHECKED : 0), MiniToggleId, tr(L"迷你浮動視窗"));
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    HMENU appearance = CreatePopupMenu();
-    AppendMenuW(appearance, MF_STRING | (themeChoice == ui::ThemeChoice::system ? MF_CHECKED : 0), ThemeSystemId, tr(L"跟隨 Windows"));
-    AppendMenuW(appearance, MF_STRING | (themeChoice == ui::ThemeChoice::dark ? MF_CHECKED : 0), ThemeDarkId, tr(L"深色"));
-    AppendMenuW(appearance, MF_STRING | (themeChoice == ui::ThemeChoice::light ? MF_CHECKED : 0), ThemeLightId, tr(L"淺色"));
-    AppendMenuW(appearance, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(appearance, MF_STRING | (pixelStyle ? MF_CHECKED : 0) | (ui::pixelFontLoaded() ? 0 : MF_GRAYED), StylePixelId, tr(L"像素風格"));
-    AppendMenuW(appearance, MF_STRING | (!pixelStyle ? MF_CHECKED : 0), StyleSmoothId, tr(L"平滑風格"));
-    AppendMenuW(appearance, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(appearance, MF_STRING | (showMascot ? MF_CHECKED : 0), MascotToggleId, tr(L"顯示電池小精靈"));
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(appearance), tr(L"外觀"));
-    HMENU languages = CreatePopupMenu();
-    AppendMenuW(languages, MF_STRING | (!english ? MF_CHECKED : 0), LanguageZhId, L"繁體中文");
-    AppendMenuW(languages, MF_STRING | (english ? MF_CHECKED : 0), LanguageEnId, L"English");
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(languages), tr(L"語言 / Language"));
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    HMENU alerts = CreatePopupMenu();
-    const std::pair<int, unsigned> levels[] = {{LowBatteryOffId, 0}, {LowBattery10Id, 10}, {LowBattery20Id, 20}, {LowBattery30Id, 30}};
-    for (const auto& level : levels)
-        AppendMenuW(alerts, MF_STRING | (lowBatteryThreshold == level.second ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), level.first,
-            level.second ? (std::to_wstring(level.second) + L"%").c_str() : tr(L"關閉"));
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(alerts), tr(L"低電量提醒"));
-    AppendMenuW(menu, MF_STRING | (drainAlerts ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), DrainAlertId, tr(L"背景耗電提醒"));
-    AppendMenuW(menu, MF_STRING | (sleepAlerts ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), SleepAlertId, tr(L"睡眠耗電提醒"));
-    HMENU reminders = CreatePopupMenu();
-    const std::pair<int, unsigned> targets[] = {{ChargeReminderOffId, 0}, {ChargeReminder80Id, 80}, {ChargeReminder85Id, 85},
-        {ChargeReminder90Id, 90}, {ChargeReminder100Id, 100}};
-    for (const auto& target : targets)
-        AppendMenuW(reminders, MF_STRING | (chargeReminderTarget == target.second ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), target.first,
-            target.second ? (std::to_wstring(target.second) + L"%").c_str() : tr(L"關閉"));
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(reminders), tr(L"充電提醒"));
-    HMENU automatic = CreatePopupMenu();
-    const std::pair<int, unsigned> savers[] = {{AutoSaverOffId, 0}, {AutoSaver20Id, 20}, {AutoSaver30Id, 30}};
-    for (const auto& item : savers)
-        AppendMenuW(automatic, MF_STRING | (autoSaverThreshold == item.second ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), item.first,
-            item.second ? (tr(L"低電量省電：") + std::to_wstring(item.second) + L"%").c_str() : tr(L"低電量省電：關閉"));
-    AppendMenuW(automatic, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(automatic, MF_STRING, PerfAppsPageId, (tr(L"效能清單（") + std::to_wstring(performanceApps.size()) + tr(L" 個）…")).c_str());
-    AppendMenuW(automatic, MF_STRING | (preview || performanceApps.empty() ? MF_GRAYED : 0), ClearPerfAppsId, tr(L"清空效能清單"));
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(automatic), tr(L"自動電源模式"));
-    HMENU records = CreatePopupMenu();
-    AppendMenuW(records, MF_STRING | (historyEnabled ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), HistoryToggleId, tr(L"記錄每日歷史"));
-    AppendMenuW(records, MF_STRING | (preview ? MF_GRAYED : 0), ClearHistoryId, tr(L"清除歷史紀錄…"));
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(records), tr(L"歷史紀錄設定"));
-    AppendMenuW(menu, MF_STRING | (trayPercent ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), TrayPercentId, tr(L"系統匣顯示電量數字"));
-    AppendMenuW(menu, MF_STRING | (hotkeyEnabled ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), HotkeyToggleId, tr(L"快速鍵 Ctrl+Alt+B"));
-    AppendMenuW(menu, MF_STRING | (autoStart ? MF_CHECKED : 0) | (demo ? MF_GRAYED : 0), StartupId, tr(L"登入時啟動"));
-    HMENU labMenu = CreatePopupMenu();
+    RegCloseKey(key);
+}
+void forgetGovernorOriginals() { RegDeleteTreeW(HKEY_CURRENT_USER, GovernorKey); }
+// After a crash or power loss: put back what the governor had changed.
+void restoreGovernorAfterCrash() {
+    for (size_t i = 0; i < size_t(bs::gov::Setting::count); ++i) {
+        DWORD value = 0, size = sizeof(value);
+        const std::wstring name = L"Original" + std::to_wstring(i);
+        if (RegGetValueW(HKEY_CURRENT_USER, GovernorKey, name.c_str(), RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS)
+            bs::lab::applyKnob(bs::gov::knobFor(bs::gov::Setting(i)), value);
+    }
+    forgetGovernorOriginals();
+}
+void applyDecision(const bs::gov::Decision& d) {
+    bool changed = false;
+    for (size_t i = 0; i < d.apply.size(); ++i) if (d.apply[i]) { bs::lab::applyKnob(bs::gov::knobFor(bs::gov::Setting(i)), *d.apply[i]); changed = true; }
+    for (const auto& [pid, created] : d.ecoOn) bs::lab::setProcessEco(pid, created, true);
+    for (const auto& [pid, created] : d.ecoOff) bs::lab::setProcessEco(pid, created, false);
+    if (d.restore) forgetGovernorOriginals();
+    else if (changed) saveGovernorOriginals();
+}
+void stopGovernor() {
+    bs::gov::Input off; off.ms = GetTickCount64(); off.onBattery = false;
+    applyDecision(governor.update(off));
+}
+void governorTick() {
+    if (!dynamicEnabled || demo || isolatedPreview) return;
+    if (!signalReader) signalReader = std::make_unique<bs::lab::SignalReader>();
+    const uint64_t now = GetTickCount64();
+    bs::gov::Options options;
+    options.refreshRate = dynamicRefresh; options.backgroundEco = dynamicEco;
+    if (dynamicTarget) options.targetHours = double(dynamicTarget);
+    DWORD refresh = 0;
+    if (bs::lab::readKnob(bs::lab::Knob::refreshRate, refresh) == ERROR_SUCCESS) topRefreshSeen = std::max(topRefreshSeen, int(refresh));
+    options.topRefresh = std::max(60, topRefreshSeen);
+    governor.setOptions(options);
+    if (labController && (!evidenceAt || now - evidenceAt >= 60000)) { governor.setEvidence(bs::gov::learn(labController->status().results)); evidenceAt = now; }
+    bs::gov::Input in; in.ms = now;
+    if (!current.history.empty()) {
+        const auto& p = current.history.back();
+        in.onBattery = p.present && p.acKnown && !p.onAc && !p.charging;
+    }
+    if (labController && labController->status().running) in.onBattery = false; // the lab owns the settings while it measures
+    Value systemCpu;
+    if (current.energy.ready) {
+        double busy = 0; for (const auto& core : current.energy.cores) busy += core.busyLogicalCores;
+        systemCpu = busy * 100 / std::max<DWORD>(1, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
+    }
+    const auto signals = signalReader->read(systemCpu);
+    in.context = bs::lab::classify(signals); in.idleSeconds = signals.idleSeconds;
+    in.hoursLeft = current.power.hoursRemaining;
+    for (size_t i = 0; i < in.actual.size(); ++i) {
+        DWORD value = 0;
+        if (bs::lab::readKnob(bs::gov::knobFor(bs::gov::Setting(i)), value) == ERROR_SUCCESS) in.actual[i] = value;
+    }
+    DWORD foreground = 0;
+    if (HWND window = GetForegroundWindow()) GetWindowThreadProcessId(window, &foreground);
+    for (const auto& row : current.processes)
+        if (row.measured && row.actionable && row.services.empty() && row.pid != GetCurrentProcessId())
+            in.apps.push_back({row.pid, row.created, row.name, row.averageCpu, row.pid == foreground});
+    applyDecision(governor.update(in));
+    if (inlinePage == InlinePage::dynamic && !hidden && now - labPageShownAt >= 3000) showDynamicPage();
+}
+void setDynamic(bool on) {
+    dynamicEnabled = on;
+    if (!writeSetting(L"Dynamic", on ? 1 : 0)) setNotice(tr(L"無法儲存設定。"));
+    if (on) { SetTimer(mainWindow, GovernorTimer, 1000, nullptr); governorTick(); setNotice(tr(L"動態省電已開啟：用電池時依你正在做的事自動調整。")); }
+    else { KillTimer(mainWindow, GovernorTimer); stopGovernor(); setNotice(tr(L"動態省電已關閉，設定已還原。")); }
+}
+std::wstring settingValueName(bs::gov::Setting setting, DWORD value) {
+    switch (setting) {
+    case bs::gov::Setting::powerMode: return modeName(PowerMode(value));
+    case bs::gov::Setting::cpuBoost: return value ? tr(L"開") : tr(L"關");
+    case bs::gov::Setting::refreshRate: return std::to_wstring(value) + L" Hz";
+    default: return std::to_wstring(value);
+    }
+}
+void showDynamicPage() {
+    const wchar_t* names[] = {tr(L"電源模式"), tr(L"處理器能源偏好"), tr(L"CPU Boost"), tr(L"螢幕更新率")};
+    std::wstring c = tr(L"用電池時，依你正在做的事自動調整電源設定：閒置與閱讀時省電，一操作就立刻恢復反應速度；高負載時給效能。插電、全螢幕遊戲或關閉時還原原本設定。G-Helper 或你自己改了某項設定，那一項會暫停管理 10 分鐘。");
+    c += tr(L"\n\n狀態：") + std::wstring(dynamicEnabled ? tr(L"開啟") : tr(L"關閉"));
+    if (dynamicEnabled) {
+        c += tr(L"\n目前判斷：") + std::wstring(tr(bs::gov::activityKey(governor.activity())));
+        const auto profile = governor.profileFor(governor.activity(), false);
+        c += tr(L"\n目標設定：");
+        bool any = false;
+        for (size_t i = 0; i < profile.values.size(); ++i) if (profile.values[i]) {
+            c += std::wstring(any ? L"，" : L"") + names[i] + L" " + settingValueName(bs::gov::Setting(i), *profile.values[i]);
+            any = true;
+        }
+        if (!any) c += tr(L"維持原本設定");
+        const uint64_t now = GetTickCount64();
+        for (size_t i = 0; i < profile.values.size(); ++i)
+            if (!governor.managing(bs::gov::Setting(i), now)) c += L"\n" + std::wstring(names[i]) + tr(L"：被其他程式改動，暫停管理中");
+    }
+    c += tr(L"\n\n選項：切換螢幕更新率 ") + std::wstring(dynamicRefresh ? tr(L"開") : tr(L"關")) + tr(L" · 背景程式效率模式 ") +
+        std::wstring(dynamicEco ? tr(L"開") : tr(L"關")) + tr(L" · 續航目標 ") + (dynamicTarget ? std::to_wstring(dynamicTarget) + tr(L" 小時") : std::wstring(tr(L"無")));
+    const auto evidence = labController ? bs::gov::learn(labController->status().results) : std::vector<bs::gov::Evidence>{};
+    c += tr(L"\n\n從省電實驗室學到的");
+    if (evidence.empty()) c += tr(L"\n還沒有足夠的實驗結果：先執行一次「一鍵自動測試」，之後只採用在這台電腦上證實省電又不變卡的設定。");
+    for (const auto& e : evidence)
+        c += L"\n" + std::wstring(tr(bs::gov::activityKey(e.activity))) + L" · " + names[size_t(e.setting)] + L" " + settingValueName(e.setting, e.savingValue) +
+            tr(L"：省 ") + number(e.wattsSaved, 2) + L" W" + (e.approved ? tr(L"，採用") : tr(L"，有代價，不採用"));
+    if (!governor.log.empty()) {
+        c += tr(L"\n\n最近的調整");
+        for (auto it = governor.log.rbegin(); it != governor.log.rend(); ++it) {
+            // Entries are Chinese; known prefixes are translated, app names stay as they are.
+            std::wstring line = *it;
+            for (const wchar_t* prefix : {L"背景程式改為效率模式：", L"→ "})
+                if (line.rfind(prefix, 0) == 0) { line = std::wstring(tr(prefix)) + line.substr(wcslen(prefix)); break; }
+            if (line.rfind(L"→ ", 0) != 0 && line.find(L"：") == std::wstring::npos) line = tr(line.c_str());
+            c += L"\n" + line;
+        }
+    }
+    const LRESULT firstLine = inlinePage == InlinePage::dynamic ? SendMessageW(inlineText, EM_GETFIRSTVISIBLELINE, 0, 0) : 0;
+    showInlinePage(InlinePage::dynamic, tr(L"動態省電"), c);
+    if (firstLine > 0) SendMessageW(inlineText, EM_LINESCROLL, 0, firstLine);
+    labPageShownAt = GetTickCount64();
+}
+
+// ----- Settings page -----
+// Every option in one scrolling list, grouped into sections. A row shows its
+// value; clicking it switches or cycles the value through the same commands
+// the menus used.
+enum class Row { section, dynamic, dynamicRefresh, dynamicEco, target, autoSaver, perfApps, lowBattery, chargeReminder, drainAlert,
+    sleepAlert, theme, style, mascot, trayPercent, mini, language, startup, hotkey, history, clearHistory, updates, checkNow };
+struct SettingRow { Row row; const wchar_t* label; };
+const SettingRow settingRows[] = {
+    {Row::section, L"省電"}, {Row::dynamic, L"動態省電（實驗功能）"}, {Row::dynamicRefresh, L"動態切換螢幕更新率"}, {Row::dynamicEco, L"背景程式自動效率模式"},
+    {Row::target, L"續航目標"}, {Row::autoSaver, L"低電量時自動省電"}, {Row::perfApps, L"效能清單"},
+    {Row::section, L"提醒"}, {Row::lowBattery, L"低電量提醒"}, {Row::chargeReminder, L"充電提醒"}, {Row::drainAlert, L"背景耗電提醒"}, {Row::sleepAlert, L"睡眠耗電提醒"},
+    {Row::section, L"外觀"}, {Row::theme, L"主題"}, {Row::style, L"風格"}, {Row::mascot, L"電池小精靈"}, {Row::trayPercent, L"系統匣顯示電量"},
+    {Row::mini, L"迷你浮動視窗"}, {Row::language, L"語言 / Language"},
+    {Row::section, L"一般"}, {Row::startup, L"登入時啟動"}, {Row::hotkey, L"快速鍵 Ctrl+Alt+B"}, {Row::history, L"記錄每日歷史"},
+    {Row::clearHistory, L"清除歷史紀錄"}, {Row::updates, L"每天檢查更新"}, {Row::checkNow, L"立即檢查更新"}};
+std::wstring rowValue(Row row) {
+    auto onOff = [](bool on) { return std::wstring(on ? tr(L"開") : tr(L"關")); };
+    auto percentOrOff = [](unsigned value) { return value ? std::to_wstring(value) + L"%" : std::wstring(tr(L"關")); };
+    switch (row) {
+    case Row::dynamic: return onOff(dynamicEnabled);
+    case Row::dynamicRefresh: return onOff(dynamicRefresh);
+    case Row::dynamicEco: return onOff(dynamicEco);
+    case Row::target: return dynamicTarget ? std::to_wstring(dynamicTarget) + tr(L" 小時") : std::wstring(tr(L"無"));
+    case Row::autoSaver: return percentOrOff(autoSaverThreshold);
+    case Row::perfApps: return std::to_wstring(performanceApps.size()) + tr(L" 個");
+    case Row::lowBattery: return percentOrOff(lowBatteryThreshold);
+    case Row::chargeReminder: return percentOrOff(chargeReminderTarget);
+    case Row::drainAlert: return onOff(drainAlerts);
+    case Row::sleepAlert: return onOff(sleepAlerts);
+    case Row::theme: return themeChoice == ui::ThemeChoice::system ? tr(L"跟隨 Windows") : themeChoice == ui::ThemeChoice::dark ? tr(L"深色") : tr(L"淺色");
+    case Row::style: return pixelStyle ? tr(L"像素") : tr(L"平滑");
+    case Row::mascot: return onOff(showMascot);
+    case Row::trayPercent: return onOff(trayPercent);
+    case Row::mini: return onOff(miniEnabled);
+    case Row::language: return english ? L"English" : L"繁體中文";
+    case Row::startup: return onOff(autoStart);
+    case Row::hotkey: return onOff(hotkeyEnabled);
+    case Row::history: return onOff(historyEnabled);
+    case Row::clearHistory: case Row::checkNow: return L"…";
+    case Row::updates: return onOff(updateChecks);
+    default: return {};
+    }
+}
+bool rowOn(Row row) {
+    switch (row) {
+    case Row::dynamic: return dynamicEnabled;
+    case Row::dynamicRefresh: return dynamicRefresh;
+    case Row::dynamicEco: return dynamicEco;
+    case Row::target: return dynamicTarget != 0;
+    case Row::autoSaver: return autoSaverThreshold != 0;
+    case Row::lowBattery: return lowBatteryThreshold != 0;
+    case Row::chargeReminder: return chargeReminderTarget != 0;
+    case Row::drainAlert: return drainAlerts;
+    case Row::sleepAlert: return sleepAlerts;
+    case Row::mascot: return showMascot;
+    case Row::trayPercent: return trayPercent;
+    case Row::mini: return miniEnabled;
+    case Row::startup: return autoStart;
+    case Row::hotkey: return hotkeyEnabled;
+    case Row::history: return historyEnabled;
+    case Row::updates: return updateChecks;
+    default: return false;
+    }
+}
+// The menu command a row sends; cycling rows pick the next value.
+int rowCommand(Row row) {
+    auto next = [](unsigned value, std::initializer_list<unsigned> values) {
+        auto it = std::find(values.begin(), values.end(), value);
+        return it == values.end() || std::next(it) == values.end() ? *values.begin() : *std::next(it);
+    };
+    switch (row) {
+    case Row::dynamic: return DynamicToggleId;
+    case Row::dynamicRefresh: return DynamicRefreshId;
+    case Row::dynamicEco: return DynamicEcoId;
+    case Row::target: return DynamicTargetId;
+    case Row::autoSaver: { const unsigned v = next(autoSaverThreshold, {0, 20, 30}); return v == 0 ? AutoSaverOffId : v == 20 ? AutoSaver20Id : AutoSaver30Id; }
+    case Row::perfApps: return PerfAppsPageId;
+    case Row::lowBattery: return LowBatteryOffId + int(next(lowBatteryThreshold, {0, 10, 20, 30}) / 10);
+    case Row::chargeReminder: {
+        const unsigned v = next(chargeReminderTarget, {0, 80, 85, 90, 100});
+        return v == 0 ? ChargeReminderOffId : v == 80 ? ChargeReminder80Id : v == 85 ? ChargeReminder85Id : v == 90 ? ChargeReminder90Id : ChargeReminder100Id;
+    }
+    case Row::drainAlert: return DrainAlertId;
+    case Row::sleepAlert: return SleepAlertId;
+    case Row::theme: return themeChoice == ui::ThemeChoice::system ? ThemeDarkId : themeChoice == ui::ThemeChoice::dark ? ThemeLightId : ThemeSystemId;
+    case Row::style: return pixelStyle ? StyleSmoothId : StylePixelId;
+    case Row::mascot: return MascotToggleId;
+    case Row::trayPercent: return TrayPercentId;
+    case Row::mini: return MiniToggleId;
+    case Row::language: return english ? LanguageZhId : LanguageEnId;
+    case Row::startup: return StartupId;
+    case Row::hotkey: return HotkeyToggleId;
+    case Row::history: return HistoryToggleId;
+    case Row::clearHistory: return ClearHistoryId;
+    case Row::updates: return UpdateCheckId;
+    case Row::checkNow: return UpdateNowId;
+    default: return 0;
+    }
+}
+void showSettingsPage() {
+    if (SendMessageW(settingsList, LB_GETCOUNT, 0, 0) == 0)
+        for (size_t i = 0; i < std::size(settingRows); ++i) SendMessageW(settingsList, LB_ADDSTRING, 0, LPARAM(i));
+    showInlinePage(InlinePage::settings, tr(L"設定"), L"");
+    InvalidateRect(settingsList, nullptr, FALSE);
+}
+void drawSettingRow(const DRAWITEMSTRUCT& item) {
+    if (item.itemID == UINT(-1) || item.itemID >= std::size(settingRows)) return;
+    const auto& entry = settingRows[item.itemID];
+    HDC dc = item.hDC; RECT r = item.rcItem;
+    fill(dc, r, Surface);
+    if (entry.row == Row::section) {
+        drawText(dc, tr(entry.label), {r.left + sp(6), r.top + sp(10), r.right - sp(6), r.bottom}, Green, strongFont);
+        return;
+    }
+    RECT box{r.left + sp(2), r.top + sp(3), r.right - sp(2), r.bottom - sp(3)};
+    rounded(dc, box, blend(Surface, Border, .45), 8);
+    drawText(dc, tr(entry.label), {box.left + sp(12), box.top, box.right - sp(110), box.bottom}, Ink, normalFont);
+    const std::wstring value = rowValue(entry.row);
+    const bool on = rowOn(entry.row);
+    const int width = std::max(sp(44), textWidth(dc, value, smallFont) + sp(18));
+    RECT pill{box.right - sp(10) - width, box.top + sp(8), box.right - sp(10), box.bottom - sp(8)};
+    rounded(dc, pill, on ? blend(Green, Surface, theme.highContrast ? 0 : .25) : blend(Surface, Border, .9), 8);
+    drawText(dc, value, pill, on ? theme.accentInk : Muted, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+}
+void activateSettingRow(int index) {
+    if (index < 0 || size_t(index) >= std::size(settingRows) || demo || isolatedPreview) return;
+    if (const int command = rowCommand(settingRows[index].row)) SendMessageW(mainWindow, WM_COMMAND, command, 0);
+    if (inlinePage == InlinePage::settings) InvalidateRect(settingsList, nullptr, FALSE);
+}
+
+// The ⋯ menu (also the tray icon's right-click menu).
+std::vector<MenuItem> mainMenuItems() {
+    const bool preview = demo || isolatedPreview;
+    std::vector<MenuItem> items;
+    if (availableUpdate) {
+        auto update = menuItem(UpdateInstallId, tr(L"安裝更新 ") + availableUpdate->version, false, updateBusy);
+        update.hint = tr(L"新版本"); update.checked = true;
+        items.push_back(update); items.push_back(menuSeparator());
+    }
+    items.push_back(menuItem(PowerModeId, tr(L"電源模式")));
+    auto dynamic = menuItem(DynamicToggleId, tr(L"動態省電"), dynamicEnabled, preview);
+    if (!dynamicEnabled) dynamic.hint = tr(L"關");
+    items.push_back(dynamic);
+    items.push_back(menuItem(DynamicPageId, tr(L"動態省電狀態")));
+    items.push_back(menuSeparator());
+    items.push_back(menuItem(PowerDetailsId, tr(L"電池與充電詳情")));
+    items.push_back(menuItem(HistoryId, tr(L"歷史紀錄（7 天）")));
+    items.push_back(menuItem(LedgerId, tr(L"本次累計耗能")));
+    items.push_back(menuItem(ReviewCandidatesId, tr(L"找出耗電的背景程式")));
+    items.push_back(menuSeparator());
     const auto labStatus = labController ? labController->status() : bs::lab::Controller::Status{};
-    AppendMenuW(labMenu, MF_STRING, LabPageId, tr(L"查看實驗室…"));
-    AppendMenuW(labMenu, MF_STRING | (labStatus.recording ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), LabRecordId, tr(L"記錄詳細資料"));
-    AppendMenuW(labMenu, MF_SEPARATOR, 0, nullptr);
-    const wchar_t* experimentNames[] = {tr(L"實驗：CPU Boost 開／關"), tr(L"實驗：處理器能源偏好"), tr(L"實驗：螢幕更新率"), tr(L"實驗：電源模式 平衡／效率")};
-    for (int i = 0; i < int(bs::lab::Knob::count); ++i)
-        AppendMenuW(labMenu, MF_STRING | (preview || labStatus.running ? MF_GRAYED : 0) |
-            (labStatus.running && int(labStatus.knob) == i ? MF_CHECKED : 0), LabExperimentId + i, experimentNames[i]);
-    AppendMenuW(labMenu, MF_STRING | (labStatus.running ? 0 : MF_GRAYED), LabStopId, tr(L"停止實驗並還原"));
-    AppendMenuW(labMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(labMenu, MF_STRING | (preview ? MF_GRAYED : 0), LabExportId, tr(L"一鍵匯出（壓縮檔＋複製摘要）"));
-    AppendMenuW(labMenu, MF_STRING | (preview ? MF_GRAYED : 0), LabFolderId, tr(L"開啟資料夾"));
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(labMenu), tr(L"省電實驗室"));
-    HMENU updates = CreatePopupMenu();
-    AppendMenuW(updates, MF_STRING | (updateChecks ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), UpdateCheckId, tr(L"每天自動檢查"));
-    AppendMenuW(updates, MF_STRING | (preview || updateBusy ? MF_GRAYED : 0), UpdateNowId, tr(L"立即檢查更新"));
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(updates), tr(L"更新"));
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, TrayShow, tr(L"顯示面板"));
-    AppendMenuW(menu, MF_STRING | (pendingAction ? MF_GRAYED : 0), TrayExit, tr(L"結束 BatteryScope"));
-    SetForegroundWindow(mainWindow);
-    TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, 0, mainWindow, nullptr);
-    DestroyMenu(menu); PostMessageW(mainWindow, WM_NULL, 0, 0);
+    std::vector<MenuItem> lab;
+    auto automatic = menuItem(LabAutoId, labStatus.running && labStatus.plan ? tr(L"停止自動測試") : tr(L"一鍵自動測試"), false,
+        preview || (labStatus.running && !labStatus.plan));
+    if (!(labStatus.running && labStatus.plan)) automatic.hint = tr(L"約 1.5 小時");
+    lab.push_back(automatic);
+    lab.push_back(menuItem(LabPageId, tr(L"查看實驗室")));
+    lab.push_back(menuItem(LabRecordId, tr(L"記錄詳細資料"), labStatus.recording, preview));
+    std::vector<MenuItem> single;
+    const wchar_t* experimentNames[] = {tr(L"CPU Boost 開／關"), tr(L"處理器能源偏好"), tr(L"螢幕更新率"), tr(L"電源模式")};
+    for (int i = 0; i < bs::lab::ManualKnobs; ++i)
+        single.push_back(menuItem(LabExperimentId + i, experimentNames[i], labStatus.running && !labStatus.plan && int(labStatus.knob) == i, preview || labStatus.running));
+    single.push_back(menuSeparator());
+    single.push_back(menuItem(LabStopId, tr(L"停止實驗並還原"), false, !(labStatus.running && !labStatus.plan)));
+    lab.push_back(submenu(tr(L"單項實驗"), single, preview));
+    lab.push_back(menuSeparator());
+    lab.push_back(menuItem(LabExportId, tr(L"一鍵匯出（壓縮檔＋摘要）"), false, preview));
+    lab.push_back(menuItem(LabFolderId, tr(L"開啟資料夾"), false, preview));
+    items.push_back(submenu(tr(L"省電實驗室"), lab));
+    std::vector<MenuItem> tools;
+    tools.push_back(menuItem(ExportCsvId, tr(L"匯出 CSV"), false, preview));
+    tools.push_back(menuItem(ShareCardId, tr(L"分享今日卡片"), false, preview));
+    tools.push_back(menuItem(MiniToggleId, tr(L"迷你浮動視窗"), miniEnabled));
+    items.push_back(submenu(tr(L"工具"), tools));
+    items.push_back(menuItem(SettingsPageId, tr(L"設定")));
+    items.push_back(menuSeparator());
+    items.push_back(menuItem(TrayShow, tr(L"顯示面板")));
+    items.push_back(menuItem(TrayExit, tr(L"結束 BatteryScope"), false, pendingAction));
+    return items;
+}
+void openMenu(POINT point) {
+    const auto items = mainMenuItems();
+    if (const int chosen = showMenu(items, point, mainWindow)) SendMessageW(mainWindow, WM_COMMAND, chosen, 0);
 }
 void applyLanguage(bool useEnglish) {
     english = useEnglish;
@@ -2683,6 +3193,8 @@ void applyLanguage(bool useEnglish) {
     if (inlinePage == InlinePage::history) showHistoryPage();
     if (inlinePage == InlinePage::perfApps) showPerformanceApps();
     if (inlinePage == InlinePage::lab) showLabPage();
+    if (inlinePage == InlinePage::settings) showSettingsPage();
+    if (inlinePage == InlinePage::dynamic) showDynamicPage();
     if (inlinePage == InlinePage::confirm && pendingForceRow) showForceConfirmation(*pendingForceRow);
     notice = tr(L"正在讀取電池與程序資料…"); noticeUntil = 0;
     if (tooltip) SendMessageW(tooltip, TTM_POP, 0, 0);
@@ -2743,6 +3255,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             0, 0, 0, 0, window, nullptr, nullptr, nullptr);
         SetWindowSubclass(inlineText, inlineTextProc, 1, 0);
         SendMessageW(inlineText, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(sp(4), sp(4)));
+        settingsList = CreateWindowExW(0, L"LISTBOX", L"", WS_CHILD | WS_VSCROLL | LBS_OWNERDRAWVARIABLE | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+            0, 0, 0, 0, window, reinterpret_cast<HMENU>(INT_PTR(SettingsListId)), nullptr, nullptr);
         inlineBack = button(tr(L"返回排行"), InlineBackId);
         inlineConfirm = button(tr(L"確定強制結束"), InlineConfirmId);
         ShowWindow(inlineBack, SW_HIDE);
@@ -2773,14 +3287,22 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         }, window);
         refreshPowerButton();
         if (!demo && !isolatedPreview) SetTimer(window, UpdateTimer, 60 * 1000, nullptr); // first check a minute after start
+        if (!demo && !isolatedPreview) { restoreGovernorAfterCrash(); if (dynamicEnabled) SetTimer(window, GovernorTimer, 1000, nullptr); }
         return 0;
     }
     case WM_MEASUREITEM:
         if (wp == ListId) { reinterpret_cast<MEASUREITEMSTRUCT*>(lp)->itemHeight = px(RowHeight); return TRUE; }
+        if (wp == SettingsListId) {
+            auto measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lp);
+            measure->itemHeight = measure->itemID < std::size(settingRows) && settingRows[measure->itemID].row == Row::section ? sp(34) : sp(46);
+            return TRUE;
+        }
         break;
     case WM_DRAWITEM: {
         auto item = reinterpret_cast<DRAWITEMSTRUCT*>(lp);
-        if (item->CtlID == ListId) drawProcess(*item); else if (item->CtlType == ODT_BUTTON) drawButton(*item);
+        if (item->CtlID == ListId) drawProcess(*item);
+        else if (item->CtlID == SettingsListId) drawSettingRow(*item);
+        else if (item->CtlType == ODT_BUTTON) drawButton(*item);
         return TRUE;
     }
     case WM_DPICHANGED: {
@@ -2796,6 +3318,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (wp == MotionTimer) { stepMotion(motionNow()); return 0; }
         if (wp == NoticeTimer) { KillTimer(window, NoticeTimer); noticeUntil = 0; InvalidateRect(window, nullptr, FALSE); return 0; }
         if (wp == UpdateTimer) { SetTimer(window, UpdateTimer, 6 * 3600 * 1000, nullptr); maybeCheckForUpdate(); return 0; }
+        if (wp == GovernorTimer) { governorTick(); return 0; }
         break;
     case WM_SYSCOLORCHANGE:
     case WM_THEMECHANGED:
@@ -2820,6 +3343,9 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         HGDIOBJ old = SelectObject(dc, bitmap); paint(dc, r); BitBlt(target, 0, 0, r.right, r.bottom, dc, 0, 0, SRCCOPY);
         SelectObject(dc, old); DeleteObject(bitmap); DeleteDC(dc); EndPaint(window, &ps); return 0;
     }
+    case WM_CTLCOLORLISTBOX:
+        if (reinterpret_cast<HWND>(lp) == settingsList) { SetDCBrushColor(reinterpret_cast<HDC>(wp), Surface); return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH)); }
+        break;
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLOREDIT:
     case WM_CTLCOLORBTN:
@@ -3011,6 +3537,22 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (id == MenuId) { RECT r{}; GetWindowRect(menuButton, &r); openMenu({r.left, r.bottom}); return 0; }
         if (id == TrayShow) { showMain(); return 0; }
         if (id == LabPageId) { showLabPage(); return 0; }
+        if (id == SettingsPageId) { showMain(); showSettingsPage(); return 0; }
+        if (id == DynamicPageId) { showMain(); showDynamicPage(); return 0; }
+        if (id == DynamicToggleId) { if (!demo && !isolatedPreview) setDynamic(!dynamicEnabled); return 0; }
+        if (id == DynamicRefreshId || id == DynamicEcoId || id == DynamicTargetId) {
+            if (demo || isolatedPreview) return 0;
+            if (id == DynamicRefreshId) { dynamicRefresh = !dynamicRefresh; writeSetting(L"DynamicRefresh", dynamicRefresh); }
+            if (id == DynamicEcoId) { dynamicEco = !dynamicEco; writeSetting(L"DynamicEco", dynamicEco); }
+            if (id == DynamicTargetId) { dynamicTarget = dynamicTarget == 0 ? 3 : dynamicTarget == 3 ? 5 : dynamicTarget == 5 ? 8 : 0; writeSetting(L"DynamicTarget", dynamicTarget); }
+            return 0;
+        }
+        if (id == SettingsListId && HIWORD(wp) == LBN_SELCHANGE) {
+            const int index = int(SendMessageW(settingsList, LB_GETCURSEL, 0, 0));
+            SendMessageW(settingsList, LB_SETCURSEL, WPARAM(-1), 0);
+            activateSettingRow(index);
+            return 0;
+        }
         if (id == LabRecordId && labController) {
             const bool on = !labController->status().recording;
             labController->setRecording(on);
@@ -3019,7 +3561,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             showLabPage();
             return 0;
         }
-        if (id >= LabExperimentId && id < LabExperimentId + int(bs::lab::Knob::count) && labController) {
+        if (id >= LabExperimentId && id < LabExperimentId + bs::lab::ManualKnobs && labController) {
             const DWORD result = labController->start(bs::lab::Knob(id - LabExperimentId));
             setNotice(result ? tr(L"無法開始實驗：") + errorText(result) : std::wstring(tr(L"實驗開始：用電池時每 2 分鐘輪流切換設定。")));
             wake.notify_one();
@@ -3028,6 +3570,22 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         }
         if (id == LabStopId && labController) { labController->stop(); setNotice(tr(L"實驗已停止，設定已還原。")); showLabPage(); return 0; }
         if (id == LabExportId) { exportLab(); return 0; }
+        if ((id == LabAutoId || id == LabAutoStartId) && labController && labEngine) {
+            if (autoTestActive && id == LabAutoStartId) return 0; // already running
+            if (autoTestActive) { // second click: stop
+                labController->stop(); labEngine->stop(); autoTestActive = false;
+                setNotice(tr(L"自動測試已停止，設定已還原。"));
+                std::thread([target = mainWindow] { bs::lab::writeSystemSnapshot(bs::lab::labFolder()); PostMessageW(target, LabExportMessage, 1, 0); }).detach();
+                return 0;
+            }
+            const DWORD result = labController->startPlan(bs::lab::automaticPlan(!bs::lab::WorkloadEngine::browserPath().empty()));
+            if (result) { setNotice(tr(L"無法開始自動測試：") + errorText(result)); showLabPage(); return 0; }
+            autoTestActive = true;
+            hideMain();
+            labEngine->start(labController.get());
+            wake.notify_one();
+            return 0;
+        }
         if (id == LabFolderId) {
             const std::wstring folder = bs::lab::labFolder();
             if (!folder.empty()) ShellExecuteW(nullptr, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -3087,6 +3645,21 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (trayAdded) updateTray(false);
         if (demo || isolatedPreview) refreshPowerButton(); // the preview mode follows the power source
         if (inlinePage == InlinePage::lab && !hidden && GetTickCount64() - labPageShownAt >= 10000) showLabPage();
+        if (autoTestActive && labController && labEngine) {
+            const bool aborted = labEngine->abortRequested();
+            if (aborted) labController->stop();
+            if (aborted || !labController->status().running) {
+                // Finished or stopped: close the test window, export everything, show the results.
+                labEngine->stop(); autoTestActive = false;
+                // A snapshot of power plans, battery report, hardware and processes goes with the export;
+                // it runs after the test so it never disturbs a measurement.
+                setNotice(tr(L"正在收集系統資訊並匯出…"));
+                std::thread([target = mainWindow, aborted] {
+                    bs::lab::writeSystemSnapshot(bs::lab::labFolder());
+                    PostMessageW(target, LabExportMessage, aborted, 0);
+                }).detach();
+            }
+        }
         if (!current.history.empty()) recordCpuPower(current.history.back().ms, current.energy);
         if (!demo && !isolatedPreview && !current.history.empty() && lowBattery.update(current.history.back(), lowBatteryThreshold))
             showLowBatteryNotice();
@@ -3130,6 +3703,11 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_HOTKEY:
         if (wp == PanelHotkey) toggleMain();
         return 0;
+    case LabExportMessage:
+        exportLab();
+        showMain(); showLabPage();
+        showBalloon(wp ? tr(L"自動測試已中止") : tr(L"自動測試完成"), tr(L"設定已還原，結果與記錄已匯出到桌面，摘要已複製。"), BalloonTarget::none);
+        return 0;
     case UpdateMessage:
         handleUpdateResult(reinterpret_cast<bs::update::Release*>(lp));
         return 0;
@@ -3156,7 +3734,9 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_CLOSE: hideMain(); return 0;
     case WM_DESTROY: {
         KillTimer(window, MotionTimer); motionTimerRunning = false;
-        KillTimer(window, NoticeTimer); KillTimer(window, UpdateTimer);
+        KillTimer(window, NoticeTimer); KillTimer(window, UpdateTimer); KillTimer(window, GovernorTimer);
+        if (dynamicEnabled && !demo && !isolatedPreview) stopGovernor();
+        if (labEngine) labEngine->stop();
         registerPanelHotkey(false);
         setMiniWindow(false);
         unwatchEffectivePowerMode(effectiveWatch); effectiveWatch = nullptr;
@@ -3240,13 +3820,23 @@ bool captureWindow(const std::wstring& path) {
     // window uses, so captures do not depend on WM_PRINT support for them.
     for (auto child : {viewport, closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck,
         powerButton, hideButton, menuButton, inlineText, inlineBack, inlineConfirm, restoreModesButton, energySettingsButton, ecoButton, perfAppButton,
-        modeButtons[0], modeButtons[1], modeButtons[2], modeButtons[3], modeButtons[4], modeButtons[5]}) {
+        modeButtons[0], modeButtons[1], modeButtons[2], modeButtons[3], modeButtons[4], modeButtons[5], settingsList}) {
         if (!(GetWindowLongPtrW(child, GWL_STYLE) & WS_VISIBLE)) continue;
         RECT childRect; GetWindowRect(child, &childRect); MapWindowPoints(nullptr, mainWindow, reinterpret_cast<POINT*>(&childRect), 2);
         const int cw = childRect.right - childRect.left, ch = childRect.bottom - childRect.top;
         SaveDC(dc); SetViewportOrgEx(dc, childRect.left, childRect.top, nullptr);
         IntersectClipRect(dc, 0, 0, cw, ch);
-        if (child == viewport) {
+        if (child == settingsList) {
+            fill(dc, {0, 0, cw, ch}, Surface);
+            const int count = int(SendMessageW(settingsList, LB_GETCOUNT, 0, 0));
+            for (int index = 0; index < count; ++index) {
+                RECT item{};
+                if (SendMessageW(settingsList, LB_GETITEMRECT, WPARAM(index), reinterpret_cast<LPARAM>(&item)) == LB_ERR || item.top >= ch) continue;
+                DRAWITEMSTRUCT draw{}; draw.CtlType = ODT_LISTBOX; draw.CtlID = SettingsListId; draw.itemID = UINT(index);
+                draw.hwndItem = settingsList; draw.hDC = dc; draw.rcItem = item;
+                drawSettingRow(draw);
+            }
+        } else if (child == viewport) {
             fill(dc, {0, 0, cw, ch}, Background);
             for (int index = 0; index < int(displayed.size()); ++index) {
                 RECT item{}; ListView_GetItemRect(list, index, &item, LVIR_BOUNDS);
@@ -3333,6 +3923,16 @@ bool panelSelfTest(const std::wstring& path) {
         if (icon) DestroyIcon(icon);
     }
     check("all_nine_icon_sizes_load", sizesOK);
+    {
+        // The custom menu renders every level and keeps the panel's look.
+        const auto items = mainMenuItems();
+        const auto file = std::filesystem::temp_directory_path() / L"BatteryScope-menu-check.bmp";
+        bool menuOK = !items.empty();
+        for (int i = -1; i < int(items.size()); ++i)
+            if (i < 0 || !items[size_t(i)].children.empty()) menuOK &= captureMenu(items, file.wstring(), i) && std::filesystem::file_size(file) > 1000;
+        std::error_code ignored; std::filesystem::remove(file, ignored);
+        check("custom_menu_renders_all_levels", menuOK);
+    }
     const UINT actualDpi = dpi;
     bool dpiIconsOK = true;
     for (UINT testDpi : {96u,120u,144u,192u}) {
@@ -3449,6 +4049,20 @@ bool panelSelfTest(const std::wstring& path) {
     check("history_page_lists_days_newest_first", inlinePage == InlinePage::history && current.days.size() == 6 &&
         historyBody.find(dayLabel(current.days.back().date) + tr(L"（今天）")) < historyBody.find(dayLabel(current.days.front().date) + tr(L" · 用電池 ")) &&
         historyBody.find(L"Browser.exe") != std::wstring::npos);
+    SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
+    // Settings page: every option in one list, grouped; clicking in demo changes nothing.
+    SendMessageW(mainWindow, WM_COMMAND, SettingsPageId, 0);
+    const bool styleBefore = pixelStyle;
+    check("settings_page_lists_every_option", inlinePage == InlinePage::settings && IsWindowVisible(settingsList) && !IsWindowVisible(inlineText) &&
+        SendMessageW(settingsList, LB_GETCOUNT, 0, 0) == LRESULT(std::size(settingRows)));
+    activateSettingRow(int(std::find_if(std::begin(settingRows), std::end(settingRows), [](const SettingRow& r) { return r.row == Row::style; }) - std::begin(settingRows)));
+    check("settings_rows_do_not_change_demo_settings", pixelStyle == styleBefore);
+    SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
+    check("settings_list_hides_on_return", inlinePage == InlinePage::none || inlineClosing || !IsWindowVisible(settingsList));
+    SendMessageW(mainWindow, WM_COMMAND, DynamicPageId, 0);
+    std::wstring dynamicBody(size_t(GetWindowTextLengthW(inlineText)) + 1, L'\0');
+    GetWindowTextW(inlineText, dynamicBody.data(), int(dynamicBody.size()));
+    check("dynamic_page_explains_state", inlinePage == InlinePage::dynamic && dynamicBody.find(L"BatteryScope") == std::wstring::npos && dynamicBody.find(L"G-Helper") != std::wstring::npos);
     SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
     {
         RECT client{}; GetClientRect(mainWindow, &client);
@@ -3712,6 +4326,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         } catch (...) { return ERROR_INVALID_PARAMETER; }
     }
     if (args.size() == 2 && args[0] == L"--diagnose") return diagnostic(args[1]);
+    // Self-test of the automatic test's local server and browser launch: runs the
+    // engine without a test for the given seconds and writes the port to stdout.
+    if (args.size() == 2 && args[0] == L"--lab-engine-test") {
+        bs::lab::WorkloadEngine engine;
+        engine.start(nullptr);
+        printf("port=%d browser=%d\n", engine.port(), int(!bs::lab::WorkloadEngine::browserPath().empty()));
+        fflush(stdout);
+        Sleep(DWORD(std::clamp(_wtoi(args[1].c_str()), 1, 120)) * 1000);
+        const bool aborted = engine.abortRequested();
+        engine.stop();
+        printf("aborted=%d\n", int(aborted));
+        return 0;
+    }
     // Used by the installer: close any running copy (any version) cleanly, so its
     // efficiency mode and power mode changes are undone before files are replaced.
     if (args.size() == 1 && args[0] == L"--quit-running") {
@@ -3752,7 +4379,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (!singleton) return 1;
     if (GetLastError() == ERROR_ALREADY_EXISTS && !isolatedPreview && !demo) {
         HWND existing = FindWindowW(ClassName, nullptr);
-        if (existing) { PostMessageW(existing, WM_COMMAND, TrayShow, 0); SetForegroundWindow(existing); }
+        // --autotest starts the power lab's automatic test in the copy that is already running.
+        if (existing) PostMessageW(existing, WM_COMMAND, option(L"--autotest") ? LabAutoStartId : TrayShow, 0);
+        if (existing && !option(L"--autotest")) SetForegroundWindow(existing);
         return 0;
     }
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -3804,9 +4433,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     else {
         if (!isolatedPreview) {
             labController = std::make_unique<bs::lab::Controller>();
+            labEngine = std::make_unique<bs::lab::WorkloadEngine>();
             if (readSetting(L"LabRecording", 0) == 1) labController->setRecording(true);
         }
         worker = std::thread(sampleLoop);
+        if (option(L"--autotest") && labController) PostMessageW(window, WM_COMMAND, LabAutoStartId, 0);
     }
     applyLanguage(english);
     if (!demo && !isolatedPreview && startupState() == StartupState::missingCopy) {
@@ -3821,6 +4452,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (screenshot && option(L"--ledger")) showLedger();
     if (screenshot && option(L"--power-mode")) showPowerModePage();
     if (screenshot && option(L"--history")) showHistoryPage();
+    if (screenshot && option(L"--settings")) showSettingsPage();
+    if (screenshot && option(L"--dynamic")) showDynamicPage();
+    if (screenshot && option(L"--lab")) showLabPage();
     if (demo) for (size_t i = 0; i + 1 < args.size(); ++i) if (args[i] == L"--card-png") {
         const bool saved = exportShareCard(args[i + 1], false);
         DestroyWindow(window);
@@ -3842,7 +4476,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
         if (message.message == WM_TIMER && message.wParam == 91) {
             KillTimer(window, 91);
-            shotOK = trayTest ? panelSelfTest(args[1]) : captureWindow(args[1]); DestroyWindow(window); continue;
+            if (screenshot && (option(L"--menu") || option(L"--menu-lab"))) {
+                // The ⋯ menu, or its lab submenu opened in place.
+                const auto items = mainMenuItems();
+                int open = -1;
+                for (int i = 0; option(L"--menu-lab") && i < int(items.size()); ++i) if (items[size_t(i)].label == tr(L"省電實驗室")) open = i;
+                shotOK = captureMenu(items, args[1], open);
+            } else shotOK = trayTest ? panelSelfTest(args[1]) : captureWindow(args[1]);
+            DestroyWindow(window); continue;
         }
         if (!IsDialogMessageW(window, &message)) { TranslateMessage(&message); DispatchMessageW(&message); }
     }
