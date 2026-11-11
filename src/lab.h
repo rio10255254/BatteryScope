@@ -32,6 +32,20 @@ struct Signals {
 Context classify(const Signals& signals);
 const wchar_t* contextKey(Context context); // a Chinese UI string, translated by the caller
 
+// Synthetic work the automatic test runs while a setting is measured, so both
+// settings of a pair face exactly the same load.
+// browse, video and office run as a page in a separate Edge (or Chrome) window
+// the lab drives; the others are built in.
+enum class Workload { none, idle, scroll, bursts, sustained, browse, video, office, count };
+const wchar_t* workloadKey(Workload workload);   // stable id: idle, scroll, bursts, sustained
+const wchar_t* workloadName(Workload workload);  // a Chinese UI string
+// What the workload engine measured since the previous sample.
+struct WorkloadMetrics {
+    double frames = 0, lateFrames = 0;   // scrolling frames, and frames later than 1.5 refresh periods
+    double bursts = 0, burstMs = 0;      // completed bursts and their total time
+    double work = 0;                     // fixed work units done by the sustained threads
+};
+
 // One sample, about every two seconds while the lab is on.
 struct Sample {
     uint64_t ms = 0;
@@ -48,6 +62,8 @@ struct Sample {
     double framesComposed = 0, framesDropped = 0, refreshes = 0; // DWM deltas since the previous sample
     int boostDc = -1, eppDc = -1; // processor settings of the active power plan, on battery
     bool ghelper = false;
+    std::wstring topProcesses;    // "name cpu%;..." busiest processes this sample
+    WorkloadMetrics workload;
     std::wstring experiment;
     int arm = -1, block = -1;
     bool counted = false;
@@ -93,6 +109,7 @@ struct Block {
     double battery = 0, package = 0, core = 0, rest = 0, cpu = 0;
     double dropsPerMinute = 0, composedPerSecond = 0;
     std::array<double, size_t(Context::count)> contextShare{};
+    double burstMs = 0, workPerSecond = 0, framesPerSecond = 0; // automatic test workload results (0 when unused)
     std::string csv() const;
     static bool parse(const std::string& line, Block& block);
     static std::string csvHeader();
@@ -100,7 +117,7 @@ struct Block {
 class BlockRecorder {
 public:
     static constexpr double WarmupSeconds = 20, MinimumSeconds = 60;
-    void begin(int pair, int arm, uint64_t ms);
+    void begin(int pair, int arm, uint64_t ms, double warmup = WarmupSeconds, double minimum = MinimumSeconds);
     // A sample during the block; ignored during warm-up or when not countable.
     bool add(const Sample& sample, double seconds);
     void invalidate() { invalid_ = true; }
@@ -114,6 +131,8 @@ public:
 private:
     int pair_ = 0, arm_ = 0;
     uint64_t start_ = 0;
+    double warmup_ = WarmupSeconds, minimum_ = MinimumSeconds;
+    WorkloadMetrics workload_;
     bool invalid_ = false;
     double seconds_ = 0, battery_ = 0, package_ = 0, core_ = 0, rest_ = 0, restSeconds_ = 0, cpu_ = 0, cpuSeconds_ = 0;
     double drops_ = 0, composed_ = 0;
@@ -131,6 +150,8 @@ Comparison comparePairs(const std::vector<std::pair<double, double>>& pairs);
 struct ExperimentResult {
     std::wstring experiment, arm0, arm1;
     Comparison battery, package, core, rest, cpu, drops;
+    Comparison burstMs, workRate, energyPerWork; // automatic test only
+    bool frames = false, bursts = false, work = false; // which workload results exist
 };
 // Groups blocks by experiment and pairs them by run and pair number.
 std::vector<ExperimentResult> analyze(const std::vector<Block>& blocks);
@@ -184,6 +205,19 @@ struct Actuator {
 
 // Runs recording and one experiment at a time. Commands come from the UI
 // thread, samples from the sampler thread. An empty folder writes no files.
+// One measured setting: a knob under a workload, run as alternating pairs.
+struct Step {
+    Knob knob = Knob::cpuBoost;
+    Workload workload = Workload::none;
+    int pairs = 8;
+    double blockSeconds = 120, warmupSeconds = 20, minimumSeconds = 60;
+    double prepareSeconds = 0; // load started but not measured, before the first block (e.g. making the test video)
+};
+// The automatic test: each knob under the workloads it can affect. With a
+// browser it uses real web browsing, video and typing; without one, built-in loads.
+std::vector<Step> automaticPlan(bool browser);
+std::wstring experimentKey(Knob knob, Workload workload); // "cpu-boost" or "cpu-boost@scroll"
+
 class Controller {
 public:
     static constexpr double BlockSeconds = 120;
@@ -197,13 +231,21 @@ public:
         double blockElapsed = 0;
         DWORD lastError = ERROR_SUCCESS;
         bool finished = false;
+        bool plan = false;            // running the automatic test
+        int step = 0, steps = 0, skipped = 0;
+        Workload workload = Workload::none;
+        double remainingSeconds = 0;  // of battery time, for the whole plan
+        uint64_t run = 0;
         Breakdown breakdown;
         std::vector<ExperimentResult> results;
     };
     explicit Controller(std::wstring folder = labFolder(), std::shared_ptr<Actuator> actuator = std::make_shared<Actuator>());
     void setRecording(bool on);
     DWORD start(Knob knob);
+    // Runs the steps one after another, restoring each setting before the next.
+    DWORD startPlan(const std::vector<Step>& steps);
     void stop();
+    Workload workload() const;    // what the workload engine should run now
     bool active() const;
     void onSample(Sample& sample, double seconds);
     Status status() const;
@@ -211,6 +253,9 @@ public:
     void flushNow(); // writes pending trace rows, e.g. before an export
 private:
     void finishRun(bool completed);
+    bool beginStep();             // plans the current step's knob; false when none is left
+    void finishStep();
+    void log(const std::wstring& text);
     void flush();
     mutable std::mutex lock_;
     std::wstring folder_;
@@ -218,6 +263,12 @@ private:
     bool recording_ = false, running_ = false, applied_ = false, paused_ = false, finished_ = false, ghelper_ = false;
     double recordedSeconds_ = 0;
     Knob knob_ = Knob::cpuBoost;
+    std::vector<Step> steps_;
+    size_t stepIndex_ = 0;
+    bool planMode_ = false;
+    int skipped_ = 0;
+    uint64_t prepareStart_ = 0;
+    bool prepared_ = false;
     KnobPlan plan_;
     Schedule schedule_{1};
     uint64_t run_ = 0;
@@ -227,8 +278,30 @@ private:
     DWORD lastError_ = ERROR_SUCCESS;
     Breakdown breakdown_;
     std::vector<Block> blocks_;
-    std::string pendingRows_;
+    std::string pendingRows_, pendingLog_;
     std::wstring traceDate_;
     size_t pendingCount_ = 0;
+};
+
+// Runs the automatic test's synthetic loads: a full-screen window that scrolls
+// a mock page with a fixed amount of work per frame and counts its own late
+// frames, short fixed bursts every 250 ms, and two threads of sustained fixed
+// work. Each load is the same for both settings of a pair. Esc asks to stop.
+class WorkloadEngine {
+public:
+    WorkloadEngine();
+    ~WorkloadEngine();
+    WorkloadEngine(const WorkloadEngine&) = delete;
+    WorkloadEngine& operator=(const WorkloadEngine&) = delete;
+    void start(Controller* controller);
+    void stop();
+    bool running() const;
+    bool abortRequested() const;
+    WorkloadMetrics take(); // and reset, once per sample
+    // Edge, else Chrome; empty when neither is installed.
+    static std::wstring browserPath();
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 }

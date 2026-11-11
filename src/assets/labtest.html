@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<title>BatteryScope 自動測試</title>
+<!--
+  BatteryScope power lab: realistic, repeatable activities run in a separate
+  browser window while BatteryScope switches one power setting back and forth.
+  Served from 127.0.0.1 by BatteryScope; it polls /state for the activity to run
+  and posts what it measured to /m every second. Nothing here uses the network.
+-->
+<style>
+  html, body { margin: 0; background: #15171c; color: #d8dce3; font: 17px/1.65 "Segoe UI", "Microsoft JhengHei UI", sans-serif; }
+  #hud { position: fixed; top: 0; left: 0; right: 0; z-index: 9; background: rgba(20, 22, 27, .94); padding: 9px 18px;
+    font: 600 15px "Segoe UI", "Microsoft JhengHei UI", sans-serif; color: #e9edf2; border-bottom: 1px solid #2b3038; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #stage { max-width: 860px; margin: 58px auto 0; padding: 0 24px 60px; }
+  article h1 { font-size: 34px; line-height: 1.25; margin: 26px 0 6px; color: #f1f3f6; }
+  article h2 { font-size: 24px; margin: 30px 0 6px; color: #e6e9ee; }
+  article p { margin: 0 0 14px; }
+  article .meta { color: #8b93a1; font-size: 14px; }
+  article img { width: 100%; border-radius: 10px; margin: 10px 0 18px; box-shadow: 0 6px 24px rgba(0, 0, 0, .35); }
+  .card { border: 1px solid #2c323b; border-radius: 12px; padding: 12px 16px; margin: 18px 0; background: #1b1e24; }
+  .ad { height: 90px; border-radius: 10px; margin: 20px 0; background: linear-gradient(90deg, #28323f, #3b4a5c, #28323f);
+    background-size: 200% 100%; animation: shine 3s linear infinite; }
+  @keyframes shine { to { background-position: -200% 0; } }
+  #video { position: fixed; left: 0; top: 40px; width: 100%; height: calc(100% - 40px); background: #000; object-fit: contain; display: none; }
+  #doc { min-height: 80vh; outline: none; background: #f7f7f5; color: #222; padding: 48px 64px; border-radius: 6px; margin-top: 20px;
+    font: 16px/1.7 Calibri, "Microsoft JhengHei UI", sans-serif; }
+</style>
+</head>
+<body>
+<div id="hud">BatteryScope</div>
+<div id="stage"></div>
+<video id="video" loop playsinline></video>
+<script>
+'use strict';
+const stage = document.getElementById('stage'), hud = document.getElementById('hud'), video = document.getElementById('video');
+let scenario = '', token = 0, refresh = 60, note = '', caption = 'BatteryScope';
+// Measured since the last report: animation frames, late ones (over 1.5 refresh
+// periods), timed events (page loads, keystrokes) and video frames.
+const m = { frames: 0, late: 0, events: 0, eventMs: 0, videoDropped: 0, videoTotal: 0 };
+let seed = 1;
+const rnd = () => { seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0; return seed / 4294967296; };
+const words = ('電池 效能 時脈 核心 顯示 影片 網頁 瀏覽 排版 字型 系統 程式 效率 筆電 螢幕 記憶體 散熱 風扇 處理器 平台 ' +
+  'the of power screen battery frame layout network cache render style script image video and with for').split(' ');
+const sentence = n => { let s = ''; for (let i = 0; i < n; i++) s += words[Math.floor(rnd() * words.length)] + (rnd() < .5 ? ' ' : ''); return s.trim() + '。'; };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const alive = my => my === token;
+const showHud = () => { hud.textContent = caption + (note ? '  ·  ' + note : ''); };
+
+const images = [];
+function makeImages() {
+  for (let i = 0; i < 6; i++) {
+    const c = document.createElement('canvas'); c.width = 1280; c.height = 720;
+    const g = c.getContext('2d'), gradient = g.createLinearGradient(0, 0, 1280, 720);
+    gradient.addColorStop(0, `hsl(${i * 50},45%,35%)`); gradient.addColorStop(1, `hsl(${i * 50 + 120},45%,20%)`);
+    g.fillStyle = gradient; g.fillRect(0, 0, 1280, 720);
+    for (let k = 0; k < 160; k++) {
+      g.fillStyle = `hsla(${(i * 50 + k * 7) % 360},60%,${30 + k % 40}%,.35)`;
+      g.beginPath(); g.arc(rnd() * 1280, rnd() * 720, 10 + rnd() * 90, 0, 7); g.fill();
+    }
+    images.push(c.toDataURL('image/jpeg', .85));
+  }
+}
+// A new article each time: build, lay out, and count the time to the first frame as a page load.
+function buildArticle() {
+  const t0 = performance.now();
+  seed = (Math.random() * 4294967296) >>> 0;
+  const article = document.createElement('article');
+  let html = '<h1>' + sentence(8) + '</h1><p class="meta">' + new Date().toLocaleString() + '</p>';
+  for (let section = 0; section < 8; section++) {
+    html += '<h2>' + sentence(5) + '</h2>';
+    for (let p = 0; p < 4; p++) html += '<p>' + sentence(40 + Math.floor(rnd() * 40)) + '</p>';
+    if (section % 2 === 0) html += '<img alt="" src="' + images[Math.floor(rnd() * images.length)] + '">';
+    if (section % 3 === 1) html += '<div class="ad"></div>';
+    if (section % 3 === 2) html += '<div class="card">' + sentence(30) + '</div>';
+  }
+  article.innerHTML = html;
+  stage.replaceChildren(article); scrollTo(0, 0);
+  void document.body.offsetHeight; // force layout now
+  return new Promise(r => requestAnimationFrame(() => { m.events++; m.eventMs += performance.now() - t0; r(); }));
+}
+// Eased scrolling, one step per frame, counting frames that miss a refresh.
+function smoothScroll(px, ms, my) {
+  const start = performance.now(), y0 = scrollY, period = 1000 / refresh;
+  let last = start;
+  return new Promise(res => {
+    function frame(t) {
+      if (!alive(my)) { res(); return; }
+      const k = Math.min(1, (t - start) / ms);
+      scrollTo(0, y0 + px * (k < .5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2));
+      if (t > start) { m.frames++; if (t - last > period * 1.5) m.late++; }
+      last = t;
+      if (k < 1) requestAnimationFrame(frame); else res();
+    }
+    requestAnimationFrame(frame);
+  });
+}
+async function browse(my) {
+  while (alive(my)) {
+    await buildArticle();
+    for (let i = 0; i < 5 && alive(my); i++) {
+      await sleep(3000 + rnd() * 3000); // reading
+      if (alive(my)) await smoothScroll(500 + rnd() * 700, 700 + rnd() * 900, my);
+    }
+    await sleep(1500);
+  }
+}
+async function idle(my) {
+  await buildArticle(); // a page left open while reading
+  while (alive(my)) await sleep(1000);
+}
+// 12 seconds of 1080p30 VP9 video with sound, recorded once from a canvas and
+// then played in a loop like any web video.
+let clip = null;
+async function makeClip() {
+  const c = document.createElement('canvas'); c.width = 1920; c.height = 1080;
+  const g = c.getContext('2d'), audio = new AudioContext(), destination = audio.createMediaStreamDestination();
+  for (const f of [220, 277, 330, 440]) {
+    const o = audio.createOscillator(), gain = audio.createGain();
+    o.frequency.value = f; gain.gain.value = .04; o.connect(gain).connect(destination); o.start();
+  }
+  const stream = new MediaStream([...c.captureStream(30).getVideoTracks(), ...destination.stream.getAudioTracks()]);
+  const type = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'].find(t => MediaRecorder.isTypeSupported(t));
+  const recorder = new MediaRecorder(stream, { mimeType: type, videoBitsPerSecond: 8e6 }), parts = [];
+  recorder.ondataavailable = e => parts.push(e.data);
+  let frame = 0;
+  const draw = () => {
+    const t = frame++ / 30;
+    g.fillStyle = `hsl(${(t * 20) % 360},40%,18%)`; g.fillRect(0, 0, 1920, 1080);
+    for (let k = 0; k < 40; k++) {
+      g.fillStyle = `hsla(${(k * 9 + t * 40) % 360},70%,55%,.6)`;
+      g.beginPath(); g.arc(960 + 700 * Math.sin(t * .7 + k), 540 + 380 * Math.cos(t * .9 + k * 1.3), 40 + 30 * Math.sin(t + k), 0, 7); g.fill();
+    }
+    g.fillStyle = '#fff'; g.font = 'bold 64px "Segoe UI"'; g.fillText('BatteryScope ' + t.toFixed(1) + ' s', 80, 1000);
+  };
+  recorder.start(1000);
+  const timer = setInterval(draw, 1000 / 30);
+  await sleep(12000);
+  clearInterval(timer);
+  await new Promise(r => { recorder.onstop = r; recorder.stop(); });
+  audio.close();
+  clip = URL.createObjectURL(new Blob(parts, { type: type.split(';')[0] }));
+}
+async function watch(my) {
+  stage.replaceChildren();
+  if (!clip) { note = '準備測試影片…'; showHud(); await makeClip(); note = ''; showHud(); }
+  if (!alive(my)) return;
+  video.src = clip; video.volume = .25; video.style.display = 'block';
+  await video.play().catch(() => { video.muted = true; return video.play(); });
+  let before = video.getVideoPlaybackQuality();
+  while (alive(my)) {
+    await sleep(1000);
+    const q = video.getVideoPlaybackQuality();
+    m.videoDropped += q.droppedVideoFrames - before.droppedVideoFrames;
+    m.videoTotal += q.totalVideoFrames - before.totalVideoFrames;
+    before = q;
+  }
+  video.pause(); video.style.display = 'none';
+}
+// Typing a report at a human pace, with corrections, paragraphs, spell check
+// and an autosave; each keystroke's time to screen is an event.
+async function office(my) {
+  const doc = document.createElement('div');
+  doc.id = 'doc'; doc.contentEditable = 'true'; doc.spellcheck = true; doc.innerHTML = '<h1>本週工作報告</h1><p><br></p>';
+  stage.replaceChildren(doc); doc.focus();
+  const selection = getSelection(); selection.selectAllChildren(doc); selection.collapseToEnd();
+  let saved = performance.now();
+  while (alive(my)) {
+    for (const ch of sentence(12 + Math.floor(rnd() * 10))) {
+      if (!alive(my)) return;
+      const t0 = performance.now();
+      if (rnd() < .03) document.execCommand('delete'); else document.execCommand('insertText', false, ch);
+      await new Promise(r => requestAnimationFrame(() => { m.events++; m.eventMs += performance.now() - t0; r(); }));
+      await sleep(90 + rnd() * 160);
+    }
+    if (rnd() < .35) document.execCommand('insertParagraph');
+    if (performance.now() - saved > 10000) { localStorage.setItem('doc', doc.innerHTML); saved = performance.now(); }
+    await sleep(600 + rnd() * 1500);
+  }
+}
+const runners = { browse, video: watch, office, idle, sustained: idle, none: idle };
+function switchTo(name) {
+  scenario = name;
+  const my = ++token;
+  video.pause(); video.style.display = 'none';
+  (runners[name] || idle)(my).catch(e => { note = String(e); showHud(); });
+}
+async function poll() {
+  try {
+    const state = await (await fetch('/state', { cache: 'no-store' })).json();
+    refresh = state.refresh || refresh; caption = state.caption || caption; showHud();
+    if (state.scenario !== scenario) switchTo(state.scenario);
+    const body = JSON.stringify(m);
+    for (const k in m) m[k] = 0;
+    await fetch('/m', { method: 'POST', body, cache: 'no-store' });
+  } catch (e) { /* BatteryScope is between samples or closing */ }
+  setTimeout(poll, 1000);
+}
+addEventListener('keydown', e => { if (e.key === 'Escape') fetch('/abort', { method: 'POST' }); });
+makeImages();
+poll();
+</script>
+</body>
+</html>

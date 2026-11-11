@@ -193,8 +193,10 @@ KnobPlan planKnob(Knob knob) {
     }
     case Knob::powerMode:
         if (PowerMode(original) == PowerMode::other) { plan.error = ERROR_NOT_SUPPORTED; return plan; } // an OEM mode we could not restore exactly
-        plan.values = {DWORD(PowerMode::balanced), DWORD(PowerMode::efficiency)};
-        plan.names = {L"平衡", L"效率"};
+        // The mode in use against efficiency (or, if efficiency is in use, against balanced).
+        plan.values = {original, PowerMode(original) == PowerMode::efficiency ? DWORD(PowerMode::balanced) : DWORD(PowerMode::efficiency)};
+        for (size_t i = 0; i < 2; ++i)
+            plan.names[i] = PowerMode(plan.values[i]) == PowerMode::efficiency ? L"效率" : PowerMode(plan.values[i]) == PowerMode::balanced ? L"平衡" : L"效能";
         break;
     default: plan.error = ERROR_INVALID_PARAMETER; return plan;
     }
@@ -357,9 +359,16 @@ void Probe::read(Sample& s, const std::vector<std::pair<std::wstring, double>>& 
     s.context = classify(s.signals);
     DWORD foregroundPid = 0;
     if (HWND window = GetForegroundWindow()) GetWindowThreadProcessId(window, &foregroundPid);
+    std::vector<const ProcessRow*> busy;
     for (const auto& row : processes) {
         if (row.pid == foregroundPid) s.foreground = row.name;
         if (lowerEquals(row.name, L"ghelper.exe")) s.ghelper = true;
+        if (row.measured && row.cpu >= .5) busy.push_back(&row);
+    }
+    std::sort(busy.begin(), busy.end(), [](const ProcessRow* a, const ProcessRow* b) { return a->cpu > b->cpu; });
+    for (size_t i = 0; i < busy.size() && i < 5; ++i) {
+        wchar_t cpu[16]; swprintf(cpu, 16, L" %.1f%%", busy[i]->cpu);
+        s.topProcesses += (i ? L";" : L"") + busy[i]->name + cpu;
     }
     s.refreshHz = currentRefresh();
     p.composition(s);
@@ -402,6 +411,12 @@ void Probe::read(Sample& s, const std::vector<std::pair<std::wstring, double>>& 
 
 namespace bs::lab {
 namespace {
+std::string utf8Text(const std::wstring& text) {
+    if (text.empty()) return {};
+    std::string out(size_t(WideCharToMultiByte(CP_UTF8, 0, text.c_str(), int(text.size()), nullptr, 0, nullptr, nullptr)), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), int(text.size()), out.data(), int(out.size()), nullptr, nullptr);
+    return out;
+}
 std::wstring todayStamp(wchar_t separator) {
     SYSTEMTIME t{}; GetLocalTime(&t);
     wchar_t text[32];
@@ -453,31 +468,109 @@ void Controller::setRecording(bool on) {
     recording_ = on;
     if (on && !folder_.empty()) pruneTraces(folder_);
 }
+std::wstring experimentKey(Knob knob, Workload workload) {
+    std::wstring key = knobKey(knob);
+    if (workload != Workload::none) key += std::wstring(L"@") + workloadKey(workload);
+    return key;
+}
+std::vector<Step> automaticPlan(bool browser) {
+    // Each setting under the activities it can change; 3 pairs of 45-second blocks (35 counted) per step.
+    using W = Workload;
+    std::vector<std::pair<Knob, Workload>> order;
+    if (browser) order = {
+        {Knob::powerMode, W::idle}, {Knob::powerMode, W::browse}, {Knob::powerMode, W::video}, {Knob::powerMode, W::office},
+        {Knob::refreshRate, W::idle}, {Knob::refreshRate, W::browse}, {Knob::refreshRate, W::video},
+        {Knob::cpuBoost, W::browse}, {Knob::cpuBoost, W::office}, {Knob::cpuBoost, W::sustained},
+        {Knob::energyPreference, W::browse}, {Knob::energyPreference, W::video}, {Knob::energyPreference, W::sustained}};
+    else order = {
+        {Knob::powerMode, W::idle}, {Knob::powerMode, W::bursts}, {Knob::powerMode, W::scroll},
+        {Knob::refreshRate, W::idle}, {Knob::refreshRate, W::scroll},
+        {Knob::cpuBoost, W::bursts}, {Knob::cpuBoost, W::scroll}, {Knob::cpuBoost, W::sustained},
+        {Knob::energyPreference, W::bursts}, {Knob::energyPreference, W::sustained}};
+    std::vector<Step> steps;
+    for (const auto& [knob, workload] : order) {
+        Step step; step.knob = knob; step.workload = workload;
+        step.pairs = 3; step.blockSeconds = 45; step.warmupSeconds = 10; step.minimumSeconds = 25;
+        // The first video step records the 12-second test clip; every step lets its load start first.
+        step.prepareSeconds = workload == W::video ? 20 : 6;
+        steps.push_back(step);
+    }
+    return steps;
+}
+void Controller::log(const std::wstring& text) {
+    pendingLog_ += utf8Text(todayStamp(L' ') + L"  " + text) + "\r\n";
+}
+bool Controller::beginStep() {
+    while (stepIndex_ < steps_.size()) {
+        const Step& step = steps_[stepIndex_];
+        KnobPlan plan = actuator_->plan(step.knob);
+        if (plan.available) {
+            actuator_->remember(step.knob, plan.original);
+            knob_ = step.knob; plan_ = plan; applied_ = false; paused_ = false;
+            FILETIME now{}; GetSystemTimeAsFileTime(&now);
+            run_ = ((uint64_t(now.dwHighDateTime) << 32) | now.dwLowDateTime) / 10000000ull + stepIndex_;
+            schedule_ = Schedule(run_ * 2654435761ull);
+            block_ = 0; pairs_.clear(); prepareStart_ = 0; prepared_ = false;
+            log(L"step " + std::to_wstring(stepIndex_ + 1) + L"/" + std::to_wstring(steps_.size()) + L" " + experimentKey(step.knob, step.workload) +
+                L": original " + std::to_wstring(plan.original) + L", arms " + std::to_wstring(plan.values[0]) + L" / " + std::to_wstring(plan.values[1]));
+            return true;
+        }
+        lastError_ = plan.error; ++skipped_;
+        log(L"step " + std::to_wstring(stepIndex_ + 1) + L" " + experimentKey(step.knob, step.workload) + L" skipped: error " + std::to_wstring(plan.error));
+        ++stepIndex_;
+    }
+    return false;
+}
 DWORD Controller::start(Knob knob) {
+    Step step; step.knob = knob; step.pairs = TargetPairs; step.blockSeconds = BlockSeconds;
     std::lock_guard<std::mutex> guard(lock_);
     if (running_) return ERROR_BUSY;
     KnobPlan plan = actuator_->plan(knob);
     if (!plan.available) { lastError_ = plan.error; return plan.error; }
-    actuator_->remember(knob, plan.original);
-    knob_ = knob; plan_ = plan; running_ = true; applied_ = false; paused_ = false; finished_ = false;
-    FILETIME now{}; GetSystemTimeAsFileTime(&now);
-    run_ = ((uint64_t(now.dwHighDateTime) << 32) | now.dwLowDateTime) / 10000000ull;
-    schedule_ = Schedule(run_ * 2654435761ull);
-    block_ = 0; externalChanges_ = 0; pairs_.clear(); lastError_ = ERROR_SUCCESS;
+    steps_ = {step}; stepIndex_ = 0; planMode_ = false; skipped_ = 0;
+    externalChanges_ = 0; lastError_ = ERROR_SUCCESS; finished_ = false;
+    if (!beginStep()) return lastError_;
+    running_ = true;
     return ERROR_SUCCESS;
 }
-void Controller::finishRun(bool completed) {
-    if (!running_) return;
+DWORD Controller::startPlan(const std::vector<Step>& steps) {
+    std::lock_guard<std::mutex> guard(lock_);
+    if (running_) return ERROR_BUSY;
+    if (steps.empty()) return ERROR_INVALID_PARAMETER;
+    steps_ = steps; stepIndex_ = 0; planMode_ = true; skipped_ = 0;
+    externalChanges_ = 0; lastError_ = ERROR_SUCCESS; finished_ = false;
+    log(L"automatic test started, " + std::to_wstring(steps.size()) + L" steps");
+    if (!beginStep()) { log(L"no setting can be changed; nothing to test"); return lastError_ ? lastError_ : ERROR_NOT_SUPPORTED; }
+    running_ = true;
+    return ERROR_SUCCESS;
+}
+Workload Controller::workload() const {
+    std::lock_guard<std::mutex> guard(lock_);
+    return running_ && stepIndex_ < steps_.size() ? steps_[stepIndex_].workload : Workload::none;
+}
+void Controller::finishStep() {
     // Always put the original back: a block may have just ended with its setting still in place.
     actuator_->apply(knob_, plan_.original);
     actuator_->forget();
-    running_ = false; applied_ = false; paused_ = false; finished_ = completed;
+    applied_ = false;
+    log(L"step " + std::to_wstring(stepIndex_ + 1) + L" done, setting restored to " + std::to_wstring(plan_.original));
+}
+void Controller::finishRun(bool completed) {
+    if (!running_) return;
+    finishStep();
+    running_ = false; paused_ = false; finished_ = completed;
+    log(completed ? L"finished" : L"stopped");
+    flush();
 }
 void Controller::stop() { std::lock_guard<std::mutex> guard(lock_); finishRun(false); }
 bool Controller::active() const { std::lock_guard<std::mutex> guard(lock_); return recording_ || running_; }
 void Controller::shutdown() { std::lock_guard<std::mutex> guard(lock_); finishRun(false); flush(); }
 void Controller::flushNow() { std::lock_guard<std::mutex> guard(lock_); flush(); }
 void Controller::flush() {
+    if (!pendingLog_.empty()) {
+        if (!folder_.empty()) appendFile(std::filesystem::path(folder_) / L"lab.log", std::string(), pendingLog_);
+        pendingLog_.clear();
+    }
     if (pendingRows_.empty()) return;
     if (!folder_.empty()) appendFile(std::filesystem::path(folder_) / (L"trace-" + traceDate_ + L".csv"), csvHeader(), pendingRows_);
     pendingRows_.clear(); pendingCount_ = 0;
@@ -487,59 +580,82 @@ void Controller::onSample(Sample& s, double seconds) {
     if (!recording_ && !running_) return;
     ghelper_ = s.ghelper;
     if (running_) {
-        s.experiment = knobKey(knob_);
+        const Step& step = steps_[stepIndex_];
+        s.experiment = experimentKey(step.knob, step.workload);
         s.block = block_;
         if (!s.onBattery) {
             // Settings on battery do not apply while plugged in: undo, and redo this block later.
-            if (applied_) { actuator_->apply(knob_, plan_.original); applied_ = false; }
+            if (applied_) { actuator_->apply(knob_, plan_.original); applied_ = false; log(L"plugged in: paused, setting restored"); }
             paused_ = true;
+        } else if (!prepared_ && (prepareStart_ ? s.ms - prepareStart_ : 0) < step.prepareSeconds * 1000) {
+            if (!prepareStart_) prepareStart_ = s.ms; // the load is starting; nothing is measured yet
         } else {
+            prepared_ = true;
             const int arm = schedule_.armFor(block_);
             const DWORD expected = plan_.values[size_t(arm)];
             if (!applied_) {
                 lastError_ = actuator_->apply(knob_, expected);
+                if (paused_) log(L"on battery: resumed");
                 applied_ = true; paused_ = false;
-                recorder_.begin(block_ / 2, arm, s.ms);
+                recorder_.begin(block_ / 2, arm, s.ms, step.warmupSeconds, step.minimumSeconds);
             } else {
                 DWORD actual = 0;
                 if (actuator_->read(knob_, actual) == ERROR_SUCCESS && actual != expected) {
                     // Another program (for example G-Helper) changed it: this block no longer measures the arm.
                     ++externalChanges_; recorder_.invalidate(); actuator_->apply(knob_, expected);
+                    log(L"setting changed from outside to " + std::to_wstring(actual) + L"; block " + std::to_wstring(block_) + L" will be repeated");
                 }
             }
             s.arm = arm;
             s.counted = recorder_.add(s, seconds);
-            if (s.ms >= recorder_.startMs() && (s.ms - recorder_.startMs()) / 1000.0 >= BlockSeconds) {
+            if (s.ms >= recorder_.startMs() && (s.ms - recorder_.startMs()) / 1000.0 >= step.blockSeconds) {
                 Block block;
                 if (recorder_.finish(block)) {
-                    block.experiment = knobKey(knob_); block.run = run_; block.armName = plan_.names[size_t(arm)];
+                    block.experiment = experimentKey(step.knob, step.workload); block.run = run_; block.armName = plan_.names[size_t(arm)];
                     block.started = todayStamp(L' ');
                     blocks_.push_back(block);
                     if (!folder_.empty()) appendFile(std::filesystem::path(folder_) / L"blocks.csv", Block::csvHeader(), block.csv());
                     pairs_[block_ / 2][size_t(arm)] = true;
+                    log(L"block " + std::to_wstring(block_) + L" " + plan_.names[size_t(arm)] + L": " + std::to_wstring(block.battery) + L" W");
                     ++block_;
-                } else if (!recorder_.invalid()) ++block_; // too little battery time counted: move on
+                } else if (!recorder_.invalid()) { log(L"block " + std::to_wstring(block_) + L" too short, skipped"); ++block_; }
                 // An invalidated block is repeated with the same arm, keeping pairs balanced.
                 applied_ = false;
                 int done = 0; for (const auto& pair : pairs_) done += pair.second[0] && pair.second[1];
-                if (done >= TargetPairs) finishRun(true);
+                if (done >= step.pairs) {
+                    finishStep();
+                    ++stepIndex_;
+                    if (!beginStep()) finishRun(true);
+                }
             }
         }
     }
-    if (recording_) {
+    if (recording_ || running_) {
         breakdown_.add(s, seconds);
         if (s.onBattery) recordedSeconds_ += seconds;
         const std::wstring date = todayStamp(0);
         if (date != traceDate_) { flush(); traceDate_ = date; }
         pendingRows_ += csvRow(s);
         if (++pendingCount_ >= 15) flush();
-    } else if (s.onBattery) breakdown_.add(s, seconds);
+    }
 }
 Controller::Status Controller::status() const {
     std::lock_guard<std::mutex> guard(lock_);
     Status st;
     st.recording = recording_; st.running = running_; st.paused = paused_; st.finished = finished_; st.ghelper = ghelper_;
     st.recordedSeconds = recordedSeconds_; st.knob = knob_; st.armNames = plan_.names;
+    st.plan = planMode_; st.step = int(stepIndex_); st.steps = int(steps_.size()); st.skipped = skipped_; st.run = run_;
+    st.workload = running_ && stepIndex_ < steps_.size() ? steps_[stepIndex_].workload : Workload::none;
+    if (running_) {
+        // Battery time left: the rest of this step's blocks plus every later step.
+        int done = 0; for (const auto& pair : pairs_) done += pair.second[0] && pair.second[1];
+        const Step& step = steps_[stepIndex_];
+        double remaining = std::max(0, step.pairs * 2 - block_) * step.blockSeconds + (prepared_ ? 0 : step.prepareSeconds);
+        if (applied_) remaining -= std::min(step.blockSeconds, (GetTickCount64() - recorder_.startMs()) / 1000.0);
+        for (size_t i = stepIndex_ + 1; i < steps_.size(); ++i) remaining += steps_[i].pairs * 2 * steps_[i].blockSeconds + steps_[i].prepareSeconds;
+        st.remainingSeconds = std::max(0.0, remaining);
+        (void)done;
+    }
     st.arm = running_ && applied_ ? schedule_.armFor(block_) : -1;
     st.block = block_; st.externalChanges = externalChanges_; st.lastError = lastError_;
     for (const auto& pair : pairs_) st.pairsDone += pair.second[0] && pair.second[1];
