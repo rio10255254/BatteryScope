@@ -2207,6 +2207,7 @@ std::wstring labPageText() {
     if (!st.results.empty()) {
         c += tr(L"\n\n實驗結果（兩種設定成對比較，± 為 95% 範圍）");
         for (const auto& r : st.results) {
+            if (r.arm0.empty() || r.arm1.empty()) continue; // an interrupted run from an older version
             c += L"\n" + labExperimentTitle(r.experiment) + L"：" + labArm(r.arm1) + tr(L" 相對於 ") + labArm(r.arm0);
             if (r.battery.pairs < 2) { c += tr(L"\n  資料不足：至少要 2 組完整的比較。"); continue; }
             c += tr(L"\n  電池 ") + signedNumber(r.battery.difference, 2) + L" W（±" + number(r.battery.halfWidth, 2) + L"，" +
@@ -3062,7 +3063,7 @@ void flushDetectionLog() {
     std::error_code error;
     const bool fresh = !std::filesystem::exists(path, error);
     std::ofstream out(path, std::ios::binary | std::ios::app);
-    if (fresh) out << "\xEF\xBB\xBFtime,workload,activity,confidence,reason,foreground,category,full_screen,idle_s,active_s,fps,cpu,gpu_3d,video_decode,audio,foreground_audio,call,locked\r\n";
+    if (fresh) out << "\xEF\xBB\xBFtime,workload,activity,confidence,reason,foreground,category,full_screen,idle_s,active_s,fps,cpu,gpu_3d,video_decode,audio,foreground_audio,call,locked,compositor_gpu\r\n";
     out << detectionLog;
     detectionLog.clear();
 }
@@ -3092,6 +3093,14 @@ void governorTick() {
         std::lock_guard<std::mutex> lock(governorGpuMutex);
         if (governorGpuAt && now - governorGpuAt < 10000) o.gpu = governorGpuLatest;
     }
+    if (o.gpu.known) {
+        // The compositor's GPU use shows whether anything on screen is moving.
+        for (const auto& row : current.processes) if (_wcsicmp(row.name.c_str(), L"dwm.exe") == 0) {
+            auto it = o.gpu.processes.find(row.pid);
+            o.compositorGpu = it != o.gpu.processes.end() ? it->second.engine3d : 0.0;
+            break;
+        }
+    }
     lastAssessment = detector.assess(o);
     if (testing) {
         // The automatic test knows what it is running: score the detection against it.
@@ -3103,11 +3112,11 @@ void governorTick() {
             detectionTally.add(workload, lastAssessment.activity, seconds);
             const auto& g = o.gpu.total;
             wchar_t line[512];
-            swprintf(line, 512, L"%llu,%ls,%ls,%.2f,\"%ls\",%ls,%ls,%d,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%d,%d,%d,%d\r\n",
+            swprintf(line, 512, L"%llu,%ls,%ls,%.2f,\"%ls\",%ls,%ls,%d,%.0f,%.0f,%.1f,%.0f,%.0f,%.0f,%d,%d,%d,%d,%.1f\r\n",
                 static_cast<unsigned long long>(now), workload.c_str(), bs::gov::activityKey(lastAssessment.activity), lastAssessment.confidence,
                 lastAssessment.reason.c_str(), o.foregroundExe.c_str(), bs::gov::categoryKey(lastAssessment.category), int(o.foregroundCoversScreen),
                 o.idleSeconds, o.activeSeconds.value_or(-1), o.framesPerSecond.value_or(-1), o.systemCpu.value_or(-1), g.engine3d, g.decode,
-                int(o.audio), int(o.foregroundAudio), int(o.call), int(o.locked));
+                int(o.audio), int(o.foregroundAudio), int(o.call), int(o.locked), o.compositorGpu.value_or(-1));
             detectionLog += utf8(line);
             if (detectionLog.size() > 64 * 1024) flushDetectionLog();
         }

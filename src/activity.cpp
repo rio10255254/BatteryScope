@@ -151,8 +151,10 @@ Assessment Detector::assess(const Observation& o) {
     const double cpu = o.systemCpu.value_or(0);
     // "Active" input: a key, click or wheel. Without raw input, any input counts.
     const double active = o.activeSeconds.value_or(o.idleSeconds);
-    const bool screenStatic = o.framesPerSecond && *o.framesPerSecond < 5;
-    const bool screenMoving = o.framesPerSecond && *o.framesPerSecond >= 10;
+    // Whether anything on screen is moving: the compositor's GPU use when known (the frame
+    // counter stays near 0.5 per second on some PCs whatever is shown), else its frame count.
+    const bool screenStatic = o.compositorGpu ? *o.compositorGpu < 1.5 : o.framesPerSecond && *o.framesPerSecond < 5;
+    const bool screenMoving = o.compositorGpu ? *o.compositorGpu >= 4 : o.framesPerSecond && *o.framesPerSecond >= 10;
 
     // Sustained busy time, so a short spike (opening a program) is not "heavy".
     if (cpu >= 25) { if (!busySince_) busySince_ = o.ms ? o.ms : 1; } else busySince_ = 0;

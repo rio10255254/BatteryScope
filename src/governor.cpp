@@ -72,7 +72,11 @@ std::vector<Evidence> learn(const std::vector<lab::ExperimentResult>& results) {
     std::vector<Evidence> evidence;
     for (const auto& r : results) {
         const size_t at = r.experiment.find(L'@');
-        if (at == std::wstring::npos || r.battery.pairs < 2 || !r.battery.significant()) continue;
+        if (at == std::wstring::npos || r.battery.pairs < 2) continue;
+        // The battery reading is noisy (screen, Wi-Fi, other apps), so a clear CPU core
+        // difference in the same direction also counts for the settings that act on the CPU.
+        const bool coreClear = r.core.significant() && r.core.difference * r.battery.difference > 0;
+        if (!r.battery.significant() && !coreClear) continue;
         const std::wstring knob = r.experiment.substr(0, at), workload = r.experiment.substr(at + 1);
         std::optional<Setting> setting;
         if (knob == L"power-mode") setting = Setting::powerMode;
@@ -84,13 +88,14 @@ std::vector<Evidence> learn(const std::vector<lab::ExperimentResult>& results) {
         const bool secondSaves = r.battery.difference < 0;
         const auto value = armValue(*setting, secondSaves ? r.arm1 : r.arm0);
         if (!value) continue;
-        const double saved = std::abs(r.battery.difference);
+        const double saved = r.battery.significant() ? std::abs(r.battery.difference) : std::abs(r.core.difference);
         const double sign = secondSaves ? 1 : -1; // turns "arm1 - arm0" into "saving arm - other arm"
         bool cost = false;
         if (r.frames && sign * r.drops.difference > 1.0) cost = true;                         // more than one late frame per minute
         if (r.bursts && r.burstMs.mean0 > 0 && r.burstMs.mean1 > 0) {
-            const double ratio = secondSaves ? r.burstMs.mean1 / r.burstMs.mean0 : r.burstMs.mean0 / r.burstMs.mean1;
-            if (ratio > 1.15) cost = true;                                                    // responses over 15% slower
+            const double saving = secondSaves ? r.burstMs.mean1 : r.burstMs.mean0, other = secondSaves ? r.burstMs.mean0 : r.burstMs.mean1;
+            // Responses over 15% slower and by more than 5 ms: a few milliseconds on a 7 ms task cannot be felt.
+            if (saving / other > 1.15 && saving - other > 5) cost = true;
         }
         if (r.work && r.workRate.mean0 > 0 && r.workRate.mean1 > 0) {
             const double ratio = secondSaves ? r.workRate.mean1 / r.workRate.mean0 : r.workRate.mean0 / r.workRate.mean1;

@@ -527,8 +527,10 @@ struct SignalReader::Impl {
     IAudioSessionManager2* sessions = nullptr;
     uint64_t sessionsAt = 0, audioAt = 0;
     std::set<uint32_t> playing;
-    // Compositor frames.
-    UINT64 frames = 0; uint64_t framesAt = 0;
+    // Compositor frames, and the most seen in one second: on some PCs the counter barely
+    // moves whatever is on screen, and then it is not reported at all.
+    UINT64 frames = 0; uint64_t framesAt = 0, framesSince = 0;
+    double framesMax = 0;
     ~Impl() { if (sessions) sessions->Release(); }
     std::wstring nameOf(uint32_t pid) {
         if (auto it = names.find(pid); it != names.end()) return it->second;
@@ -620,6 +622,9 @@ struct SignalReader::Impl {
         Value fps;
         if (framesAt && now > framesAt && timing.cFrame >= frames) fps = double(timing.cFrame - frames) * 1000 / double(now - framesAt);
         frames = timing.cFrame; framesAt = now;
+        if (!framesSince) framesSince = now;
+        if (fps) framesMax = std::max(framesMax, *fps);
+        if (now - framesSince >= 60000 && framesMax < 2) return std::nullopt; // the counter does not work here
         return fps;
     }
 };
@@ -805,13 +810,15 @@ std::vector<Step> automaticPlan(bool browser) {
         {Knob::cpuBoost, W::browse}, {Knob::cpuBoost, W::office}, {Knob::cpuBoost, W::sustained},
         {Knob::energyPreference, W::browse}, {Knob::energyPreference, W::video}, {Knob::energyPreference, W::sustained},
         {Knob::backgroundEco, W::idle}, {Knob::backgroundEco, W::browse},
-        {Knob::brightness, W::browse}, {Knob::display, W::idle}}; // screen off last: it may let Windows sleep
+        {Knob::brightness, W::browse}, {Knob::powerMode, W::sustained}};
+        // Screen off is not measured: on Modern Standby laptops Windows goes to standby soon after
+        // the screen turns off, so the blocks measure standby rather than a dark screen.
     else order = {
         {Knob::powerMode, W::idle}, {Knob::powerMode, W::bursts}, {Knob::powerMode, W::scroll},
         {Knob::refreshRate, W::idle}, {Knob::refreshRate, W::scroll},
         {Knob::cpuBoost, W::bursts}, {Knob::cpuBoost, W::scroll}, {Knob::cpuBoost, W::sustained},
         {Knob::energyPreference, W::bursts}, {Knob::energyPreference, W::sustained},
-        {Knob::backgroundEco, W::idle}, {Knob::brightness, W::idle}, {Knob::display, W::idle}};
+        {Knob::backgroundEco, W::idle}, {Knob::brightness, W::idle}, {Knob::powerMode, W::sustained}};
     std::vector<Step> steps;
     for (const auto& [knob, workload] : order) {
         Step step; step.knob = knob; step.workload = workload;

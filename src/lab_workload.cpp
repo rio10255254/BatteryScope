@@ -229,7 +229,10 @@ struct WorkloadEngine::Impl {
         } else if (post && path == "/m") {
             WorkloadMetrics m;
             m.frames = jsonNumber(body, "frames") + jsonNumber(body, "videoTotal");
-            m.lateFrames = jsonNumber(body, "late") + jsonNumber(body, "videoDropped");
+            // The browser's dropped-frame count for the recorded test clip is not used: its frame
+            // times are irregular (recorded on a timer), so at 60 Hz frames land in the same refresh
+            // and count as dropped although a real 30 fps video would play cleanly.
+            m.lateFrames = jsonNumber(body, "late");
             m.bursts = jsonNumber(body, "events"); m.burstMs = jsonNumber(body, "eventMs");
             add(m);
             respond(client, "text/plain", "ok");
