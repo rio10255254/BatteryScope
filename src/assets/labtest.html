@@ -8,24 +8,34 @@
   browser window while BatteryScope switches one power setting back and forth.
   Served from 127.0.0.1 by BatteryScope; it polls /state for the activity to run
   and posts what it measured to /m every second. Nothing here uses the network.
+  Pages are light, like most websites: on an OLED panel a dark page would hide
+  what brightness costs.
 -->
 <style>
-  html, body { margin: 0; background: #15171c; color: #d8dce3; font: 17px/1.65 "Segoe UI", "Microsoft JhengHei UI", sans-serif; }
+  html, body { margin: 0; background: #ffffff; color: #202124; font: 17px/1.65 "Segoe UI", "Microsoft JhengHei UI", sans-serif; }
   #hud { position: fixed; top: 0; left: 0; right: 0; z-index: 9; background: rgba(20, 22, 27, .94); padding: 9px 18px;
     font: 600 15px "Segoe UI", "Microsoft JhengHei UI", sans-serif; color: #e9edf2; border-bottom: 1px solid #2b3038; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #stage { max-width: 860px; margin: 58px auto 0; padding: 0 24px 60px; }
-  article h1 { font-size: 34px; line-height: 1.25; margin: 26px 0 6px; color: #f1f3f6; }
-  article h2 { font-size: 24px; margin: 30px 0 6px; color: #e6e9ee; }
+  article h1 { font-size: 34px; line-height: 1.25; margin: 26px 0 6px; color: #111316; }
+  article h2 { font-size: 24px; margin: 30px 0 6px; color: #1b1e23; }
   article p { margin: 0 0 14px; }
-  article .meta { color: #8b93a1; font-size: 14px; }
-  article img { width: 100%; border-radius: 10px; margin: 10px 0 18px; box-shadow: 0 6px 24px rgba(0, 0, 0, .35); }
-  .card { border: 1px solid #2c323b; border-radius: 12px; padding: 12px 16px; margin: 18px 0; background: #1b1e24; }
-  .ad { height: 90px; border-radius: 10px; margin: 20px 0; background: linear-gradient(90deg, #28323f, #3b4a5c, #28323f);
+  article .meta { color: #5f6672; font-size: 14px; }
+  article img { width: 100%; border-radius: 10px; margin: 10px 0 18px; box-shadow: 0 6px 24px rgba(0, 0, 0, .12); }
+  .card { border: 1px solid #dfe3e8; border-radius: 12px; padding: 12px 16px; margin: 18px 0; background: #f6f8fa; }
+  .ad { height: 90px; border-radius: 10px; margin: 20px 0; background: linear-gradient(90deg, #e8edf3, #d3dce7, #e8edf3);
     background-size: 200% 100%; animation: shine 3s linear infinite; }
   @keyframes shine { to { background-position: -200% 0; } }
   #video { position: fixed; left: 0; top: 40px; width: 100%; height: calc(100% - 40px); background: #000; object-fit: contain; display: none; }
   #doc { min-height: 80vh; outline: none; background: #f7f7f5; color: #222; padding: 48px 64px; border-radius: 6px; margin-top: 20px;
     font: 16px/1.7 Calibri, "Microsoft JhengHei UI", sans-serif; }
+  /* Windows dark mode (the dark-mode step) turns the page dark, as sites that follow it do. */
+  @media (prefers-color-scheme: dark) {
+    html, body { background: #15171c; color: #d8dce3; }
+    article h1 { color: #f1f3f6; } article h2 { color: #e6e9ee; } article .meta { color: #8b93a1; }
+    .card { border-color: #2c323b; background: #1b1e24; }
+    .ad { background: linear-gradient(90deg, #28323f, #3b4a5c, #28323f); background-size: 200% 100%; }
+    #doc { background: #1e2026; color: #e3e5e8; }
+  }
 </style>
 </head>
 <body>

@@ -64,7 +64,8 @@ struct Observation {
     bool foregroundAudio = false;               // the foreground program is playing sound
     Value systemCpu;                            // percent of all logical processors
     GpuActivity gpu;
-    Value framesPerSecond;                      // frames the compositor drew; ~0 when nothing moves
+    Value framesPerSecond;                      // frames the compositor drew; ~0 when nothing moves (nullopt when the counter does not work)
+    Value compositorGpu;                        // 3D engine use of the compositor (dwm.exe); preferred over framesPerSecond
 };
 
 struct Candidate { Activity activity; double confidence; std::wstring reason; };

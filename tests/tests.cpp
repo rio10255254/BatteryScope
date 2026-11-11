@@ -415,6 +415,13 @@ int wmain(int argc, wchar_t** argv) {
         auto results = lab::analyze(blocks);
         check(results.size() == 1 && results[0].battery.pairs == 3 && std::abs(results[0].battery.difference + 1) < 1e-9
             && results[0].arm1 == L"60 Hz", "results pair blocks by run and pair, skipping incomplete pairs");
+        for (int pair = 0; pair < 3; ++pair) for (int arm = 0; arm < 2; ++arm) {
+            lab::Block b; b.experiment = L"refresh"; b.run = 2; b.pair = pair; b.arm = arm; b.armName = arm ? L"60 Hz" : L"90 Hz";
+            b.battery = arm ? 7 : 7.5; b.seconds = 100; blocks.push_back(b);
+        }
+        results = lab::analyze(blocks);
+        check(results.size() == 2 && results[0].battery.pairs == 3 && results[1].battery.pairs == 3,
+            "runs that compared different settings are not pooled into one result");
         lab::Breakdown breakdown;
         auto onBattery = labSample(0, 9, 4, 1.5, lab::Context::interactive); onBattery.dgpuState = 0; onBattery.dgpuApps = L"game.exe;chrome.exe";
         breakdown.add(onBattery, 10); breakdown.add(pluggedSample, 10);
@@ -475,9 +482,21 @@ int wmain(int argc, wchar_t** argv) {
         check(fake->value == 2 && !stopped.active() && !fake->remembered, "stopping restores the original at once");
         // Automatic test plan and its preparation phase.
         const auto browserPlan = lab::automaticPlan(true), builtInPlan = lab::automaticPlan(false);
-        check(browserPlan.size() == 17 && browserPlan.back().knob == lab::Knob::display && builtInPlan.back().knob == lab::Knob::display
+        auto noScreenOff = [](const std::vector<lab::Step>& plan) { return std::none_of(plan.begin(), plan.end(), [](const lab::Step& step) { return step.knob == lab::Knob::display; }); };
+        check(browserPlan.size() == 16 && noScreenOff(browserPlan) && noScreenOff(builtInPlan)
+            && std::any_of(browserPlan.begin(), browserPlan.end(), [](const lab::Step& step) { return step.knob == lab::Knob::powerMode && step.workload == lab::Workload::sustained; })
             && std::all_of(browserPlan.begin(), browserPlan.end(), [](const lab::Step& step) { return step.pairs == 3 && step.blockSeconds == 45; }),
-            "the automatic test covers every setting, with screen-off last");
+            "the automatic test covers every setting it can measure, without screen-off (standby would end it)");
+        {
+            const auto quick = lab::quickPlan(true);
+            double seconds = 0; for (const auto& step : quick) seconds += step.prepareSeconds + step.pairs * 2 * step.blockSeconds;
+            check(quick.size() == 7 && seconds <= 30 * 60 && noScreenOff(quick)
+                && std::any_of(quick.begin(), quick.end(), [](const lab::Step& step) { return step.workload == lab::Workload::video; })
+                && std::any_of(quick.begin(), quick.end(), [](const lab::Step& step) { return step.knob == lab::Knob::darkMode; }),
+                "the quick test takes under half an hour and still covers every activity and dark mode");
+        }
+        check(std::any_of(browserPlan.begin(), browserPlan.end(), [](const lab::Step& step) { return step.knob == lab::Knob::darkMode && step.workload == lab::Workload::browse; })
+            && lab::knobKey(lab::Knob::darkMode) == std::wstring(L"dark-mode"), "dark mode is measured on a browsed page");
         check(std::any_of(browserPlan.begin(), browserPlan.end(), [](const lab::Step& step) { return step.workload == lab::Workload::video && step.prepareSeconds >= 15; })
             && std::none_of(builtInPlan.begin(), builtInPlan.end(), [](const lab::Step& step) { return step.workload == lab::Workload::video; }),
             "real video runs only with a browser, after time to record the clip");
@@ -582,6 +601,18 @@ int wmain(int argc, wchar_t** argv) {
             const auto learnedProfile = learned.profileFor(gov::Activity::interactive, false);
             check(learnedProfile.values[size_t(Setting::cpuBoost)] == DWORD(0) && !learnedProfile.values[size_t(Setting::energyPreference)],
                 "an approved saving is used and a costly one is left to the user");
+            // From the first real automatic test: efficiency mode saved 2-3 W of CPU power in every
+            // activity, while bursts took 7 -> 10 ms and the battery reading was noisy.
+            lab::ExperimentResult mode; mode.experiment = L"power-mode@office"; mode.arm0 = L"效能"; mode.arm1 = L"效率";
+            mode.battery = lab::comparePairs({{14.2, 12.4}, {13.2, 11.7}, {12.8, 12.1}});
+            mode.core = lab::comparePairs({{4.3, 1.9}, {4.4, 2.0}, {4.2, 1.9}});
+            mode.bursts = true; mode.burstMs = lab::comparePairs({{7.2, 10.2}, {7.1, 10.1}, {7.3, 10.3}});
+            auto modeEvidence = gov::learn({mode});
+            check(!mode.battery.significant() && modeEvidence.size() == 1 && modeEvidence[0].approved && modeEvidence[0].savingValue == 0
+                && nearlyEqual(modeEvidence[0].wattsSaved, mode.core.difference < 0 ? -mode.core.difference : mode.core.difference),
+                "a clear CPU core saving counts when the battery reading is noisy, and 3 ms slower bursts are no cost");
+            mode.burstMs = lab::comparePairs({{20, 30}, {21, 31}, {19, 29}});
+            check(!gov::learn({mode})[0].approved, "10 ms slower responses are a cost");
         }
         // Activity detector v2.
         {
@@ -607,6 +638,11 @@ int wmain(int argc, wchar_t** argv) {
             check(detector.assess(o).activity == Activity::idle, "a long pause with a still screen is idle");
             o.framesPerSecond = 40;
             check(detector.assess(o).activity == Activity::reading, "a long pause while the screen keeps moving is watching, not idle");
+            o = observe(300, 300, gov::InputKind::none); o.framesPerSecond.reset(); o.compositorGpu = 9;
+            check(detector.assess(o).activity == Activity::reading, "the compositor's GPU use shows a moving screen when the frame counter does not work");
+            o.compositorGpu = .5;
+            auto still = detector.assess(o);
+            check(still.activity == Activity::idle && still.confidence >= .9, "and a still one");
             o = observe(30, 30, gov::InputKind::none); o.gpu.total.decode = 8;
             auto muted = detector.assess(o);
             check(muted.activity == Activity::media && muted.reason.find(L"靜音") != std::wstring::npos, "muted video is found through the video decoder");

@@ -255,6 +255,26 @@ DWORD setBackgroundEco(bool on) {
     return ERROR_SUCCESS;
 }
 DWORD brightnessValue = 0, displayValue = 1, backgroundEcoValue = 0; // last values applied (not readable cheaply)
+// Windows' app theme: AppsUseLightTheme = 0 is dark. Browsers follow it for prefers-color-scheme.
+constexpr wchar_t ThemeKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
+DWORD readDarkMode(DWORD& dark) {
+    DWORD light = 1, size = sizeof(light);
+    const LSTATUS status = RegGetValueW(HKEY_CURRENT_USER, ThemeKey, L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &size);
+    if (status == ERROR_FILE_NOT_FOUND) { dark = 0; return ERROR_SUCCESS; } // never set: light
+    if (status != ERROR_SUCCESS) return DWORD(status);
+    dark = light ? 0 : 1; return ERROR_SUCCESS;
+}
+DWORD setDarkMode(bool dark) {
+    HKEY key = nullptr;
+    LSTATUS status = RegCreateKeyExW(HKEY_CURRENT_USER, ThemeKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr);
+    if (status != ERROR_SUCCESS) return DWORD(status);
+    const DWORD light = dark ? 0 : 1;
+    status = RegSetValueExW(key, L"AppsUseLightTheme", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&light), sizeof(light));
+    RegCloseKey(key);
+    DWORD_PTR ignored = 0; // tell running apps (and the browser) the theme changed
+    SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, reinterpret_cast<LPARAM>(L"ImmersiveColorSet"), SMTO_ABORTIFHUNG, 2000, &ignored);
+    return DWORD(status);
+}
 }
 void setProtectedJob(HANDLE job) { protectedJob = job; }
 void writeSystemSnapshot(const std::wstring& folder) {
@@ -289,6 +309,7 @@ const wchar_t* knobKey(Knob knob) {
     case Knob::brightness: return L"brightness";
     case Knob::display: return L"display";
     case Knob::backgroundEco: return L"background-eco";
+    case Knob::darkMode: return L"dark-mode";
     default: return L"";
     }
 }
@@ -305,6 +326,7 @@ DWORD readKnob(Knob knob, DWORD& value) {
     case Knob::brightness: value = brightnessValue; return ERROR_SUCCESS;
     case Knob::display: value = displayValue; return ERROR_SUCCESS;
     case Knob::backgroundEco: value = backgroundEcoValue; return ERROR_SUCCESS;
+    case Knob::darkMode: return readDarkMode(value);
     default: return ERROR_INVALID_PARAMETER;
     }
 }
@@ -317,6 +339,7 @@ DWORD applyKnob(Knob knob, DWORD value) {
     case Knob::brightness: { const DWORD status = setBrightness(value); if (!status) brightnessValue = value; return status; }
     case Knob::display: displayValue = value ? 1 : 0; return setDisplay(value != 0);
     case Knob::backgroundEco: backgroundEcoValue = value ? 1 : 0; return setBackgroundEco(value != 0);
+    case Knob::darkMode: return setDarkMode(value != 0);
     default: return ERROR_INVALID_PARAMETER;
     }
 }
@@ -365,6 +388,10 @@ KnobPlan planKnob(Knob knob) {
         break;
     case Knob::backgroundEco:
         plan.values = {0u, 1u}; plan.names = {L"背景程式照常", L"背景程式效率模式"};
+        break;
+    case Knob::darkMode:
+        plan.values = {original ? 1u : 0u, original ? 0u : 1u};
+        for (size_t i = 0; i < 2; ++i) plan.names[i] = plan.values[i] ? L"深色模式" : L"淺色模式";
         break;
     default: plan.error = ERROR_INVALID_PARAMETER; return plan;
     }
@@ -527,8 +554,10 @@ struct SignalReader::Impl {
     IAudioSessionManager2* sessions = nullptr;
     uint64_t sessionsAt = 0, audioAt = 0;
     std::set<uint32_t> playing;
-    // Compositor frames.
-    UINT64 frames = 0; uint64_t framesAt = 0;
+    // Compositor frames, and the most seen in one second: on some PCs the counter barely
+    // moves whatever is on screen, and then it is not reported at all.
+    UINT64 frames = 0; uint64_t framesAt = 0, framesSince = 0;
+    double framesMax = 0;
     ~Impl() { if (sessions) sessions->Release(); }
     std::wstring nameOf(uint32_t pid) {
         if (auto it = names.find(pid); it != names.end()) return it->second;
@@ -620,6 +649,9 @@ struct SignalReader::Impl {
         Value fps;
         if (framesAt && now > framesAt && timing.cFrame >= frames) fps = double(timing.cFrame - frames) * 1000 / double(now - framesAt);
         frames = timing.cFrame; framesAt = now;
+        if (!framesSince) framesSince = now;
+        if (fps) framesMax = std::max(framesMax, *fps);
+        if (now - framesSince >= 60000 && framesMax < 2) return std::nullopt; // the counter does not work here
         return fps;
     }
 };
@@ -803,21 +835,40 @@ std::vector<Step> automaticPlan(bool browser) {
         {Knob::powerMode, W::idle}, {Knob::powerMode, W::browse}, {Knob::powerMode, W::video}, {Knob::powerMode, W::office},
         {Knob::refreshRate, W::idle}, {Knob::refreshRate, W::browse}, {Knob::refreshRate, W::video},
         {Knob::cpuBoost, W::browse}, {Knob::cpuBoost, W::office}, {Knob::cpuBoost, W::sustained},
-        {Knob::energyPreference, W::browse}, {Knob::energyPreference, W::video}, {Knob::energyPreference, W::sustained},
+        {Knob::energyPreference, W::browse},
         {Knob::backgroundEco, W::idle}, {Knob::backgroundEco, W::browse},
-        {Knob::brightness, W::browse}, {Knob::display, W::idle}}; // screen off last: it may let Windows sleep
+        {Knob::brightness, W::browse}, {Knob::darkMode, W::browse}, {Knob::powerMode, W::sustained}};
+        // One energy preference step only: the first real test found no difference in any activity.
+        // Screen off is not measured: on Modern Standby laptops Windows goes to standby soon after
+        // the screen turns off, so the blocks measure standby rather than a dark screen.
     else order = {
         {Knob::powerMode, W::idle}, {Knob::powerMode, W::bursts}, {Knob::powerMode, W::scroll},
         {Knob::refreshRate, W::idle}, {Knob::refreshRate, W::scroll},
         {Knob::cpuBoost, W::bursts}, {Knob::cpuBoost, W::scroll}, {Knob::cpuBoost, W::sustained},
         {Knob::energyPreference, W::bursts}, {Knob::energyPreference, W::sustained},
-        {Knob::backgroundEco, W::idle}, {Knob::brightness, W::idle}, {Knob::display, W::idle}};
+        {Knob::backgroundEco, W::idle}, {Knob::brightness, W::idle}, {Knob::powerMode, W::sustained}};
     std::vector<Step> steps;
     for (const auto& [knob, workload] : order) {
         Step step; step.knob = knob; step.workload = workload;
         step.pairs = 3; step.blockSeconds = 45; step.warmupSeconds = 10; step.minimumSeconds = 25;
         // The first video step records the 12-second test clip; every step lets its load start first.
         step.prepareSeconds = workload == W::video ? 20 : 6;
+        steps.push_back(step);
+    }
+    return steps;
+}
+std::vector<Step> quickPlan(bool browser) {
+    using W = Workload;
+    std::vector<std::pair<Knob, Workload>> order;
+    if (browser) order = {
+        {Knob::powerMode, W::idle}, {Knob::powerMode, W::browse}, {Knob::powerMode, W::office}, {Knob::powerMode, W::video},
+        {Knob::darkMode, W::browse}, {Knob::brightness, W::browse}, {Knob::powerMode, W::sustained}};
+    else order = {{Knob::powerMode, W::idle}, {Knob::powerMode, W::bursts}, {Knob::powerMode, W::scroll}, {Knob::brightness, W::idle}, {Knob::powerMode, W::sustained}};
+    std::vector<Step> steps;
+    for (const auto& [knob, workload] : order) {
+        Step step; step.knob = knob; step.workload = workload;
+        step.pairs = 3; step.blockSeconds = 30; step.warmupSeconds = 8; step.minimumSeconds = 18;
+        step.prepareSeconds = workload == W::video ? 20 : 5;
         steps.push_back(step);
     }
     return steps;
