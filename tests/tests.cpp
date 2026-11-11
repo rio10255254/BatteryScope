@@ -547,8 +547,9 @@ int wmain(int argc, wchar_t** argv) {
                 return last;
             };
             step(2, lab::Context::interactive, 1);
-            check(governor.activity() == gov::Activity::responsive && in.actual[size_t(Setting::powerMode)] == DWORD(1) && in.actual[size_t(Setting::energyPreference)] == DWORD(40),
-                "right after input the governor gives a responsive profile");
+            check(governor.activity() == gov::Activity::responsive && in.actual[size_t(Setting::powerMode)] == DWORD(0) && in.actual[size_t(Setting::energyPreference)] == DWORD(50)
+                && in.actual[size_t(Setting::cpuBoost)] == DWORD(0),
+                "right after input the governor gives a responsive profile (efficiency, which cost only milliseconds in the real test)");
             check(in.actual[size_t(Setting::refreshRate)] == DWORD(120) && governor.originals()[size_t(Setting::powerMode)] == DWORD(2),
                 "refresh switching is off by default and the originals are kept");
             step(4, lab::Context::interactive, 10);
@@ -557,7 +558,7 @@ int wmain(int argc, wchar_t** argv) {
             check(governor.activity() == gov::Activity::reading && in.actual[size_t(Setting::powerMode)] == DWORD(0) && in.actual[size_t(Setting::energyPreference)] == DWORD(80),
                 "after settling, reading uses efficiency");
             step(2, lab::Context::heavy, 0);
-            check(governor.activity() == gov::Activity::heavy && in.actual[size_t(Setting::powerMode)] == DWORD(2), "a move toward performance is immediate");
+            check(governor.activity() == gov::Activity::heavy && in.actual[size_t(Setting::powerMode)] == DWORD(1), "a move toward performance is immediate");
             step(2, lab::Context::idle, 300);
             check(governor.activity() == gov::Activity::heavy, "a short idle moment does not drop performance at once");
             step(20, lab::Context::idle, 302);
@@ -595,7 +596,7 @@ int wmain(int argc, wchar_t** argv) {
             lab::ExperimentResult costly = saving; costly.experiment = L"epp@browse"; costly.arm0 = L"能源偏好 60"; costly.arm1 = L"能源偏好 85";
             costly.drops = lab::comparePairs({{0, 3}, {0, 4}, {.5, 3}});
             auto evidence = gov::learn({saving, costly});
-            check(evidence.size() == 4 && evidence[0].approved && evidence[0].savingValue == 0 && !evidence[2].approved,
+            check(evidence.size() == 6 && evidence[0].approved && evidence[0].savingValue == 0 && !evidence[3].approved,
                 "lab results become evidence: savings without cost are approved, savings with late frames are not");
             gov::Governor learned; learned.setEvidence(evidence);
             const auto learnedProfile = learned.profileFor(gov::Activity::interactive, false);
@@ -608,7 +609,7 @@ int wmain(int argc, wchar_t** argv) {
             mode.core = lab::comparePairs({{4.3, 1.9}, {4.4, 2.0}, {4.2, 1.9}});
             mode.bursts = true; mode.burstMs = lab::comparePairs({{7.2, 10.2}, {7.1, 10.1}, {7.3, 10.3}});
             auto modeEvidence = gov::learn({mode});
-            check(!mode.battery.significant() && modeEvidence.size() == 1 && modeEvidence[0].approved && modeEvidence[0].savingValue == 0
+            check(!mode.battery.significant() && modeEvidence.size() == 2 && modeEvidence[0].approved && modeEvidence[0].savingValue == 0
                 && nearlyEqual(modeEvidence[0].wattsSaved, mode.core.difference < 0 ? -mode.core.difference : mode.core.difference),
                 "a clear CPU core saving counts when the battery reading is noisy, and 3 ms slower bursts are no cost");
             mode.burstMs = lab::comparePairs({{20, 30}, {21, 31}, {19, 29}});
@@ -695,13 +696,33 @@ int wmain(int argc, wchar_t** argv) {
             for (int i = 0; i < 8; ++i) feed(Activity::reading, 1);
             check(fi.actual[size_t(Setting::energyPreference)] == DWORD(80), "the governor follows the detector");
             feed(Activity::responsive, 1);
-            check(fi.actual[size_t(Setting::energyPreference)] == DWORD(40), "a boost is applied within one sample even right after a saving change");
+            check(fi.actual[size_t(Setting::energyPreference)] == DWORD(50), "a boost is applied within one sample even right after a saving change");
             for (int i = 0; i < 7; ++i) feed(Activity::reading, .6);
             check(fast.activity() == Activity::responsive, "an unsure detection waits longer before saving power");
             for (int i = 0; i < 4; ++i) feed(Activity::reading, .6);
             check(fast.activity() == Activity::reading, "and saves once it has held");
             fi.actual[size_t(Setting::powerMode)] = 2; // the user picks best performance
             auto overridden = feed(Activity::reading, 1);
+            // Bursts, low battery and a vetoed efficiency mode.
+            {
+                gov::Detector burstDetector; gov::Observation bo; bo.ms = 1000; bo.idleSeconds = 0; bo.activeSeconds = 0.5; bo.lastInput = gov::InputKind::click;
+                bo.systemCpu = 55; bo.foregroundExe = L"chrome.exe";
+                check(burstDetector.assess(bo).activity == Activity::burst, "a click with a CPU spike is a burst (a program or page loading)");
+                bo.systemCpu = 8;
+                check(burstDetector.assess(bo).activity == Activity::responsive, "a click without one is plain input");
+                gov::Governor g; gov::Options o; g.setOptions(o);
+                check(g.profileFor(Activity::burst, 0).values[size_t(Setting::powerMode)] == DWORD(1) && g.profileFor(Activity::burst, 1).values[size_t(Setting::powerMode)] == DWORD(0),
+                    "a burst gets balanced, and efficiency when saving harder");
+                gov::Input li; li.onBattery = true; li.actual = {DWORD(1), DWORD(60), DWORD(0), DWORD(120)}; li.detected = Activity::interactive; li.ms = 100;
+                li.batteryPercent = 50.0; g.update(li);
+                check(g.stretchLevel() == 0, "no extra saving with half a battery");
+                li.ms += 1000; li.batteryPercent = 18.0; g.update(li);
+                check(g.stretchLevel() == 1, "one level more saving at the low-battery level");
+                li.ms += 1000; li.batteryPercent = 9.0; auto low = g.update(li);
+                check(g.stretchLevel() == 2 && low.reason.find(L"最大省電") != std::wstring::npos, "two levels when the battery is very low");
+                gov::Governor vetoed; vetoed.setEvidence({{Setting::powerMode, Activity::interactive, 0, 2, false}});
+                check(vetoed.profileFor(Activity::interactive, 0).values[size_t(Setting::powerMode)] == DWORD(1), "a proven cost of efficiency falls back to balanced, not to the user's mode");
+            }
             check(overridden.overrides.size() == 1 && overridden.overrides[0].first == Setting::powerMode && overridden.overrides[0].second == 1,
                 "a user override toward performance is reported for learning");
         }

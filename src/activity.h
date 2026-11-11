@@ -21,7 +21,8 @@
 // confident about, with the reasons.
 namespace bs::gov {
 
-enum class Activity { idle, reading, responsive, interactive, media, call, heavy, game, exempt, count };
+// burst: input or a program switch together with a CPU spike (opening a program, loading a page).
+enum class Activity { idle, reading, responsive, burst, interactive, media, call, heavy, game, exempt, count };
 const wchar_t* activityKey(Activity activity); // a Chinese UI string
 int rank(Activity activity);                    // higher needs more performance
 

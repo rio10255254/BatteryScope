@@ -15,8 +15,8 @@
 
 From the **[Releases page](https://github.com/rio10255254/BatteryScope/releases/latest)**:
 
-- **Installer (recommended):** `BatteryScope-0.16.0-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
-- **Portable:** `BatteryScope-0.16.0-win64.zip`; extract it and run `BatteryScope.exe`.
+- **Installer (recommended):** `BatteryScope-0.17.0-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
+- **Portable:** `BatteryScope-0.17.0-win64.zip`; extract it and run `BatteryScope.exe`.
 
 Requires Windows 10 version 1703 or later (Windows 11 recommended), 64-bit. The program is not code-signed; if SmartScreen appears the first time, choose **More info → Run anyway**. It lives in the notification area, where the icon shows the battery percentage; click it to show or hide the panel.
 
@@ -24,7 +24,7 @@ Requires Windows 10 version 1703 or later (Windows 11 recommended), 64-bit. The 
 
 - **Older copies are closed first:** the installer closes any running BatteryScope (installed or portable, any version), cleanly first so it undoes its efficiency mode and power mode changes, and by force if it does not respond.
 - **Shortcuts and pins follow the latest version:** every install goes to the same folder, so Start menu and desktop shortcuts, taskbar pins, and launch at sign-in keep working after updates. Installing also repoints shortcuts, taskbar pins, Windows 10 Start pins, and launch at sign-in that still open an older `BatteryScope.exe` elsewhere. The old portable folder is not deleted.
-- **Update reminders:** once a day BatteryScope checks GitHub for a newer release and shows one notification per new version. Clicking it (or **⋯ → Install update**) downloads the installer, checks its SHA-256 against the published checksum, installs, and reopens BatteryScope; on a mismatch nothing runs and the download page opens instead. Turn off daily checks or check now under **⋯ → Updates**. A check only reads version information from `api.github.com` and sends no usage data.
+- **Updates (all under Settings → Update since 0.17):** once a day BatteryScope checks GitHub for a newer release. By default it installs it automatically: it downloads the installer, checks its SHA-256 against the published checksum, installs, and reopens (after any running automatic test and its export). You can choose to be notified instead, or not to check; the same menu checks or installs now. A new version also shows **Install update** at the top of the ⋯ menu. On a checksum mismatch nothing runs and the download page opens instead. A check only reads version information from `api.github.com` and sends no usage data.
 
 ## Supported PCs
 
@@ -52,7 +52,7 @@ Details follow.
 
 ## Using it
 
-1. Download `BatteryScope-0.16.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
+1. Download `BatteryScope-0.17.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
 2. Click its battery icon in the notification area to show or hide the panel. Esc hides it; monitoring continues at a lower frequency.
 3. Open **⋯ → Language / 語言 → English** to switch immediately. The setting persists for your Windows account. Selection and scroll position are retained.
 4. Use Background and Show filters, the mouse wheel, arrow keys, Home/End, or Page Up/Down. Enter or double-click opens details.
@@ -108,6 +108,7 @@ Turn it on from **⋯ → Dynamic power saving** or the settings page. On batter
   - **Other:** the CPU must be busy for 4 s to count as heavy (short spikes do not); a locked screen or display off is always idle.
   - Only timings, program names, and device states are read: no screenshots, no screen or text content, and no record of which keys were pressed.
 - **App rules:** Settings → App rules sets "always save power", "always balanced", "performance first", or "leave alone" per program; programs in the performance list count as "performance first". When you (or G-Helper) move a setting the same way twice in the same program, the rule is learned and applied, and can be changed or forgotten in the same place.
+- **Profiles (tuned on the first real test, 0.17):** everything except a burst (input or a program switch with a sudden CPU spike, such as opening a program or loading a page), heavy work, and calls runs in efficiency mode with CPU Boost off; efficiency cost only milliseconds there and Boost about 5 W in light use. Bursts and heavy work use balanced. Under the low-battery level (20% by default) it saves one level harder, under half of it two; being over the power goal saves one level harder and gives background apps efficiency mode after 15 s.
 - **Fast up, slow down:** moves toward performance are immediate (0.3 s between changes of a setting); moves toward saving wait until the activity has held for 6 s, longer when the detector is less sure (up to 12 s), and each setting has a minimum gap between changes.
 - **Respects others:** a setting changed by G-Helper or you is left alone for 10 minutes.
 - **Learns from the lab:** a saving is used only after an experiment on this PC proved it saves power without more late frames or slower responses; a proven cost vetoes it.
@@ -165,7 +166,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-To avoid replacing a running executable, use `-OutputDirectory dist/v0.16.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
+To avoid replacing a running executable, use `-OutputDirectory dist/v0.17.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
 
 ```powershell
 .\dist\BatteryScope.exe --demo

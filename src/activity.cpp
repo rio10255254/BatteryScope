@@ -18,6 +18,7 @@ const wchar_t* activityKey(Activity a) {
     case Activity::idle: return L"閒置";
     case Activity::reading: return L"閱讀";
     case Activity::responsive: return L"操作中";
+    case Activity::burst: return L"開啟／載入中";
     case Activity::interactive: return L"一般操作";
     case Activity::media: return L"看影片／聽音樂";
     case Activity::call: return L"視訊／通話";
@@ -33,8 +34,9 @@ int rank(Activity a) {
     case Activity::reading: case Activity::media: return 1;
     case Activity::interactive: case Activity::call: return 2;
     case Activity::responsive: return 3;
-    case Activity::heavy: return 4;
-    case Activity::game: case Activity::exempt: return 5;
+    case Activity::burst: return 4;
+    case Activity::heavy: return 5;
+    case Activity::game: case Activity::exempt: return 6;
     default: return 2;
     }
 }
@@ -172,6 +174,9 @@ Assessment Detector::assess(const Observation& o) {
     if (a.category == Category::game && fg.engine3d >= 30 && !o.foregroundCoversScreen) c.push_back({Activity::game, .8, L"視窗模式遊戲"});
     if (active < ResponsiveSeconds) c.push_back({Activity::responsive, 1, inputKey(o.lastInput)});
     else if (o.foregroundSwitchSeconds < 2) c.push_back({Activity::responsive, .9, L"剛切換程式"});
+    // Input or a switch with the CPU jumping: a program opening or a page loading, worth a short boost.
+    if ((active < ResponsiveSeconds || o.foregroundSwitchSeconds < ResponsiveSeconds) && cpu >= 30)
+        c.push_back({Activity::burst, .95, L"剛開啟或載入（CPU 尖峰）"});
     if (busyFor >= HeavyAfterSeconds) c.push_back({Activity::heavy, std::min(.95, .65 + (cpu - 25) / 100), L"CPU 持續忙碌"});
     if (gpuBusyFor >= HeavyAfterSeconds) c.push_back({Activity::heavy, .75, L"顯示卡持續運算"});
     if (a.category == Category::creative && cpu >= 15) c.push_back({Activity::heavy, .75, L"創作／運算程式忙碌中"});

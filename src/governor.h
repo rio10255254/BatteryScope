@@ -38,6 +38,8 @@ struct Options {
     bool refreshRate = false;     // switching the refresh rate makes the screen blink, so it is opt-in
     bool backgroundEco = true;
     std::optional<double> targetHours; // battery should last this long from now
+    unsigned lowBattery = 20;     // at or under this percent: one level more saving; at half of it: two
+    double ecoAfterSeconds = 30;  // a background app busy this long gets efficiency mode (half when saving harder)
     int topRefresh = 120;         // the panel's highest rate, used when refresh switching is on
 };
 
@@ -54,6 +56,7 @@ struct Input {
     lab::Context context = lab::Context::interactive;
     double idleSeconds = 0;
     Value hoursLeft;
+    Value batteryPercent;
     // The settings as they are now (from the actuators), or nullopt if unreadable.
     std::array<std::optional<DWORD>, size_t(Setting::count)> actual{};
     std::vector<BackgroundApp> apps;
@@ -91,8 +94,10 @@ public:
     void setOptions(const Options& options) { options_ = options; }
     const Options& options() const { return options_; }
     void setEvidence(std::vector<Evidence> evidence) { evidence_ = std::move(evidence); }
-    // The profile used for an activity, after evidence and the battery target.
-    Profile profileFor(Activity activity, bool stretch) const;
+    // The profile used for an activity, after evidence and `stretch` levels of extra saving
+    // (from the battery target or the power goal, and low battery).
+    Profile profileFor(Activity activity, int stretch) const;
+    int stretchLevel() const { return stretch_; }
     // One sample. Feeding a sample with onBattery = false also stops the governor and
     // returns the originals to restore, which is how it is switched off.
     Decision update(const Input& input);
@@ -109,6 +114,7 @@ private:
     Options options_;
     std::vector<Evidence> evidence_;
     Activity activity_ = Activity::interactive, candidate_ = Activity::interactive;
+    int stretch_ = 0;
     uint64_t candidateSince_ = 0;
     bool active_ = false;
     std::array<std::optional<DWORD>, size_t(Setting::count)> originals_{}, lastSet_{};
