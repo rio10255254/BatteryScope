@@ -1,0 +1,231 @@
+#include "governor.h"
+#include <algorithm>
+
+namespace bs::gov {
+namespace {
+constexpr size_t Settings = size_t(Setting::count);
+// Higher means more performance; moving up is immediate, moving down waits.
+int rank(Activity a) {
+    switch (a) {
+    case Activity::idle: return 0;
+    case Activity::reading: case Activity::media: return 1;
+    case Activity::interactive: case Activity::call: return 2;
+    case Activity::responsive: return 3;
+    case Activity::heavy: return 4;
+    case Activity::game: return 5;
+    default: return 2;
+    }
+}
+Activity derive(const Input& in) {
+    switch (in.context) {
+    case lab::Context::game: return Activity::game;
+    case lab::Context::call: return Activity::call;
+    case lab::Context::media: return Activity::media;
+    case lab::Context::heavy: return Activity::heavy;
+    case lab::Context::idle: return Activity::idle;
+    default:
+        if (in.idleSeconds < Governor::ResponsiveSeconds) return Activity::responsive;
+        if (in.idleSeconds >= Governor::ReadingAfterSeconds) return Activity::reading;
+        return Activity::interactive;
+    }
+}
+// The next more saving activity, used when the battery will not last to the target.
+Activity stretched(Activity a) {
+    switch (a) {
+    case Activity::heavy: case Activity::responsive: return Activity::interactive;
+    case Activity::interactive: return Activity::reading;
+    case Activity::reading: case Activity::media: return Activity::idle;
+    default: return a;
+    }
+}
+constexpr DWORD Efficiency = 0, Balanced = 1, Performance = 2; // PowerMode
+// Values parsed from the lab's arm names, which BatteryScope itself writes.
+std::optional<DWORD> armValue(Setting setting, const std::wstring& name) {
+    auto number = [&]() -> std::optional<DWORD> {
+        size_t at = name.find_first_of(L"0123456789");
+        if (at == std::wstring::npos) return std::nullopt;
+        return DWORD(std::wcstoul(name.c_str() + at, nullptr, 10));
+    };
+    switch (setting) {
+    case Setting::powerMode:
+        if (name == L"效率") return Efficiency;
+        if (name == L"平衡") return Balanced;
+        if (name == L"效能") return Performance;
+        return std::nullopt;
+    case Setting::cpuBoost:
+        if (name == L"Boost 關") return 0u;
+        if (name == L"Boost 開") return 2u;
+        return std::nullopt;
+    case Setting::energyPreference: case Setting::refreshRate: return number();
+    default: return std::nullopt;
+    }
+}
+std::vector<Activity> activitiesFor(const std::wstring& workload) {
+    if (workload == L"browse" || workload == L"scroll") return {Activity::interactive, Activity::reading};
+    if (workload == L"office" || workload == L"bursts") return {Activity::interactive};
+    if (workload == L"video") return {Activity::media};
+    if (workload == L"idle") return {Activity::idle, Activity::reading};
+    if (workload == L"sustained") return {Activity::heavy};
+    return {};
+}
+}
+
+const wchar_t* activityKey(Activity a) {
+    switch (a) {
+    case Activity::idle: return L"閒置";
+    case Activity::reading: return L"閱讀";
+    case Activity::responsive: return L"操作中";
+    case Activity::interactive: return L"一般操作";
+    case Activity::media: return L"看影片／聽音樂";
+    case Activity::call: return L"視訊／通話";
+    case Activity::heavy: return L"高負載";
+    case Activity::game: return L"全螢幕遊戲";
+    default: return L"";
+    }
+}
+lab::Knob knobFor(Setting s) {
+    switch (s) {
+    case Setting::powerMode: return lab::Knob::powerMode;
+    case Setting::energyPreference: return lab::Knob::energyPreference;
+    case Setting::cpuBoost: return lab::Knob::cpuBoost;
+    default: return lab::Knob::refreshRate;
+    }
+}
+
+std::vector<Evidence> learn(const std::vector<lab::ExperimentResult>& results) {
+    std::vector<Evidence> evidence;
+    for (const auto& r : results) {
+        const size_t at = r.experiment.find(L'@');
+        if (at == std::wstring::npos || r.battery.pairs < 2 || !r.battery.significant()) continue;
+        const std::wstring knob = r.experiment.substr(0, at), workload = r.experiment.substr(at + 1);
+        std::optional<Setting> setting;
+        if (knob == L"power-mode") setting = Setting::powerMode;
+        else if (knob == L"epp") setting = Setting::energyPreference;
+        else if (knob == L"cpu-boost") setting = Setting::cpuBoost;
+        else if (knob == L"refresh") setting = Setting::refreshRate;
+        if (!setting) continue;
+        // Which arm used less power, and what choosing it costs.
+        const bool secondSaves = r.battery.difference < 0;
+        const auto value = armValue(*setting, secondSaves ? r.arm1 : r.arm0);
+        if (!value) continue;
+        const double saved = std::abs(r.battery.difference);
+        const double sign = secondSaves ? 1 : -1; // turns "arm1 - arm0" into "saving arm - other arm"
+        bool cost = false;
+        if (r.frames && sign * r.drops.difference > 1.0) cost = true;                         // more than one late frame per minute
+        if (r.bursts && r.burstMs.mean0 > 0 && r.burstMs.mean1 > 0) {
+            const double ratio = secondSaves ? r.burstMs.mean1 / r.burstMs.mean0 : r.burstMs.mean0 / r.burstMs.mean1;
+            if (ratio > 1.15) cost = true;                                                    // responses over 15% slower
+        }
+        if (r.work && r.workRate.mean0 > 0 && r.workRate.mean1 > 0) {
+            const double ratio = secondSaves ? r.workRate.mean1 / r.workRate.mean0 : r.workRate.mean0 / r.workRate.mean1;
+            if (ratio < .9) cost = true;                                                      // work over 10% slower
+        }
+        for (Activity a : activitiesFor(workload)) evidence.push_back({*setting, a, *value, saved, saved >= .15 && !cost});
+    }
+    return evidence;
+}
+
+Governor::Governor() = default;
+double Governor::minimumGap(Setting s) {
+    switch (s) {
+    case Setting::energyPreference: return 4;
+    case Setting::refreshRate: return 30;
+    default: return 8;
+    }
+}
+void Governor::note(const std::wstring& text) {
+    log.push_back(text);
+    while (log.size() > 30) log.pop_front();
+}
+Profile Governor::profileFor(Activity activity, bool stretch) const {
+    if (stretch) activity = stretched(activity);
+    Profile p;
+    auto set = [&](Setting s, std::optional<DWORD> v) { p.values[size_t(s)] = v; };
+    const std::optional<DWORD> low = options_.refreshRate ? std::optional<DWORD>(60) : std::nullopt;
+    const std::optional<DWORD> top = options_.refreshRate ? std::optional<DWORD>(DWORD(options_.topRefresh)) : std::nullopt;
+    switch (activity) {
+    case Activity::idle: set(Setting::powerMode, Efficiency); set(Setting::energyPreference, 90u); set(Setting::cpuBoost, 0u); set(Setting::refreshRate, low); break;
+    case Activity::reading: set(Setting::powerMode, Efficiency); set(Setting::energyPreference, 80u); set(Setting::cpuBoost, 0u); set(Setting::refreshRate, low); break;
+    case Activity::media: set(Setting::powerMode, Efficiency); set(Setting::energyPreference, 80u); set(Setting::cpuBoost, 0u); set(Setting::refreshRate, low); break;
+    case Activity::interactive: set(Setting::powerMode, Balanced); set(Setting::energyPreference, 60u); set(Setting::refreshRate, top); break;
+    case Activity::call: set(Setting::powerMode, Balanced); set(Setting::energyPreference, 55u); break;
+    case Activity::responsive: set(Setting::powerMode, Balanced); set(Setting::energyPreference, 40u); set(Setting::refreshRate, top); break;
+    case Activity::heavy: set(Setting::powerMode, Performance); set(Setting::energyPreference, 25u); break;
+    default: break; // game: everything as the user had it
+    }
+    // Lab evidence: a vetoed saving leaves the setting alone; a proven one is used.
+    for (size_t s = 0; s < Settings; ++s) {
+        if (Setting(s) == Setting::refreshRate && !options_.refreshRate) continue;
+        bool approved = false, vetoed = false; DWORD value = 0;
+        for (const auto& e : evidence_) {
+            if (size_t(e.setting) != s || e.activity != activity) continue;
+            if (e.approved && !approved) { approved = true; value = e.savingValue; }
+            if (!e.approved) vetoed = true;
+        }
+        if (vetoed) p.values[s].reset();
+        else if (approved) p.values[s] = value;
+    }
+    return p;
+}
+Decision Governor::update(const Input& in) {
+    Decision d;
+    if (!in.onBattery) {
+        if (active_) {
+            // Plugged in: every setting the governor changed goes back, and throttled apps are released.
+            for (size_t s = 0; s < Settings; ++s) if (lastSet_[s] && originals_[s]) d.apply[s] = originals_[s];
+            for (const auto& app : throttled_) d.ecoOff.push_back(app);
+            throttled_.clear(); busySince_.clear(); lastSet_ = {};
+            active_ = false; d.restore = true; d.reason = L"插電：已還原";
+            note(d.reason);
+        }
+        return d;
+    }
+    if (!active_) {
+        active_ = true; originals_ = in.actual; lastSet_ = {}; changedAt_ = {};
+        activity_ = candidate_ = derive(in); candidateSince_ = in.ms;
+        note(L"開始管理（用電池）");
+    }
+    const Activity raw = derive(in);
+    if (raw != candidate_) { candidate_ = raw; candidateSince_ = in.ms; }
+    if (rank(raw) > rank(activity_)) activity_ = raw;                                       // fast attack
+    else if (raw != activity_ && in.ms - candidateSince_ >= SettleSeconds * 1000) activity_ = raw; // slow decay
+    const bool stretch = options_.targetHours && in.hoursLeft && *in.hoursLeft < *options_.targetHours;
+    const Profile profile = profileFor(activity_, stretch);
+    for (size_t s = 0; s < Settings; ++s) {
+        if (!in.actual[s]) continue;
+        // Someone else changed what the governor set: hand the setting back for a while.
+        if (lastSet_[s] && *in.actual[s] != *lastSet_[s] && in.ms >= pausedUntil_[s]) {
+            pausedUntil_[s] = in.ms + uint64_t(OwnershipPauseSeconds * 1000);
+            originals_[s] = in.actual[s]; lastSet_[s].reset();
+            note(L"設定被其他程式或使用者改動，暫停管理 10 分鐘");
+            continue;
+        }
+        if (in.ms < pausedUntil_[s]) continue;
+        const std::optional<DWORD> target = profile.values[s] ? profile.values[s] : originals_[s];
+        if (!target || *target == *in.actual[s]) continue;
+        if (changedAt_[s] && in.ms - changedAt_[s] < uint64_t(minimumGap(Setting(s)) * 1000)) continue;
+        d.apply[s] = target; lastSet_[s] = target; changedAt_[s] = in.ms;
+    }
+    // Background apps busy for 30 s get efficiency mode until they come to the front.
+    std::set<std::pair<uint32_t, uint64_t>> seen;
+    for (const auto& app : in.apps) {
+        const auto key = std::make_pair(app.pid, app.created);
+        seen.insert(key);
+        if (!options_.backgroundEco || app.foreground) {
+            if (throttled_.erase(key)) d.ecoOff.push_back(key);
+            busySince_.erase(key);
+            continue;
+        }
+        if (app.cpu >= 1.0) {
+            auto& since = busySince_[key];
+            if (!since) since = in.ms;
+            if (in.ms - since >= 30000 && throttled_.insert(key).second) { d.ecoOn.push_back(key); note(L"背景程式改為效率模式：" + app.name); }
+        } else busySince_.erase(key);
+    }
+    for (auto it = throttled_.begin(); it != throttled_.end();) it = seen.count(*it) ? std::next(it) : throttled_.erase(it);
+    d.reason = std::wstring(activityKey(activity_)) + (stretch ? L" · 為了續航目標加強省電" : L"");
+    bool changed = false; for (const auto& value : d.apply) changed |= value.has_value();
+    if (changed) note(L"→ " + d.reason);
+    return d;
+}
+}

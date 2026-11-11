@@ -511,6 +511,35 @@ struct Probe::Impl {
     }
 };
 
+struct SignalReader::Impl {
+    Probe::Impl* probe = nullptr; // reuses the audio meter
+    uint64_t callAt = 0;
+    bool call = false;
+};
+SignalReader::SignalReader() : impl_(std::make_unique<Impl>()) { impl_->probe = new Probe::Impl(); }
+SignalReader::~SignalReader() { delete impl_->probe; }
+Signals SignalReader::read(Value systemCpu) {
+    Signals s;
+    const uint64_t now = GetTickCount64();
+    LASTINPUTINFO input{}; input.cbSize = sizeof(input);
+    s.idleSeconds = GetLastInputInfo(&input) ? (GetTickCount() - input.dwTime) / 1000.0 : 0;
+    s.audio = impl_->probe->audioPlaying(now);
+    if (!impl_->callAt || now - impl_->callAt >= 5000) { impl_->call = deviceInUse(L"microphone") || deviceInUse(L"webcam"); impl_->callAt = now; }
+    s.call = impl_->call;
+    QUERY_USER_NOTIFICATION_STATE notification{};
+    s.fullscreenGame = SUCCEEDED(SHQueryUserNotificationState(&notification)) && notification == QUNS_RUNNING_D3D_FULL_SCREEN;
+    s.systemCpu = systemCpu;
+    return s;
+}
+DWORD setProcessEco(uint32_t pid, uint64_t created, bool on) {
+    HANDLE process = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return GetLastError();
+    FILETIME c{}, e{}, k{}, u{};
+    DWORD status = ERROR_NOT_FOUND;
+    if (GetProcessTimes(process, &c, &e, &k, &u) && fileTime(c) == created) { throttle(process, on); status = ERROR_SUCCESS; }
+    CloseHandle(process);
+    return status;
+}
 Probe::Probe() : impl_(std::make_unique<Impl>()) {}
 Probe::~Probe() = default;
 void Probe::read(Sample& s, const std::vector<std::pair<std::wstring, double>>& gpu, const std::vector<ProcessRow>& processes) {

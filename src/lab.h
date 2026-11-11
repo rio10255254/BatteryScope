@@ -184,10 +184,26 @@ public:
     Probe& operator=(const Probe&) = delete;
     void read(Sample& sample, const std::vector<std::pair<std::wstring, double>>& gpuInstances,
         const std::vector<ProcessRow>& processes);
+    struct Impl; // also used by SignalReader
+private:
+    std::unique_ptr<Impl> impl_;
+};
+
+// The activity signals alone, cheap enough to read every second (no process
+// or GPU scan): input idle time, sound, microphone/camera, full-screen games.
+class SignalReader {
+public:
+    SignalReader();
+    ~SignalReader();
+    SignalReader(const SignalReader&) = delete;
+    SignalReader& operator=(const SignalReader&) = delete;
+    Signals read(Value systemCpu);
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+// EcoQoS for one process (no priority change), checked against its start time.
+DWORD setProcessEco(uint32_t pid, uint64_t created, bool on);
 
 // Remembers the original value of the setting under test in the registry, so a
 // crash or power loss mid-experiment is undone at the next start.

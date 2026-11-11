@@ -5,6 +5,7 @@
 #include "version.h"
 #include "update.h"
 #include "lab.h"
+#include "governor.h"
 #include "ui.h"
 #include <commctrl.h>
 #include <shellapi.h>
@@ -45,6 +46,8 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     EcoToggleId = 163, PerfAppToggleId = 164, MascotToggleId = 165, ShareCardId = 166, MiniToggleId = 167, MiniOpenId = 168,
     UpdateCheckId = 169, UpdateNowId = 170, UpdateInstallId = 171,
     LabPageId = 172, LabRecordId = 173, LabExperimentId = 174 /* ..177, one per knob */, LabStopId = 178, LabFolderId = 179, LabExportId = 180, LabAutoId = 181, LabAutoStartId = 182,
+    DynamicToggleId = 183, DynamicPageId = 184, DynamicRefreshId = 185, DynamicEcoId = 186, DynamicTargetId = 187, SettingsPageId = 188,
+    SettingsListId = 300,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1;
 const wchar_t* ClassName = L"BatteryScope.Main.v1";
@@ -94,7 +97,7 @@ void* effectiveWatch = nullptr;
 PowerModes powerModes;
 HWND modeButtons[6] = {}, restoreModesButton = nullptr, energySettingsButton = nullptr;
 bool isolatedPreview = false;
-enum class InlinePage { none, process, power, candidates, ledger, powerMode, history, perfApps, lab, confirm, error };
+enum class InlinePage { none, process, power, candidates, ledger, powerMode, history, perfApps, lab, settings, dynamic, confirm, error };
 unsigned lowBatteryThreshold = 0; // percent; 0 = off
 LowBatteryMonitor lowBattery;
 bool hotkeyEnabled = false, hotkeyRegistered = false;
@@ -104,6 +107,10 @@ std::set<std::pair<uint32_t, uint64_t>> drainNotified;
 uint64_t lastDrainAlert = 0;
 enum class BalloonTarget { none, candidates, powerDetails, update };
 bool updateChecks = true; // daily update check, on unless turned off
+// Dynamic power saving (the governor), opt-in. Target 0 means no battery target.
+bool dynamicEnabled = false, dynamicRefresh = false, dynamicEco = true;
+unsigned dynamicTarget = 0;
+HWND settingsList = nullptr;
 BalloonTarget balloonTarget = BalloonTarget::none;  // what clicking the last notification opens
 bool sleepAlerts = true;          // notify after a sleep with unusual battery drain
 unsigned seenSleeps = 0;
@@ -137,6 +144,8 @@ bool isEfficient(const ProcessRow& row) {
 bool performanceListed(const ProcessRow& row) { return !row.name.empty() && performanceApps.count(lowerName(row.name)) != 0; }
 void refreshPowerModeControls();
 void showLabPage();
+void showSettingsPage();
+void showDynamicPage();
 // The power lab; absent in demo and preview modes.
 std::unique_ptr<bs::lab::Controller> labController;
 std::unique_ptr<bs::lab::WorkloadEngine> labEngine; // the automatic test's loads and window
@@ -157,7 +166,7 @@ std::optional<ProcessRow> pendingForceRow;
 std::wstring notice = tr(L"正在讀取電池與程序資料…");
 uint64_t noticeUntil = 0;
 std::deque<uint64_t> actionMarks;
-constexpr UINT_PTR MotionTimer = 92, NoticeTimer = 93, UpdateTimer = 94;
+constexpr UINT_PTR MotionTimer = 92, NoticeTimer = 93, UpdateTimer = 94, GovernorTimer = 95;
 constexpr int PanelWidth = 360, PanelHeight = 640, RowHeight = 51;
 bool motionEnabled = true, suppressMotion = false, panelTargetShown = false, motionTimerRunning = false;
 double motionNow() {
@@ -369,7 +378,7 @@ void applyTheme() {
     Surface = theme.surface; Border = theme.border; Selected = theme.selected; Danger = theme.danger;
     if (!mainWindow) return;
     const wchar_t* controls = theme.highContrast ? nullptr : theme.dark ? L"DarkMode_Explorer" : L"Explorer";
-    for (HWND control : {viewport, list, inlineText}) if (control) SetWindowTheme(control, controls, nullptr);
+    for (HWND control : {viewport, list, inlineText, settingsList}) if (control) SetWindowTheme(control, controls, nullptr);
     if (list) { ListView_SetBkColor(list, Background); ListView_SetTextBkColor(list, Background); ListView_SetTextColor(list, Ink); }
     if (tooltip) { SendMessageW(tooltip, TTM_SETTIPBKCOLOR, Surface, 0); SendMessageW(tooltip, TTM_SETTIPTEXTCOLOR, Ink, 0); }
     BOOL dark = theme.dark; DwmSetWindowAttribute(mainWindow, 20, &dark, sizeof(dark));
@@ -886,6 +895,7 @@ void layout() {
     MoveWindow(menuButton, w - sp(92), sp(16), sp(32), sp(30), TRUE);
     MoveWindow(hideButton, w - sp(52), sp(16), sp(32), sp(30), TRUE);
     const bool fullPage = inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history || inlinePage == InlinePage::lab ||
+        inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic ||
         inlinePage == InlinePage::confirm || inlinePage == InlinePage::error;
     const int textTop = inlinePage == InlinePage::powerMode ? sp(318) : inlinePage == InlinePage::history ? sp(262) : fullPage ? sp(128) : top - sp(37);
     {
@@ -898,6 +908,7 @@ void layout() {
     }
     const int textBottom = inlinePage == InlinePage::process ? h - sp(140) : h - sp(94);
     MoveWindow(inlineText, margin + sp(12), textTop, inner - sp(24), std::max(sp(55), textBottom - textTop), TRUE);
+    if (settingsList) MoveWindow(settingsList, margin + sp(8), textTop - sp(4), inner - sp(16), std::max(sp(55), textBottom - textTop + sp(4)), TRUE);
     {
         const int pageLeft = margin + sp(12), pageWidth = inner - sp(24), pageHalf = (pageWidth - sp(8)) / 2;
         MoveWindow(ecoButton, pageLeft, h - sp(103), pageHalf, sp(32), TRUE);
@@ -933,19 +944,20 @@ void showInlinePage(InlinePage page, const std::wstring& title, const std::wstri
     }
     SetWindowTextW(inlineText, lines.c_str());
     ShowScrollBar(inlineText, SB_VERT, page == InlinePage::process || page == InlinePage::power || page == InlinePage::ledger ||
-        page == InlinePage::powerMode || page == InlinePage::history || page == InlinePage::lab ||
+        page == InlinePage::powerMode || page == InlinePage::history || page == InlinePage::lab || page == InlinePage::dynamic ||
         (page == InlinePage::candidates && lines.size() > 500));
     SendMessageW(inlineText, EM_SETSEL, 0, 0);
     SendMessageW(inlineText, EM_SCROLLCARET, 0, 0);
     for (auto control : {viewport, closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck}) ShowWindow(control, SW_HIDE);
-    ShowWindow(inlineText, SW_SHOW); ShowWindow(inlineBack, SW_SHOW);
+    ShowWindow(inlineText, page == InlinePage::settings ? SW_HIDE : SW_SHOW); ShowWindow(inlineBack, SW_SHOW);
+    if (settingsList) ShowWindow(settingsList, page == InlinePage::settings ? SW_SHOW : SW_HIDE);
     ShowWindow(inlineConfirm, page == InlinePage::confirm ? SW_SHOW : SW_HIDE);
     for (HWND control : modeButtons) ShowWindow(control, page == InlinePage::powerMode ? SW_SHOW : SW_HIDE);
     for (HWND control : {ecoButton, perfAppButton}) ShowWindow(control, page == InlinePage::process ? SW_SHOW : SW_HIDE);
     for (HWND control : {restoreModesButton, energySettingsButton}) ShowWindow(control, page == InlinePage::powerMode ? SW_SHOW : SW_HIDE);
     SetWindowTextW(inlineBack, page == InlinePage::confirm ? tr(L"取消") : tr(L"返回排行"));
     layout();
-    HWND focus = page == InlinePage::confirm ? inlineBack : inlineText;
+    HWND focus = page == InlinePage::confirm ? inlineBack : page == InlinePage::settings ? settingsList : inlineText;
     if (page == InlinePage::powerMode) {
         focus = inlineBack;
         for (HWND control : modeButtons) if (IsWindowEnabled(control)) { focus = control; break; }
@@ -956,6 +968,7 @@ void finishInlineClose() {
     inlinePage = InlinePage::none; inlineTitle.clear(); inlineProcess.reset(); pendingForceRow.reset();
     inlineClosing = false;
     ShowWindow(inlineText, SW_HIDE); ShowWindow(inlineBack, SW_HIDE); ShowWindow(inlineConfirm, SW_HIDE);
+    if (settingsList) ShowWindow(settingsList, SW_HIDE);
     for (HWND control : modeButtons) ShowWindow(control, SW_HIDE);
     ShowWindow(restoreModesButton, SW_HIDE); ShowWindow(energySettingsButton, SW_HIDE);
     ShowWindow(ecoButton, SW_HIDE); ShowWindow(perfAppButton, SW_HIDE);
@@ -1142,7 +1155,8 @@ void paint(HDC dc, RECT bounds) {
     }
     drawText(dc, demo ? tr(L"示範資料 · 關閉操作已停用") : tr(L"電池與背景活動"), {margin + sp(30), sp(39), w - sp(96), sp(60)}, Muted, smallFont);
     if (inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history ||
-        inlinePage == InlinePage::lab || inlinePage == InlinePage::confirm || inlinePage == InlinePage::error) {
+        inlinePage == InlinePage::lab || inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic ||
+        inlinePage == InlinePage::confirm || inlinePage == InlinePage::error) {
         card(dc, {margin, sp(74), right, h - sp(14)}, Surface, 14);
         drawText(dc, inlineTitle, {margin + sp(14), sp(84), right - sp(14), sp(114)}, Ink, titleFont);
         fill(dc, {margin + sp(14), sp(119), right - sp(14), sp(119) + 1}, Border);
@@ -1677,6 +1691,11 @@ void loadSettings() {
     miniEnabled = readSetting(L"MiniWindow", 0) == 1;
     historyEnabled = readSetting(L"History", 1) != 0;
     updateChecks = readSetting(L"UpdateCheck", 1) != 0;
+    dynamicEnabled = readSetting(L"Dynamic", 0) == 1;
+    dynamicRefresh = readSetting(L"DynamicRefresh", 0) == 1;
+    dynamicEco = readSetting(L"DynamicEco", 1) != 0;
+    dynamicTarget = readSetting(L"DynamicTarget", 0);
+    if (dynamicTarget != 3 && dynamicTarget != 5 && dynamicTarget != 8) dynamicTarget = 0;
     std::vector<uint8_t> curve(512); DWORD curveBytes = DWORD(curve.size());
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\BatteryScope", L"ChargeCurve", RRF_RT_REG_BINARY, nullptr, curve.data(), &curveBytes) == ERROR_SUCCESS) {
         curve.resize(curveBytes); chargeCurve.load(curve);
@@ -2600,6 +2619,273 @@ void finishUpdateDownload(DWORD status) {
     if (!ShellExecuteExW(&run)) { setNotice(tr(L"無法啟動安裝程式，已改開啟下載頁。")); openReleasePage(); }
     else setNotice(tr(L"正在安裝更新，BatteryScope 會自動重新開啟。"));
 }
+// ----- Dynamic power saving -----
+// The governor runs on a one-second timer on the UI thread from cheap signals
+// (input, sound, calls, full screen) and the latest sample, and writes power
+// settings through the lab's actuators. The originals of what it changed are
+// kept in the registry until restored, so a crash is undone at the next start.
+bs::gov::Governor governor;
+std::unique_ptr<bs::lab::SignalReader> signalReader;
+uint64_t evidenceAt = 0;
+int topRefreshSeen = 0;
+constexpr wchar_t GovernorKey[] = L"Software\\BatteryScope\\Governor";
+void saveGovernorOriginals() {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, GovernorKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) return;
+    for (size_t i = 0; i < governor.originals().size(); ++i) {
+        const std::wstring name = L"Original" + std::to_wstring(i);
+        if (const auto& value = governor.originals()[i]) { const DWORD v = *value; RegSetValueExW(key, name.c_str(), 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v), sizeof(v)); }
+    }
+    RegCloseKey(key);
+}
+void forgetGovernorOriginals() { RegDeleteTreeW(HKEY_CURRENT_USER, GovernorKey); }
+// After a crash or power loss: put back what the governor had changed.
+void restoreGovernorAfterCrash() {
+    for (size_t i = 0; i < size_t(bs::gov::Setting::count); ++i) {
+        DWORD value = 0, size = sizeof(value);
+        const std::wstring name = L"Original" + std::to_wstring(i);
+        if (RegGetValueW(HKEY_CURRENT_USER, GovernorKey, name.c_str(), RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS)
+            bs::lab::applyKnob(bs::gov::knobFor(bs::gov::Setting(i)), value);
+    }
+    forgetGovernorOriginals();
+}
+void applyDecision(const bs::gov::Decision& d) {
+    bool changed = false;
+    for (size_t i = 0; i < d.apply.size(); ++i) if (d.apply[i]) { bs::lab::applyKnob(bs::gov::knobFor(bs::gov::Setting(i)), *d.apply[i]); changed = true; }
+    for (const auto& [pid, created] : d.ecoOn) bs::lab::setProcessEco(pid, created, true);
+    for (const auto& [pid, created] : d.ecoOff) bs::lab::setProcessEco(pid, created, false);
+    if (d.restore) forgetGovernorOriginals();
+    else if (changed) saveGovernorOriginals();
+}
+void stopGovernor() {
+    bs::gov::Input off; off.ms = GetTickCount64(); off.onBattery = false;
+    applyDecision(governor.update(off));
+}
+void governorTick() {
+    if (!dynamicEnabled || demo || isolatedPreview) return;
+    if (!signalReader) signalReader = std::make_unique<bs::lab::SignalReader>();
+    const uint64_t now = GetTickCount64();
+    bs::gov::Options options;
+    options.refreshRate = dynamicRefresh; options.backgroundEco = dynamicEco;
+    if (dynamicTarget) options.targetHours = double(dynamicTarget);
+    DWORD refresh = 0;
+    if (bs::lab::readKnob(bs::lab::Knob::refreshRate, refresh) == ERROR_SUCCESS) topRefreshSeen = std::max(topRefreshSeen, int(refresh));
+    options.topRefresh = std::max(60, topRefreshSeen);
+    governor.setOptions(options);
+    if (labController && (!evidenceAt || now - evidenceAt >= 60000)) { governor.setEvidence(bs::gov::learn(labController->status().results)); evidenceAt = now; }
+    bs::gov::Input in; in.ms = now;
+    if (!current.history.empty()) {
+        const auto& p = current.history.back();
+        in.onBattery = p.present && p.acKnown && !p.onAc && !p.charging;
+    }
+    if (labController && labController->status().running) in.onBattery = false; // the lab owns the settings while it measures
+    Value systemCpu;
+    if (current.energy.ready) {
+        double busy = 0; for (const auto& core : current.energy.cores) busy += core.busyLogicalCores;
+        systemCpu = busy * 100 / std::max<DWORD>(1, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
+    }
+    const auto signals = signalReader->read(systemCpu);
+    in.context = bs::lab::classify(signals); in.idleSeconds = signals.idleSeconds;
+    in.hoursLeft = current.power.hoursRemaining;
+    for (size_t i = 0; i < in.actual.size(); ++i) {
+        DWORD value = 0;
+        if (bs::lab::readKnob(bs::gov::knobFor(bs::gov::Setting(i)), value) == ERROR_SUCCESS) in.actual[i] = value;
+    }
+    DWORD foreground = 0;
+    if (HWND window = GetForegroundWindow()) GetWindowThreadProcessId(window, &foreground);
+    for (const auto& row : current.processes)
+        if (row.measured && row.actionable && row.services.empty() && row.pid != GetCurrentProcessId())
+            in.apps.push_back({row.pid, row.created, row.name, row.averageCpu, row.pid == foreground});
+    applyDecision(governor.update(in));
+    if (inlinePage == InlinePage::dynamic && !hidden && now - labPageShownAt >= 3000) showDynamicPage();
+}
+void setDynamic(bool on) {
+    dynamicEnabled = on;
+    if (!writeSetting(L"Dynamic", on ? 1 : 0)) setNotice(tr(L"無法儲存設定。"));
+    if (on) { SetTimer(mainWindow, GovernorTimer, 1000, nullptr); governorTick(); setNotice(tr(L"動態省電已開啟：用電池時依你正在做的事自動調整。")); }
+    else { KillTimer(mainWindow, GovernorTimer); stopGovernor(); setNotice(tr(L"動態省電已關閉，設定已還原。")); }
+}
+std::wstring settingValueName(bs::gov::Setting setting, DWORD value) {
+    switch (setting) {
+    case bs::gov::Setting::powerMode: return modeName(PowerMode(value));
+    case bs::gov::Setting::cpuBoost: return value ? tr(L"開") : tr(L"關");
+    case bs::gov::Setting::refreshRate: return std::to_wstring(value) + L" Hz";
+    default: return std::to_wstring(value);
+    }
+}
+void showDynamicPage() {
+    const wchar_t* names[] = {tr(L"電源模式"), tr(L"處理器能源偏好"), tr(L"CPU Boost"), tr(L"螢幕更新率")};
+    std::wstring c = tr(L"用電池時，依你正在做的事自動調整電源設定：閒置與閱讀時省電，一操作就立刻恢復反應速度；高負載時給效能。插電、全螢幕遊戲或關閉時還原原本設定。G-Helper 或你自己改了某項設定，那一項會暫停管理 10 分鐘。");
+    c += tr(L"\n\n狀態：") + std::wstring(dynamicEnabled ? tr(L"開啟") : tr(L"關閉"));
+    if (dynamicEnabled) {
+        c += tr(L"\n目前判斷：") + std::wstring(tr(bs::gov::activityKey(governor.activity())));
+        const auto profile = governor.profileFor(governor.activity(), false);
+        c += tr(L"\n目標設定：");
+        bool any = false;
+        for (size_t i = 0; i < profile.values.size(); ++i) if (profile.values[i]) {
+            c += std::wstring(any ? L"，" : L"") + names[i] + L" " + settingValueName(bs::gov::Setting(i), *profile.values[i]);
+            any = true;
+        }
+        if (!any) c += tr(L"維持原本設定");
+        const uint64_t now = GetTickCount64();
+        for (size_t i = 0; i < profile.values.size(); ++i)
+            if (!governor.managing(bs::gov::Setting(i), now)) c += L"\n" + std::wstring(names[i]) + tr(L"：被其他程式改動，暫停管理中");
+    }
+    c += tr(L"\n\n選項：切換螢幕更新率 ") + std::wstring(dynamicRefresh ? tr(L"開") : tr(L"關")) + tr(L" · 背景程式效率模式 ") +
+        std::wstring(dynamicEco ? tr(L"開") : tr(L"關")) + tr(L" · 續航目標 ") + (dynamicTarget ? std::to_wstring(dynamicTarget) + tr(L" 小時") : std::wstring(tr(L"無")));
+    const auto evidence = labController ? bs::gov::learn(labController->status().results) : std::vector<bs::gov::Evidence>{};
+    c += tr(L"\n\n從省電實驗室學到的");
+    if (evidence.empty()) c += tr(L"\n還沒有足夠的實驗結果：先執行一次「一鍵自動測試」，之後只採用在這台電腦上證實省電又不變卡的設定。");
+    for (const auto& e : evidence)
+        c += L"\n" + std::wstring(tr(bs::gov::activityKey(e.activity))) + L" · " + names[size_t(e.setting)] + L" " + settingValueName(e.setting, e.savingValue) +
+            tr(L"：省 ") + number(e.wattsSaved, 2) + L" W" + (e.approved ? tr(L"，採用") : tr(L"，有代價，不採用"));
+    if (!governor.log.empty()) {
+        c += tr(L"\n\n最近的調整");
+        for (auto it = governor.log.rbegin(); it != governor.log.rend(); ++it) {
+            // Entries are Chinese; known prefixes are translated, app names stay as they are.
+            std::wstring line = *it;
+            for (const wchar_t* prefix : {L"背景程式改為效率模式：", L"→ "})
+                if (line.rfind(prefix, 0) == 0) { line = std::wstring(tr(prefix)) + line.substr(wcslen(prefix)); break; }
+            if (line.rfind(L"→ ", 0) != 0 && line.find(L"：") == std::wstring::npos) line = tr(line.c_str());
+            c += L"\n" + line;
+        }
+    }
+    const LRESULT firstLine = inlinePage == InlinePage::dynamic ? SendMessageW(inlineText, EM_GETFIRSTVISIBLELINE, 0, 0) : 0;
+    showInlinePage(InlinePage::dynamic, tr(L"動態省電"), c);
+    if (firstLine > 0) SendMessageW(inlineText, EM_LINESCROLL, 0, firstLine);
+    labPageShownAt = GetTickCount64();
+}
+
+// ----- Settings page -----
+// Every option in one scrolling list, grouped into sections. A row shows its
+// value; clicking it switches or cycles the value through the same commands
+// the menus used.
+enum class Row { section, dynamic, dynamicRefresh, dynamicEco, target, autoSaver, perfApps, lowBattery, chargeReminder, drainAlert,
+    sleepAlert, theme, style, mascot, trayPercent, mini, language, startup, hotkey, history, clearHistory, updates, checkNow };
+struct SettingRow { Row row; const wchar_t* label; };
+const SettingRow settingRows[] = {
+    {Row::section, L"省電"}, {Row::dynamic, L"動態省電（實驗功能）"}, {Row::dynamicRefresh, L"動態切換螢幕更新率"}, {Row::dynamicEco, L"背景程式自動效率模式"},
+    {Row::target, L"續航目標"}, {Row::autoSaver, L"低電量時自動省電"}, {Row::perfApps, L"效能清單"},
+    {Row::section, L"提醒"}, {Row::lowBattery, L"低電量提醒"}, {Row::chargeReminder, L"充電提醒"}, {Row::drainAlert, L"背景耗電提醒"}, {Row::sleepAlert, L"睡眠耗電提醒"},
+    {Row::section, L"外觀"}, {Row::theme, L"主題"}, {Row::style, L"風格"}, {Row::mascot, L"電池小精靈"}, {Row::trayPercent, L"系統匣顯示電量"},
+    {Row::mini, L"迷你浮動視窗"}, {Row::language, L"語言 / Language"},
+    {Row::section, L"一般"}, {Row::startup, L"登入時啟動"}, {Row::hotkey, L"快速鍵 Ctrl+Alt+B"}, {Row::history, L"記錄每日歷史"},
+    {Row::clearHistory, L"清除歷史紀錄"}, {Row::updates, L"每天檢查更新"}, {Row::checkNow, L"立即檢查更新"}};
+std::wstring rowValue(Row row) {
+    auto onOff = [](bool on) { return std::wstring(on ? tr(L"開") : tr(L"關")); };
+    auto percentOrOff = [](unsigned value) { return value ? std::to_wstring(value) + L"%" : std::wstring(tr(L"關")); };
+    switch (row) {
+    case Row::dynamic: return onOff(dynamicEnabled);
+    case Row::dynamicRefresh: return onOff(dynamicRefresh);
+    case Row::dynamicEco: return onOff(dynamicEco);
+    case Row::target: return dynamicTarget ? std::to_wstring(dynamicTarget) + tr(L" 小時") : std::wstring(tr(L"無"));
+    case Row::autoSaver: return percentOrOff(autoSaverThreshold);
+    case Row::perfApps: return std::to_wstring(performanceApps.size()) + tr(L" 個");
+    case Row::lowBattery: return percentOrOff(lowBatteryThreshold);
+    case Row::chargeReminder: return percentOrOff(chargeReminderTarget);
+    case Row::drainAlert: return onOff(drainAlerts);
+    case Row::sleepAlert: return onOff(sleepAlerts);
+    case Row::theme: return themeChoice == ui::ThemeChoice::system ? tr(L"跟隨 Windows") : themeChoice == ui::ThemeChoice::dark ? tr(L"深色") : tr(L"淺色");
+    case Row::style: return pixelStyle ? tr(L"像素") : tr(L"平滑");
+    case Row::mascot: return onOff(showMascot);
+    case Row::trayPercent: return onOff(trayPercent);
+    case Row::mini: return onOff(miniEnabled);
+    case Row::language: return english ? L"English" : L"繁體中文";
+    case Row::startup: return onOff(autoStart);
+    case Row::hotkey: return onOff(hotkeyEnabled);
+    case Row::history: return onOff(historyEnabled);
+    case Row::clearHistory: case Row::checkNow: return L"…";
+    case Row::updates: return onOff(updateChecks);
+    default: return {};
+    }
+}
+bool rowOn(Row row) {
+    switch (row) {
+    case Row::dynamic: return dynamicEnabled;
+    case Row::dynamicRefresh: return dynamicRefresh;
+    case Row::dynamicEco: return dynamicEco;
+    case Row::target: return dynamicTarget != 0;
+    case Row::autoSaver: return autoSaverThreshold != 0;
+    case Row::lowBattery: return lowBatteryThreshold != 0;
+    case Row::chargeReminder: return chargeReminderTarget != 0;
+    case Row::drainAlert: return drainAlerts;
+    case Row::sleepAlert: return sleepAlerts;
+    case Row::mascot: return showMascot;
+    case Row::trayPercent: return trayPercent;
+    case Row::mini: return miniEnabled;
+    case Row::startup: return autoStart;
+    case Row::hotkey: return hotkeyEnabled;
+    case Row::history: return historyEnabled;
+    case Row::updates: return updateChecks;
+    default: return false;
+    }
+}
+// The menu command a row sends; cycling rows pick the next value.
+int rowCommand(Row row) {
+    auto next = [](unsigned value, std::initializer_list<unsigned> values) {
+        auto it = std::find(values.begin(), values.end(), value);
+        return it == values.end() || std::next(it) == values.end() ? *values.begin() : *std::next(it);
+    };
+    switch (row) {
+    case Row::dynamic: return DynamicToggleId;
+    case Row::dynamicRefresh: return DynamicRefreshId;
+    case Row::dynamicEco: return DynamicEcoId;
+    case Row::target: return DynamicTargetId;
+    case Row::autoSaver: { const unsigned v = next(autoSaverThreshold, {0, 20, 30}); return v == 0 ? AutoSaverOffId : v == 20 ? AutoSaver20Id : AutoSaver30Id; }
+    case Row::perfApps: return PerfAppsPageId;
+    case Row::lowBattery: return LowBatteryOffId + int(next(lowBatteryThreshold, {0, 10, 20, 30}) / 10);
+    case Row::chargeReminder: {
+        const unsigned v = next(chargeReminderTarget, {0, 80, 85, 90, 100});
+        return v == 0 ? ChargeReminderOffId : v == 80 ? ChargeReminder80Id : v == 85 ? ChargeReminder85Id : v == 90 ? ChargeReminder90Id : ChargeReminder100Id;
+    }
+    case Row::drainAlert: return DrainAlertId;
+    case Row::sleepAlert: return SleepAlertId;
+    case Row::theme: return themeChoice == ui::ThemeChoice::system ? ThemeDarkId : themeChoice == ui::ThemeChoice::dark ? ThemeLightId : ThemeSystemId;
+    case Row::style: return pixelStyle ? StyleSmoothId : StylePixelId;
+    case Row::mascot: return MascotToggleId;
+    case Row::trayPercent: return TrayPercentId;
+    case Row::mini: return MiniToggleId;
+    case Row::language: return english ? LanguageZhId : LanguageEnId;
+    case Row::startup: return StartupId;
+    case Row::hotkey: return HotkeyToggleId;
+    case Row::history: return HistoryToggleId;
+    case Row::clearHistory: return ClearHistoryId;
+    case Row::updates: return UpdateCheckId;
+    case Row::checkNow: return UpdateNowId;
+    default: return 0;
+    }
+}
+void showSettingsPage() {
+    if (SendMessageW(settingsList, LB_GETCOUNT, 0, 0) == 0)
+        for (size_t i = 0; i < std::size(settingRows); ++i) SendMessageW(settingsList, LB_ADDSTRING, 0, LPARAM(i));
+    showInlinePage(InlinePage::settings, tr(L"設定"), L"");
+    InvalidateRect(settingsList, nullptr, FALSE);
+}
+void drawSettingRow(const DRAWITEMSTRUCT& item) {
+    if (item.itemID == UINT(-1) || item.itemID >= std::size(settingRows)) return;
+    const auto& entry = settingRows[item.itemID];
+    HDC dc = item.hDC; RECT r = item.rcItem;
+    fill(dc, r, Surface);
+    if (entry.row == Row::section) {
+        drawText(dc, tr(entry.label), {r.left + sp(6), r.top + sp(10), r.right - sp(6), r.bottom}, Green, strongFont);
+        return;
+    }
+    RECT box{r.left + sp(2), r.top + sp(3), r.right - sp(2), r.bottom - sp(3)};
+    rounded(dc, box, blend(Surface, Border, .45), 8);
+    drawText(dc, tr(entry.label), {box.left + sp(12), box.top, box.right - sp(110), box.bottom}, Ink, normalFont);
+    const std::wstring value = rowValue(entry.row);
+    const bool on = rowOn(entry.row);
+    const int width = std::max(sp(44), textWidth(dc, value, smallFont) + sp(18));
+    RECT pill{box.right - sp(10) - width, box.top + sp(8), box.right - sp(10), box.bottom - sp(8)};
+    rounded(dc, pill, on ? blend(Green, Surface, theme.highContrast ? 0 : .25) : blend(Surface, Border, .9), 8);
+    drawText(dc, value, pill, on ? theme.accentInk : Muted, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+}
+void activateSettingRow(int index) {
+    if (index < 0 || size_t(index) >= std::size(settingRows) || demo || isolatedPreview) return;
+    if (const int command = rowCommand(settingRows[index].row)) SendMessageW(mainWindow, WM_COMMAND, command, 0);
+    if (inlinePage == InlinePage::settings) InvalidateRect(settingsList, nullptr, FALSE);
+}
+
 void openMenu(POINT point) {
     const bool preview = demo || isolatedPreview;
     HMENU menu = CreatePopupMenu();
@@ -2608,81 +2894,38 @@ void openMenu(POINT point) {
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     }
     AppendMenuW(menu, MF_STRING, PowerModeId, tr(L"電源模式…"));
+    AppendMenuW(menu, MF_STRING | (dynamicEnabled ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), DynamicToggleId, tr(L"動態省電"));
+    AppendMenuW(menu, MF_STRING, DynamicPageId, tr(L"動態省電狀態…"));
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, PowerDetailsId, tr(L"電池與充電詳情"));
-    AppendMenuW(menu, MF_STRING, LedgerId, tr(L"本次累計耗能"));
     AppendMenuW(menu, MF_STRING, HistoryId, tr(L"歷史紀錄（7 天）"));
+    AppendMenuW(menu, MF_STRING, LedgerId, tr(L"本次累計耗能"));
     AppendMenuW(menu, MF_STRING, ReviewCandidatesId, tr(L"找出耗電的背景程式…"));
-    AppendMenuW(menu, MF_STRING | (preview ? MF_GRAYED : 0), ExportCsvId, tr(L"匯出 CSV…"));
-    AppendMenuW(menu, MF_STRING | (preview ? MF_GRAYED : 0), ShareCardId, tr(L"分享今日卡片…"));
-    AppendMenuW(menu, MF_STRING | (miniEnabled ? MF_CHECKED : 0), MiniToggleId, tr(L"迷你浮動視窗"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    HMENU appearance = CreatePopupMenu();
-    AppendMenuW(appearance, MF_STRING | (themeChoice == ui::ThemeChoice::system ? MF_CHECKED : 0), ThemeSystemId, tr(L"跟隨 Windows"));
-    AppendMenuW(appearance, MF_STRING | (themeChoice == ui::ThemeChoice::dark ? MF_CHECKED : 0), ThemeDarkId, tr(L"深色"));
-    AppendMenuW(appearance, MF_STRING | (themeChoice == ui::ThemeChoice::light ? MF_CHECKED : 0), ThemeLightId, tr(L"淺色"));
-    AppendMenuW(appearance, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(appearance, MF_STRING | (pixelStyle ? MF_CHECKED : 0) | (ui::pixelFontLoaded() ? 0 : MF_GRAYED), StylePixelId, tr(L"像素風格"));
-    AppendMenuW(appearance, MF_STRING | (!pixelStyle ? MF_CHECKED : 0), StyleSmoothId, tr(L"平滑風格"));
-    AppendMenuW(appearance, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(appearance, MF_STRING | (showMascot ? MF_CHECKED : 0), MascotToggleId, tr(L"顯示電池小精靈"));
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(appearance), tr(L"外觀"));
-    HMENU languages = CreatePopupMenu();
-    AppendMenuW(languages, MF_STRING | (!english ? MF_CHECKED : 0), LanguageZhId, L"繁體中文");
-    AppendMenuW(languages, MF_STRING | (english ? MF_CHECKED : 0), LanguageEnId, L"English");
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(languages), tr(L"語言 / Language"));
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    HMENU alerts = CreatePopupMenu();
-    const std::pair<int, unsigned> levels[] = {{LowBatteryOffId, 0}, {LowBattery10Id, 10}, {LowBattery20Id, 20}, {LowBattery30Id, 30}};
-    for (const auto& level : levels)
-        AppendMenuW(alerts, MF_STRING | (lowBatteryThreshold == level.second ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), level.first,
-            level.second ? (std::to_wstring(level.second) + L"%").c_str() : tr(L"關閉"));
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(alerts), tr(L"低電量提醒"));
-    AppendMenuW(menu, MF_STRING | (drainAlerts ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), DrainAlertId, tr(L"背景耗電提醒"));
-    AppendMenuW(menu, MF_STRING | (sleepAlerts ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), SleepAlertId, tr(L"睡眠耗電提醒"));
-    HMENU reminders = CreatePopupMenu();
-    const std::pair<int, unsigned> targets[] = {{ChargeReminderOffId, 0}, {ChargeReminder80Id, 80}, {ChargeReminder85Id, 85},
-        {ChargeReminder90Id, 90}, {ChargeReminder100Id, 100}};
-    for (const auto& target : targets)
-        AppendMenuW(reminders, MF_STRING | (chargeReminderTarget == target.second ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), target.first,
-            target.second ? (std::to_wstring(target.second) + L"%").c_str() : tr(L"關閉"));
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(reminders), tr(L"充電提醒"));
-    HMENU automatic = CreatePopupMenu();
-    const std::pair<int, unsigned> savers[] = {{AutoSaverOffId, 0}, {AutoSaver20Id, 20}, {AutoSaver30Id, 30}};
-    for (const auto& item : savers)
-        AppendMenuW(automatic, MF_STRING | (autoSaverThreshold == item.second ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), item.first,
-            item.second ? (tr(L"低電量省電：") + std::to_wstring(item.second) + L"%").c_str() : tr(L"低電量省電：關閉"));
-    AppendMenuW(automatic, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(automatic, MF_STRING, PerfAppsPageId, (tr(L"效能清單（") + std::to_wstring(performanceApps.size()) + tr(L" 個）…")).c_str());
-    AppendMenuW(automatic, MF_STRING | (preview || performanceApps.empty() ? MF_GRAYED : 0), ClearPerfAppsId, tr(L"清空效能清單"));
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(automatic), tr(L"自動電源模式"));
-    HMENU records = CreatePopupMenu();
-    AppendMenuW(records, MF_STRING | (historyEnabled ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), HistoryToggleId, tr(L"記錄每日歷史"));
-    AppendMenuW(records, MF_STRING | (preview ? MF_GRAYED : 0), ClearHistoryId, tr(L"清除歷史紀錄…"));
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(records), tr(L"歷史紀錄設定"));
-    AppendMenuW(menu, MF_STRING | (trayPercent ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), TrayPercentId, tr(L"系統匣顯示電量數字"));
-    AppendMenuW(menu, MF_STRING | (hotkeyEnabled ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), HotkeyToggleId, tr(L"快速鍵 Ctrl+Alt+B"));
-    AppendMenuW(menu, MF_STRING | (autoStart ? MF_CHECKED : 0) | (demo ? MF_GRAYED : 0), StartupId, tr(L"登入時啟動"));
     HMENU labMenu = CreatePopupMenu();
     const auto labStatus = labController ? labController->status() : bs::lab::Controller::Status{};
     AppendMenuW(labMenu, MF_STRING | (preview || (labStatus.running && !labStatus.plan) ? MF_GRAYED : 0), LabAutoId,
-        labStatus.running && labStatus.plan ? tr(L"停止自動測試") : tr(L"一鍵自動測試（約 1 小時，結束自動匯出）"));
+        labStatus.running && labStatus.plan ? tr(L"停止自動測試") : tr(L"一鍵自動測試（約 1.5 小時，結束自動匯出）"));
     AppendMenuW(labMenu, MF_STRING, LabPageId, tr(L"查看實驗室…"));
     AppendMenuW(labMenu, MF_STRING | (labStatus.recording ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), LabRecordId, tr(L"記錄詳細資料"));
-    AppendMenuW(labMenu, MF_SEPARATOR, 0, nullptr);
-    const wchar_t* experimentNames[] = {tr(L"實驗：CPU Boost 開／關"), tr(L"實驗：處理器能源偏好"), tr(L"實驗：螢幕更新率"), tr(L"實驗：電源模式 平衡／效率")};
-    AppendMenuW(labMenu, MF_SEPARATOR, 0, nullptr);
+    HMENU single = CreatePopupMenu();
+    const wchar_t* experimentNames[] = {tr(L"CPU Boost 開／關"), tr(L"處理器能源偏好"), tr(L"螢幕更新率"), tr(L"電源模式")};
     for (int i = 0; i < bs::lab::ManualKnobs; ++i)
-        AppendMenuW(labMenu, MF_STRING | (preview || labStatus.running ? MF_GRAYED : 0) |
-            (labStatus.running && int(labStatus.knob) == i ? MF_CHECKED : 0), LabExperimentId + i, experimentNames[i]);
-    AppendMenuW(labMenu, MF_STRING | (labStatus.running ? 0 : MF_GRAYED), LabStopId, tr(L"停止實驗並還原"));
+        AppendMenuW(single, MF_STRING | (preview || labStatus.running ? MF_GRAYED : 0) |
+            (labStatus.running && !labStatus.plan && int(labStatus.knob) == i ? MF_CHECKED : 0), LabExperimentId + i, experimentNames[i]);
+    AppendMenuW(single, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(single, MF_STRING | (labStatus.running && !labStatus.plan ? 0 : MF_GRAYED), LabStopId, tr(L"停止實驗並還原"));
+    AppendMenuW(labMenu, MF_POPUP | (preview ? MF_GRAYED : 0), reinterpret_cast<UINT_PTR>(single), tr(L"單項實驗"));
     AppendMenuW(labMenu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(labMenu, MF_STRING | (preview ? MF_GRAYED : 0), LabExportId, tr(L"一鍵匯出（壓縮檔＋複製摘要）"));
     AppendMenuW(labMenu, MF_STRING | (preview ? MF_GRAYED : 0), LabFolderId, tr(L"開啟資料夾"));
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(labMenu), tr(L"省電實驗室"));
-    HMENU updates = CreatePopupMenu();
-    AppendMenuW(updates, MF_STRING | (updateChecks ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), UpdateCheckId, tr(L"每天自動檢查"));
-    AppendMenuW(updates, MF_STRING | (preview || updateBusy ? MF_GRAYED : 0), UpdateNowId, tr(L"立即檢查更新"));
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(updates), tr(L"更新"));
+    HMENU tools = CreatePopupMenu();
+    AppendMenuW(tools, MF_STRING | (preview ? MF_GRAYED : 0), ExportCsvId, tr(L"匯出 CSV…"));
+    AppendMenuW(tools, MF_STRING | (preview ? MF_GRAYED : 0), ShareCardId, tr(L"分享今日卡片…"));
+    AppendMenuW(tools, MF_STRING | (miniEnabled ? MF_CHECKED : 0), MiniToggleId, tr(L"迷你浮動視窗"));
+    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(tools), tr(L"工具"));
+    AppendMenuW(menu, MF_STRING, SettingsPageId, tr(L"設定…"));
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, TrayShow, tr(L"顯示面板"));
     AppendMenuW(menu, MF_STRING | (pendingAction ? MF_GRAYED : 0), TrayExit, tr(L"結束 BatteryScope"));
@@ -2715,6 +2958,8 @@ void applyLanguage(bool useEnglish) {
     if (inlinePage == InlinePage::history) showHistoryPage();
     if (inlinePage == InlinePage::perfApps) showPerformanceApps();
     if (inlinePage == InlinePage::lab) showLabPage();
+    if (inlinePage == InlinePage::settings) showSettingsPage();
+    if (inlinePage == InlinePage::dynamic) showDynamicPage();
     if (inlinePage == InlinePage::confirm && pendingForceRow) showForceConfirmation(*pendingForceRow);
     notice = tr(L"正在讀取電池與程序資料…"); noticeUntil = 0;
     if (tooltip) SendMessageW(tooltip, TTM_POP, 0, 0);
@@ -2775,6 +3020,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             0, 0, 0, 0, window, nullptr, nullptr, nullptr);
         SetWindowSubclass(inlineText, inlineTextProc, 1, 0);
         SendMessageW(inlineText, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(sp(4), sp(4)));
+        settingsList = CreateWindowExW(0, L"LISTBOX", L"", WS_CHILD | WS_VSCROLL | LBS_OWNERDRAWVARIABLE | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+            0, 0, 0, 0, window, reinterpret_cast<HMENU>(INT_PTR(SettingsListId)), nullptr, nullptr);
         inlineBack = button(tr(L"返回排行"), InlineBackId);
         inlineConfirm = button(tr(L"確定強制結束"), InlineConfirmId);
         ShowWindow(inlineBack, SW_HIDE);
@@ -2805,14 +3052,22 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         }, window);
         refreshPowerButton();
         if (!demo && !isolatedPreview) SetTimer(window, UpdateTimer, 60 * 1000, nullptr); // first check a minute after start
+        if (!demo && !isolatedPreview) { restoreGovernorAfterCrash(); if (dynamicEnabled) SetTimer(window, GovernorTimer, 1000, nullptr); }
         return 0;
     }
     case WM_MEASUREITEM:
         if (wp == ListId) { reinterpret_cast<MEASUREITEMSTRUCT*>(lp)->itemHeight = px(RowHeight); return TRUE; }
+        if (wp == SettingsListId) {
+            auto measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lp);
+            measure->itemHeight = measure->itemID < std::size(settingRows) && settingRows[measure->itemID].row == Row::section ? sp(34) : sp(46);
+            return TRUE;
+        }
         break;
     case WM_DRAWITEM: {
         auto item = reinterpret_cast<DRAWITEMSTRUCT*>(lp);
-        if (item->CtlID == ListId) drawProcess(*item); else if (item->CtlType == ODT_BUTTON) drawButton(*item);
+        if (item->CtlID == ListId) drawProcess(*item);
+        else if (item->CtlID == SettingsListId) drawSettingRow(*item);
+        else if (item->CtlType == ODT_BUTTON) drawButton(*item);
         return TRUE;
     }
     case WM_DPICHANGED: {
@@ -2828,6 +3083,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (wp == MotionTimer) { stepMotion(motionNow()); return 0; }
         if (wp == NoticeTimer) { KillTimer(window, NoticeTimer); noticeUntil = 0; InvalidateRect(window, nullptr, FALSE); return 0; }
         if (wp == UpdateTimer) { SetTimer(window, UpdateTimer, 6 * 3600 * 1000, nullptr); maybeCheckForUpdate(); return 0; }
+        if (wp == GovernorTimer) { governorTick(); return 0; }
         break;
     case WM_SYSCOLORCHANGE:
     case WM_THEMECHANGED:
@@ -2852,6 +3108,9 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         HGDIOBJ old = SelectObject(dc, bitmap); paint(dc, r); BitBlt(target, 0, 0, r.right, r.bottom, dc, 0, 0, SRCCOPY);
         SelectObject(dc, old); DeleteObject(bitmap); DeleteDC(dc); EndPaint(window, &ps); return 0;
     }
+    case WM_CTLCOLORLISTBOX:
+        if (reinterpret_cast<HWND>(lp) == settingsList) { SetDCBrushColor(reinterpret_cast<HDC>(wp), Surface); return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH)); }
+        break;
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLOREDIT:
     case WM_CTLCOLORBTN:
@@ -3043,6 +3302,22 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (id == MenuId) { RECT r{}; GetWindowRect(menuButton, &r); openMenu({r.left, r.bottom}); return 0; }
         if (id == TrayShow) { showMain(); return 0; }
         if (id == LabPageId) { showLabPage(); return 0; }
+        if (id == SettingsPageId) { showMain(); showSettingsPage(); return 0; }
+        if (id == DynamicPageId) { showMain(); showDynamicPage(); return 0; }
+        if (id == DynamicToggleId) { if (!demo && !isolatedPreview) setDynamic(!dynamicEnabled); return 0; }
+        if (id == DynamicRefreshId || id == DynamicEcoId || id == DynamicTargetId) {
+            if (demo || isolatedPreview) return 0;
+            if (id == DynamicRefreshId) { dynamicRefresh = !dynamicRefresh; writeSetting(L"DynamicRefresh", dynamicRefresh); }
+            if (id == DynamicEcoId) { dynamicEco = !dynamicEco; writeSetting(L"DynamicEco", dynamicEco); }
+            if (id == DynamicTargetId) { dynamicTarget = dynamicTarget == 0 ? 3 : dynamicTarget == 3 ? 5 : dynamicTarget == 5 ? 8 : 0; writeSetting(L"DynamicTarget", dynamicTarget); }
+            return 0;
+        }
+        if (id == SettingsListId && HIWORD(wp) == LBN_SELCHANGE) {
+            const int index = int(SendMessageW(settingsList, LB_GETCURSEL, 0, 0));
+            SendMessageW(settingsList, LB_SETCURSEL, WPARAM(-1), 0);
+            activateSettingRow(index);
+            return 0;
+        }
         if (id == LabRecordId && labController) {
             const bool on = !labController->status().recording;
             labController->setRecording(on);
@@ -3224,7 +3499,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_CLOSE: hideMain(); return 0;
     case WM_DESTROY: {
         KillTimer(window, MotionTimer); motionTimerRunning = false;
-        KillTimer(window, NoticeTimer); KillTimer(window, UpdateTimer);
+        KillTimer(window, NoticeTimer); KillTimer(window, UpdateTimer); KillTimer(window, GovernorTimer);
+        if (dynamicEnabled && !demo && !isolatedPreview) stopGovernor();
         if (labEngine) labEngine->stop();
         registerPanelHotkey(false);
         setMiniWindow(false);
@@ -3309,13 +3585,23 @@ bool captureWindow(const std::wstring& path) {
     // window uses, so captures do not depend on WM_PRINT support for them.
     for (auto child : {viewport, closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck,
         powerButton, hideButton, menuButton, inlineText, inlineBack, inlineConfirm, restoreModesButton, energySettingsButton, ecoButton, perfAppButton,
-        modeButtons[0], modeButtons[1], modeButtons[2], modeButtons[3], modeButtons[4], modeButtons[5]}) {
+        modeButtons[0], modeButtons[1], modeButtons[2], modeButtons[3], modeButtons[4], modeButtons[5], settingsList}) {
         if (!(GetWindowLongPtrW(child, GWL_STYLE) & WS_VISIBLE)) continue;
         RECT childRect; GetWindowRect(child, &childRect); MapWindowPoints(nullptr, mainWindow, reinterpret_cast<POINT*>(&childRect), 2);
         const int cw = childRect.right - childRect.left, ch = childRect.bottom - childRect.top;
         SaveDC(dc); SetViewportOrgEx(dc, childRect.left, childRect.top, nullptr);
         IntersectClipRect(dc, 0, 0, cw, ch);
-        if (child == viewport) {
+        if (child == settingsList) {
+            fill(dc, {0, 0, cw, ch}, Surface);
+            const int count = int(SendMessageW(settingsList, LB_GETCOUNT, 0, 0));
+            for (int index = 0; index < count; ++index) {
+                RECT item{};
+                if (SendMessageW(settingsList, LB_GETITEMRECT, WPARAM(index), reinterpret_cast<LPARAM>(&item)) == LB_ERR || item.top >= ch) continue;
+                DRAWITEMSTRUCT draw{}; draw.CtlType = ODT_LISTBOX; draw.CtlID = SettingsListId; draw.itemID = UINT(index);
+                draw.hwndItem = settingsList; draw.hDC = dc; draw.rcItem = item;
+                drawSettingRow(draw);
+            }
+        } else if (child == viewport) {
             fill(dc, {0, 0, cw, ch}, Background);
             for (int index = 0; index < int(displayed.size()); ++index) {
                 RECT item{}; ListView_GetItemRect(list, index, &item, LVIR_BOUNDS);
@@ -3518,6 +3804,20 @@ bool panelSelfTest(const std::wstring& path) {
     check("history_page_lists_days_newest_first", inlinePage == InlinePage::history && current.days.size() == 6 &&
         historyBody.find(dayLabel(current.days.back().date) + tr(L"（今天）")) < historyBody.find(dayLabel(current.days.front().date) + tr(L" · 用電池 ")) &&
         historyBody.find(L"Browser.exe") != std::wstring::npos);
+    SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
+    // Settings page: every option in one list, grouped; clicking in demo changes nothing.
+    SendMessageW(mainWindow, WM_COMMAND, SettingsPageId, 0);
+    const bool styleBefore = pixelStyle;
+    check("settings_page_lists_every_option", inlinePage == InlinePage::settings && IsWindowVisible(settingsList) && !IsWindowVisible(inlineText) &&
+        SendMessageW(settingsList, LB_GETCOUNT, 0, 0) == LRESULT(std::size(settingRows)));
+    activateSettingRow(int(std::find_if(std::begin(settingRows), std::end(settingRows), [](const SettingRow& r) { return r.row == Row::style; }) - std::begin(settingRows)));
+    check("settings_rows_do_not_change_demo_settings", pixelStyle == styleBefore);
+    SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
+    check("settings_list_hides_on_return", inlinePage == InlinePage::none || inlineClosing || !IsWindowVisible(settingsList));
+    SendMessageW(mainWindow, WM_COMMAND, DynamicPageId, 0);
+    std::wstring dynamicBody(size_t(GetWindowTextLengthW(inlineText)) + 1, L'\0');
+    GetWindowTextW(inlineText, dynamicBody.data(), int(dynamicBody.size()));
+    check("dynamic_page_explains_state", inlinePage == InlinePage::dynamic && dynamicBody.find(L"BatteryScope") == std::wstring::npos && dynamicBody.find(L"G-Helper") != std::wstring::npos);
     SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
     {
         RECT client{}; GetClientRect(mainWindow, &client);
@@ -3907,6 +4207,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (screenshot && option(L"--ledger")) showLedger();
     if (screenshot && option(L"--power-mode")) showPowerModePage();
     if (screenshot && option(L"--history")) showHistoryPage();
+    if (screenshot && option(L"--settings")) showSettingsPage();
+    if (screenshot && option(L"--dynamic")) showDynamicPage();
+    if (screenshot && option(L"--lab")) showLabPage();
     if (demo) for (size_t i = 0; i + 1 < args.size(); ++i) if (args[i] == L"--card-png") {
         const bool saved = exportShareCard(args[i + 1], false);
         DestroyWindow(window);
