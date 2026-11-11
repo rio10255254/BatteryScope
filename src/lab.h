@@ -158,7 +158,11 @@ std::vector<ExperimentResult> analyze(const std::vector<Block>& blocks);
 
 // ----- Windows side (lab_system.cpp) -----
 
-enum class Knob { cpuBoost, energyPreference, refreshRate, powerMode, count };
+// brightness, display and backgroundEco are used by the automatic test only:
+// display turns the screen off for a block, backgroundEco puts every background
+// app of this user in EcoQoS (the "App Nap" idea).
+enum class Knob { cpuBoost, energyPreference, refreshRate, powerMode, brightness, display, backgroundEco, count };
+constexpr int ManualKnobs = 4; // the first four can also be run one at a time from the menu
 const wchar_t* knobKey(Knob knob); // stable id used in files: cpu-boost, epp, refresh, power-mode
 struct KnobPlan {
     bool available = false;
@@ -192,6 +196,11 @@ void forgetOriginal();
 bool restoreInterrupted();
 
 std::wstring labFolder(); // %LOCALAPPDATA%\BatteryScope\lab, created on demand
+// Processes in this job (the test browser) are never throttled by backgroundEco.
+void setProtectedJob(HANDLE job);
+// Power plans, battery report, hardware, display, processes, startup apps and
+// running tasks, written to <folder>\system-<time>. Takes up to a minute.
+void writeSystemSnapshot(const std::wstring& folder);
 
 // How the controller reads and changes settings; replaced by a fake in tests.
 struct Actuator {
@@ -300,6 +309,7 @@ public:
     WorkloadMetrics take(); // and reset, once per sample
     // Edge, else Chrome; empty when neither is installed.
     static std::wstring browserPath();
+    int port() const; // the local server's port in browser mode, else 0
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

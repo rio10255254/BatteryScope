@@ -288,6 +288,7 @@ struct WorkloadEngine::Impl {
         PROCESS_INFORMATION process{};
         if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_SUSPENDED, nullptr, nullptr, &startup, &process)) return false;
         if (job) AssignProcessToJobObject(job, process.hProcess);
+        setProtectedJob(job); // the test browser is never throttled as a background app
         ResumeThread(process.hThread);
         CloseHandle(process.hThread); CloseHandle(process.hProcess);
         return true;
@@ -342,11 +343,12 @@ void WorkloadEngine::start(Controller* controller) {
 void WorkloadEngine::stop() {
     auto& d = *impl_;
     d.running = false;
-    if (d.job) { TerminateJobObject(d.job, 0); CloseHandle(d.job); d.job = nullptr; }
+    if (d.job) { setProtectedJob(nullptr); TerminateJobObject(d.job, 0); CloseHandle(d.job); d.job = nullptr; }
     for (auto& thread : d.threads) if (thread.joinable()) thread.join();
     d.threads.clear();
     SetThreadExecutionState(ES_CONTINUOUS);
 }
+int WorkloadEngine::port() const { return impl_->port > 0 ? impl_->port.load() : 0; }
 bool WorkloadEngine::running() const { return impl_->running; }
 bool WorkloadEngine::abortRequested() const { return impl_->abort; }
 WorkloadMetrics WorkloadEngine::take() {

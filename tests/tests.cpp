@@ -472,6 +472,43 @@ int wmain(int argc, wchar_t** argv) {
         lab::Sample s1 = labSample(clock, 8, 3, 1, lab::Context::idle); stopped.onSample(s1, 2);
         stopped.stop();
         check(fake->value == 2 && !stopped.active() && !fake->remembered, "stopping restores the original at once");
+        // Automatic test plan and its preparation phase.
+        const auto browserPlan = lab::automaticPlan(true), builtInPlan = lab::automaticPlan(false);
+        check(browserPlan.size() == 17 && browserPlan.back().knob == lab::Knob::display && builtInPlan.back().knob == lab::Knob::display
+            && std::all_of(browserPlan.begin(), browserPlan.end(), [](const lab::Step& step) { return step.pairs == 3 && step.blockSeconds == 45; }),
+            "the automatic test covers every setting, with screen-off last");
+        check(std::any_of(browserPlan.begin(), browserPlan.end(), [](const lab::Step& step) { return step.workload == lab::Workload::video && step.prepareSeconds >= 15; })
+            && std::none_of(builtInPlan.begin(), builtInPlan.end(), [](const lab::Step& step) { return step.workload == lab::Workload::video; }),
+            "real video runs only with a browser, after time to record the clip");
+        check(lab::experimentKey(lab::Knob::cpuBoost, lab::Workload::browse) == L"cpu-boost@browse" && lab::experimentKey(lab::Knob::refreshRate, lab::Workload::none) == L"refresh",
+            "experiment keys name the setting and the activity");
+        auto planned = std::make_shared<FakeActuator>();
+        lab::Controller sequence(L"", planned);
+        lab::Step first; first.knob = lab::Knob::cpuBoost; first.workload = lab::Workload::browse; first.pairs = 1; first.blockSeconds = 40;
+        first.warmupSeconds = 5; first.minimumSeconds = 20; first.prepareSeconds = 10;
+        lab::Step second = first; second.workload = lab::Workload::sustained; second.prepareSeconds = 0;
+        check(sequence.startPlan({first, second}) == ERROR_SUCCESS && sequence.workload() == lab::Workload::browse, "a plan starts with its first activity");
+        planned->value = 2; const DWORD appliedBefore = planned->applied;
+        uint64_t at = 50000;
+        auto feedPlan = [&](double secondsToFeed) {
+            for (double elapsed = 0; elapsed < secondsToFeed; elapsed += 2) {
+                lab::Sample s = labSample(at, 8, 3, 1, lab::Context::interactive);
+                s.workload.bursts = 1; s.workload.burstMs = 7;
+                sequence.onSample(s, 2); at += 2000;
+            }
+        };
+        feedPlan(8);
+        check(planned->applied == appliedBefore && sequence.status().arm == -1, "nothing is switched while the activity starts up");
+        feedPlan(4);
+        check(planned->applied > appliedBefore && sequence.status().arm >= 0, "blocks begin after the preparation time");
+        feedPlan(90);
+        check(sequence.workload() == lab::Workload::sustained && sequence.status().step == 1, "after its pairs, the next step's activity starts");
+        feedPlan(90);
+        const auto planStatus = sequence.status();
+        check(!planStatus.running && planStatus.finished && planned->value == 2 && !planned->remembered, "the plan ends with every setting restored");
+        bool burstsRecorded = false;
+        for (const auto& r : planStatus.results) burstsRecorded |= r.experiment == L"cpu-boost@browse" && r.bursts && std::abs(r.burstMs.mean0 - 7) < 1e-9;
+        check(burstsRecorded, "blocks keep the activity's response times");
         CpuAttributor slowEstimator;
         report.cores = heterogeneous; report.coreWatts = 5; report.ready = true; report.intervalSeconds = 20;
         a.cpu = 25; a.fixedCoreBusy.clear(); b.cpu = 25; energyRows = {a,b};

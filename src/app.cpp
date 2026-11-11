@@ -30,7 +30,7 @@
 namespace {
 using namespace bs;
 constexpr UINT SampleMessage = WM_APP + 1, TrayMessage = WM_APP + 2, ActionMessage = WM_APP + 3, RefreshMessage = WM_APP + 4,
-    PowerModeMessage = WM_APP + 5, UpdateMessage = WM_APP + 6, UpdateDownloadedMessage = WM_APP + 7;
+    PowerModeMessage = WM_APP + 5, UpdateMessage = WM_APP + 6, UpdateDownloadedMessage = WM_APP + 7, LabExportMessage = WM_APP + 8;
 constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, DetailsId = 104,
     BackgroundId = 105, AllId = 106, StartupId = 107, HideId = 108, MenuId = 109,
     LanguageZhId = 110, LanguageEnId = 111, PowerDetailsId = 112, PowerModeId = 113,
@@ -1869,6 +1869,9 @@ const wchar_t* labKnobTitle(const std::wstring& key) {
     if (key == L"epp") return tr(L"處理器能源偏好");
     if (key == L"refresh") return tr(L"螢幕更新率");
     if (key == L"power-mode") return tr(L"電源模式");
+    if (key == L"brightness") return tr(L"螢幕亮度");
+    if (key == L"display") return tr(L"螢幕開關");
+    if (key == L"background-eco") return tr(L"背景程式效率模式");
     return L"";
 }
 // "cpu-boost@scroll" -> "CPU Boost · 捲動頁面".
@@ -1887,6 +1890,8 @@ std::wstring signedNumber(double value, int precision) {
 std::wstring labArm(const std::wstring& name) {
     const std::wstring prefix = L"能源偏好 ";
     if (name.rfind(prefix, 0) == 0) return tr(L"能源偏好 ") + name.substr(prefix.size());
+    const std::wstring brightness = L"亮度 ";
+    if (name.rfind(brightness, 0) == 0) return tr(L"亮度 ") + name.substr(brightness.size());
     return tr(name.c_str());
 }
 uint64_t labPageShownAt = 0;
@@ -2666,7 +2671,7 @@ void openMenu(POINT point) {
     AppendMenuW(labMenu, MF_SEPARATOR, 0, nullptr);
     const wchar_t* experimentNames[] = {tr(L"實驗：CPU Boost 開／關"), tr(L"實驗：處理器能源偏好"), tr(L"實驗：螢幕更新率"), tr(L"實驗：電源模式 平衡／效率")};
     AppendMenuW(labMenu, MF_SEPARATOR, 0, nullptr);
-    for (int i = 0; i < int(bs::lab::Knob::count); ++i)
+    for (int i = 0; i < bs::lab::ManualKnobs; ++i)
         AppendMenuW(labMenu, MF_STRING | (preview || labStatus.running ? MF_GRAYED : 0) |
             (labStatus.running && int(labStatus.knob) == i ? MF_CHECKED : 0), LabExperimentId + i, experimentNames[i]);
     AppendMenuW(labMenu, MF_STRING | (labStatus.running ? 0 : MF_GRAYED), LabStopId, tr(L"停止實驗並還原"));
@@ -3046,7 +3051,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             showLabPage();
             return 0;
         }
-        if (id >= LabExperimentId && id < LabExperimentId + int(bs::lab::Knob::count) && labController) {
+        if (id >= LabExperimentId && id < LabExperimentId + bs::lab::ManualKnobs && labController) {
             const DWORD result = labController->start(bs::lab::Knob(id - LabExperimentId));
             setNotice(result ? tr(L"無法開始實驗：") + errorText(result) : std::wstring(tr(L"實驗開始：用電池時每 2 分鐘輪流切換設定。")));
             wake.notify_one();
@@ -3059,7 +3064,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             if (autoTestActive && id == LabAutoStartId) return 0; // already running
             if (autoTestActive) { // second click: stop
                 labController->stop(); labEngine->stop(); autoTestActive = false;
-                setNotice(tr(L"自動測試已停止，設定已還原。")); exportLab(); showLabPage();
+                setNotice(tr(L"自動測試已停止，設定已還原。"));
+                std::thread([target = mainWindow] { bs::lab::writeSystemSnapshot(bs::lab::labFolder()); PostMessageW(target, LabExportMessage, 1, 0); }).detach();
                 return 0;
             }
             const DWORD result = labController->startPlan(bs::lab::automaticPlan(!bs::lab::WorkloadEngine::browserPath().empty()));
@@ -3135,9 +3141,13 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             if (aborted || !labController->status().running) {
                 // Finished or stopped: close the test window, export everything, show the results.
                 labEngine->stop(); autoTestActive = false;
-                exportLab();
-                showMain(); showLabPage();
-                showBalloon(aborted ? tr(L"自動測試已中止") : tr(L"自動測試完成"), tr(L"設定已還原，結果與記錄已匯出到桌面，摘要已複製。"), BalloonTarget::none);
+                // A snapshot of power plans, battery report, hardware and processes goes with the export;
+                // it runs after the test so it never disturbs a measurement.
+                setNotice(tr(L"正在收集系統資訊並匯出…"));
+                std::thread([target = mainWindow, aborted] {
+                    bs::lab::writeSystemSnapshot(bs::lab::labFolder());
+                    PostMessageW(target, LabExportMessage, aborted, 0);
+                }).detach();
             }
         }
         if (!current.history.empty()) recordCpuPower(current.history.back().ms, current.energy);
@@ -3182,6 +3192,11 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     }
     case WM_HOTKEY:
         if (wp == PanelHotkey) toggleMain();
+        return 0;
+    case LabExportMessage:
+        exportLab();
+        showMain(); showLabPage();
+        showBalloon(wp ? tr(L"自動測試已中止") : tr(L"自動測試完成"), tr(L"設定已還原，結果與記錄已匯出到桌面，摘要已複製。"), BalloonTarget::none);
         return 0;
     case UpdateMessage:
         handleUpdateResult(reinterpret_cast<bs::update::Release*>(lp));
@@ -3766,6 +3781,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         } catch (...) { return ERROR_INVALID_PARAMETER; }
     }
     if (args.size() == 2 && args[0] == L"--diagnose") return diagnostic(args[1]);
+    // Self-test of the automatic test's local server and browser launch: runs the
+    // engine without a test for the given seconds and writes the port to stdout.
+    if (args.size() == 2 && args[0] == L"--lab-engine-test") {
+        bs::lab::WorkloadEngine engine;
+        engine.start(nullptr);
+        printf("port=%d browser=%d\n", engine.port(), int(!bs::lab::WorkloadEngine::browserPath().empty()));
+        fflush(stdout);
+        Sleep(DWORD(std::clamp(_wtoi(args[1].c_str()), 1, 120)) * 1000);
+        const bool aborted = engine.abortRequested();
+        engine.stop();
+        printf("aborted=%d\n", int(aborted));
+        return 0;
+    }
     // Used by the installer: close any running copy (any version) cleanly, so its
     // efficiency mode and power mode changes are undone before files are replaced.
     if (args.size() == 1 && args[0] == L"--quit-running") {

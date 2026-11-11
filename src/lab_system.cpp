@@ -9,6 +9,7 @@
 #include <shlobj.h>
 #include <cstring>
 #include <cwctype>
+#include <tlhelp32.h>
 #include <functional>
 #include <map>
 #include <set>
@@ -138,12 +139,155 @@ bool deviceInUse(const wchar_t* capability) {
 }
 }
 
+namespace {
+// Runs a command without a window and returns its standard output (UTF-8 or OEM text).
+bool runCapture(std::wstring command, std::string& output, DWORD timeoutMs) {
+    SECURITY_ATTRIBUTES inherit{sizeof(inherit), nullptr, TRUE};
+    HANDLE readPipe = nullptr, writePipe = nullptr;
+    if (!CreatePipe(&readPipe, &writePipe, &inherit, 0)) return false;
+    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOW startup{}; startup.cb = sizeof(startup); startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdOutput = writePipe; startup.hStdError = writePipe; startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    PROCESS_INFORMATION process{};
+    const bool started = CreateProcessW(nullptr, command.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
+    CloseHandle(writePipe);
+    DWORD code = 1;
+    if (started) {
+        char buffer[4096]; DWORD read = 0;
+        while (ReadFile(readPipe, buffer, sizeof(buffer), &read, nullptr) && read && output.size() < (1u << 20)) output.append(buffer, read);
+        if (WaitForSingleObject(process.hProcess, timeoutMs) != WAIT_OBJECT_0) TerminateProcess(process.hProcess, 1);
+        GetExitCodeProcess(process.hProcess, &code);
+        CloseHandle(process.hThread); CloseHandle(process.hProcess);
+    }
+    CloseHandle(readPipe);
+    return started && code == 0;
+}
+std::wstring base64(const std::string& bytes) {
+    static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::wstring out;
+    for (size_t i = 0; i < bytes.size(); i += 3) {
+        uint32_t n = uint32_t(uint8_t(bytes[i])) << 16;
+        if (i + 1 < bytes.size()) n |= uint32_t(uint8_t(bytes[i + 1])) << 8;
+        if (i + 2 < bytes.size()) n |= uint8_t(bytes[i + 2]);
+        out += table[(n >> 18) & 63]; out += table[(n >> 12) & 63];
+        out += i + 1 < bytes.size() ? table[(n >> 6) & 63] : '='; out += i + 2 < bytes.size() ? table[n & 63] : '=';
+    }
+    return out;
+}
+// A PowerShell script passed as -EncodedCommand (UTF-16LE base64), so nothing needs quoting.
+bool powershell(const std::wstring& script, std::string& output, DWORD timeoutMs) {
+    std::string utf16(reinterpret_cast<const char*>(script.data()), script.size() * sizeof(wchar_t));
+    wchar_t system[MAX_PATH]{}; GetSystemDirectoryW(system, MAX_PATH);
+    return runCapture(L"\"" + std::wstring(system) + L"\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " +
+        base64(utf16), output, timeoutMs);
+}
+int readBrightness() {
+    std::string out;
+    if (!powershell(L"(Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightness -ErrorAction Stop | Select-Object -First 1).CurrentBrightness", out, 15000)) return -1;
+    const int value = atoi(out.c_str());
+    return out.find_first_of("0123456789") != std::string::npos && value >= 0 && value <= 100 ? value : -1;
+}
+DWORD setBrightness(DWORD value) {
+    std::string out;
+    return powershell(L"try { Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightnessMethods -ErrorAction Stop | "
+        L"Invoke-CimMethod -MethodName WmiSetBrightness -Arguments @{Timeout=[uint32]0; Brightness=[byte]" + std::to_wstring(value) + L"} -ErrorAction Stop | Out-Null; exit 0 } catch { exit 1 }",
+        out, 15000) ? ERROR_SUCCESS : ERROR_NOT_SUPPORTED;
+}
+// The screen on or off, as the display timeout does; input or "on" wakes it.
+DWORD setDisplay(bool on) {
+    PostMessageW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, on ? -1 : 2);
+    if (on) {
+        INPUT moves[2]{};
+        moves[0].type = moves[1].type = INPUT_MOUSE;
+        moves[0].mi.dwFlags = moves[1].mi.dwFlags = MOUSEEVENTF_MOVE;
+        moves[0].mi.dx = 1; moves[1].mi.dx = -1;
+        SendInput(2, moves, sizeof(INPUT));
+    }
+    return ERROR_SUCCESS;
+}
+HANDLE protectedJob = nullptr;
+std::vector<std::pair<DWORD, uint64_t>> throttled; // background processes we put in EcoQoS
+const wchar_t* const shellProcesses[] = {L"explorer.exe", L"dwm.exe", L"csrss.exe", L"winlogon.exe", L"audiodg.exe", L"svchost.exe",
+    L"sihost.exe", L"ctfmon.exe", L"textinputhost.exe", L"shellexperiencehost.exe", L"startmenuexperiencehost.exe", L"searchhost.exe",
+    L"runtimebroker.exe", L"fontdrvhost.exe", L"batteryscope.exe", L"ghelper.exe", L"conhost.exe"};
+void throttle(HANDLE process, bool on) {
+    PROCESS_POWER_THROTTLING_STATE state{}; state.Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+    state.ControlMask = on ? PROCESS_POWER_THROTTLING_EXECUTION_SPEED : 0;
+    state.StateMask = on ? PROCESS_POWER_THROTTLING_EXECUTION_SPEED : 0;
+    SetProcessInformation(process, ProcessPowerThrottling, &state, sizeof(state));
+}
+// EcoQoS for this user's background apps; never the foreground app, the test
+// browser, shell processes, or anything elevated (it cannot be opened).
+DWORD setBackgroundEco(bool on) {
+    for (const auto& [pid, created] : throttled) {
+        HANDLE process = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!process) continue;
+        FILETIME c{}, e{}, k{}, u{};
+        if (GetProcessTimes(process, &c, &e, &k, &u) && fileTime(c) == created) throttle(process, false);
+        CloseHandle(process);
+    }
+    throttled.clear();
+    if (!on) return ERROR_SUCCESS;
+    DWORD session = 0, foreground = 0;
+    ProcessIdToSessionId(GetCurrentProcessId(), &session);
+    if (HWND window = GetForegroundWindow()) GetWindowThreadProcessId(window, &foreground);
+    Handle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+    PROCESSENTRY32W entry{}; entry.dwSize = sizeof(entry);
+    if (!snapshot || !Process32FirstW(snapshot, &entry)) return GetLastError();
+    do {
+        DWORD processSession = 0;
+        if (entry.th32ProcessID <= 4 || entry.th32ProcessID == GetCurrentProcessId() || entry.th32ProcessID == foreground ||
+            !ProcessIdToSessionId(entry.th32ProcessID, &processSession) || processSession != session) continue;
+        std::wstring name = entry.szExeFile;
+        std::transform(name.begin(), name.end(), name.begin(), [](wchar_t c) { return wchar_t(std::towlower(c)); });
+        if (std::any_of(std::begin(shellProcesses), std::end(shellProcesses), [&](const wchar_t* shell) { return name == shell; })) continue;
+        HANDLE process = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, entry.th32ProcessID);
+        if (!process) continue;
+        BOOL inJob = FALSE;
+        FILETIME c{}, e{}, k{}, u{};
+        if (!(protectedJob && IsProcessInJob(process, protectedJob, &inJob) && inJob) && GetProcessTimes(process, &c, &e, &k, &u)) {
+            throttle(process, true);
+            throttled.emplace_back(entry.th32ProcessID, fileTime(c));
+        }
+        CloseHandle(process);
+    } while (Process32NextW(snapshot, &entry));
+    return ERROR_SUCCESS;
+}
+DWORD brightnessValue = 0, displayValue = 1, backgroundEcoValue = 0; // last values applied (not readable cheaply)
+}
+void setProtectedJob(HANDLE job) { protectedJob = job; }
+void writeSystemSnapshot(const std::wstring& folder) {
+    SYSTEMTIME t{}; GetLocalTime(&t);
+    wchar_t name[64]; swprintf(name, 64, L"system-%04u%02u%02u-%02u%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute);
+    const std::wstring dir = (std::filesystem::path(folder) / name).wstring();
+    std::wstring quoted; for (wchar_t c : dir) { quoted += c; if (c == L'\'') quoted += L'\''; }
+    const std::wstring script = L"$ErrorActionPreference='SilentlyContinue'; $d='" + quoted + L"'; New-Item -ItemType Directory -Force $d | Out-Null;"
+        L"powercfg /list > \"$d\\powercfg.txt\"; powercfg /getactivescheme >> \"$d\\powercfg.txt\"; powercfg /query > \"$d\\powercfg-query.txt\";"
+        L"powercfg /a > \"$d\\sleep-states.txt\"; powercfg /requests > \"$d\\power-requests.txt\" 2>&1;"
+        L"powercfg /batteryreport /output \"$d\\battery-report.html\" | Out-Null;"
+        L"Get-CimInstance Win32_ComputerSystem | Format-List Manufacturer,Model,SystemFamily,TotalPhysicalMemory > \"$d\\hardware.txt\";"
+        L"Get-CimInstance Win32_OperatingSystem | Format-List Caption,Version,BuildNumber >> \"$d\\hardware.txt\";"
+        L"Get-CimInstance Win32_BIOS | Format-List SMBIOSBIOSVersion,ReleaseDate >> \"$d\\hardware.txt\";"
+        L"Get-CimInstance Win32_Processor | Format-List Name,NumberOfCores,NumberOfLogicalProcessors,MaxClockSpeed,CurrentClockSpeed >> \"$d\\hardware.txt\";"
+        L"Get-CimInstance Win32_VideoController | Format-List Name,DriverVersion,DriverDate,CurrentRefreshRate,VideoModeDescription >> \"$d\\hardware.txt\";"
+        L"Get-CimInstance Win32_Battery | Format-List Name,DesignVoltage,EstimatedChargeRemaining,BatteryStatus >> \"$d\\hardware.txt\";"
+        L"Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightness | Format-List CurrentBrightness,Levels >> \"$d\\hardware.txt\";"
+        L"Get-Process | Sort-Object CPU -Descending | Select-Object -First 80 Name,Id,CPU,@{n='MB';e={[int]($_.WorkingSet64/1MB)}},Path | Format-Table -AutoSize | Out-String -Width 400 > \"$d\\processes.txt\";"
+        L"Get-CimInstance Win32_StartupCommand | Format-Table Name,Command,Location -AutoSize | Out-String -Width 400 > \"$d\\startup.txt\";"
+        L"Get-ScheduledTask | Where-Object State -eq 'Running' | Format-Table TaskName,TaskPath -AutoSize | Out-String -Width 400 > \"$d\\running-tasks.txt\";"
+        L"Get-Service | Where-Object Status -eq 'Running' | Format-Table Name,DisplayName -AutoSize | Out-String -Width 400 > \"$d\\services.txt\"";
+    std::string out;
+    powershell(script, out, 90000);
+}
 const wchar_t* knobKey(Knob knob) {
     switch (knob) {
     case Knob::cpuBoost: return L"cpu-boost";
     case Knob::energyPreference: return L"epp";
     case Knob::refreshRate: return L"refresh";
     case Knob::powerMode: return L"power-mode";
+    case Knob::brightness: return L"brightness";
+    case Knob::display: return L"display";
+    case Knob::backgroundEco: return L"background-eco";
     default: return L"";
     }
 }
@@ -157,6 +301,9 @@ DWORD readKnob(Knob knob, DWORD& value) {
         if (!modes.dcKnown) return modes.error ? modes.error : ERROR_GEN_FAILURE;
         value = DWORD(modes.dc); return ERROR_SUCCESS;
     }
+    case Knob::brightness: value = brightnessValue; return ERROR_SUCCESS;
+    case Knob::display: value = displayValue; return ERROR_SUCCESS;
+    case Knob::backgroundEco: value = backgroundEcoValue; return ERROR_SUCCESS;
     default: return ERROR_INVALID_PARAMETER;
     }
 }
@@ -166,12 +313,22 @@ DWORD applyKnob(Knob knob, DWORD value) {
     case Knob::energyPreference: return writeProcessor(EnergyPreference, value);
     case Knob::refreshRate: return setRefresh(int(value));
     case Knob::powerMode: { GUID replaced{}; return overridePowerMode(false, PowerMode(value), replaced); }
+    case Knob::brightness: { const DWORD status = setBrightness(value); if (!status) brightnessValue = value; return status; }
+    case Knob::display: displayValue = value ? 1 : 0; return setDisplay(value != 0);
+    case Knob::backgroundEco: backgroundEcoValue = value ? 1 : 0; return setBackgroundEco(value != 0);
     default: return ERROR_INVALID_PARAMETER;
     }
 }
 KnobPlan planKnob(Knob knob) {
     KnobPlan plan;
     DWORD original = 0;
+    if (knob == Knob::brightness) { // read the real level once; later reads use the value we set
+        const int level = readBrightness();
+        if (level < 0) { plan.error = ERROR_NOT_SUPPORTED; return plan; }
+        brightnessValue = DWORD(level);
+    }
+    if (knob == Knob::display) displayValue = 1;
+    if (knob == Knob::backgroundEco) backgroundEcoValue = 0;
     if ((plan.error = readKnob(knob, original)) != ERROR_SUCCESS) return plan;
     plan.original = original;
     switch (knob) {
@@ -197,6 +354,16 @@ KnobPlan planKnob(Knob knob) {
         plan.values = {original, PowerMode(original) == PowerMode::efficiency ? DWORD(PowerMode::balanced) : DWORD(PowerMode::efficiency)};
         for (size_t i = 0; i < 2; ++i)
             plan.names[i] = PowerMode(plan.values[i]) == PowerMode::efficiency ? L"效率" : PowerMode(plan.values[i]) == PowerMode::balanced ? L"平衡" : L"效能";
+        break;
+    case Knob::brightness:
+        plan.values = {original, original >= 50 ? original - 40 : original + 40};
+        plan.names = {L"亮度 " + std::to_wstring(plan.values[0]) + L"%", L"亮度 " + std::to_wstring(plan.values[1]) + L"%"};
+        break;
+    case Knob::display:
+        plan.values = {1u, 0u}; plan.names = {L"螢幕開", L"螢幕關"};
+        break;
+    case Knob::backgroundEco:
+        plan.values = {0u, 1u}; plan.names = {L"背景程式照常", L"背景程式效率模式"};
         break;
     default: plan.error = ERROR_INVALID_PARAMETER; return plan;
     }
@@ -367,7 +534,9 @@ void Probe::read(Sample& s, const std::vector<std::pair<std::wstring, double>>& 
     }
     std::sort(busy.begin(), busy.end(), [](const ProcessRow* a, const ProcessRow* b) { return a->cpu > b->cpu; });
     for (size_t i = 0; i < busy.size() && i < 5; ++i) {
-        wchar_t cpu[16]; swprintf(cpu, 16, L" %.1f%%", busy[i]->cpu);
+        wchar_t cpu[48];
+        if (busy[i]->averageCpuWatts) swprintf(cpu, 48, L" %.1f%% %.2fW", busy[i]->cpu, *busy[i]->averageCpuWatts);
+        else swprintf(cpu, 48, L" %.1f%%", busy[i]->cpu);
         s.topProcesses += (i ? L";" : L"") + busy[i]->name + cpu;
     }
     s.refreshHz = currentRefresh();
@@ -481,12 +650,15 @@ std::vector<Step> automaticPlan(bool browser) {
         {Knob::powerMode, W::idle}, {Knob::powerMode, W::browse}, {Knob::powerMode, W::video}, {Knob::powerMode, W::office},
         {Knob::refreshRate, W::idle}, {Knob::refreshRate, W::browse}, {Knob::refreshRate, W::video},
         {Knob::cpuBoost, W::browse}, {Knob::cpuBoost, W::office}, {Knob::cpuBoost, W::sustained},
-        {Knob::energyPreference, W::browse}, {Knob::energyPreference, W::video}, {Knob::energyPreference, W::sustained}};
+        {Knob::energyPreference, W::browse}, {Knob::energyPreference, W::video}, {Knob::energyPreference, W::sustained},
+        {Knob::backgroundEco, W::idle}, {Knob::backgroundEco, W::browse},
+        {Knob::brightness, W::browse}, {Knob::display, W::idle}}; // screen off last: it may let Windows sleep
     else order = {
         {Knob::powerMode, W::idle}, {Knob::powerMode, W::bursts}, {Knob::powerMode, W::scroll},
         {Knob::refreshRate, W::idle}, {Knob::refreshRate, W::scroll},
         {Knob::cpuBoost, W::bursts}, {Knob::cpuBoost, W::scroll}, {Knob::cpuBoost, W::sustained},
-        {Knob::energyPreference, W::bursts}, {Knob::energyPreference, W::sustained}};
+        {Knob::energyPreference, W::bursts}, {Knob::energyPreference, W::sustained},
+        {Knob::backgroundEco, W::idle}, {Knob::brightness, W::idle}, {Knob::display, W::idle}};
     std::vector<Step> steps;
     for (const auto& [knob, workload] : order) {
         Step step; step.knob = knob; step.workload = workload;
