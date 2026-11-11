@@ -14,15 +14,18 @@
 #include <uxtheme.h>
 #include <dwmapi.h>
 #include <windowsx.h>
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <cwctype>
 #include <set>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iterator>
 #include <mutex>
@@ -35,7 +38,8 @@ constexpr UINT SampleMessage = WM_APP + 1, TrayMessage = WM_APP + 2, ActionMessa
     PowerModeMessage = WM_APP + 5, UpdateMessage = WM_APP + 6, UpdateDownloadedMessage = WM_APP + 7, LabExportMessage = WM_APP + 8,
     GovernorNowMessage = WM_APP + 9, // input or a program switch: re-run the governor now
     GpuUsersMessage = WM_APP + 10,   // programs found on the discrete GPU (before switching it off)
-    SectionRefreshMessage = WM_APP + 11, AsusKeyMessage = WM_APP + 12, AsusServicesMessage = WM_APP + 13;
+    SectionRefreshMessage = WM_APP + 11, AsusKeyMessage = WM_APP + 12, AsusServicesMessage = WM_APP + 13,
+    OsdMessage = WM_APP + 14;      // a key's result from the key worker: wParam what, lParam the level (-1 unknown)
 constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, DetailsId = 104,
     BackgroundId = 105, AllId = 106, StartupId = 107, HideId = 108, MenuId = 109,
     LanguageZhId = 110, LanguageEnId = 111, PowerDetailsId = 112, PowerModeId = 113,
@@ -56,9 +60,11 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     HwModeMenuId = 212, HwGpuMenuId = 213, HwChargeMenuId = 214, HwKeyboardMenuId = 215, HwKeysMenuId = 216, HwServicesMenuId = 217,
     AppRulesMenuId = 218, LabSingleMenuId = 219, Keyboard0Id = 220 /* ..223 */, KeyboardAutoOffId = 224, KeysHandleId = 225,
     RogOpenId = 226, RogModeId = 227, RogNoneId = 228, ServicesStopId = 229, ServicesStartId = 230,
+    ServicesDefaultsId = 231, FnLockId = 232, FnCLockId = 233, FnCNoneId = 234, HwSlashMenuId = 235, SlashToggleId = 236, SlashBatteryId = 237,
+    SlashBright1Id = 238 /* ..240 */, SlashIntervalId = 241 /* ..246 */, SlashModeId = 250 /* ..265 */,
     SettingsListId = 300,
     TrayShow = 200, TrayExit = 201;
-constexpr int PanelHotkey = 1;
+constexpr int PanelHotkey = 1, FnKeyHotkey = 10 /* ..20: F1-F11 under the software Fn lock */;
 const wchar_t* ClassName = L"BatteryScope.Main.v1";
 const wchar_t* const AppTitle = L"BatteryScope " BS_VERSION_STRING;
 // Theme palette; the short names below mirror it for the drawing code.
@@ -119,10 +125,10 @@ bool updateChecks = true; // daily update check, on unless turned off
 bool updateAuto = true;    // install a new version by itself (after any running test)
 bool updateDeferred = false;
 bool gpuAuto = false;          // ASUS: discrete GPU in Eco on battery, standard when plugged in
-unsigned chargeLimitWanted = 0; // ASUS: the charge limit chosen here, re-applied after a restart or sleep (0: not managed)
 bool keyboardAutoOff = false;   // ASUS: keyboard backlight off after 30 s without input on battery
-bool asusKeysHandled = false;   // ASUS: BatteryScope acts on the ASUS keys (needed once ASUS services are stopped)
+bool asusKeysHandled = true;    // ASUS: BatteryScope acts on the ASUS keys the ASUS software is not there to handle
 unsigned rogKeyAction = 0;      // 0 open BatteryScope, 1 cycle the performance mode, 2 nothing
+unsigned fnCAction = 0;         // Fn+C: 0 toggles the Fn lock, 1 nothing
 std::deque<std::pair<unsigned, uint64_t>> asusKeysSeen; // recent ASUS key codes, newest last
 // Dynamic power saving (the governor), opt-in. Target 0 means no battery target.
 bool dynamicEnabled = false, dynamicRefresh = false, dynamicEco = true;
@@ -207,7 +213,7 @@ std::optional<ProcessRow> pendingForceRow;
 std::wstring notice = tr(L"正在讀取電池與程序資料…");
 uint64_t noticeUntil = 0;
 std::deque<uint64_t> actionMarks;
-constexpr UINT_PTR MotionTimer = 92, NoticeTimer = 93, UpdateTimer = 94, GovernorTimer = 95, KeyboardTimer = 96;
+constexpr UINT_PTR MotionTimer = 92, NoticeTimer = 93, UpdateTimer = 94, GovernorTimer = 95, KeyboardTimer = 96, AsusTimer = 97;
 constexpr int PanelWidth = 360, PanelHeight = 640, RowHeight = 51;
 bool motionEnabled = true, suppressMotion = false, panelTargetShown = false, motionTimerRunning = false;
 double motionNow() {
@@ -2363,10 +2369,10 @@ void loadSettings() {
     updateChecks = readSetting(L"UpdateCheck", 1) != 0;
     updateAuto = readSetting(L"UpdateAuto", 1) != 0;
     gpuAuto = readSetting(L"GpuAuto", 0) != 0;
-    chargeLimitWanted = readSetting(L"ChargeLimit", 0);
     keyboardAutoOff = readSetting(L"KeyboardAutoOff", 0) != 0;
-    asusKeysHandled = readSetting(L"AsusKeys", 0) != 0;
+    asusKeysHandled = readSetting(L"AsusKeysOff", 0) == 0;
     rogKeyAction = std::min<DWORD>(2, readSetting(L"RogKey", 0));
+    fnCAction = std::min<DWORD>(1, readSetting(L"FnCKey", 0));
     dynamicEnabled = readSetting(L"Dynamic", 0) == 1;
     dynamicRefresh = readSetting(L"DynamicRefresh", 0) == 1;
     dynamicEco = readSetting(L"DynamicEco", 1) != 0;
@@ -2570,9 +2576,10 @@ void showHistoryPage() {
     }
     if (p.remainingWh && p.fullWh && *p.fullWh > 0)
         v.push_back(vMeter(tr(L"剩餘容量"), number(*p.remainingWh, 1) + L" / " + number(*p.fullWh, 1) + L" Wh", *p.remainingWh, 0, *p.fullWh));
-    if (asusAvailable)
-        if (const auto limit = asusNow().chargeLimit)
-            v.push_back(vAction(tr(L"充電上限"), std::to_wstring(*limit) + L"%", HwChargeMenuId, *limit <= 80 ? Green : COLORREF(0)));
+    if (asusAvailable && asusNow().chargeDevice) {
+        const auto limit = asusNow().chargeLimit;
+        v.push_back(vAction(tr(L"充電上限"), limit ? std::to_wstring(*limit) + L"%" : std::wstring(tr(L"未設定")), HwChargeMenuId, limit && *limit <= 80 ? Green : COLORREF(0)));
+    }
     v.push_back(vHeading(tr(L"近 7 天")));
     {
         std::vector<VBar> bars;
@@ -4402,11 +4409,15 @@ void applyGpuAuto() {
     if (source == 1 && *h.gpuEco) { if (bs::asus::setGpuEco(false) == ERROR_SUCCESS) setNotice(tr(L"插電：獨顯已切到標準。")); asusReadAt = 0; }
     else if (source == 0 && !*h.gpuEco) requestGpuEco(false, true);
 }
-// Some models forget the charge limit at a restart; put back the one chosen here.
-void reapplyChargeLimit() {
-    if (!chargeLimitWanted || !asusAvailable || demo || isolatedPreview) return;
-    const auto& h = asusNow();
-    if (h.chargeLimit && *h.chargeLimit != chargeLimitWanted && bs::asus::setChargeLimit(chargeLimitWanted) == ERROR_SUCCESS) asusReadAt = 0;
+// The firmware of many models forgets the charge limit at a restart and never reports the
+// mode back: what BatteryScope set (mode, charge limit, keyboard, Fn lock, Slash) is put back
+// at start and after sleep. A running test owns the mode until it ends.
+void reapplyAsus() {
+    if (!asusAvailable || demo || isolatedPreview) return;
+    const bool labOwnsMode = labController && labController->status().running;
+    bs::asus::reapply(!labOwnsMode, true);
+    if (const auto slash = bs::asus::slashSettings(); slash.remembered && bs::asus::slashPresent()) bs::asus::setSlash(slash);
+    asusReadAt = 0;
 }
 // ----- Hardware controls: one menu per row of the hardware page -----
 bs::asus::Hotkeys asusKeys;
@@ -4423,15 +4434,15 @@ const wchar_t* keyboardLevelName(unsigned level) {
 }
 std::vector<MenuItem> modeMenuItems() {
     const auto& h = asusNow();
-    const bool preview = demo || isolatedPreview;
+    const bool preview = demo || isolatedPreview, off = preview || !h.modeDevice;
     // "Automatic" hands the mode to dynamic saving; picking a mode holds it for this battery session.
     const bool autoMode = dynamicEnabled && !governor.held(bs::gov::Setting::firmwareMode);
-    auto automatic = menuItem(AsusAutoId, tr(L"自動（動態省電）"), autoMode, preview || !h.mode || !dynamicEnabled);
+    auto automatic = menuItem(AsusAutoId, tr(L"自動（動態省電）"), autoMode, off || !dynamicEnabled);
     if (!dynamicEnabled) automatic.hint = tr(L"需開啟動態省電");
     return {automatic, menuSeparator(),
-        menuItem(AsusSilentId, tr(L"靜音（最省電）"), !autoMode && h.mode == bs::asus::Mode::silent, preview || !h.mode),
-        menuItem(AsusBalancedId, tr(L"平衡"), !autoMode && h.mode == bs::asus::Mode::balanced, preview || !h.mode),
-        menuItem(AsusTurboId, tr(L"Turbo"), !autoMode && h.mode == bs::asus::Mode::turbo, preview || !h.mode)};
+        menuItem(AsusSilentId, tr(L"靜音（最省電）"), !autoMode && h.mode == bs::asus::Mode::silent, off),
+        menuItem(AsusBalancedId, tr(L"平衡"), !autoMode && h.mode == bs::asus::Mode::balanced, off),
+        menuItem(AsusTurboId, tr(L"Turbo"), !autoMode && h.mode == bs::asus::Mode::turbo, off)};
 }
 std::vector<MenuItem> gpuMenuItems() {
     const auto& h = asusNow();
@@ -4440,13 +4451,13 @@ std::vector<MenuItem> gpuMenuItems() {
         menuItem(GpuEcoId, tr(L"Eco（斷電，最省電）"), !gpuAuto && eco, preview), menuItem(GpuStandardId, tr(L"標準（需要時使用）"), !gpuAuto && !eco, preview)};
 }
 std::vector<MenuItem> chargeMenuItems() {
-    const unsigned limit = asusNow().chargeLimit.value_or(100);
+    const unsigned limit = asusNow().chargeLimit.value_or(0);
     const bool preview = demo || isolatedPreview;
     return {menuItem(Charge60Id, tr(L"60%（長時間插電）"), limit == 60, preview), menuItem(Charge80Id, tr(L"80%（建議）"), limit == 80, preview),
         menuItem(Charge100Id, tr(L"100%（要出門前）"), limit == 100, preview)};
 }
 std::vector<MenuItem> keyboardMenuItems() {
-    const unsigned level = asusNow().keyboard.value_or(0);
+    const auto level = asusNow().keyboard;
     const bool preview = demo || isolatedPreview;
     std::vector<MenuItem> items;
     for (unsigned i = 0; i < 4; ++i) items.push_back(menuItem(Keyboard0Id + int(i), keyboardLevelName(i), !keyboardDimmed && level == i, preview));
@@ -4456,42 +4467,276 @@ std::vector<MenuItem> keyboardMenuItems() {
 }
 std::vector<MenuItem> keysMenuItems() {
     const bool preview = demo || isolatedPreview;
-    auto handle = menuItem(KeysHandleId, tr(L"由 BatteryScope 處理華碩按鍵"), asusKeysHandled, preview);
-    handle.hint = asusKeysHandled ? tr(L"開") : tr(L"華碩處理");
+    auto handle = menuItem(KeysHandleId, tr(L"由 BatteryScope 接手華碩按鍵"), asusKeysHandled, preview);
+    handle.hint = asusKeysHandled ? tr(L"華碩軟體不在時") : tr(L"關");
     return {handle, menuSeparator(),
         submenu(tr(L"ROG 鍵"), {menuItem(RogOpenId, tr(L"開啟 BatteryScope"), rogKeyAction == 0, preview), menuItem(RogModeId, tr(L"切換效能模式"), rogKeyAction == 1, preview),
-            menuItem(RogNoneId, tr(L"不動作"), rogKeyAction == 2, preview)}, !asusKeysHandled)};
+            menuItem(RogNoneId, tr(L"不動作"), rogKeyAction == 2, preview)}, !asusKeysHandled),
+        submenu(L"Fn+C", {menuItem(FnCLockId, tr(L"切換 Fn 鎖定"), fnCAction == 0, preview), menuItem(FnCNoneId, tr(L"不動作"), fnCAction == 1, preview)}, !asusKeysHandled)};
 }
 std::vector<MenuItem> servicesMenuItems() {
     const bool preview = demo || isolatedPreview;
-    size_t running = 0; for (const auto& sv : asusServicesNow()) running += sv.running;
-    auto stop = menuItem(ServicesStopId, tr(L"停止全部華碩服務（開機也不啟動）"), false, preview || asusServicesBusy || asusServicesNow().empty());
+    size_t running = 0, managed = 0, disabled = 0;
+    for (const auto& sv : asusServicesNow()) { if (sv.managed) { ++managed; running += sv.running; } disabled += sv.startType == SERVICE_DISABLED; }
+    auto stop = menuItem(ServicesStopId, tr(L"停止華碩背景服務（開機也不啟動）"), false, preview || asusServicesBusy || !managed);
     stop.hint = std::to_wstring(running) + tr(L" 個執行中");
-    return {stop, menuItem(ServicesStartId, tr(L"恢復華碩服務"), false, preview || asusServicesBusy || !bs::asus::servicesKeptOff())};
+    auto defaults = menuItem(ServicesDefaultsId, tr(L"恢復成華碩預設（自動啟動）"), false, preview || asusServicesBusy || asusServicesNow().empty());
+    if (disabled) defaults.hint = std::to_wstring(disabled) + tr(L" 個已停用");
+    return {stop, menuItem(ServicesStartId, tr(L"恢復停止前的設定"), false, preview || asusServicesBusy || !bs::asus::servicesKeptOff()), defaults};
 }
-// The hardware keys, once BatteryScope handles them.
-void handleAsusKey(unsigned code) {
-    asusKeysSeen.push_back({code, GetTickCount64()});
+std::vector<MenuItem> slashMenuItems() {
+    const auto s = bs::asus::slashSettings();
+    const bool preview = demo || isolatedPreview;
+    std::vector<MenuItem> modes, brightness, interval;
+    const auto& all = bs::asus::slashModes();
+    for (size_t i = 0; i < all.size(); ++i) modes.push_back(menuItem(SlashModeId + int(i), bs::asus::slashModeName(all[i]), s.mode == all[i], preview));
+    for (unsigned i = 1; i <= 3; ++i) brightness.push_back(menuItem(SlashBright1Id + int(i) - 1, keyboardLevelName(i), s.brightness == i, preview));
+    for (unsigned i = 0; i <= 5; ++i) interval.push_back(menuItem(SlashIntervalId + int(i), i ? std::to_wstring(i) : std::wstring(tr(L"不停頓")), s.interval == i, preview));
+    auto toggle = menuItem(SlashToggleId, tr(L"Slash 燈效"), s.on, preview);
+    toggle.hint = s.on ? tr(L"開") : tr(L"關");
+    return {toggle, menuSeparator(), submenu(tr(L"燈效"), modes, !s.on), submenu(tr(L"亮度"), brightness, !s.on), submenu(tr(L"動畫停頓"), interval, !s.on),
+        menuSeparator(), menuItem(SlashBatteryId, tr(L"用電池時關閉"), s.offOnBattery, preview)};
+}
+// ----- Hardware keys -----
+// Key actions that take a moment (WMI, audio devices) run one at a time, in order, off the UI thread.
+class KeyWork {
+public:
+    void post(std::function<void()> job) {
+        { std::lock_guard<std::mutex> guard(lock_); if (stop_) return; jobs_.push_back(std::move(job)); }
+        if (!thread_.joinable()) thread_ = std::thread([this] { run(); });
+        ready_.notify_one();
+    }
+    void stop() {
+        { std::lock_guard<std::mutex> guard(lock_); stop_ = true; jobs_.clear(); }
+        ready_.notify_one();
+        if (thread_.joinable()) thread_.join();
+    }
+    ~KeyWork() { if (thread_.joinable()) thread_.detach(); }
+private:
+    void run() {
+        for (;;) {
+            std::function<void()> job;
+            {
+                std::unique_lock<std::mutex> guard(lock_);
+                ready_.wait(guard, [this] { return stop_ || !jobs_.empty(); });
+                if (stop_) return;
+                job = std::move(jobs_.front()); jobs_.pop_front();
+            }
+            job();
+        }
+    }
+    std::mutex lock_; std::condition_variable ready_; std::deque<std::function<void()>> jobs_; std::thread thread_; bool stop_ = false;
+};
+KeyWork keyWork;
+enum OsdKind : WPARAM { OsdBrightness = 0, OsdMicrophone = 1, OsdTouchpad = 2 };
+// A small on-screen display for the keys: what changed, with a level bar where there is one.
+HWND osdWindow = nullptr;
+const wchar_t* OsdClassName = L"BatteryScope.Osd.v1";
+std::wstring osdText; int osdLevel = -1; // 0-100, or -1 for no bar
+COLORREF osdColor = 0;
+void paintOsd(HDC dc, RECT r) {
+    fill(dc, r, Background);
+    card(dc, r, Surface, 12);
+    const bool bar = osdLevel >= 0;
+    drawText(dc, osdText, {r.left + px(12), r.top + px(6), r.right - px(12), bar ? r.top + px(30) : r.bottom - px(6)}, Ink, strongFont,
+        DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    if (!bar) return;
+    const RECT track{r.left + px(16), r.top + px(36), r.right - px(16), r.top + px(36) + pixelUnit() * 3};
+    const double level = std::clamp(osdLevel / 100.0, 0.0, 1.0);
+    const COLORREF on = osdColor ? osdColor : Green, off = blend(Surface, Border, .35);
+    if (pixelStyle) ui::pixelSegments(dc, track, level, on, off, pixelUnit());
+    else {
+        rounded(dc, track, off, 3);
+        const int filled = int((track.right - track.left) * level);
+        if (filled > 0) rounded(dc, {track.left, track.top, track.left + std::max(filled, sp(4)), track.bottom}, on, 3);
+    }
+}
+LRESULT CALLBACK osdProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    switch (message) {
+    case WM_NCHITTEST: return HTTRANSPARENT;
+    case WM_TIMER: KillTimer(window, 1); ShowWindow(window, SW_HIDE); return 0;
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps{}; HDC target = BeginPaint(window, &ps); RECT r{}; GetClientRect(window, &r);
+        HDC dc = CreateCompatibleDC(target); HBITMAP bitmap = CreateCompatibleBitmap(target, r.right, r.bottom);
+        HGDIOBJ old = SelectObject(dc, bitmap); paintOsd(dc, r); BitBlt(target, 0, 0, r.right, r.bottom, dc, 0, 0, SRCCOPY);
+        SelectObject(dc, old); DeleteObject(bitmap); DeleteDC(dc); EndPaint(window, &ps); return 0;
+    }
+    }
+    return DefWindowProcW(window, message, wp, lp);
+}
+void showOsd(const std::wstring& text, int level = -1, COLORREF color = 0) {
+    osdText = text; osdLevel = level; osdColor = color;
+    if (!osdWindow) {
+        osdWindow = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT, OsdClassName, L"BatteryScope OSD",
+            WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (!osdWindow) { setNotice(text); return; }
+        SetLayeredWindowAttributes(osdWindow, 0, 245, LWA_ALPHA);
+    }
+    // Bottom centre of the screen in use, where Windows shows its own volume display.
+    MONITORINFO monitor{}; monitor.cbSize = sizeof(monitor);
+    GetMonitorInfoW(MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY), &monitor);
+    const RECT work = monitor.rcWork;
+    const int width = px(232), height = level >= 0 ? px(56) : px(40);
+    SetWindowPos(osdWindow, HWND_TOPMOST, (work.left + work.right - width) / 2, work.bottom - height - px(72), width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(osdWindow, nullptr, FALSE);
+    SetTimer(osdWindow, 1, 1600, nullptr);
+}
+// Which ASUS software still handles the keys: ASUS Optimization (brightness, backlight, touchpad,
+// microphone, Fn lock...) and Armoury Crate (Fn+F5, the ROG key, lighting). Checked at most every 3 s.
+struct { uint64_t at = 0; bool optimization = false, armoury = false; } asusRunning;
+void refreshAsusRunning() {
+    const uint64_t now = GetTickCount64();
+    if (asusRunning.at && now - asusRunning.at < 3000) return;
+    asusRunning.at = now;
+    asusRunning.optimization = bs::asus::os::processRunning(L"asusoptimization.exe") || bs::asus::os::serviceRunning(L"ASUSOptimization");
+    asusRunning.armoury = bs::asus::os::serviceRunning(L"ArmouryCrateControlInterface") || bs::asus::os::serviceRunning(L"ArmouryCrateService");
+}
+void cycleAsusMode() {
+    const auto& h = asusNow();
+    if (!h.modeDevice) return;
+    // Silent → balanced → turbo → silent; a choice made with the key holds against dynamic saving.
+    const auto next = bs::asus::nextMode(h.mode.value_or(bs::asus::Mode::balanced));
+    const DWORD status = bs::asus::setMode(next);
+    asusReadAt = 0;
+    if (status != ERROR_SUCCESS) { showOsd(tr(L"效能模式沒有切換")); return; }
+    if (dynamicEnabled) governor.hold(bs::gov::Setting::firmwareMode);
+    showOsd(tr(L"效能模式：") + std::wstring(tr(bs::asus::modeKey(next))), -1, next == bs::asus::Mode::silent ? Green : next == bs::asus::Mode::turbo ? theme.warn : COLORREF(0));
+}
+void stepKeyboard(unsigned code) {
+    const auto& h = asusNow();
+    if (!h.keyboardDevice) return;
+    const unsigned level = keyboardDimmed ? keyboardBefore : h.keyboard.value_or(0);
+    const unsigned next = code == bs::asus::key::KeyboardUp ? std::min(3u, level + 1) : code == bs::asus::key::KeyboardDown ? (level ? level - 1 : 0) : (level + 1) % 4;
+    keyboardDimmed = false;
+    const DWORD status = bs::asus::setKeyboardBacklight(next);
+    asusReadAt = 0;
+    if (status == ERROR_SUCCESS) showOsd(tr(L"鍵盤背光：") + std::wstring(keyboardLevelName(next)), int(next * 100 / 3));
+    else showOsd(tr(L"鍵盤背光沒有回應"));
+}
+// Fn lock without one in the firmware (ROG): F1-F11 are taken as hotkeys and do what Fn+F1..F11
+// does, as G-Helper does it. Registered while the lock is on and BatteryScope handles the keys.
+bool fnKeysRegistered = false;
+std::array<uint64_t, 11> fnKeyLast{};
+void updateFnKeys() {
+    const bool wanted = asusAvailable && asusKeysHandled && !demo && !isolatedPreview && bs::asus::remembered().fnLock.value_or(false) && !bs::asus::fnLockHardware();
+    if (wanted == fnKeysRegistered) return;
+    for (int i = 0; i < 11; ++i) {
+        if (wanted) RegisterHotKey(mainWindow, FnKeyHotkey + i, 0, VK_F1 + i);
+        else UnregisterHotKey(mainWindow, FnKeyHotkey + i);
+    }
+    fnKeysRegistered = wanted;
+}
+void toggleFnLock() {
+    const bool next = !bs::asus::remembered().fnLock.value_or(false);
+    const DWORD status = bs::asus::setFnLock(next);
+    asusReadAt = 0;
+    updateFnKeys();
+    showOsd(status != ERROR_SUCCESS ? std::wstring(tr(L"Fn 鎖定沒有回應")) : next ? tr(L"Fn 鎖定：開") : tr(L"Fn 鎖定：關"));
+    if (inlinePage == InlinePage::hardware && !hidden) PostMessageW(mainWindow, SectionRefreshMessage, 0, 0);
+}
+void toggleSlash() {
+    if (!bs::asus::slashPresent()) return;
+    auto s = bs::asus::slashSettings();
+    s.on = !s.on;
+    showOsd(bs::asus::setSlash(s) != ERROR_SUCCESS ? std::wstring(tr(L"Slash 燈效沒有回應")) : s.on ? tr(L"Slash 燈效：開") : tr(L"Slash 燈效：關"));
+}
+// When BatteryScope last had the firmware send a brightness key: should the firmware also
+// report it back as an ASUS key, that echo is not taken for a new press.
+std::atomic<uint64_t> brightnessSentAt{0};
+std::atomic<int> brightnessPending{0}; // brightness steps waiting for the key worker (+ up, - down)
+// What each key does (also F1-F11 under a software Fn lock).
+void performAsusKey(unsigned code) {
+    namespace key = bs::asus::key;
+    HWND target = mainWindow;
+    switch (code) {
+    case key::BrightnessDown: case key::BrightnessUp: {
+        // The firmware sends Windows its own brightness key (as G-Helper does); where that
+        // changes nothing, BatteryScope sets the level itself and shows it.
+        // Presses while one is being applied add up (a held key), applied together.
+        if (brightnessPending.fetch_add(code == key::BrightnessUp ? 1 : -1) != 0) return;
+        keyWork.post([target] {
+            for (int steps; (steps = brightnessPending.load()) != 0; brightnessPending.fetch_sub(steps)) {
+                const bool up = steps > 0;
+                const auto before = bs::asus::os::screenBrightness();
+                brightnessSentAt = GetTickCount64();
+                for (int i = 0; i < std::abs(steps); ++i)
+                    bs::asus::firmwareKey(up ? bs::asus::FirmwareKey::brightnessUp : bs::asus::FirmwareKey::brightnessDown);
+                Sleep(150);
+                auto after = bs::asus::os::screenBrightness();
+                if (before && after && *after != *before) continue; // Windows did it, with its own display
+                if (before && (up ? *before >= 100 : *before <= 0)) { PostMessageW(target, OsdMessage, OsdBrightness, *before); continue; }
+                if (bs::asus::os::stepScreenBrightness(steps * 10) == ERROR_SUCCESS) after = bs::asus::os::screenBrightness();
+                PostMessageW(target, OsdMessage, OsdBrightness, after ? *after : -1);
+            }
+        });
+        return;
+    }
+    case key::MicMute:
+        keyWork.post([target] {
+            const auto muted = bs::asus::os::toggleMicrophone();
+            PostMessageW(target, OsdMessage, OsdMicrophone, muted ? (*muted ? 1 : 0) : -1);
+        });
+        return;
+    case key::KeyboardUp: case key::KeyboardDown: case key::KeyboardCycle: stepKeyboard(code); return;
+    case key::Touchpad:
+        bs::asus::os::toggleTouchpad();
+        keyWork.post([target] { Sleep(250); const auto on = bs::asus::os::touchpadOn(); PostMessageW(target, OsdMessage, OsdTouchpad, on ? (*on ? 1 : 0) : -1); });
+        return;
+    case key::Sleep: if (bs::asus::firmwareKey(bs::asus::FirmwareKey::sleep) != ERROR_SUCCESS) bs::asus::os::screenOff(mainWindow); return;
+    case key::ScreenOff: case key::ScreenOffOld: bs::asus::os::screenOff(mainWindow); return;
+    case key::Emoji: bs::asus::os::emojiPanel(); return;
+    case key::Airplane: bs::asus::firmwareKey(bs::asus::FirmwareKey::airplane); return;
+    case key::Calculator: ShellExecuteW(nullptr, L"open", L"calc.exe", nullptr, nullptr, SW_SHOWNORMAL); return;
+    case key::FnLock: toggleFnLock(); return;
+    case key::FnC: if (fnCAction == 0) toggleFnLock(); return;
+    case key::Mode: case key::ModeOld: cycleAsusMode(); return;
+    case key::Rog: if (rogKeyAction == 0) showMain(); else if (rogKeyAction == 1) cycleAsusMode(); return;
+    case key::Aura: case key::AuraOld: if (bs::asus::slashPresent()) toggleSlash(); else stepKeyboard(key::KeyboardCycle); return;
+    default: return;
+    }
+}
+// The hardware keys, as the firmware and the keyboard report them. Each is left to the ASUS
+// software that normally handles it while that runs, so nothing happens twice; once it is
+// stopped (or was never installed) BatteryScope does it.
+void handleAsusKey(unsigned code, bool fromKeyboard) {
+    // The same key through both routes within a moment counts once.
+    static unsigned lastCode = 0; static bool lastKeyboard = false; static uint64_t lastAt = 0;
+    const uint64_t now = GetTickCount64();
+    if (code == lastCode && fromKeyboard != lastKeyboard && now - lastAt < 150) return;
+    lastCode = code; lastKeyboard = fromKeyboard; lastAt = now;
+    asusKeysSeen.push_back({code, now});
     while (asusKeysSeen.size() > 6) asusKeysSeen.pop_front();
     if (inlinePage == InlinePage::hardware && !hidden) PostMessageW(mainWindow, SectionRefreshMessage, 0, 0);
     if (!asusKeysHandled || demo || isolatedPreview) return;
-    const auto& h = asusNow();
-    if ((code == bs::asus::key::KeyboardUp || code == bs::asus::key::KeyboardDown) && h.keyboard) {
-        const unsigned level = keyboardDimmed ? keyboardBefore : *h.keyboard;
-        const unsigned next = code == bs::asus::key::KeyboardUp ? std::min(3u, level + 1) : level ? level - 1 : 0;
-        keyboardDimmed = false;
-        if (bs::asus::setKeyboardBacklight(next) == ERROR_SUCCESS) setNotice(tr(L"鍵盤背光：") + std::wstring(keyboardLevelName(next)));
-        asusReadAt = 0;
-    } else if ((code == bs::asus::key::Mode || (code == bs::asus::key::Rog && rogKeyAction == 1)) && h.mode) {
-        // Silent → balanced → turbo → silent; a choice made with the key holds against dynamic saving.
-        const auto next = *h.mode == bs::asus::Mode::silent ? bs::asus::Mode::balanced : *h.mode == bs::asus::Mode::balanced ? bs::asus::Mode::turbo : bs::asus::Mode::silent;
-        if (bs::asus::setMode(next) == ERROR_SUCCESS) {
-            if (dynamicEnabled) governor.hold(bs::gov::Setting::firmwareMode);
-            setNotice(tr(L"效能模式：") + std::wstring(tr(bs::asus::modeKey(next))));
-            showBalloon(tr(L"效能模式"), tr(bs::asus::modeKey(next)), BalloonTarget::none);
-        }
-        asusReadAt = 0;
-    } else if (code == bs::asus::key::Rog && rogKeyAction == 0) showMain();
+    namespace key = bs::asus::key;
+    if ((code == key::BrightnessUp || code == key::BrightnessDown) && now - brightnessSentAt.load() < 250) return;
+    refreshAsusRunning();
+    const bool armouryKey = code == key::Mode || code == key::ModeOld || code == key::Rog || code == key::Aura || code == key::AuraOld;
+    if (armouryKey ? asusRunning.armoury : code != key::FnC && asusRunning.optimization) return;
+    performAsusKey(code);
+}
+// F1-F11 under the software Fn lock: what Fn+F1..F11 does on a ROG keyboard.
+void handleFnKey(int index) {
+    if (index < 0 || index > 10) return;
+    namespace key = bs::asus::key;
+    const uint64_t now = GetTickCount64();
+    const bool repeats = index == 1 || index == 2 || index == 6 || index == 7; // backlight and brightness steps repeat while held
+    if (!repeats && now - fnKeyLast[size_t(index)] < 400) return;
+    fnKeyLast[size_t(index)] = now;
+    switch (index) {
+    case 0: bs::asus::os::tap({VK_VOLUME_MUTE}); return;
+    case 1: performAsusKey(key::KeyboardDown); return;
+    case 2: performAsusKey(key::KeyboardUp); return;
+    case 3: performAsusKey(key::Aura); return;
+    case 4: performAsusKey(key::Mode); return;
+    case 5: bs::asus::os::tap({VK_SNAPSHOT}); return;
+    case 6: performAsusKey(key::BrightnessDown); return;
+    case 7: performAsusKey(key::BrightnessUp); return;
+    case 8: bs::asus::os::tap({VK_LWIN, 'P'}); return;
+    case 9: performAsusKey(key::Touchpad); return;
+    default: performAsusKey(key::Sleep); return;
+    }
 }
 // Keyboard backlight off after 30 s without input on battery, back on at the next input.
 void keyboardTick() {
@@ -4503,8 +4748,8 @@ void keyboardTick() {
     if (keyboardDimmed && (idle < 1 || !battery)) {
         bs::asus::setKeyboardBacklight(keyboardBefore); keyboardDimmed = false; asusReadAt = 0;
     } else if (!keyboardDimmed && battery && idle >= 30) {
-        const auto level = bs::asus::read().keyboard;
-        if (level && *level > 0 && bs::asus::setKeyboardBacklight(0) == ERROR_SUCCESS) { keyboardBefore = *level; keyboardDimmed = true; asusReadAt = 0; }
+        const auto level = asusNow().keyboard;
+        if (level && *level > 0 && bs::asus::setKeyboardBacklight(0, false) == ERROR_SUCCESS) { keyboardBefore = *level; keyboardDimmed = true; asusReadAt = 0; }
     }
 }
 void updateKeyboardTimer() {
@@ -4513,42 +4758,48 @@ void updateKeyboardTimer() {
 }
 // Stopping or starting ASUS services needs administrator rights: BatteryScope runs a copy
 // of itself elevated (one UAC prompt) and waits for it on a worker thread.
-void runAsusServices(bool stop) {
+enum class ServicesAction { start = 0, stop = 1, defaults = 2 };
+void runAsusServices(ServicesAction action) {
     if (asusServicesBusy) return;
     asusServicesBusy = true;
     HWND target = mainWindow; const std::wstring path = executablePath();
-    std::thread([target, path, stop] {
+    std::thread([target, path, action] {
         SHELLEXECUTEINFOW info{}; info.cbSize = sizeof(info); info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
-        info.lpVerb = L"runas"; info.lpFile = path.c_str(); info.lpParameters = stop ? L"--asus-services stop" : L"--asus-services start"; info.nShow = SW_HIDE;
+        info.lpVerb = L"runas"; info.lpFile = path.c_str(); info.nShow = SW_HIDE;
+        info.lpParameters = action == ServicesAction::stop ? L"--asus-services stop" : action == ServicesAction::defaults ? L"--asus-services defaults" : L"--asus-services start";
         DWORD code = ERROR_CANCELLED;
         if (ShellExecuteExW(&info) && info.hProcess) {
             WaitForSingleObject(info.hProcess, 120000);
             GetExitCodeProcess(info.hProcess, &code);
             CloseHandle(info.hProcess);
         } else code = GetLastError();
-        PostMessageW(target, AsusServicesMessage, code, stop ? 1 : 0);
+        PostMessageW(target, AsusServicesMessage, code, LPARAM(action));
     }).detach();
 }
 std::wstring hardwareText(const bs::asus::Snapshot& h) {
     std::wstring c = tr(L"型號：") + (h.model.empty() ? std::wstring(tr(L"未知")) : h.model);
     if (!h.driver) return c + tr(L"\n找不到華碩的 ATKACPI 驅動（ASUS System Control Interface）。這台可能不是華碩筆電，或驅動沒有安裝。");
-    if (h.mode) c += tr(L"\n效能模式：") + std::wstring(tr(bs::asus::modeKey(*h.mode)));
+    if (h.modeDevice) c += tr(L"\n效能模式：") + std::wstring(h.mode ? tr(bs::asus::modeKey(*h.mode)) : tr(L"未設定"));
     if (h.gpuEco) c += tr(L"\n獨顯：") + std::wstring(*h.gpuEco ? L"Eco" : tr(L"標準"));
     if (h.gpuMux) c += tr(L"\n畫面輸出：") + std::wstring(*h.gpuMux ? tr(L"混合（內顯）") : tr(L"獨顯直連"));
-    if (h.chargeLimit) c += tr(L"\n充電上限：") + std::to_wstring(*h.chargeLimit) + L"%";
+    if (h.chargeDevice) c += tr(L"\n充電上限：") + (h.chargeLimit ? std::to_wstring(*h.chargeLimit) + L"%" : std::wstring(tr(L"未設定")));
+    if (h.keyboard) c += tr(L"\n鍵盤背光：") + std::wstring(keyboardLevelName(*h.keyboard));
+    if (h.fnLock) c += tr(L"\nFn 鎖定：") + std::wstring(*h.fnLock ? tr(L"開") : tr(L"關")) + (h.fnLockHardware ? L"" : tr(L"（BatteryScope 對應）"));
     if (h.cpuTemp) c += tr(L"\nCPU 溫度：") + std::to_wstring(*h.cpuTemp) + L" °C";
     if (h.cpuFan) c += tr(L"\nCPU 風扇：") + std::to_wstring(*h.cpuFan * 100) + L" RPM";
     if (h.gpuFan) c += tr(L"\n獨顯風扇：") + std::to_wstring(*h.gpuFan * 100) + L" RPM";
     for (const auto& [label, watts] : h.limits) c += L"\n" + std::wstring(tr(label)) + L"：" + std::to_wstring(watts) + L" W";
-    c += L"\n\n" + bs::asus::dump(h);
+    wchar_t status[64]; swprintf(status, 64, L"\nhotkeys wmi=0x%08lX keyboard=%d", static_cast<unsigned long>(asusKeys.status()), asusKeys.keyboard() ? 1 : 0);
+    c += L"\n\n" + bs::asus::dump(h) + status;
     return c;
 }
 void showHardwarePage() {
     bs::asus::Snapshot h = asusNow();
-    if (demo || isolatedPreview) { // preview data, as a G14 2024 reports it
-        h.driver = true; h.model = L"ROG Zephyrus G14 GA403UV"; h.mode = bs::asus::Mode::balanced; h.gpuEco = true; h.gpuMux = true;
-        h.chargeLimit = 80; h.overdrive = false; h.cpuTemp = 52; h.cpuFan = 28; h.gpuFan = 0;
-        h.limits = {{L"SPL（持續）", 45}, {L"SPPT（短時）", 54}, {L"FPPT（瞬間）", 65}};
+    const bool preview = demo || isolatedPreview;
+    if (preview) { // preview data, as a G14 2024 reports it
+        h.driver = true; h.model = L"ROG Zephyrus G14 GA403UV"; h.modeDevice = true; h.mode = bs::asus::Mode::balanced; h.gpuEco = true; h.gpuMux = true;
+        h.chargeDevice = true; h.chargeLimit = 80; h.overdrive.reset(); h.cpuTemp = 52; h.cpuFan = 28; h.gpuFan = 0;
+        h.keyboardDevice = true; h.keyboard = 1; h.fnLockHardware = false; h.fnLock = false; h.slash = true; h.limits.clear();
     }
     std::vector<VBlock> v;
     std::vector<std::pair<std::wstring, COLORREF>> chips{{h.model.empty() ? std::wstring(tr(L"型號未知")) : h.model, 0}};
@@ -4558,27 +4809,38 @@ void showHardwarePage() {
         showChartPage(InlinePage::hardware, tr(L"華碩硬體"), hardwareText(h), std::move(v));
         return;
     }
-    if (h.mode) chips.push_back({tr(L"效能模式 ") + std::wstring(tr(bs::asus::modeKey(*h.mode))), *h.mode == bs::asus::Mode::silent ? Green : *h.mode == bs::asus::Mode::turbo ? theme.warn : COLORREF(0)});
+    const auto modeColor = [&](std::optional<bs::asus::Mode> mode) { return mode == bs::asus::Mode::silent ? Green : mode == bs::asus::Mode::turbo ? theme.warn : COLORREF(0); };
+    if (h.mode) chips.push_back({tr(L"效能模式 ") + std::wstring(tr(bs::asus::modeKey(*h.mode))), modeColor(h.mode)});
     if (h.gpuEco) chips.push_back({*h.gpuEco ? tr(L"獨顯 Eco") : tr(L"獨顯 標準"), *h.gpuEco ? Green : theme.warn});
     if (h.gpuMux && !*h.gpuMux) chips.push_back({tr(L"獨顯直連"), theme.warn});
     if (h.chargeLimit) chips.push_back({tr(L"充電上限 ") + std::to_wstring(*h.chargeLimit) + L"%", *h.chargeLimit <= 80 ? Green : COLORREF(0)});
-    if (h.overdrive) chips.push_back({*h.overdrive ? tr(L"Overdrive 開") : tr(L"Overdrive 關"), 0});
     v.push_back(vChips(std::move(chips)));
     // Controls, each opening its choices in place.
     {
         const bool autoMode = dynamicEnabled && !governor.held(bs::gov::Setting::firmwareMode);
-        if (h.mode) v.push_back(vAction(tr(L"效能模式"), (autoMode ? tr(L"自動") + std::wstring(L" · ") : std::wstring()) + tr(bs::asus::modeKey(*h.mode)),
-            HwModeMenuId, *h.mode == bs::asus::Mode::silent ? Green : *h.mode == bs::asus::Mode::turbo ? theme.warn : COLORREF(0)));
+        const std::wstring unset = tr(L"未設定");
+        if (h.modeDevice) v.push_back(vAction(tr(L"效能模式"), (autoMode ? tr(L"自動") + std::wstring(L" · ") : std::wstring()) + (h.mode ? tr(bs::asus::modeKey(*h.mode)) : unset),
+            HwModeMenuId, modeColor(h.mode)));
         if (h.gpuEco) v.push_back(vAction(tr(L"獨顯"), (gpuAuto ? tr(L"自動") + std::wstring(L" · ") : std::wstring()) + (*h.gpuEco ? L"Eco" : tr(L"標準")), HwGpuMenuId, *h.gpuEco ? Green : COLORREF(0)));
-        if (h.chargeLimit) v.push_back(vAction(tr(L"充電上限"), std::to_wstring(*h.chargeLimit) + L"%", HwChargeMenuId, *h.chargeLimit <= 80 ? Green : COLORREF(0)));
-        if (h.keyboard) v.push_back(vAction(tr(L"鍵盤背光"), std::wstring(keyboardLevelName(keyboardDimmed ? 0 : *h.keyboard)) + (keyboardAutoOff ? tr(L" · 閒置自動關") : L""), HwKeyboardMenuId));
+        if (h.chargeDevice) v.push_back(vAction(tr(L"充電上限"), h.chargeLimit ? std::to_wstring(*h.chargeLimit) + L"%" : unset, HwChargeMenuId,
+            h.chargeLimit && *h.chargeLimit <= 80 ? Green : COLORREF(0)));
+        if (h.keyboardDevice) v.push_back(vAction(tr(L"鍵盤背光"), (h.keyboard || keyboardDimmed ? std::wstring(keyboardLevelName(keyboardDimmed ? 0 : *h.keyboard)) : unset)
+            + (keyboardAutoOff ? tr(L" · 閒置自動關") : L""), HwKeyboardMenuId));
+        v.push_back(vAction(tr(L"Fn 鎖定"), h.fnLock.value_or(false) ? tr(L"開（F1–F11 免按 Fn）") : tr(L"關"), FnLockId, h.fnLock.value_or(false) ? Green : COLORREF(0)));
+        if (h.slash) {
+            const auto s = preview ? bs::asus::Slash{} : bs::asus::slashSettings();
+            v.push_back(vAction(tr(L"Slash 燈效"), s.on ? std::wstring(bs::asus::slashModeName(s.mode)) + (s.offOnBattery ? tr(L" · 用電池關") : L"") : std::wstring(tr(L"關")), HwSlashMenuId,
+                s.on ? Green : COLORREF(0)));
+        }
         if (h.overdrive) v.push_back(vAction(tr(L"螢幕 Overdrive"), *h.overdrive ? tr(L"開") : tr(L"關"), OverdriveId));
-        v.push_back(vAction(tr(L"華碩按鍵"), asusKeysHandled ? tr(L"BatteryScope 處理") : tr(L"華碩處理"), HwKeysMenuId, asusKeysHandled ? Green : COLORREF(0)));
-        size_t running = 0, total = 0;
-        if (!demo && !isolatedPreview) for (const auto& sv : asusServicesNow()) { running += sv.running; ++total; }
-        else { running = 7; total = 9; }
-        v.push_back(vAction(tr(L"華碩服務"), total ? std::to_wstring(running) + L" / " + std::to_wstring(total) + tr(L" 執行中") : std::wstring(tr(L"沒有")), HwServicesMenuId,
-            running ? theme.warn : Green));
+        const bool listening = preview || SUCCEEDED(asusKeys.status()) || asusKeys.keyboard();
+        v.push_back(vAction(tr(L"華碩按鍵"), !asusKeysHandled ? std::wstring(tr(L"交給華碩軟體")) : !listening ? std::wstring(tr(L"收不到按鍵")) : tr(L"BatteryScope 接手"),
+            HwKeysMenuId, !asusKeysHandled ? COLORREF(0) : !listening ? theme.warn : Green));
+        size_t running = 0, total = 0, disabled = 0;
+        if (!preview) for (const auto& sv : asusServicesNow()) { if (sv.managed) { running += sv.running; ++total; } disabled += sv.startType == SERVICE_DISABLED; }
+        else { running = 0; total = 9; }
+        v.push_back(vAction(tr(L"華碩服務"), total ? std::to_wstring(running) + L" / " + std::to_wstring(total) + tr(L" 執行中") + (disabled ? L" · " + std::to_wstring(disabled) + tr(L" 個停用") : L"")
+            : std::wstring(tr(L"沒有")), HwServicesMenuId, running ? theme.warn : Green));
     }
     if (h.cpuTemp || h.gpuTemp) {
         v.push_back(vHeading(tr(L"溫度")));
@@ -4599,16 +4861,20 @@ void showHardwarePage() {
         for (const auto& [label, watts] : h.limits) bars.push_back({tr(label), std::to_wstring(watts) + L" W", double(watts), 0, blend(Green, Surface, .3), {}});
         v.push_back(vBars(std::move(bars)));
     }
+    if (!preview && asusKeysHandled && FAILED(asusKeys.status()) && !asusKeys.keyboard()) {
+        wchar_t code[16]; swprintf(code, 16, L"0x%08lX", static_cast<unsigned long>(asusKeys.status()));
+        v.push_back(vNote(tr(L"收不到華碩按鍵的訊號（") + std::wstring(code) + tr(L"）：ASUS System Control Interface 驅動可能沒有安裝。")));
+    }
     if (!asusKeysSeen.empty()) {
         std::wstring keys;
         for (auto it = asusKeysSeen.rbegin(); it != asusKeysSeen.rend(); ++it) {
             wchar_t code[16]; swprintf(code, 16, L"0x%02X", it->first);
             const wchar_t* name = bs::asus::keyName(it->first);
-            keys += (keys.empty() ? L"" : L"、") + (name ? std::wstring(tr(name)) + L"（" + code + L"）" : std::wstring(code));
+            keys += (keys.empty() ? L"" : std::wstring(tr(L"、"))) + (name ? std::wstring(tr(name)) + L" " + code : std::wstring(code));
         }
         v.push_back(vNote(tr(L"最近按下的華碩按鍵：") + keys));
     }
-    v.push_back(vNote(tr(L"效能模式選「自動」時由動態省電管理：輕度使用靜音，開啟／載入中、通話與高負載平衡，遊戲時還原；手動選的模式在這次用電池期間保留。停止華碩服務後，請開啟「由 BatteryScope 處理華碩按鍵」，鍵盤背光鍵與效能模式鍵才會繼續有作用。")));
+    v.push_back(vNote(tr(L"這台的韌體不會回報效能模式與充電上限：顯示的是 BatteryScope 最後設定的值，開機與睡眠喚醒後會自動重設。效能模式選「自動」時由動態省電管理；手動選的模式在這次用電池期間保留。華碩軟體停止後，亮度、鍵盤背光、觸控板、麥克風、睡眠、Fn 鎖定（Fn+C、Fn+Esc）、效能模式與 ROG 鍵都由 BatteryScope 接手。Fn 鎖定開啟時，F1–F11 不按 Fn 就是快捷功能。")));
     showChartPage(InlinePage::hardware, tr(L"華碩硬體"), hardwareText(h), std::move(v));
 }
 // The ⋯ menu (also the tray icon's right-click menu).
@@ -4783,8 +5049,15 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         }, window);
         refreshPowerButton();
         if (!demo && !isolatedPreview) SetTimer(window, UpdateTimer, 60 * 1000, nullptr); // first check a minute after start
-        if (!demo && !isolatedPreview) { asusAvailable = bs::asus::Acpi().available(); reapplyChargeLimit();
-            if (asusAvailable) { asusKeys.start(window, AsusKeyMessage); updateKeyboardTimer(); } restoreGovernorAfterCrash(); loadAppRules(); refreshDetectorRules(); updateSensing(); }
+        if (!demo && !isolatedPreview) {
+            asusAvailable = bs::asus::Acpi().available();
+            if (asusAvailable) {
+                // 0.18 kept the charge limit in the main settings; it now lives with the other ASUS settings.
+                if (const DWORD old = readSetting(L"ChargeLimit", 0)) { if (!bs::asus::remembered().chargeLimit) bs::asus::setChargeLimit(old); writeSetting(L"ChargeLimit", 0); }
+                reapplyAsus(); asusKeys.start(window, AsusKeyMessage); updateKeyboardTimer(); updateFnKeys();
+            }
+            restoreGovernorAfterCrash(); loadAppRules(); refreshDetectorRules(); updateSensing();
+        }
         if (demo || isolatedPreview) asusAvailable = true; // the preview shows the hardware menu
         return 0;
     }
@@ -4818,6 +5091,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (wp == UpdateTimer) { SetTimer(window, UpdateTimer, 6 * 3600 * 1000, nullptr); maybeCheckForUpdate(); return 0; }
         if (wp == GovernorTimer) { governorTick(); return 0; }
         if (wp == KeyboardTimer) { keyboardTick(); return 0; }
+        if (wp == AsusTimer) { KillTimer(window, AsusTimer); reapplyAsus(); asusKeys.stop(); asusKeys.start(window, AsusKeyMessage); return 0; }
         break;
     case WM_SYSCOLORCHANGE:
     case WM_THEMECHANGED:
@@ -5068,37 +5342,58 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (id == DynamicPageId) { showMain(); showDynamicPage(); return 0; }
         if (id == GoalPageId) { showMain(); showGoalPage(); return 0; }
         if (id == HardwarePageId) { showMain(); showHardwarePage(); return 0; }
-        if (id == HwModeMenuId || id == HwGpuMenuId || id == HwChargeMenuId || id == HwKeyboardMenuId || id == HwKeysMenuId || id == HwServicesMenuId) {
+        if (id == HwModeMenuId || id == HwGpuMenuId || id == HwChargeMenuId || id == HwKeyboardMenuId || id == HwKeysMenuId || id == HwServicesMenuId || id == HwSlashMenuId) {
             if (!asusAvailable) return 0;
             const auto items = id == HwModeMenuId ? modeMenuItems() : id == HwGpuMenuId ? gpuMenuItems() : id == HwChargeMenuId ? chargeMenuItems() :
-                id == HwKeyboardMenuId ? keyboardMenuItems() : id == HwKeysMenuId ? keysMenuItems() : servicesMenuItems();
+                id == HwKeyboardMenuId ? keyboardMenuItems() : id == HwKeysMenuId ? keysMenuItems() : id == HwSlashMenuId ? slashMenuItems() : servicesMenuItems();
             if (const int chosen = showMenu(items, menuAnchor(), mainWindow)) SendMessageW(window, WM_COMMAND, chosen, 0);
             return 0;
         }
-        if ((id >= Keyboard0Id && id <= Keyboard0Id + 3) || id == KeyboardAutoOffId || id == KeysHandleId || id == RogOpenId || id == RogModeId || id == RogNoneId) {
+        if ((id >= Keyboard0Id && id <= Keyboard0Id + 3) || id == KeyboardAutoOffId || id == KeysHandleId || id == RogOpenId || id == RogModeId || id == RogNoneId
+            || id == FnLockId || id == FnCLockId || id == FnCNoneId) {
             if (demo || isolatedPreview || !asusAvailable) return 0;
             if (id == KeyboardAutoOffId) {
                 keyboardAutoOff = !keyboardAutoOff; writeSetting(L"KeyboardAutoOff", keyboardAutoOff ? 1 : 0); updateKeyboardTimer();
                 setNotice(keyboardAutoOff ? tr(L"用電池時閒置 30 秒會關閉鍵盤背光，一碰就恢復。") : tr(L"鍵盤背光不再自動關閉。"));
             } else if (id == KeysHandleId) {
-                asusKeysHandled = !asusKeysHandled; writeSetting(L"AsusKeys", asusKeysHandled ? 1 : 0);
-                setNotice(asusKeysHandled ? tr(L"BatteryScope 會處理鍵盤背光鍵、效能模式鍵與 ROG 鍵。") : tr(L"華碩按鍵交回華碩軟體處理。"));
+                asusKeysHandled = !asusKeysHandled; writeSetting(L"AsusKeysOff", asusKeysHandled ? 0 : 1); updateFnKeys();
+                setNotice(asusKeysHandled ? tr(L"華碩軟體不在時，BatteryScope 會處理亮度、背光、觸控板、麥克風、Fn 鎖定、效能模式與 ROG 鍵。") : tr(L"華碩按鍵交回華碩軟體處理。"));
             } else if (id == RogOpenId || id == RogModeId || id == RogNoneId) {
                 rogKeyAction = id == RogOpenId ? 0 : id == RogModeId ? 1 : 2; writeSetting(L"RogKey", rogKeyAction);
+            } else if (id == FnCLockId || id == FnCNoneId) {
+                fnCAction = id == FnCLockId ? 0 : 1; writeSetting(L"FnCKey", fnCAction);
+            } else if (id == FnLockId) {
+                toggleFnLock();
             } else {
                 keyboardDimmed = false;
                 const DWORD status = bs::asus::setKeyboardBacklight(unsigned(id - Keyboard0Id));
-                setNotice(status == ERROR_SUCCESS ? tr(L"鍵盤背光：") + std::wstring(keyboardLevelName(unsigned(id - Keyboard0Id))) : tr(L"韌體沒有接受這個設定：") + errorText(status));
+                setNotice(status == ERROR_SUCCESS ? tr(L"鍵盤背光：") + std::wstring(keyboardLevelName(unsigned(id - Keyboard0Id))) : tr(L"鍵盤沒有接受這個設定：") + errorText(status));
                 asusReadAt = 0;
             }
+            if (inlinePage == InlinePage::hardware) showHardwarePage();
             return 0;
         }
-        if (id == ServicesStopId || id == ServicesStartId) {
+        if (id == ServicesStopId || id == ServicesStartId || id == ServicesDefaultsId) {
             if (demo || isolatedPreview || !asusAvailable) return 0;
-            if (id == ServicesStopId && MessageBoxW(mainWindow, tr(L"停止並停用所有華碩與 Armoury Crate 服務？\n\nArmoury Crate、MyASUS 的部分功能會停止運作，直到你在這裡選「恢復華碩服務」。效能模式、獨顯、充電上限與鍵盤背光可以繼續在 BatteryScope 裡調整。需要管理員權限。"),
+            if (id == ServicesStopId && MessageBoxW(mainWindow, tr(L"停止並停用 Armoury Crate 與華碩背景服務（和 G-Helper 停止的相同）？\n\nArmoury Crate、MyASUS 的部分功能會停止運作，直到你在這裡選「恢復成華碩預設」。效能模式、獨顯、充電上限、鍵盤背光與 Fn 鍵改由 BatteryScope 處理。觸控板與系統控制驅動不受影響。需要管理員權限。"),
                 L"BatteryScope", MB_OKCANCEL | MB_ICONQUESTION) != IDOK) return 0;
-            runAsusServices(id == ServicesStopId);
+            runAsusServices(id == ServicesStopId ? ServicesAction::stop : id == ServicesDefaultsId ? ServicesAction::defaults : ServicesAction::start);
             setNotice(tr(L"正在處理華碩服務…"));
+            return 0;
+        }
+        if (id == SlashToggleId || id == SlashBatteryId || (id >= SlashBright1Id && id <= SlashBright1Id + 2) || (id >= SlashIntervalId && id <= SlashIntervalId + 5)
+            || (id >= SlashModeId && id < SlashModeId + int(bs::asus::slashModes().size()))) {
+            if (demo || isolatedPreview || !asusAvailable) return 0;
+            auto slash = bs::asus::slashSettings();
+            if (id == SlashToggleId) slash.on = !slash.on;
+            else if (id == SlashBatteryId) slash.offOnBattery = !slash.offOnBattery;
+            else if (id >= SlashModeId) { slash.mode = bs::asus::slashModes()[size_t(id - SlashModeId)]; slash.on = true; }
+            else if (id >= SlashIntervalId) slash.interval = unsigned(id - SlashIntervalId);
+            else slash.brightness = unsigned(id - SlashBright1Id) + 1;
+            const DWORD status = bs::asus::setSlash(slash);
+            setNotice(status == ERROR_SUCCESS ? (slash.on ? tr(L"Slash 燈效：") + std::wstring(bs::asus::slashModeName(slash.mode)) : std::wstring(tr(L"Slash 燈效已關閉")))
+                : tr(L"燈效控制器沒有回應：") + errorText(status));
+            if (inlinePage == InlinePage::hardware) showHardwarePage();
             return 0;
         }
         if (id == AsusAutoId || id == AsusSilentId || id == AsusBalancedId || id == AsusTurboId || id == GpuAutoId || id == GpuEcoId || id == GpuStandardId ||
@@ -5125,8 +5420,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             } else if (id == OverdriveId) { const bool on = !(asusNow().overdrive.value_or(false)); status = bs::asus::setOverdrive(on); done = on ? tr(L"螢幕 Overdrive 已開啟") : tr(L"螢幕 Overdrive 已關閉"); }
             else {
                 const unsigned percent = id == Charge60Id ? 60 : id == Charge80Id ? 80 : 100;
-                status = bs::asus::setChargeLimit(percent); done = tr(L"充電上限：") + std::to_wstring(percent) + L"%";
-                if (status == ERROR_SUCCESS) { chargeLimitWanted = percent; writeSetting(L"ChargeLimit", percent); } // re-applied after restarts
+                status = bs::asus::setChargeLimit(percent); done = tr(L"充電上限：") + std::to_wstring(percent) + L"%"; // remembered and re-applied after restarts
             }
             asusReadAt = 0;
             setNotice(status == ERROR_SUCCESS ? done : tr(L"韌體沒有接受這個設定：") + errorText(status));
@@ -5329,15 +5623,22 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (tabHover >= 0) { tabHover = -1; RECT client{}; GetClientRect(window, &client); RECT bar{0, client.bottom - tabBarHeight(), client.right, client.bottom}; InvalidateRect(window, &bar, FALSE); }
         break;
     case GpuUsersMessage: finishGpuEco(reinterpret_cast<std::vector<std::wstring>*>(lp)); return 0;
-    case AsusKeyMessage: handleAsusKey(unsigned(wp)); return 0;
+    case AsusKeyMessage: handleAsusKey(unsigned(wp), lp != 0); return 0;
+    case OsdMessage: {
+        const int level = int(lp);
+        if (wp == OsdBrightness) showOsd(level >= 0 ? tr(L"螢幕亮度 ") + std::to_wstring(level) + L"%" : std::wstring(tr(L"螢幕亮度沒有回應")), level >= 0 ? level : -1, theme.accent);
+        else if (wp == OsdMicrophone) showOsd(level < 0 ? std::wstring(tr(L"找不到麥克風")) : level ? tr(L"麥克風：靜音") : tr(L"麥克風：開啟"), -1, level > 0 ? theme.warn : Green);
+        else if (wp == OsdTouchpad) showOsd(level < 0 ? std::wstring(tr(L"觸控板：切換")) : level ? tr(L"觸控板：開") : tr(L"觸控板：關"));
+        return 0;
+    }
     case AsusServicesMessage: {
-        asusServicesBusy = false; asusServicesAt = 0;
-        const bool stopped = lp != 0;
-        if (wp == ERROR_SUCCESS) {
-            if (stopped && !asusKeysHandled) { asusKeysHandled = true; writeSetting(L"AsusKeys", 1); } // the keys need a handler now
-            if (!stopped && asusKeysHandled) { asusKeysHandled = false; writeSetting(L"AsusKeys", 0); }
-            setNotice(stopped ? tr(L"華碩服務已停止並停用；華碩按鍵改由 BatteryScope 處理。") : tr(L"華碩服務已恢復。"));
-        } else setNotice(wp == ERROR_CANCELLED ? tr(L"已取消管理員授權。") : tr(L"部分華碩服務沒有變更：") + errorText(DWORD(wp)));
+        asusServicesBusy = false; asusServicesAt = 0; asusRunning.at = 0;
+        const auto action = ServicesAction(lp);
+        if (wp == ERROR_SUCCESS)
+            setNotice(action == ServicesAction::stop ? tr(L"華碩背景服務已停止並停用；華碩按鍵改由 BatteryScope 處理。")
+                : action == ServicesAction::defaults ? tr(L"華碩服務已恢復成預設並啟動。") : tr(L"華碩服務已恢復停止前的設定。"));
+        else setNotice(wp == ERROR_CANCELLED ? tr(L"已取消管理員授權。") : tr(L"部分華碩服務沒有變更：") + errorText(DWORD(wp)));
+        if (asusAvailable && !demo && !isolatedPreview) { asusKeys.stop(); asusKeys.start(window, AsusKeyMessage); } // greet the keyboard again
         if (inlinePage == InlinePage::hardware) showHardwarePage();
         return 0;
     }
@@ -5360,7 +5661,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             return TRUE;
         }
         if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND || wp == PBT_APMPOWERSTATUSCHANGE) { resetSamples = true; wake.notify_one(); }
-        if (wp == PBT_APMRESUMEAUTOMATIC) { asusReadAt = 0; reapplyChargeLimit(); }
+        // After sleep the firmware and the keyboard may have forgotten: set things again once they are awake.
+        if (wp == PBT_APMRESUMEAUTOMATIC && asusAvailable && !demo && !isolatedPreview) { asusReadAt = 0; SetTimer(window, AsusTimer, 3000, nullptr); }
         return TRUE;
     case PowerModeMessage:
         effectiveMode = EffectiveMode(wp);
@@ -5383,6 +5685,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     }
     case WM_HOTKEY:
         if (wp == PanelHotkey) toggleMain();
+        else if (int(wp) >= FnKeyHotkey && int(wp) < FnKeyHotkey + 11) handleFnKey(int(wp) - FnKeyHotkey);
         return 0;
     case LabExportMessage:
         exportLab();
@@ -5419,7 +5722,9 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         KillTimer(window, NoticeTimer); KillTimer(window, UpdateTimer); KillTimer(window, GovernorTimer);
         if (dynamicEnabled && !demo && !isolatedPreview) stopGovernor();
         dynamicEnabled = false; autoTestActive = false; updateSensing();
-        asusKeys.stop(); KillTimer(window, KeyboardTimer);
+        asusKeys.stop(); keyWork.stop(); KillTimer(window, KeyboardTimer); KillTimer(window, AsusTimer);
+        if (fnKeysRegistered) for (int i = 0; i < 11; ++i) UnregisterHotKey(window, FnKeyHotkey + i);
+        if (osdWindow) { DestroyWindow(osdWindow); osdWindow = nullptr; }
         if (keyboardDimmed) bs::asus::setKeyboardBacklight(keyboardBefore);
         if (labEngine) labEngine->stop();
         registerPanelHotkey(false);
@@ -5756,6 +6061,18 @@ bool panelSelfTest(const std::wstring& path) {
     GetWindowTextW(inlineText, goalBody.data(), int(goalBody.size()));
     check("goal_page_shows_goal_and_tips", inlinePage == InlinePage::goal && goalBody.find(L"10 W") != std::wstring::npos && goalBody.find(L"1. ") != std::wstring::npos);
     SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
+    // The ASUS page (preview data): every control is a row, and the key display shows without taking focus.
+    SendMessageW(mainWindow, WM_COMMAND, HardwarePageId, 0);
+    auto hasAction = [](const std::wstring& title) {
+        return std::any_of(visualBlocks.begin(), visualBlocks.end(), [&](const VBlock& b) { return b.kind == VBlock::Kind::action && b.title == title; });
+    };
+    check("hardware_page_offers_every_control", inlinePage == InlinePage::hardware && hasAction(tr(L"效能模式")) && hasAction(tr(L"充電上限"))
+        && hasAction(tr(L"鍵盤背光")) && hasAction(tr(L"Fn 鎖定")) && hasAction(tr(L"Slash 燈效")) && hasAction(tr(L"華碩按鍵")) && hasAction(tr(L"華碩服務")));
+    SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
+    showOsd(L"Test", 50);
+    check("key_display_shows_without_focus", osdWindow && IsWindowVisible(osdWindow) && GetForegroundWindow() != osdWindow
+        && (GetWindowLongPtrW(osdWindow, GWL_EXSTYLE) & WS_EX_NOACTIVATE));
+    if (osdWindow) ShowWindow(osdWindow, SW_HIDE);
     {
         RECT client{}; GetClientRect(mainWindow, &client);
         HDC screen = GetDC(mainWindow), dc = CreateCompatibleDC(screen);
@@ -6024,7 +6341,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     // raw input): a quick check that every signal can be read on this PC.
     if (args.size() == 2 && args[0] == L"--asus-services") {
         // Run elevated by BatteryScope itself (see runAsusServices).
-        return int(args[1] == L"stop" ? bs::asus::stopServices(true) : bs::asus::startServices());
+        return int(args[1] == L"stop" ? bs::asus::stopServices(true) : args[1] == L"defaults" ? bs::asus::restoreServiceDefaults() : bs::asus::startServices());
     }
     if (args.size() == 1 && args[0] == L"--asus-dump") {
         // Every ASUS firmware value BatteryScope reads, for checking a new model.
@@ -6110,6 +6427,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     WNDCLASSEXW mini{}; mini.cbSize = sizeof(mini); mini.hInstance = instance; mini.lpfnWndProc = miniProc;
     mini.lpszClassName = MiniClassName; mini.hCursor = LoadCursorW(nullptr, IDC_SIZEALL);
     RegisterClassExW(&mini);
+    WNDCLASSEXW osd{}; osd.cbSize = sizeof(osd); osd.hInstance = instance; osd.lpfnWndProc = osdProc;
+    if (isolatedPreview || demo) OsdClassName = L"BatteryScope.OsdPreview.v1";
+    osd.lpszClassName = OsdClassName; osd.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    RegisterClassExW(&osd);
     dpi = GetDpiForSystem();
     RECT bounds{0, 0, px(PanelWidth), px(PanelHeight)};
     if (screenshot && option(L"--compact")) bounds.bottom = px(520);

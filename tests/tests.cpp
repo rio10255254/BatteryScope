@@ -500,6 +500,34 @@ int wmain(int argc, wchar_t** argv) {
             // ASUS firmware answers: bit 16 marks a present device, the value is the low 16 bits.
             check(asus::decode(0x00010002).present && asus::decode(0x00010002).value() == 2 && !asus::decode(0xFFFFFFFE).present && !asus::decode(0x2).present,
                 "ASUS firmware readings are decoded and absent devices recognised");
+            using Bytes = std::vector<uint8_t>;
+            check(asus::packet::keyboardBrightness(0x5A, 2) == Bytes{0x5A, 0xBA, 0xC5, 0xC4, 0x02} && asus::packet::keyboardBrightness(0x5A, 9).back() == 3,
+                "the keyboard backlight packet is G-Helper's, clamped to level 3");
+            check(asus::packet::fnLock(true) == Bytes{0x5A, 0xD0, 0x4E, 0x00} && asus::packet::fnLock(false) == Bytes{0x5A, 0xD0, 0x4E, 0x01}
+                && asus::packet::touchpad() == Bytes{0x5A, 0xF4, 0x6B}, "Fn lock and touchpad packets match G-Helper's");
+            const Bytes greeting = asus::packet::init(0x5A);
+            check(greeting.size() == 15 && greeting[0] == 0x5A && std::string(greeting.begin() + 1, greeting.end()) == "ASUS Tech.Inc.", "the keyboard greeting is the report id and \"ASUS Tech.Inc.\"");
+            asus::Slash slashOn; slashOn.mode = asus::SlashMode::bounce; slashOn.brightness = 2; slashOn.interval = 1; slashOn.offOnBattery = true;
+            const auto lit = asus::packet::slash(0x5E, slashOn);
+            check(lit.size() == 10 && lit[0] == asus::packet::init(0x5E) && lit[1] == Bytes{0x5E, 0xC2} && lit[2] == Bytes{0x5E, 0xD1, 0x01, 0x00, 0x01}
+                && lit[3] == Bytes{0x5E, 0xD8, 0x02, 0x00, 0x01, 0x00} && lit[4] == Bytes{0x5E, 0xD8, 0x01, 0x00, 0x01, 0x80}
+                && lit[5] == Bytes{0x5E, 0xD7, 0x00, 0x00, 0x01, 0xAC} && lit[6] == Bytes{0x5E, 0xD2, 0x02, 0x01, 0x08, 0xAB}
+                && lit[7] == Bytes{0x5E, 0xD3, 0x04, 0x00, 0x0C, 0x01, 0x10, 0x02, 0x42, 0x03, 0x13, 0x04, 0x11, 0x05, 0x12, 0x06, 0x13}
+                && lit[8] == Bytes{0x5E, 0xD3, 0x03, 0x01, 0x08, 0xAB, 0xFF, 0x01, 0x01, 0x06, 170, 0xFF, 0x01} && lit[9] == Bytes{0x5E, 0xD4, 0x00, 0x00, 0x01, 0xAB},
+                "Slash lighting: wake, on, battery flag, set up, mode, options and save, byte for byte as G-Helper sends them");
+            asus::Slash slashOff; slashOff.on = false;
+            const auto dark = asus::packet::slash(0x5D, slashOff);
+            check(dark.size() == 5 && dark[3] == Bytes{0x5D, 0xD8, 0x02, 0x00, 0x01, 0x80} && dark[4] == Bytes{0x5D, 0xD8, 0x01, 0x00, 0x01, 0x00},
+                "turning the Slash off only wakes it and switches it off");
+            check(asus::slashModes().size() == 16 && std::none_of(asus::slashModes().begin(), asus::slashModes().end(), [](asus::SlashMode m) { return std::wstring(asus::slashModeName(m)) == L"?"; }),
+                "every Slash mode has a name");
+            check(asus::nextMode(asus::Mode::silent) == asus::Mode::balanced && asus::nextMode(asus::Mode::balanced) == asus::Mode::turbo && asus::nextMode(asus::Mode::turbo) == asus::Mode::silent,
+                "Fn+F5 cycles silent, balanced, turbo");
+            check(asus::key::optimization(asus::key::BrightnessUp) && asus::key::optimization(asus::key::Touchpad) && !asus::key::optimization(asus::key::Mode)
+                && !asus::key::optimization(asus::key::Rog), "brightness and touchpad keys belong to ASUS Optimization, Fn+F5 and ROG to Armoury Crate");
+            for (unsigned code : {asus::key::BrightnessDown, asus::key::BrightnessUp, asus::key::KeyboardUp, asus::key::KeyboardDown, asus::key::KeyboardCycle, asus::key::Mode,
+                    asus::key::Rog, asus::key::MicMute, asus::key::Touchpad, asus::key::Sleep, asus::key::Airplane, asus::key::FnLock, asus::key::FnC, asus::key::Aura, asus::key::Emoji})
+                check(asus::keyName(code) != nullptr, "every handled ASUS key has a name");
             check(lab::knobKey(lab::Knob::asusMode) == std::wstring(L"asus-mode") && gov::knobFor(gov::Setting::firmwareMode) == lab::Knob::asusMode,
                 "the ASUS performance mode is both an experiment and a dynamic saving setting");
             gov::Governor fw;

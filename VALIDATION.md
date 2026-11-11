@@ -1,5 +1,14 @@
 # BatteryScope 驗證紀錄
 
+## 0.19.0：G14 實機讀值後的華碩修正（按鍵、背光、Slash、服務）
+
+- 依使用者 G14 2024（GA403UV）的 `--asus-dump`：效能模式讀回 3、充電上限讀回 0（韌體只收寫入），0.18 寫入後讀回比對因此全部失敗；改為採用韌體回應並記住設定（同 G-Helper 與 Linux 驅動），開機與喚醒後重新套用；實驗與動態省電改用記住的模式，不再略過華碩效能模式。
+- 協定逐項對照 G-Helper 原始碼（seerge/g-helper 主分支 2026-11-10）：鍵盤背光 `5A BA C5 C4 等級`、Fn 鎖定 `5A D0 4E 00/01`、觸控板 `5A F4 6B`、問候 `5A "ASUS Tech.Inc."`、Slash 的喚醒／開關／設定／模式／選項／儲存與用電池時燈效，以單元測試逐位元組比對；Slash 偵測（0x19B6 報告 0x5D 或 0x193B 報告 0x5E，長度 ≥128）、亮度與睡眠改由韌體送出按鍵（UniversalControl 0x10／0x20／0x6C）、按鍵同時讀 WMI 與鍵盤 HID 輸入報告（0x5A），都與 G-Helper 相同。
+- HID 介面的報告編號由 `HidP_GetButtonCaps`／`HidP_GetValueCaps` 取得，只送給宣告了該報告的介面。
+- 華碩服務停止改用 G-Helper 的清單；新增「恢復成華碩預設」（G-Helper 停用過的服務改回自動並啟動）。
+- 核心單元測試、面板自我測試在 Wine 中通過（Wine 已知例外一項）；華碩分頁以示範資料截圖檢查。
+- **尚未實機驗證**：鍵盤 HID 輸入在 G14 上實際送出的按鍵代碼、UniversalControl 亮度鍵是否觸發 Windows 亮度、軟體 Fn 鎖定與 Windows 快捷鍵的衝突、Slash 封包在 0x193B 上的效果、睡眠鍵在 Modern Standby 上的行為。
+
 ## 0.18.0：華碩硬體控制（ATKACPI）
 
 - 新增 `src/asus.*`：以 `\\.\ATKACPI` 的 DSTS／DEVS 讀寫韌體裝置（裝置編號依 Linux asus-wmi 的公開定義）；讀值第 16 位元表示裝置存在，數值取低 16 位元；寫入後讀回確認。

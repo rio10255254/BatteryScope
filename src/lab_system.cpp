@@ -332,8 +332,11 @@ DWORD readKnob(Knob knob, DWORD& value) {
     case Knob::asusMode: {
         asus::Acpi acpi;
         const auto r = acpi.available() ? acpi.get(asus::device::ThermalPolicy) : std::nullopt;
-        if (!r || !r->present || r->value() > 2) return ERROR_NOT_SUPPORTED;
-        value = r->value(); return ERROR_SUCCESS;
+        if (!r || !r->present) return ERROR_NOT_SUPPORTED;
+        // Write-only on most models: the mode set last (here or by dynamic saving), balanced when none was.
+        const auto known = asus::remembered().mode;
+        value = DWORD(known ? *known : r->value() <= 2 ? asus::Mode(r->value()) : asus::Mode::balanced);
+        return ERROR_SUCCESS;
     }
     default: return ERROR_INVALID_PARAMETER;
     }

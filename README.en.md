@@ -15,8 +15,8 @@
 
 From the **[Releases page](https://github.com/rio10255254/BatteryScope/releases/latest)**:
 
-- **Installer (recommended):** `BatteryScope-0.18.0-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
-- **Portable:** `BatteryScope-0.18.0-win64.zip`; extract it and run `BatteryScope.exe`.
+- **Installer (recommended):** `BatteryScope-0.19.0-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
+- **Portable:** `BatteryScope-0.19.0-win64.zip`; extract it and run `BatteryScope.exe`.
 
 Requires Windows 10 version 1703 or later (Windows 11 recommended), 64-bit. The program is not code-signed; if SmartScreen appears the first time, choose **More info → Run anyway**. It lives in the notification area, where the icon shows the battery percentage; click it to show or hide the panel.
 
@@ -52,7 +52,7 @@ Details follow.
 
 ## Using it
 
-1. Download `BatteryScope-0.18.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
+1. Download `BatteryScope-0.19.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
 2. Click its battery icon in the notification area to show or hide the panel. Esc hides it; monitoring continues at a lower frequency.
 3. Open **⋯ → Language / 語言 → English** to switch immediately. The setting persists for your Windows account. Selection and scroll position are retained.
 4. Use Background and Show filters, the mouse wheel, arrow keys, Home/End, or Page Up/Down. Enter or double-click opens details.
@@ -143,26 +143,27 @@ Programs you put in efficiency mode yourself are left alone.
 
 ## ASUS hardware (0.18, ASUS laptops)
 
-**⋯ → ASUS hardware** reads and writes firmware settings through the ASUS ATKACPI driver (ASUS System Control Interface, which Armoury Crate and G-Helper also use). G-Helper is not needed:
+The **ASUS** tab reads and writes settings through the ASUS ATKACPI driver (ASUS System Control Interface, which Armoury Crate and G-Helper also use) and the keyboard's and lighting's HID interfaces. Neither G-Helper nor Armoury Crate is needed:
 
-- **Status:** model, performance mode, GPU Eco or standard, display output (hybrid or GPU direct), charge limit, overdrive, CPU and GPU temperatures, fan speeds, and power limits (SPL, SPPT, FPPT and more).
-- **Controls:** performance mode (silent, balanced, turbo); GPU Eco, with a warning when programs use the discrete GPU; charge limit 60, 80, or 100%; and screen overdrive. Every write is read back, and a refusal is reported.
+- **Status:** model, performance mode, GPU Eco or standard, display output (hybrid or GPU direct), charge limit, overdrive, CPU and GPU temperatures, fan speeds, and power limits (those reading 0 are left out).
+- **Performance mode and charge limit:** on most models (the G14 2024 among them) the firmware accepts these but never reports them back. Like G-Helper, BatteryScope remembers what it last set and sets it again at startup and after sleep; "Not set" means it has not set one yet.
+- **Controls:** performance mode (silent, balanced, turbo); GPU Eco, with a warning when programs use the discrete GPU (read back after writing); charge limit 60, 80, or 100%; and screen overdrive.
 - **Dynamic saving** also manages the performance mode:
   - silent for light use;
   - balanced while opening or loading, in calls, and for heavy work;
   - restored in games and for "leave alone" programs.
-  - When Fn keys or another program change it, it pauses for 10 minutes, and two changes are at least 20 s apart so the fans do not flap.
+  - Two changes are at least 20 s apart so the fans do not flap.
 - **Experiments:** the quick and full tests measure what silent mode saves (skipped on other PCs). Only a proven saving is used.
-- Diagnostics: `BatteryScope.exe --asus-dump` prints every firmware value read.
 - **GPU automatic:** Eco on battery and standard when plugged in, like G-Helper's Optimized mode. It waits until no program uses the discrete GPU.
-- **Charge limit:** remembered and re-applied at startup and after sleep.
-- **Keyboard backlight:** off, low, medium, or high. On battery it can turn off after 30 s idle and come back at a touch.
-- **ASUS keys:** BatteryScope can handle the backlight keys, the performance mode key (Fn+F5), and the ROG key. The ROG key can open BatteryScope, cycle the mode, or do nothing. Recent key codes are listed.
+- **Keyboard backlight:** off, low, medium, or high, through the keyboard's HID interface on ROG models. On battery it can turn off after 30 s idle and come back at a touch.
+- **Fn lock:** Fn+C or Fn+Esc. Where the firmware has a Fn lock it is used; on ROG models BatteryScope maps F1–F11 to their hotkeys itself (mute, backlight, lighting, performance mode, screenshot, brightness, project, touchpad, sleep).
+- **Slash lighting** (Zephyrus G14/G16 2024): on or off, 16 effects, brightness, pause between animations, off on battery. Fn+F4 switches it.
+- **ASUS keys:** when the ASUS software is not running, BatteryScope handles every Fn key: brightness, keyboard backlight, touchpad, microphone mute, sleep, airplane mode, emoji, Fn lock, the performance mode key (Fn+F5), and the ROG key (open BatteryScope, cycle the mode, or nothing). A small display at the bottom of the screen shows the result. Keys are read both from ATK WMI events and from the keyboard's HID input, as G-Helper does; while ASUS software runs, it keeps handling them, so nothing happens twice.
 - **ASUS services:**
-  - Stop and disable every ASUS and Armoury Crate service in one step, with administrator rights. The original start types are saved, so one step restores them.
-  - Stopping them makes BatteryScope handle the ASUS keys.
+  - Stop and disable Armoury Crate and the ASUS background services (the same list G-Helper stops; the touchpad and system control drivers are left alone), with administrator rights. The original start types are saved.
+  - Restore them as they were, or **Restore ASUS defaults (start automatically)**, which also brings back services G-Helper disabled.
+- Diagnostics: `BatteryScope.exe --asus-dump` prints every firmware value read, the remembered settings, and the report ids of every ASUS HID interface.
 - Fan curves and power-limit changes come once these readings are confirmed on your model.
-- Lid lighting (Slash) comes once the ASUS HID devices that `--asus-dump` lists are confirmed.
 
 ## Power lab (experimental)
 
@@ -211,7 +212,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-To avoid replacing a running executable, use `-OutputDirectory dist/v0.18.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
+To avoid replacing a running executable, use `-OutputDirectory dist/v0.19.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
 
 ```powershell
 .\dist\BatteryScope.exe --demo
