@@ -15,8 +15,8 @@
 
 From the **[Releases page](https://github.com/rio10255254/BatteryScope/releases/latest)**:
 
-- **Installer (recommended):** `BatteryScope-0.17.0-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
-- **Portable:** `BatteryScope-0.17.0-win64.zip`; extract it and run `BatteryScope.exe`.
+- **Installer (recommended):** `BatteryScope-0.18.0-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
+- **Portable:** `BatteryScope-0.18.0-win64.zip`; extract it and run `BatteryScope.exe`.
 
 Requires Windows 10 version 1703 or later (Windows 11 recommended), 64-bit. The program is not code-signed; if SmartScreen appears the first time, choose **More info → Run anyway**. It lives in the notification area, where the icon shows the battery percentage; click it to show or hide the panel.
 
@@ -52,7 +52,7 @@ Details follow.
 
 ## Using it
 
-1. Download `BatteryScope-0.17.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
+1. Download `BatteryScope-0.18.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
 2. Click its battery icon in the notification area to show or hide the panel. Esc hides it; monitoring continues at a lower frequency.
 3. Open **⋯ → Language / 語言 → English** to switch immediately. The setting persists for your Windows account. Selection and scroll position are retained.
 4. Use Background and Show filters, the mouse wheel, arrow keys, Home/End, or Page Up/Down. Enter or double-click opens details.
@@ -119,6 +119,21 @@ Turn it on from **⋯ → Dynamic power saving** or the settings page. On batter
 - **Detection accuracy:** during the automatic test, detection is scored against the activity actually running; the export summary shows the accuracy and `detection-log.csv` has every second.
 - Diagnostics: `BatteryScope.exe --detect-test 30` prints what the detector sees for 30 seconds (without the GPU).
 
+## ASUS hardware (0.18, ASUS laptops)
+
+**⋯ → ASUS hardware** reads and writes firmware settings through the ASUS ATKACPI driver (ASUS System Control Interface, which Armoury Crate and G-Helper also use). G-Helper is not needed:
+
+- **Status:** model, performance mode, GPU Eco or standard, display output (hybrid or GPU direct), charge limit, overdrive, CPU and GPU temperatures, fan speeds, and power limits (SPL, SPPT, FPPT and more).
+- **Controls:** performance mode (silent, balanced, turbo); GPU Eco, with a warning when programs use the discrete GPU; charge limit 60, 80, or 100%; and screen overdrive. Every write is read back, and a refusal is reported.
+- **Dynamic saving** also manages the performance mode:
+  - silent for light use;
+  - balanced while opening or loading, in calls, and for heavy work;
+  - restored in games and for "leave alone" programs.
+  - When Fn keys or another program change it, it pauses for 10 minutes, and two changes are at least 20 s apart so the fans do not flap.
+- **Experiments:** the quick and full tests measure what silent mode saves (skipped on other PCs). Only a proven saving is used.
+- Diagnostics: `BatteryScope.exe --asus-dump` prints every firmware value read.
+- Fan curves and power-limit changes come once these readings are confirmed on your model.
+
 ## Power lab (experimental)
 
 **⋯ → Power lab** measures on your own PC instead of guessing which settings help. All data stays in `%LOCALAPPDATA%\BatteryScope\lab`.
@@ -166,7 +181,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-To avoid replacing a running executable, use `-OutputDirectory dist/v0.17.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
+To avoid replacing a running executable, use `-OutputDirectory dist/v0.18.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
 
 ```powershell
 .\dist\BatteryScope.exe --demo

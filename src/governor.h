@@ -28,7 +28,8 @@
 namespace bs::gov {
 
 // The settings the governor manages; a subset of the lab's knobs.
-enum class Setting { powerMode, energyPreference, cpuBoost, refreshRate, count };
+// firmwareMode: the ASUS performance mode (0 balanced, 1 turbo, 2 silent); unreadable elsewhere, so left alone.
+enum class Setting { powerMode, energyPreference, cpuBoost, refreshRate, firmwareMode, count };
 lab::Knob knobFor(Setting setting);
 
 // Desired value per setting; std::nullopt leaves the setting as the user had it.

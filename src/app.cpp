@@ -6,6 +6,7 @@
 #include "update.h"
 #include "lab.h"
 #include "governor.h"
+#include "asus.h"
 #include "ui.h"
 #include <commctrl.h>
 #include <shellapi.h>
@@ -48,6 +49,8 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     UpdateCheckId = 169, UpdateNowId = 170, UpdateInstallId = 171,
     LabPageId = 172, LabRecordId = 173, LabExperimentId = 174 /* ..177, one per knob */, LabStopId = 178, LabFolderId = 179, LabExportId = 180, LabAutoId = 181, LabAutoStartId = 182,
     DynamicToggleId = 183, DynamicPageId = 184, DynamicRefreshId = 185, DynamicEcoId = 186, DynamicTargetId = 187, SettingsPageId = 188, GoalPageId = 189, GoalCycleId = 190, LabQuickId = 191, LabQuickStartId = 192, UpdateAutoId = 193, UpdateNotifyId = 194, UpdateOffId = 195, UpdatePageId = 196,
+    HardwarePageId = 197, AsusSilentId = 198, AsusBalancedId = 199, AsusTurboId = 202, GpuEcoId = 203, GpuStandardId = 204,
+    Charge60Id = 205, Charge80Id = 206, Charge100Id = 207, OverdriveId = 208,
     SettingsListId = 300,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1;
@@ -98,7 +101,7 @@ void* effectiveWatch = nullptr;
 PowerModes powerModes;
 HWND modeButtons[6] = {}, restoreModesButton = nullptr, energySettingsButton = nullptr;
 bool isolatedPreview = false;
-enum class InlinePage { none, process, power, candidates, ledger, powerMode, history, perfApps, lab, settings, dynamic, goal, confirm, error };
+enum class InlinePage { none, process, power, candidates, ledger, powerMode, history, perfApps, lab, settings, dynamic, goal, hardware, confirm, error };
 unsigned lowBatteryThreshold = 0; // percent; 0 = off
 LowBatteryMonitor lowBattery;
 bool hotkeyEnabled = false, hotkeyRegistered = false;
@@ -1400,7 +1403,7 @@ void layout() {
     MoveWindow(powerButton, w - sp(108), sp(47), sp(88), sp(22), TRUE);
     MoveWindow(menuButton, w - sp(92), sp(16), sp(32), sp(30), TRUE);
     MoveWindow(hideButton, w - sp(52), sp(16), sp(32), sp(30), TRUE);
-    const bool fullPage = inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history || inlinePage == InlinePage::lab || inlinePage == InlinePage::ledger ||
+    const bool fullPage = inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history || inlinePage == InlinePage::lab || inlinePage == InlinePage::ledger || inlinePage == InlinePage::hardware ||
         inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic || inlinePage == InlinePage::goal ||
         inlinePage == InlinePage::confirm || inlinePage == InlinePage::error;
     const int textTop = inlinePage == InlinePage::powerMode ? sp(318) : fullPage ? sp(128) : top - sp(37);
@@ -1663,7 +1666,7 @@ void paint(HDC dc, RECT bounds) {
         }
     }
     drawText(dc, demo ? tr(L"示範資料 · 關閉操作已停用") : tr(L"電池與背景活動"), {margin + sp(30), sp(39), w - sp(96), sp(60)}, Muted, smallFont);
-    if (inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history || inlinePage == InlinePage::ledger ||
+    if (inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history || inlinePage == InlinePage::ledger || inlinePage == InlinePage::hardware ||
         inlinePage == InlinePage::lab || inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic || inlinePage == InlinePage::goal ||
         inlinePage == InlinePage::confirm || inlinePage == InlinePage::error) {
         card(dc, {margin, sp(74), right, h - sp(14)}, Surface, 14);
@@ -3592,11 +3595,12 @@ std::wstring settingValueName(bs::gov::Setting setting, DWORD value) {
     case bs::gov::Setting::powerMode: return modeName(PowerMode(value));
     case bs::gov::Setting::cpuBoost: return value ? tr(L"開") : tr(L"關");
     case bs::gov::Setting::refreshRate: return std::to_wstring(value) + L" Hz";
+    case bs::gov::Setting::firmwareMode: return value <= 2 ? tr(bs::asus::modeKey(bs::asus::Mode(value))) : std::to_wstring(value);
     default: return std::to_wstring(value);
     }
 }
 std::wstring dynamicText() {
-    const wchar_t* names[] = {tr(L"電源模式"), tr(L"處理器能源偏好"), tr(L"CPU Boost"), tr(L"螢幕更新率")};
+    const wchar_t* names[] = {tr(L"電源模式"), tr(L"處理器能源偏好"), tr(L"CPU Boost"), tr(L"螢幕更新率"), tr(L"華碩效能模式")};
     std::wstring c = tr(L"用電池時，依你正在做的事自動調整電源設定：閒置與閱讀時省電，一操作就立刻恢復反應速度；高負載時給效能。插電、全螢幕遊戲或關閉時還原原本設定。G-Helper 或你自己改了某項設定，那一項會暫停管理 10 分鐘。");
     c += tr(L"\n\n狀態：") + std::wstring(dynamicEnabled ? tr(L"開啟") : tr(L"關閉"));
     if (dynamicEnabled) {
@@ -4061,6 +4065,102 @@ void activateSettingRow(int index) {
     if (inlinePage == InlinePage::settings) InvalidateRect(settingsList, nullptr, FALSE);
 }
 
+// ----- ASUS hardware -----
+// The firmware settings G-Helper and Armoury Crate change, through the same ATKACPI
+// driver. Reads are cheap; every write is read back, and dynamic saving also manages
+// the performance mode (silent for light use) when it is on.
+bool asusAvailable = false;
+bs::asus::Snapshot asusState;
+uint64_t asusReadAt = 0;
+const bs::asus::Snapshot& asusNow() {
+    const uint64_t now = GetTickCount64();
+    if (!asusReadAt || now - asusReadAt >= 2000) { asusState = bs::asus::read(); asusReadAt = now; }
+    return asusState;
+}
+std::vector<MenuItem> hardwareMenuItems() {
+    const auto& h = asusNow();
+    const bool preview = demo || isolatedPreview;
+    std::vector<MenuItem> items;
+    items.push_back(menuItem(HardwarePageId, tr(L"硬體狀態")));
+    items.push_back(menuSeparator());
+    std::vector<MenuItem> modes{
+        menuItem(AsusSilentId, tr(L"靜音（最省電）"), h.mode == bs::asus::Mode::silent, preview || !h.mode),
+        menuItem(AsusBalancedId, tr(L"平衡"), h.mode == bs::asus::Mode::balanced, preview || !h.mode),
+        menuItem(AsusTurboId, tr(L"Turbo"), h.mode == bs::asus::Mode::turbo, preview || !h.mode)};
+    auto modeMenu = submenu(tr(L"效能模式"), modes, !h.mode);
+    if (h.mode) modeMenu.hint = tr(bs::asus::modeKey(*h.mode));
+    items.push_back(modeMenu);
+    if (h.gpuEco) {
+        auto gpu = submenu(tr(L"獨顯"), {menuItem(GpuEcoId, tr(L"Eco（斷電，最省電）"), *h.gpuEco, preview), menuItem(GpuStandardId, tr(L"標準（需要時使用）"), !*h.gpuEco, preview)});
+        gpu.hint = *h.gpuEco ? L"Eco" : tr(L"標準");
+        items.push_back(gpu);
+    }
+    if (h.chargeLimit) {
+        auto charge = submenu(tr(L"充電上限"), {menuItem(Charge60Id, L"60%", *h.chargeLimit == 60, preview), menuItem(Charge80Id, tr(L"80%（建議）"), *h.chargeLimit == 80, preview),
+            menuItem(Charge100Id, L"100%", *h.chargeLimit == 100, preview)});
+        charge.hint = std::to_wstring(*h.chargeLimit) + L"%";
+        items.push_back(charge);
+    }
+    if (h.overdrive) items.push_back(menuItem(OverdriveId, tr(L"螢幕 Overdrive"), *h.overdrive, preview));
+    return items;
+}
+std::wstring hardwareText(const bs::asus::Snapshot& h) {
+    std::wstring c = tr(L"型號：") + (h.model.empty() ? std::wstring(tr(L"未知")) : h.model);
+    if (!h.driver) return c + tr(L"\n找不到華碩的 ATKACPI 驅動（ASUS System Control Interface）。這台可能不是華碩筆電，或驅動沒有安裝。");
+    if (h.mode) c += tr(L"\n效能模式：") + std::wstring(tr(bs::asus::modeKey(*h.mode)));
+    if (h.gpuEco) c += tr(L"\n獨顯：") + std::wstring(*h.gpuEco ? L"Eco" : tr(L"標準"));
+    if (h.gpuMux) c += tr(L"\n畫面輸出：") + std::wstring(*h.gpuMux ? tr(L"混合（內顯）") : tr(L"獨顯直連"));
+    if (h.chargeLimit) c += tr(L"\n充電上限：") + std::to_wstring(*h.chargeLimit) + L"%";
+    if (h.cpuTemp) c += tr(L"\nCPU 溫度：") + std::to_wstring(*h.cpuTemp) + L" °C";
+    if (h.cpuFan) c += tr(L"\nCPU 風扇：") + std::to_wstring(*h.cpuFan * 100) + L" RPM";
+    if (h.gpuFan) c += tr(L"\n獨顯風扇：") + std::to_wstring(*h.gpuFan * 100) + L" RPM";
+    for (const auto& [label, watts] : h.limits) c += L"\n" + std::wstring(tr(label)) + L"：" + std::to_wstring(watts) + L" W";
+    c += L"\n\n" + bs::asus::dump(h);
+    return c;
+}
+void showHardwarePage() {
+    bs::asus::Snapshot h = asusNow();
+    if (demo || isolatedPreview) { // preview data, as a G14 2024 reports it
+        h.driver = true; h.model = L"ROG Zephyrus G14 GA403UV"; h.mode = bs::asus::Mode::balanced; h.gpuEco = true; h.gpuMux = true;
+        h.chargeLimit = 80; h.overdrive = false; h.cpuTemp = 52; h.cpuFan = 28; h.gpuFan = 0;
+        h.limits = {{L"SPL（持續）", 45}, {L"SPPT（短時）", 54}, {L"FPPT（瞬間）", 65}};
+    }
+    std::vector<VBlock> v;
+    std::vector<std::pair<std::wstring, COLORREF>> chips{{h.model.empty() ? std::wstring(tr(L"型號未知")) : h.model, 0}};
+    if (!h.driver) {
+        v.push_back(vChips(std::move(chips)));
+        v.push_back(vNote(tr(L"找不到華碩的 ATKACPI 驅動（ASUS System Control Interface）。這台可能不是華碩筆電，或驅動沒有安裝。")));
+        showChartPage(InlinePage::hardware, tr(L"華碩硬體"), hardwareText(h), std::move(v));
+        return;
+    }
+    if (h.mode) chips.push_back({tr(L"效能模式 ") + std::wstring(tr(bs::asus::modeKey(*h.mode))), *h.mode == bs::asus::Mode::silent ? Green : *h.mode == bs::asus::Mode::turbo ? theme.warn : COLORREF(0)});
+    if (h.gpuEco) chips.push_back({*h.gpuEco ? tr(L"獨顯 Eco") : tr(L"獨顯 標準"), *h.gpuEco ? Green : theme.warn});
+    if (h.gpuMux && !*h.gpuMux) chips.push_back({tr(L"獨顯直連"), theme.warn});
+    if (h.chargeLimit) chips.push_back({tr(L"充電上限 ") + std::to_wstring(*h.chargeLimit) + L"%", *h.chargeLimit <= 80 ? Green : COLORREF(0)});
+    if (h.overdrive) chips.push_back({*h.overdrive ? tr(L"Overdrive 開") : tr(L"Overdrive 關"), 0});
+    v.push_back(vChips(std::move(chips)));
+    if (h.cpuTemp || h.gpuTemp) {
+        v.push_back(vHeading(tr(L"溫度")));
+        if (h.cpuTemp) v.push_back(vMeter(L"CPU", std::to_wstring(*h.cpuTemp) + L" °C", *h.cpuTemp, 85, 100));
+        if (h.gpuTemp) v.push_back(vMeter(tr(L"獨顯"), std::to_wstring(*h.gpuTemp) + L" °C", *h.gpuTemp, 80, 100));
+    }
+    if (h.cpuFan || h.gpuFan || h.midFan) {
+        v.push_back(vHeading(tr(L"風扇")));
+        std::vector<VBar> bars;
+        if (h.cpuFan) bars.push_back({L"CPU", *h.cpuFan ? std::to_wstring(*h.cpuFan * 100) + L" RPM" : std::wstring(tr(L"停止")), double(*h.cpuFan), 0, 0, {}});
+        if (h.gpuFan) bars.push_back({tr(L"獨顯"), *h.gpuFan ? std::to_wstring(*h.gpuFan * 100) + L" RPM" : std::wstring(tr(L"停止")), double(*h.gpuFan), 0, 0, {}});
+        if (h.midFan) bars.push_back({tr(L"中間"), *h.midFan ? std::to_wstring(*h.midFan * 100) + L" RPM" : std::wstring(tr(L"停止")), double(*h.midFan), 0, 0, {}});
+        v.push_back(vBars(std::move(bars), 70));
+    }
+    if (!h.limits.empty()) {
+        v.push_back(vHeading(tr(L"功耗上限")));
+        std::vector<VBar> bars;
+        for (const auto& [label, watts] : h.limits) bars.push_back({tr(label), std::to_wstring(watts) + L" W", double(watts), 0, blend(Green, Surface, .3), {}});
+        v.push_back(vBars(std::move(bars)));
+    }
+    v.push_back(vNote(tr(L"從「⋯ → 華碩硬體」切換效能模式、獨顯、充電上限與 Overdrive。開啟動態省電時，它也會管理效能模式：輕度使用用靜音，開啟／載入中、通話與高負載用平衡，遊戲時還原。")));
+    showChartPage(InlinePage::hardware, tr(L"華碩硬體"), hardwareText(h), std::move(v));
+}
 // The ⋯ menu (also the tray icon's right-click menu).
 std::vector<MenuItem> mainMenuItems() {
     const bool preview = demo || isolatedPreview;
@@ -4076,6 +4176,7 @@ std::vector<MenuItem> mainMenuItems() {
     if (!dynamicEnabled) dynamic.hint = tr(L"關");
     items.push_back(dynamic);
     items.push_back(menuItem(PowerModeId, tr(L"電源模式")));
+    if (asusAvailable) items.push_back(submenu(tr(L"華碩硬體"), hardwareMenuItems()));
     items.push_back(menuSeparator());
     items.push_back(menuItem(LedgerId, tr(L"耗電程式")));
     items.push_back(menuItem(HistoryId, tr(L"電池與歷史")));
@@ -4245,7 +4346,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         }, window);
         refreshPowerButton();
         if (!demo && !isolatedPreview) SetTimer(window, UpdateTimer, 60 * 1000, nullptr); // first check a minute after start
-        if (!demo && !isolatedPreview) { restoreGovernorAfterCrash(); loadAppRules(); refreshDetectorRules(); updateSensing(); }
+        if (!demo && !isolatedPreview) { asusAvailable = bs::asus::Acpi().available(); restoreGovernorAfterCrash(); loadAppRules(); refreshDetectorRules(); updateSensing(); }
+        if (demo || isolatedPreview) asusAvailable = true; // the preview shows the hardware menu
         return 0;
     }
     case WM_MEASUREITEM:
@@ -4504,6 +4606,32 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (id == SettingsPageId) { showMain(); showSettingsPage(); return 0; }
         if (id == DynamicPageId) { showMain(); showDynamicPage(); return 0; }
         if (id == GoalPageId) { showMain(); showGoalPage(); return 0; }
+        if (id == HardwarePageId) { showMain(); showHardwarePage(); return 0; }
+        if (id == AsusSilentId || id == AsusBalancedId || id == AsusTurboId || id == GpuEcoId || id == GpuStandardId ||
+            id == Charge60Id || id == Charge80Id || id == Charge100Id || id == OverdriveId) {
+            if (demo || isolatedPreview || !asusAvailable) return 0;
+            DWORD status = ERROR_SUCCESS; std::wstring done;
+            if (id == AsusSilentId || id == AsusBalancedId || id == AsusTurboId) {
+                const auto mode = id == AsusSilentId ? bs::asus::Mode::silent : id == AsusTurboId ? bs::asus::Mode::turbo : bs::asus::Mode::balanced;
+                status = bs::asus::setMode(mode); done = tr(L"效能模式：") + std::wstring(tr(bs::asus::modeKey(mode)));
+            } else if (id == GpuEcoId) {
+                // The discrete GPU cannot switch off while a program uses it.
+                std::wstring users;
+                for (const auto& row : current.processes) if (row.gpuPercent && *row.gpuPercent >= 1 && row.name != L"dwm.exe") users += (users.empty() ? L"" : L"、") + row.name;
+                if (!users.empty() && MessageBoxW(mainWindow, (tr(L"這些程式可能正在用獨顯：") + users + tr(L"\n切到 Eco 前請先關閉它們，否則可能失敗或讓它們出錯。仍要切換嗎？")).c_str(),
+                    L"BatteryScope", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return 0;
+                status = bs::asus::setGpuEco(true); done = tr(L"獨顯已切到 Eco（斷電）");
+            } else if (id == GpuStandardId) { status = bs::asus::setGpuEco(false); done = tr(L"獨顯已切到標準"); }
+            else if (id == OverdriveId) { const bool on = !(asusNow().overdrive.value_or(false)); status = bs::asus::setOverdrive(on); done = on ? tr(L"螢幕 Overdrive 已開啟") : tr(L"螢幕 Overdrive 已關閉"); }
+            else {
+                const unsigned percent = id == Charge60Id ? 60 : id == Charge80Id ? 80 : 100;
+                status = bs::asus::setChargeLimit(percent); done = tr(L"充電上限：") + std::to_wstring(percent) + L"%";
+            }
+            asusReadAt = 0;
+            setNotice(status == ERROR_SUCCESS ? done : tr(L"韌體沒有接受這個設定：") + errorText(status));
+            if (inlinePage == InlinePage::hardware) showHardwarePage();
+            return 0;
+        }
         if (id == GoalCycleId) {
             if (demo || isolatedPreview) return 0;
             // 10/7 W -> 12/8 W -> 8/6 W -> off -> 10/7 W
@@ -4659,6 +4787,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         checkBatteryNotices();
         applyAutoPowerRules();
         recordGoalSample();
+        if (inlinePage == InlinePage::hardware && !hidden) showHardwarePage();
         if (inlinePage == InlinePage::goal && !hidden && GetTickCount64() - goalPageShownAt >= 10000) showGoalPage();
         return 0;
     }
@@ -5345,6 +5474,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     // engine without a test for the given seconds and writes the port to stdout.
     // Prints what the activity detector sees once a second (no GPU engines, no
     // raw input): a quick check that every signal can be read on this PC.
+    if (args.size() == 1 && args[0] == L"--asus-dump") {
+        // Every ASUS firmware value BatteryScope reads, for checking a new model.
+        printf("%s", utf8(bs::asus::dump(bs::asus::read())).c_str());
+        return 0;
+    }
     if (args.size() == 2 && args[0] == L"--detect-test") {
         bs::lab::SignalReader reader; bs::gov::Detector probe;
         const int seconds = std::clamp(_wtoi(args[1].c_str()), 1, 600);
@@ -5487,6 +5621,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (screenshot && option(L"--settings")) showSettingsPage();
     if (screenshot && option(L"--dynamic")) showDynamicPage();
     if (screenshot && option(L"--goal")) showGoalPage();
+    if (screenshot && option(L"--hardware")) showHardwarePage();
     if (screenshot && option(L"--lab")) showLabPage();
     if (demo) for (size_t i = 0; i + 1 < args.size(); ++i) if (args[i] == L"--card-png") {
         const bool saved = exportShareCard(args[i + 1], false);

@@ -163,7 +163,8 @@ std::vector<ExperimentResult> analyze(const std::vector<Block>& blocks);
 // display turns the screen off for a block, backgroundEco puts every background
 // app of this user in EcoQoS (the "App Nap" idea).
 // darkMode switches Windows' app theme (light or dark); on an OLED panel a dark page draws much less power.
-enum class Knob { cpuBoost, energyPreference, refreshRate, powerMode, brightness, display, backgroundEco, darkMode, count };
+// asusMode is the ASUS firmware performance mode (silent / balanced / turbo), on ASUS laptops only.
+enum class Knob { cpuBoost, energyPreference, refreshRate, powerMode, brightness, display, backgroundEco, darkMode, asusMode, count };
 constexpr int ManualKnobs = 4; // the first four can also be run one at a time from the menu
 const wchar_t* knobKey(Knob knob); // stable id used in files: cpu-boost, epp, refresh, power-mode
 struct KnobPlan {

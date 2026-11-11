@@ -1,5 +1,6 @@
 #include "lab.h"
 #include "platform.h"
+#include "asus.h"
 #include <cfgmgr32.h>
 #include <dwmapi.h>
 #include <dxgi.h>
@@ -310,6 +311,7 @@ const wchar_t* knobKey(Knob knob) {
     case Knob::display: return L"display";
     case Knob::backgroundEco: return L"background-eco";
     case Knob::darkMode: return L"dark-mode";
+    case Knob::asusMode: return L"asus-mode";
     default: return L"";
     }
 }
@@ -327,6 +329,12 @@ DWORD readKnob(Knob knob, DWORD& value) {
     case Knob::display: value = displayValue; return ERROR_SUCCESS;
     case Knob::backgroundEco: value = backgroundEcoValue; return ERROR_SUCCESS;
     case Knob::darkMode: return readDarkMode(value);
+    case Knob::asusMode: {
+        asus::Acpi acpi;
+        const auto r = acpi.available() ? acpi.get(asus::device::ThermalPolicy) : std::nullopt;
+        if (!r || !r->present || r->value() > 2) return ERROR_NOT_SUPPORTED;
+        value = r->value(); return ERROR_SUCCESS;
+    }
     default: return ERROR_INVALID_PARAMETER;
     }
 }
@@ -340,6 +348,7 @@ DWORD applyKnob(Knob knob, DWORD value) {
     case Knob::display: displayValue = value ? 1 : 0; return setDisplay(value != 0);
     case Knob::backgroundEco: backgroundEcoValue = value ? 1 : 0; return setBackgroundEco(value != 0);
     case Knob::darkMode: return setDarkMode(value != 0);
+    case Knob::asusMode: return value <= 2 ? asus::setMode(asus::Mode(value)) : DWORD(ERROR_INVALID_PARAMETER);
     default: return ERROR_INVALID_PARAMETER;
     }
 }
@@ -389,6 +398,13 @@ KnobPlan planKnob(Knob knob) {
     case Knob::backgroundEco:
         plan.values = {0u, 1u}; plan.names = {L"背景程式照常", L"背景程式效率模式"};
         break;
+    case Knob::asusMode: {
+        // The mode in use against silent (or, when silent is in use, against balanced).
+        const DWORD silent = DWORD(asus::Mode::silent), balanced = DWORD(asus::Mode::balanced);
+        plan.values = {original, original == silent ? balanced : silent};
+        for (size_t i = 0; i < 2; ++i) plan.names[i] = asus::modeKey(asus::Mode(plan.values[i]));
+        break;
+    }
     case Knob::darkMode:
         plan.values = {original ? 1u : 0u, original ? 0u : 1u};
         for (size_t i = 0; i < 2; ++i) plan.names[i] = plan.values[i] ? L"深色模式" : L"淺色模式";
@@ -837,7 +853,8 @@ std::vector<Step> automaticPlan(bool browser) {
         {Knob::cpuBoost, W::browse}, {Knob::cpuBoost, W::office}, {Knob::cpuBoost, W::sustained},
         {Knob::energyPreference, W::browse},
         {Knob::backgroundEco, W::idle}, {Knob::backgroundEco, W::browse},
-        {Knob::brightness, W::browse}, {Knob::darkMode, W::browse}, {Knob::powerMode, W::sustained}};
+        {Knob::brightness, W::browse}, {Knob::darkMode, W::browse}, {Knob::powerMode, W::sustained},
+        {Knob::asusMode, W::idle}, {Knob::asusMode, W::browse}, {Knob::asusMode, W::sustained}}; // ASUS only; skipped elsewhere
         // One energy preference step only: the first real test found no difference in any activity.
         // Screen off is not measured: on Modern Standby laptops Windows goes to standby soon after
         // the screen turns off, so the blocks measure standby rather than a dark screen.
@@ -862,7 +879,8 @@ std::vector<Step> quickPlan(bool browser) {
     std::vector<std::pair<Knob, Workload>> order;
     if (browser) order = {
         {Knob::powerMode, W::idle}, {Knob::powerMode, W::browse}, {Knob::powerMode, W::office}, {Knob::powerMode, W::video},
-        {Knob::darkMode, W::browse}, {Knob::brightness, W::browse}, {Knob::powerMode, W::sustained}};
+        {Knob::darkMode, W::browse}, {Knob::brightness, W::browse}, {Knob::powerMode, W::sustained},
+        {Knob::asusMode, W::browse}, {Knob::asusMode, W::sustained}}; // ASUS only; skipped elsewhere
     else order = {{Knob::powerMode, W::idle}, {Knob::powerMode, W::bursts}, {Knob::powerMode, W::scroll}, {Knob::brightness, W::idle}, {Knob::powerMode, W::sustained}};
     std::vector<Step> steps;
     for (const auto& [knob, workload] : order) {
