@@ -4,6 +4,7 @@
 #include <dwmapi.h>
 #include <dxgi.h>
 #include <mmdeviceapi.h>
+#include <audiopolicy.h>
 #include <setupapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -515,6 +516,112 @@ struct SignalReader::Impl {
     Probe::Impl* probe = nullptr; // reuses the audio meter
     uint64_t callAt = 0;
     bool call = false;
+    // Foreground program, remembered by window so the name is looked up once.
+    HWND foregroundWindow = nullptr;
+    uint32_t foregroundPid = 0;
+    std::wstring foregroundExe;
+    bool coversScreen = false;
+    uint64_t foregroundSince = 0;
+    std::map<uint32_t, std::wstring> names;
+    // Sound per program, from the audio sessions of the default output.
+    IAudioSessionManager2* sessions = nullptr;
+    uint64_t sessionsAt = 0, audioAt = 0;
+    std::set<uint32_t> playing;
+    // Compositor frames.
+    UINT64 frames = 0; uint64_t framesAt = 0;
+    ~Impl() { if (sessions) sessions->Release(); }
+    std::wstring nameOf(uint32_t pid) {
+        if (auto it = names.find(pid); it != names.end()) return it->second;
+        std::wstring name;
+        if (HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid)) {
+            wchar_t path[MAX_PATH]; DWORD size = MAX_PATH;
+            if (QueryFullProcessImageNameW(process, 0, path, &size)) name = std::filesystem::path(path).filename().wstring();
+            CloseHandle(process);
+        }
+        for (auto& c : name) c = wchar_t(std::towlower(c));
+        if (names.size() > 256) names.clear();
+        names[pid] = name;
+        return name;
+    }
+    void readForeground(uint64_t now) {
+        HWND window = GetForegroundWindow();
+        if (!window) return;
+        DWORD pid = 0; GetWindowThreadProcessId(window, &pid);
+        if (pid == GetCurrentProcessId()) return; // BatteryScope itself: keep the program the user came from
+        if (window != foregroundWindow) {
+            foregroundWindow = window; foregroundSince = now;
+            std::wstring name = nameOf(pid);
+            // Store apps live inside ApplicationFrameHost: use the app's own window.
+            if (name == L"applicationframehost.exe") {
+                struct Find { DWORD host; DWORD found; } find{pid, 0};
+                EnumChildWindows(window, [](HWND child, LPARAM data) -> BOOL {
+                    auto* f = reinterpret_cast<Find*>(data); DWORD owner = 0; GetWindowThreadProcessId(child, &owner);
+                    if (owner && owner != f->host) { f->found = owner; return FALSE; }
+                    return TRUE;
+                }, reinterpret_cast<LPARAM>(&find));
+                if (find.found) { pid = find.found; name = nameOf(pid); }
+            }
+            if (pid != foregroundPid) foregroundSince = now;
+            foregroundPid = pid; foregroundExe = name;
+        }
+        // Full screen: the window covers its monitor and has no title bar (borderless,
+        // exclusive, or a browser in full-screen mode). The desktop never counts.
+        coversScreen = false;
+        wchar_t cls[64]{}; GetClassNameW(window, cls, 64);
+        if (wcscmp(cls, L"Progman") && wcscmp(cls, L"WorkerW") && wcscmp(cls, L"Shell_TrayWnd")) {
+            RECT r{}; MONITORINFO m{}; m.cbSize = sizeof(m);
+            const LONG style = GetWindowLongW(window, GWL_STYLE);
+            if (GetWindowRect(window, &r) && GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &m))
+                coversScreen = r.left <= m.rcMonitor.left && r.top <= m.rcMonitor.top && r.right >= m.rcMonitor.right && r.bottom >= m.rcMonitor.bottom &&
+                    (style & WS_CAPTION) != WS_CAPTION;
+        }
+    }
+    // Which programs are making sound, every 2 seconds.
+    void readSessions(uint64_t now) {
+        if (audioAt && now - audioAt < 2000) return;
+        audioAt = now; playing.clear();
+        if (!probe->comReady) probe->comReady = SUCCEEDED(CoInitializeEx(nullptr, COINIT_MULTITHREADED));
+        if (!sessions && (!sessionsAt || now - sessionsAt > 30000)) {
+            sessionsAt = now;
+            IMMDeviceEnumerator* devices = nullptr;
+            if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&devices)))) {
+                IMMDevice* device = nullptr;
+                if (SUCCEEDED(devices->GetDefaultAudioEndpoint(eRender, eConsole, &device))) {
+                    device->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&sessions));
+                    device->Release();
+                }
+                devices->Release();
+            }
+        }
+        if (!sessions) return;
+        IAudioSessionEnumerator* list = nullptr;
+        if (FAILED(sessions->GetSessionEnumerator(&list))) { sessions->Release(); sessions = nullptr; return; }
+        int count = 0; list->GetCount(&count);
+        for (int i = 0; i < count; ++i) {
+            IAudioSessionControl* control = nullptr;
+            if (FAILED(list->GetSession(i, &control))) continue;
+            AudioSessionState state{};
+            IAudioSessionControl2* control2 = nullptr; PeakMeter* meter = nullptr;
+            if (SUCCEEDED(control->GetState(&state)) && state == AudioSessionStateActive &&
+                SUCCEEDED(control->QueryInterface(__uuidof(IAudioSessionControl2), reinterpret_cast<void**>(&control2))) &&
+                SUCCEEDED(control->QueryInterface(PeakMeterId, reinterpret_cast<void**>(&meter)))) {
+                float peak = 0; DWORD pid = 0;
+                if (SUCCEEDED(meter->GetPeakValue(&peak)) && peak > .001f && SUCCEEDED(control2->GetProcessId(&pid)) && pid) playing.insert(pid);
+            }
+            if (meter) meter->Release();
+            if (control2) control2->Release();
+            control->Release();
+        }
+        list->Release();
+    }
+    Value framesPerSecond(uint64_t now) {
+        DWM_TIMING_INFO timing{}; timing.cbSize = sizeof(timing);
+        if (FAILED(DwmGetCompositionTimingInfo(nullptr, &timing))) { framesAt = 0; return std::nullopt; }
+        Value fps;
+        if (framesAt && now > framesAt && timing.cFrame >= frames) fps = double(timing.cFrame - frames) * 1000 / double(now - framesAt);
+        frames = timing.cFrame; framesAt = now;
+        return fps;
+    }
 };
 SignalReader::SignalReader() : impl_(std::make_unique<Impl>()) { impl_->probe = new Probe::Impl(); }
 SignalReader::~SignalReader() { delete impl_->probe; }
@@ -531,6 +638,23 @@ Signals SignalReader::read(Value systemCpu) {
     s.systemCpu = systemCpu;
     return s;
 }
+gov::Observation SignalReader::observe(Value systemCpu) {
+    auto& p = *impl_;
+    const Signals s = read(systemCpu);
+    gov::Observation o;
+    o.ms = GetTickCount64();
+    o.idleSeconds = s.idleSeconds; o.audio = s.audio; o.call = s.call; o.exclusiveFullscreen = s.fullscreenGame; o.systemCpu = systemCpu;
+    p.readForeground(o.ms);
+    o.foregroundExe = p.foregroundExe; o.foregroundPid = p.foregroundPid; o.foregroundCoversScreen = p.coversScreen;
+    o.foregroundSwitchSeconds = p.foregroundSince ? (o.ms - p.foregroundSince) / 1000.0 : 1e9;
+    if (s.audio) { p.readSessions(o.ms); o.foregroundAudio = p.playing.count(p.foregroundPid) > 0; }
+    o.framesPerSecond = p.framesPerSecond(o.ms);
+    // The secure desktop (lock screen, sign-in) cannot be opened from the user's session.
+    if (HDESK desktop = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS)) CloseDesktop(desktop);
+    else o.locked = true;
+    return o;
+}
+const std::wstring& SignalReader::lastForeground() const { return impl_->foregroundExe; }
 DWORD setProcessEco(uint32_t pid, uint64_t created, bool on) {
     HANDLE process = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (!process) return GetLastError();
