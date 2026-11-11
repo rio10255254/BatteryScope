@@ -15,8 +15,8 @@
 
 到 **[Releases 頁面](https://github.com/rio10255254/BatteryScope/releases/latest)** 下載：
 
-- **安裝版（建議）**：`BatteryScope-0.18.0-setup.exe`。不需要管理員權限，安裝到 `%LOCALAPPDATA%\Programs\BatteryScope`，會建立開始功能表捷徑，可選擇桌面捷徑與登入時啟動，並可從「設定 → 應用程式」解除安裝。
-- **免安裝版**：`BatteryScope-0.18.0-win64.zip`，解壓後執行 `BatteryScope.exe`。
+- **安裝版（建議）**：`BatteryScope-0.19.0-setup.exe`。不需要管理員權限，安裝到 `%LOCALAPPDATA%\Programs\BatteryScope`，會建立開始功能表捷徑，可選擇桌面捷徑與登入時啟動，並可從「設定 → 應用程式」解除安裝。
+- **免安裝版**：`BatteryScope-0.19.0-win64.zip`，解壓後執行 `BatteryScope.exe`。
 
 需要 Windows 10 1703 以上（建議 Windows 11），64 位元。程式沒有數位簽章，第一次開啟若出現 SmartScreen，點「其他資訊 → 仍要執行」。開啟後在右下角系統匣，圖示會顯示電量百分比；點圖示開關面板。
 
@@ -54,7 +54,7 @@
 
 ## 使用方式
 
-1. 從 [GitHub Releases](https://github.com/rio10255254/BatteryScope/releases/latest) 下載 `BatteryScope-0.18.0-win64.zip`，解壓後執行 `BatteryScope.exe`。已編譯版本適用 Windows 10（1703 以上）與 Windows 11 的 x64 筆電與桌機。
+1. 從 [GitHub Releases](https://github.com/rio10255254/BatteryScope/releases/latest) 下載 `BatteryScope-0.19.0-win64.zip`，解壓後執行 `BatteryScope.exe`。已編譯版本適用 Windows 10（1703 以上）與 Windows 11 的 x64 筆電與桌機。
    升級時先從系統匣結束舊版，再執行新版；程式會避免同時啟動多個正式監測視窗。
 2. 目前耗電顯示電池回報的整機放電功率；資料累積後顯示平均功率、耗電速度與預估續航。
 3. 硬體能源資料可用時，下方依「估計 CPU W」由高到低列出前 10 個程序／服務。每張卡片第二行顯示類型、PID 與核心分攤模型範圍。點「僅背景」切換背景篩選，點「顯示」切換前 10 名／全部；滑鼠滾輪或鍵盤上下鍵瀏覽。若能源資料不可用，會明確退回 CPU / I/O 活動排行。
@@ -113,19 +113,21 @@
 
 ### 華碩硬體（0.18 起，華碩筆電）
 
-「⋯ → 華碩硬體」直接透過華碩的 ATKACPI 驅動（ASUS System Control Interface，Armoury Crate 與 G-Helper 也用它）讀寫韌體設定，不需要 G-Helper：
+「華碩」分頁直接透過華碩的 ATKACPI 驅動（ASUS System Control Interface，Armoury Crate 與 G-Helper 也用它）與鍵盤、燈效的 HID 介面讀寫設定，不需要 G-Helper 或 Armoury Crate：
 
-- **狀態**：型號、效能模式、獨顯 Eco／標準、畫面輸出（混合或獨顯直連）、充電上限、Overdrive、CPU／獨顯溫度、風扇轉速、功耗上限（SPL／SPPT／FPPT 等）。
-- **切換**：效能模式（靜音／平衡／Turbo）、獨顯 Eco（有程式在用獨顯時會先警告）、充電上限 60／80／100%、螢幕 Overdrive。每次寫入都會讀回確認，韌體不接受時會說明。
-- **動態省電**：開啟時也管理效能模式——輕度使用用靜音，開啟／載入中、通話與高負載用平衡，遊戲與「不要管理」的程式還原；被 Fn 鍵或其他程式改動時同樣暫停 10 分鐘。兩次切換至少隔 20 秒，避免風扇忽快忽慢。
+- **狀態**：型號、效能模式、獨顯 Eco／標準、畫面輸出（混合或獨顯直連）、充電上限、Overdrive、CPU／獨顯溫度、風扇轉速、功耗上限（讀值為 0 的項目不顯示）。
+- **效能模式與充電上限**：多數機型（包括 G14 2024）的韌體只接受寫入、不會回報目前值。BatteryScope 和 G-Helper 一樣記住最後設定的值，開機與睡眠喚醒後自動重新套用；沒設定過時顯示「未設定」。
+- **切換**：效能模式（靜音／平衡／Turbo）、獨顯 Eco（有程式在用獨顯時會先警告，寫入後讀回確認）、充電上限 60／80／100%、螢幕 Overdrive。
+- **動態省電**：開啟時也管理效能模式——輕度使用用靜音，開啟／載入中、通話與高負載用平衡，遊戲與「不要管理」的程式還原。兩次切換至少隔 20 秒，避免風扇忽快忽慢。
 - **實驗**：快速測試與完整測試會量靜音模式能省多少（非華碩電腦自動略過），證實有效才採用。
-- 診斷：`BatteryScope.exe --asus-dump` 列出讀到的每個韌體值。
 - **獨顯自動**：用電池時 Eco、插電時標準（等同 G-Helper 的 Optimized），有程式在用獨顯時會等它關閉再切。
-- **充電上限**會記住，開機與睡眠喚醒後自動重新套用。
-- **鍵盤背光**：關／低／中／高，並可在用電池時閒置 30 秒自動關閉、一碰就恢復。
-- **華碩按鍵**：BatteryScope 可以接手鍵盤背光鍵、效能模式鍵（Fn+F5）與 ROG 鍵（開啟 BatteryScope、切換效能模式或不動作），並列出最近按下的按鍵代碼。
-- **華碩服務**：一鍵停止並停用所有華碩與 Armoury Crate 服務（需要管理員權限，原本的啟動方式會記下），之後可一鍵恢復；停止後自動改由 BatteryScope 處理華碩按鍵。
-- 風扇曲線與功耗上限的調整會在確認這些讀值在你的機型上正確後再開放；機身燈效（Slash）在 `--asus-dump` 會列出華碩的 HID 裝置，確認型號後再加入。
+- **鍵盤背光**：關／低／中／高，經由鍵盤的 HID 介面設定（ROG 機型），並可在用電池時閒置 30 秒自動關閉、一碰就恢復。
+- **Fn 鎖定**：Fn+C 或 Fn+Esc 切換。韌體有 Fn 鎖定的機型直接用韌體；ROG 機型由 BatteryScope 把 F1–F11 對應成快捷功能（靜音、背光、燈效、效能模式、截圖、亮度、投影、觸控板、睡眠）。
+- **Slash 燈效**（Zephyrus G14／G16 2024）：開關、16 種燈效、亮度、動畫停頓、用電池時關閉；Fn+F4 開關。
+- **華碩按鍵**：華碩的軟體不在時，BatteryScope 自動接手所有 Fn 鍵——螢幕亮度、鍵盤背光、觸控板、麥克風靜音、睡眠、飛航模式、表情符號、Fn 鎖定、效能模式（Fn+F5）與 ROG 鍵（開啟 BatteryScope、切換效能模式或不動作），並在畫面下方顯示結果。按鍵同時從 ATK WMI 事件與鍵盤 HID 輸入讀取（和 G-Helper 一樣）；華碩的軟體還在執行時，交給它處理，不會重複動作。
+- **華碩服務**：一鍵停止並停用 Armoury Crate 與華碩背景服務（與 G-Helper 停止的清單相同，觸控板與系統控制驅動不動；需要管理員權限，原本的啟動方式會記下），之後可恢復停止前的設定，或「恢復成華碩預設（自動啟動）」——被 G-Helper 停用過的服務也能用這個救回來。
+- 診斷：`BatteryScope.exe --asus-dump` 列出讀到的每個韌體值、記住的設定，以及每個華碩 HID 介面的報告編號。
+- 風扇曲線與功耗上限的調整會在確認讀值在你的機型上正確後再開放。
 
 ### 省電實驗室（實驗功能）
 
@@ -240,7 +242,7 @@
 .\build.ps1 -Test
 ```
 
-舊版仍在執行時，可使用 `./build.ps1 -Test -OutputDirectory dist/v0.18.0` 編譯到獨立目錄，避免覆寫使用中的 EXE。
+舊版仍在執行時，可使用 `./build.ps1 -Test -OutputDirectory dist/v0.19.0` 編譯到獨立目錄，避免覆寫使用中的 EXE。
 
 預設尋找 PATH 上的 `g++.exe`，其次使用 `C:\mingw64\bin\g++.exe`，並使用同目錄的 `windres.exe`。產出 `dist\BatteryScope.exe`。
 
