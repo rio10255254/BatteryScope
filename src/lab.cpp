@@ -1,4 +1,5 @@
 #include "lab.h"
+#include <tuple>
 #include <algorithm>
 #include <cmath>
 #include <iomanip>
@@ -248,17 +249,20 @@ Comparison comparePairs(const std::vector<std::pair<double, double>>& pairs) {
     return c;
 }
 std::vector<ExperimentResult> analyze(const std::vector<Block>& blocks) {
-    std::map<std::wstring, std::map<std::pair<uint64_t, int>, std::array<const Block*, 2>>> grouped;
-    std::map<std::wstring, std::array<std::wstring, 2>> names;
+    // Runs of the same experiment are pooled only when they compared the same two
+    // settings: with a different original (e.g. after switching the power mode) a
+    // run compares something else and becomes its own result.
+    std::map<std::pair<std::wstring, uint64_t>, std::array<std::wstring, 2>> runNames;
+    for (const auto& b : blocks) runNames[{b.experiment, b.run}][size_t(b.arm)] = b.armName;
+    std::map<std::tuple<std::wstring, std::wstring, std::wstring>, std::map<std::pair<uint64_t, int>, std::array<const Block*, 2>>> grouped;
     for (const auto& b : blocks) {
-        auto& slot = grouped[b.experiment][{b.run, b.pair}];
-        slot[size_t(b.arm)] = &b;
-        names[b.experiment][size_t(b.arm)] = b.armName;
+        const auto& n = runNames[{b.experiment, b.run}];
+        grouped[{b.experiment, n[0], n[1]}][{b.run, b.pair}][size_t(b.arm)] = &b;
     }
     std::vector<ExperimentResult> results;
-    for (const auto& [experiment, pairs] : grouped) {
-        ExperimentResult r; r.experiment = experiment;
-        r.arm0 = names[experiment][0]; r.arm1 = names[experiment][1];
+    for (const auto& [key, pairs] : grouped) {
+        ExperimentResult r; r.experiment = std::get<0>(key);
+        r.arm0 = std::get<1>(key); r.arm1 = std::get<2>(key);
         std::vector<std::pair<double, double>> battery, package, core, rest, cpu, drops, burst, work, perWork;
         for (const auto& item : pairs) {
             const Block* a = item.second[0]; const Block* b = item.second[1];

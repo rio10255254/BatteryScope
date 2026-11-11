@@ -91,7 +91,9 @@ std::vector<Evidence> learn(const std::vector<lab::ExperimentResult>& results) {
         const double saved = r.battery.significant() ? std::abs(r.battery.difference) : std::abs(r.core.difference);
         const double sign = secondSaves ? 1 : -1; // turns "arm1 - arm0" into "saving arm - other arm"
         bool cost = false;
-        if (r.frames && sign * r.drops.difference > 1.0) cost = true;                         // more than one late frame per minute
+        // More than one late frame per minute. Not for video: the test clip's own dropped-frame
+        // count (in results from 0.15 and earlier) is an artifact of how it was recorded.
+        if (r.frames && workload != L"video" && sign * r.drops.difference > 1.0) cost = true;
         if (r.bursts && r.burstMs.mean0 > 0 && r.burstMs.mean1 > 0) {
             const double saving = secondSaves ? r.burstMs.mean1 : r.burstMs.mean0, other = secondSaves ? r.burstMs.mean0 : r.burstMs.mean1;
             // Responses over 15% slower and by more than 5 ms: a few milliseconds on a 7 ms task cannot be felt.

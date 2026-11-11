@@ -47,7 +47,7 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     EcoToggleId = 163, PerfAppToggleId = 164, MascotToggleId = 165, ShareCardId = 166, MiniToggleId = 167, MiniOpenId = 168,
     UpdateCheckId = 169, UpdateNowId = 170, UpdateInstallId = 171,
     LabPageId = 172, LabRecordId = 173, LabExperimentId = 174 /* ..177, one per knob */, LabStopId = 178, LabFolderId = 179, LabExportId = 180, LabAutoId = 181, LabAutoStartId = 182,
-    DynamicToggleId = 183, DynamicPageId = 184, DynamicRefreshId = 185, DynamicEcoId = 186, DynamicTargetId = 187, SettingsPageId = 188,
+    DynamicToggleId = 183, DynamicPageId = 184, DynamicRefreshId = 185, DynamicEcoId = 186, DynamicTargetId = 187, SettingsPageId = 188, GoalPageId = 189, GoalCycleId = 190, LabQuickId = 191, LabQuickStartId = 192,
     SettingsListId = 300,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1;
@@ -98,7 +98,7 @@ void* effectiveWatch = nullptr;
 PowerModes powerModes;
 HWND modeButtons[6] = {}, restoreModesButton = nullptr, energySettingsButton = nullptr;
 bool isolatedPreview = false;
-enum class InlinePage { none, process, power, candidates, ledger, powerMode, history, perfApps, lab, settings, dynamic, confirm, error };
+enum class InlinePage { none, process, power, candidates, ledger, powerMode, history, perfApps, lab, settings, dynamic, goal, confirm, error };
 unsigned lowBatteryThreshold = 0; // percent; 0 = off
 LowBatteryMonitor lowBattery;
 bool hotkeyEnabled = false, hotkeyRegistered = false;
@@ -111,6 +111,8 @@ bool updateChecks = true; // daily update check, on unless turned off
 // Dynamic power saving (the governor), opt-in. Target 0 means no battery target.
 bool dynamicEnabled = false, dynamicRefresh = false, dynamicEco = true;
 unsigned dynamicTarget = 0;
+// Battery power goals in watts while in use and while still (0 = no goal).
+unsigned goalUse = 10, goalStill = 7;
 HWND settingsList = nullptr;
 BalloonTarget balloonTarget = BalloonTarget::none;  // what clicking the last notification opens
 bool sleepAlerts = true;          // notify after a sleep with unusual battery drain
@@ -147,6 +149,7 @@ void refreshPowerModeControls();
 void showLabPage();
 void showSettingsPage();
 void showDynamicPage();
+void showGoalPage();
 // The power lab; absent in demo and preview modes.
 std::unique_ptr<bs::lab::Controller> labController;
 std::unique_ptr<bs::lab::WorkloadEngine> labEngine; // the automatic test's loads and window
@@ -1136,7 +1139,7 @@ void layout() {
     MoveWindow(menuButton, w - sp(92), sp(16), sp(32), sp(30), TRUE);
     MoveWindow(hideButton, w - sp(52), sp(16), sp(32), sp(30), TRUE);
     const bool fullPage = inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history || inlinePage == InlinePage::lab ||
-        inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic ||
+        inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic || inlinePage == InlinePage::goal ||
         inlinePage == InlinePage::confirm || inlinePage == InlinePage::error;
     const int textTop = inlinePage == InlinePage::powerMode ? sp(318) : inlinePage == InlinePage::history ? sp(262) : fullPage ? sp(128) : top - sp(37);
     {
@@ -1185,7 +1188,7 @@ void showInlinePage(InlinePage page, const std::wstring& title, const std::wstri
     }
     SetWindowTextW(inlineText, lines.c_str());
     ShowScrollBar(inlineText, SB_VERT, page == InlinePage::process || page == InlinePage::power || page == InlinePage::ledger ||
-        page == InlinePage::powerMode || page == InlinePage::history || page == InlinePage::lab || page == InlinePage::dynamic ||
+        page == InlinePage::powerMode || page == InlinePage::history || page == InlinePage::lab || page == InlinePage::dynamic || page == InlinePage::goal ||
         (page == InlinePage::candidates && lines.size() > 500));
     SendMessageW(inlineText, EM_SETSEL, 0, 0);
     SendMessageW(inlineText, EM_SCROLLCARET, 0, 0);
@@ -1396,7 +1399,7 @@ void paint(HDC dc, RECT bounds) {
     }
     drawText(dc, demo ? tr(L"示範資料 · 關閉操作已停用") : tr(L"電池與背景活動"), {margin + sp(30), sp(39), w - sp(96), sp(60)}, Muted, smallFont);
     if (inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history ||
-        inlinePage == InlinePage::lab || inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic ||
+        inlinePage == InlinePage::lab || inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic || inlinePage == InlinePage::goal ||
         inlinePage == InlinePage::confirm || inlinePage == InlinePage::error) {
         card(dc, {margin, sp(74), right, h - sp(14)}, Surface, 14);
         drawText(dc, inlineTitle, {margin + sp(14), sp(84), right - sp(14), sp(114)}, Ink, titleFont);
@@ -1932,6 +1935,7 @@ void loadSettings() {
     dynamicRefresh = readSetting(L"DynamicRefresh", 0) == 1;
     dynamicEco = readSetting(L"DynamicEco", 1) != 0;
     dynamicTarget = readSetting(L"DynamicTarget", 0);
+    goalUse = readSetting(L"GoalUse", 10); goalStill = readSetting(L"GoalStill", 7);
     if (dynamicTarget != 3 && dynamicTarget != 5 && dynamicTarget != 8) dynamicTarget = 0;
     std::vector<uint8_t> curve(512); DWORD curveBytes = DWORD(curve.size());
     if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\BatteryScope", L"ChargeCurve", RRF_RT_REG_BINARY, nullptr, curve.data(), &curveBytes) == ERROR_SUCCESS) {
@@ -2128,6 +2132,7 @@ const wchar_t* labKnobTitle(const std::wstring& key) {
     if (key == L"brightness") return tr(L"螢幕亮度");
     if (key == L"display") return tr(L"螢幕開關");
     if (key == L"background-eco") return tr(L"背景程式效率模式");
+    if (key == L"dark-mode") return tr(L"深色模式");
     return L"";
 }
 // "cpu-boost@scroll" -> "CPU Boost · 捲動頁面".
@@ -3234,16 +3239,137 @@ void showDynamicPage() {
     labPageShownAt = GetTickCount64();
 }
 
+// ----- Power goal -----
+// Battery power in use and while still over the last 30 minutes, against the
+// user's goal, with the changes that would close the gap ranked by what the
+// lab measured on this PC. "Still" means no keyboard or mouse input for a minute
+// (or the detector saw idle); automatic test time is left out.
+struct GoalSample { uint64_t ms = 0; double watts = 0; bool still = false; };
+std::deque<GoalSample> goalSamples;
+uint64_t goalLastPowerMs = 0, goalPageShownAt = 0;
+void recordGoalSample() {
+    if (current.history.empty()) return;
+    const auto& p = current.history.back();
+    if (p.ms == goalLastPowerMs) return;
+    goalLastPowerMs = p.ms;
+    if (!p.present || !p.acKnown || p.onAc || p.charging || !p.watts || *p.watts <= 0 || planRunning() || demo || isolatedPreview) return;
+    LASTINPUTINFO input{}; input.cbSize = sizeof(input);
+    const double idle = GetLastInputInfo(&input) ? (GetTickCount() - input.dwTime) / 1000.0 : 0;
+    const bool still = idle >= 60 || (sensing && lastAssessment.activity == bs::gov::Activity::idle);
+    goalSamples.push_back({p.ms, *p.watts, still});
+    while (!goalSamples.empty() && p.ms - goalSamples.front().ms > 30 * 60000) goalSamples.pop_front();
+}
+struct GoalAverage { double watts = 0, minutes = 0; };
+GoalAverage goalAverage(bool still) {
+    // Time-weighted: each sample counts until the next one (at most 30 s).
+    GoalAverage a; double energy = 0, seconds = 0;
+    for (size_t i = 0; i < goalSamples.size(); ++i) {
+        if (goalSamples[i].still != still) continue;
+        const double span = i + 1 < goalSamples.size() ? std::min(30.0, (goalSamples[i + 1].ms - goalSamples[i].ms) / 1000.0) : 6.0;
+        energy += goalSamples[i].watts * span; seconds += span;
+    }
+    if (seconds > 0) { a.watts = energy / seconds; a.minutes = seconds / 60; }
+    return a;
+}
+// What the lab measured for a setting: the smallest and largest clear saving over its activities.
+struct Measured { double low = 0, high = 0; int count = 0; std::wstring arms; };
+Measured measuredSaving(const wchar_t* knob) {
+    Measured m;
+    if (!labController) return m;
+    const std::wstring prefix = knob;
+    for (const auto& r : labController->status().results) {
+        if (r.experiment.compare(0, prefix.size(), prefix) != 0 || (r.experiment.size() > prefix.size() && r.experiment[prefix.size()] != L'@')) continue;
+        if (r.arm0.empty() || r.arm1.empty() || r.battery.pairs < 2) continue;
+        const bool coreClear = r.core.significant() && r.core.difference * r.battery.difference > 0;
+        if (!r.battery.significant() && !coreClear) continue;
+        const double saving = r.battery.significant() ? std::abs(r.battery.difference) : std::abs(r.core.difference);
+        if (!m.count) { m.low = m.high = saving; m.arms = r.battery.difference < 0 ? labArm(r.arm1) : labArm(r.arm0); }
+        m.low = std::min(m.low, saving); m.high = std::max(m.high, saving); ++m.count;
+    }
+    return m;
+}
+std::wstring wattRange(const Measured& m) {
+    return m.high - m.low < .1 ? tr(L"約 −") + number(m.high, 1) + L" W" : tr(L"約 −") + number(m.low, 1) + L"～" + number(m.high, 1) + L" W";
+}
+std::wstring goalText() {
+    std::wstring c;
+    if (!goalUse) c = tr(L"沒有設定目標（可在「設定 → 省電目標」選擇）。");
+    else c = tr(L"目標：使用時 ") + std::to_wstring(goalUse) + tr(L" W 以下、靜態時 ") + std::to_wstring(goalStill) + tr(L" W 以下。只算用電池的時間，自動測試期間不算。");
+    const auto use = goalAverage(false), still = goalAverage(true);
+    c += tr(L"\n\n最近 30 分鐘");
+    auto line = [&](const wchar_t* label, const GoalAverage& a, unsigned goal) {
+        c += L"\n" + std::wstring(tr(label));
+        if (a.minutes < 1) { c += tr(L"：資料不足（用電池至少 1 分鐘）"); return; }
+        c += L"：" + number(a.watts, 1) + L" W（" + number(a.minutes, 0) + tr(L" 分鐘）");
+        if (goal) c += a.watts <= goal ? tr(L" · 已達成") : tr(L" · 比目標多 ") + number(a.watts - goal, 1) + L" W";
+    };
+    line(L"使用中", use, goalUse);
+    line(L"靜態（1 分鐘沒操作）", still, goalStill);
+    if (!current.history.empty() && current.history.back().watts && !current.history.back().onAc)
+        c += tr(L"\n現在：") + number(*current.history.back().watts, 1) + L" W";
+    // Changes, ranked by what they save. Measured ones come from the lab on this PC.
+    struct Tip { double watts; std::wstring text; };
+    std::vector<Tip> tips;
+    auto measuredTip = [&](const wchar_t* knob, const std::wstring& what, const std::wstring& now, double guess, const std::wstring& guessText) {
+        const auto m = measuredSaving(knob);
+        const std::wstring colon = english ? L": " : L"：";
+        if (m.count) tips.push_back({m.high, what + colon + wattRange(m) + tr(L"（這台實測）") + now});
+        else tips.push_back({guess, what + colon + guessText + now});
+    };
+    const auto modes = queryPowerModes();
+    if (modes.dcKnown && modes.dc != PowerMode::efficiency)
+        measuredTip(L"power-mode", tr(L"用電池時的電源模式改「最佳電源效率」（⋯ → 電源模式）"), std::wstring(tr(L" · 目前：")) + modeName(modes.dc), 1.5, tr(L"通常可省 1～3 W（尚未量測）"));
+    DWORD value = 0;
+    if (bs::lab::readKnob(bs::lab::Knob::refreshRate, value) == ERROR_SUCCESS && value > 60)
+        measuredTip(L"refresh", tr(L"螢幕改 60 Hz（Windows 設定 → 顯示器 → 進階顯示）"), tr(L" · 目前：") + std::to_wstring(value) + L" Hz", .7, tr(L"通常可省 0.5～1 W（尚未量測）"));
+    if (bs::lab::readKnob(bs::lab::Knob::cpuBoost, value) == ERROR_SUCCESS && value != 0)
+        measuredTip(L"cpu-boost", tr(L"用電池時關閉 CPU Boost"), tr(L" · 目前：開"), 3, tr(L"輕度使用通常可省 3～5 W（尚未量測）"));
+    if (bs::lab::readKnob(bs::lab::Knob::darkMode, value) == ERROR_SUCCESS && value == 0)
+        measuredTip(L"dark-mode", tr(L"Windows 與網頁改深色模式（OLED 螢幕）"), tr(L" · 目前：淺色"), .8, tr(L"OLED 上白底網頁比深色多耗電（尚未量測，跑一次自動測試就會知道）"));
+    {
+        const auto m = measuredSaving(L"brightness");
+        if (m.count) tips.push_back({m.high, tr(L"螢幕亮度每降 40%：") + wattRange(m) + tr(L"（這台實測）")});
+        else tips.push_back({.6, tr(L"螢幕亮度調低：OLED 上白底畫面影響最大（尚未量測）")});
+    }
+    {
+        // Busy background programs right now (CPU watts, averaged).
+        std::vector<const ProcessRow*> busy;
+        for (const auto& row : current.processes)
+            if (row.averageCpuWatts && *row.averageCpuWatts >= .1 && row.pid != GetCurrentProcessId()) busy.push_back(&row);
+        std::sort(busy.begin(), busy.end(), [](const ProcessRow* a, const ProcessRow* b) { return *a->averageCpuWatts > *b->averageCpuWatts; });
+        double total = 0; std::wstring names;
+        for (size_t i = 0; i < busy.size() && i < 5; ++i) {
+            total += *busy[i]->averageCpuWatts;
+            names += (i ? std::wstring(tr(L"、")) : std::wstring()) + busy[i]->name + L" " + number(*busy[i]->averageCpuWatts, 2) + L" W";
+        }
+        if (!names.empty()) tips.push_back({total, tr(L"關閉不用的程式（現在的 CPU 耗電）：") + names});
+    }
+    std::sort(tips.begin(), tips.end(), [](const Tip& a, const Tip& b) { return a.watts > b.watts; });
+    c += tr(L"\n\n可以怎麼省（省最多的在前）");
+    if (tips.empty()) c += tr(L"\n目前的設定都已是最省電的選擇。");
+    for (size_t i = 0; i < tips.size(); ++i) c += L"\n" + std::to_wstring(i + 1) + L". " + tips[i].text;
+    c += tr(L"\n\nWindows 讀不到、但很耗電的：鍵盤背光與機身燈效（關掉約可省 0.5～1 W）、藍牙與外接裝置、獨顯（G-Helper 的 Eco 模式讓它完全斷電）。");
+    if (!labController || labController->status().results.empty())
+        c += tr(L"\n\n跑一次「快速測試」（約 25 分鐘）後，上面會換成這台電腦的實測數字。");
+    return c;
+}
+void showGoalPage() {
+    const LRESULT firstLine = inlinePage == InlinePage::goal ? SendMessageW(inlineText, EM_GETFIRSTVISIBLELINE, 0, 0) : 0;
+    showInlinePage(InlinePage::goal, tr(L"省電目標"), goalText());
+    if (firstLine > 0) SendMessageW(inlineText, EM_LINESCROLL, 0, firstLine);
+    goalPageShownAt = GetTickCount64();
+}
+
 // ----- Settings page -----
 // Every option in one scrolling list, grouped into sections. A row shows its
 // value; clicking it switches or cycles the value through the same commands
 // the menus used.
-enum class Row { section, dynamic, dynamicRefresh, dynamicEco, target, appRules, autoSaver, perfApps, lowBattery, chargeReminder, drainAlert,
+enum class Row { section, dynamic, dynamicRefresh, dynamicEco, target, goal, appRules, autoSaver, perfApps, lowBattery, chargeReminder, drainAlert,
     sleepAlert, theme, style, mascot, trayPercent, mini, language, startup, hotkey, history, clearHistory, updates, checkNow };
 struct SettingRow { Row row; const wchar_t* label; };
 const SettingRow settingRows[] = {
     {Row::section, L"省電"}, {Row::dynamic, L"動態省電（實驗功能）"}, {Row::dynamicRefresh, L"動態切換螢幕更新率"}, {Row::dynamicEco, L"背景程式自動效率模式"},
-    {Row::target, L"續航目標"}, {Row::appRules, L"程式規則"}, {Row::autoSaver, L"低電量時自動省電"}, {Row::perfApps, L"效能清單"},
+    {Row::target, L"續航目標"}, {Row::goal, L"省電目標"}, {Row::appRules, L"程式規則"}, {Row::autoSaver, L"低電量時自動省電"}, {Row::perfApps, L"效能清單"},
     {Row::section, L"提醒"}, {Row::lowBattery, L"低電量提醒"}, {Row::chargeReminder, L"充電提醒"}, {Row::drainAlert, L"背景耗電提醒"}, {Row::sleepAlert, L"睡眠耗電提醒"},
     {Row::section, L"外觀"}, {Row::theme, L"主題"}, {Row::style, L"風格"}, {Row::mascot, L"電池小精靈"}, {Row::trayPercent, L"系統匣顯示電量"},
     {Row::mini, L"迷你浮動視窗"}, {Row::language, L"語言 / Language"},
@@ -3257,6 +3383,7 @@ std::wstring rowValue(Row row) {
     case Row::dynamicRefresh: return onOff(dynamicRefresh);
     case Row::dynamicEco: return onOff(dynamicEco);
     case Row::target: return dynamicTarget ? std::to_wstring(dynamicTarget) + tr(L" 小時") : std::wstring(tr(L"無"));
+    case Row::goal: return goalUse ? std::to_wstring(goalUse) + L" W／" + std::to_wstring(goalStill) + L" W" : std::wstring(tr(L"關"));
     case Row::autoSaver: return percentOrOff(autoSaverThreshold);
     case Row::perfApps: return std::to_wstring(performanceApps.size()) + tr(L" 個");
     case Row::appRules: {
@@ -3313,6 +3440,7 @@ int rowCommand(Row row) {
     case Row::dynamicRefresh: return DynamicRefreshId;
     case Row::dynamicEco: return DynamicEcoId;
     case Row::target: return DynamicTargetId;
+    case Row::goal: return GoalCycleId;
     case Row::autoSaver: { const unsigned v = next(autoSaverThreshold, {0, 20, 30}); return v == 0 ? AutoSaverOffId : v == 20 ? AutoSaver20Id : AutoSaver30Id; }
     case Row::perfApps: return PerfAppsPageId;
     case Row::lowBattery: return LowBatteryOffId + int(next(lowBatteryThreshold, {0, 10, 20, 30}) / 10);
@@ -3419,6 +3547,7 @@ std::vector<MenuItem> mainMenuItems() {
     if (!dynamicEnabled) dynamic.hint = tr(L"關");
     items.push_back(dynamic);
     items.push_back(menuItem(DynamicPageId, tr(L"動態省電狀態")));
+    items.push_back(menuItem(GoalPageId, tr(L"省電目標")));
     items.push_back(menuSeparator());
     items.push_back(menuItem(PowerDetailsId, tr(L"電池與充電詳情")));
     items.push_back(menuItem(HistoryId, tr(L"歷史紀錄（7 天）")));
@@ -3427,10 +3556,14 @@ std::vector<MenuItem> mainMenuItems() {
     items.push_back(menuSeparator());
     const auto labStatus = labController ? labController->status() : bs::lab::Controller::Status{};
     std::vector<MenuItem> lab;
-    auto automatic = menuItem(LabAutoId, labStatus.running && labStatus.plan ? tr(L"停止自動測試") : tr(L"一鍵自動測試"), false,
-        preview || (labStatus.running && !labStatus.plan));
-    if (!(labStatus.running && labStatus.plan)) automatic.hint = tr(L"約 1.5 小時");
-    lab.push_back(automatic);
+    if (labStatus.running && labStatus.plan) lab.push_back(menuItem(LabAutoId, tr(L"停止自動測試"), false, preview));
+    else {
+        auto quick = menuItem(LabQuickId, tr(L"快速測試"), false, preview || labStatus.running);
+        quick.hint = tr(L"約 25 分鐘");
+        auto full = menuItem(LabAutoId, tr(L"完整測試"), false, preview || labStatus.running);
+        full.hint = tr(L"約 1.3 小時");
+        lab.push_back(quick); lab.push_back(full);
+    }
     lab.push_back(menuItem(LabPageId, tr(L"查看實驗室")));
     lab.push_back(menuItem(LabRecordId, tr(L"記錄詳細資料"), labStatus.recording, preview));
     std::vector<MenuItem> single;
@@ -3486,6 +3619,7 @@ void applyLanguage(bool useEnglish) {
     if (inlinePage == InlinePage::lab) showLabPage();
     if (inlinePage == InlinePage::settings) showSettingsPage();
     if (inlinePage == InlinePage::dynamic) showDynamicPage();
+    if (inlinePage == InlinePage::goal) showGoalPage();
     if (inlinePage == InlinePage::confirm && pendingForceRow) showForceConfirmation(*pendingForceRow);
     notice = tr(L"正在讀取電池與程序資料…"); noticeUntil = 0;
     if (tooltip) SendMessageW(tooltip, TTM_POP, 0, 0);
@@ -3831,6 +3965,15 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (id == LabPageId) { showLabPage(); return 0; }
         if (id == SettingsPageId) { showMain(); showSettingsPage(); return 0; }
         if (id == DynamicPageId) { showMain(); showDynamicPage(); return 0; }
+        if (id == GoalPageId) { showMain(); showGoalPage(); return 0; }
+        if (id == GoalCycleId) {
+            if (demo || isolatedPreview) return 0;
+            // 10/7 W -> 12/8 W -> 8/6 W -> off -> 10/7 W
+            if (goalUse == 10) { goalUse = 12; goalStill = 8; } else if (goalUse == 12) { goalUse = 8; goalStill = 6; }
+            else if (goalUse == 8) { goalUse = 0; goalStill = 0; } else { goalUse = 10; goalStill = 7; }
+            writeSetting(L"GoalUse", goalUse); writeSetting(L"GoalStill", goalStill);
+            return 0;
+        }
         if (id == DynamicToggleId) { if (!demo && !isolatedPreview) setDynamic(!dynamicEnabled); return 0; }
         if (id == DynamicRefreshId || id == DynamicEcoId || id == DynamicTargetId) {
             if (demo || isolatedPreview) return 0;
@@ -3862,15 +4005,17 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         }
         if (id == LabStopId && labController) { labController->stop(); setNotice(tr(L"實驗已停止，設定已還原。")); showLabPage(); return 0; }
         if (id == LabExportId) { exportLab(); return 0; }
-        if ((id == LabAutoId || id == LabAutoStartId) && labController && labEngine) {
-            if (autoTestActive && id == LabAutoStartId) return 0; // already running
+        if ((id == LabAutoId || id == LabAutoStartId || id == LabQuickId || id == LabQuickStartId) && labController && labEngine) {
+            if (autoTestActive && (id == LabAutoStartId || id == LabQuickStartId)) return 0; // already running
             if (autoTestActive) { // second click: stop
                 labController->stop(); labEngine->stop(); autoTestActive = false; updateSensing(); flushDetectionLog();
                 setNotice(tr(L"自動測試已停止，設定已還原。"));
                 std::thread([target = mainWindow] { bs::lab::writeSystemSnapshot(bs::lab::labFolder()); PostMessageW(target, LabExportMessage, 1, 0); }).detach();
                 return 0;
             }
-            const DWORD result = labController->startPlan(bs::lab::automaticPlan(!bs::lab::WorkloadEngine::browserPath().empty()));
+            const bool browser = !bs::lab::WorkloadEngine::browserPath().empty();
+            const bool quick = id == LabQuickId || id == LabQuickStartId;
+            const DWORD result = labController->startPlan(quick ? bs::lab::quickPlan(browser) : bs::lab::automaticPlan(browser));
             if (result) { setNotice(tr(L"無法開始自動測試：") + errorText(result)); showLabPage(); return 0; }
             autoTestActive = true;
             detectionTally = {}; detectionLog.clear(); lastTallyMs = 0;
@@ -3964,6 +4109,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         checkDrainAlert();
         checkBatteryNotices();
         applyAutoPowerRules();
+        recordGoalSample();
+        if (inlinePage == InlinePage::goal && !hidden && GetTickCount64() - goalPageShownAt >= 10000) showGoalPage();
         return 0;
     }
     case ActionMessage: {
@@ -4375,6 +4522,11 @@ bool panelSelfTest(const std::wstring& path) {
     GetWindowTextW(inlineText, dynamicBody.data(), int(dynamicBody.size()));
     check("dynamic_page_explains_state", inlinePage == InlinePage::dynamic && dynamicBody.find(L"BatteryScope") == std::wstring::npos && dynamicBody.find(L"G-Helper") != std::wstring::npos);
     SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
+    SendMessageW(mainWindow, WM_COMMAND, GoalPageId, 0);
+    std::wstring goalBody(size_t(GetWindowTextLengthW(inlineText)) + 1, L'\0');
+    GetWindowTextW(inlineText, goalBody.data(), int(goalBody.size()));
+    check("goal_page_shows_goal_and_tips", inlinePage == InlinePage::goal && goalBody.find(L"10 W") != std::wstring::npos && goalBody.find(L"1. ") != std::wstring::npos);
+    SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
     {
         RECT client{}; GetClientRect(mainWindow, &client);
         HDC screen = GetDC(mainWindow), dc = CreateCompatibleDC(screen);
@@ -4707,8 +4859,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (GetLastError() == ERROR_ALREADY_EXISTS && !isolatedPreview && !demo) {
         HWND existing = FindWindowW(ClassName, nullptr);
         // --autotest starts the power lab's automatic test in the copy that is already running.
-        if (existing) PostMessageW(existing, WM_COMMAND, option(L"--autotest") ? LabAutoStartId : TrayShow, 0);
-        if (existing && !option(L"--autotest")) SetForegroundWindow(existing);
+        if (existing) PostMessageW(existing, WM_COMMAND, option(L"--autotest") ? LabAutoStartId : option(L"--quicktest") ? LabQuickStartId : TrayShow, 0);
+        if (existing && !option(L"--autotest") && !option(L"--quicktest")) SetForegroundWindow(existing);
         return 0;
     }
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -4765,6 +4917,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         }
         worker = std::thread(sampleLoop);
         if (option(L"--autotest") && labController) PostMessageW(window, WM_COMMAND, LabAutoStartId, 0);
+        if (option(L"--quicktest") && labController) PostMessageW(window, WM_COMMAND, LabQuickStartId, 0);
     }
     applyLanguage(english);
     if (!demo && !isolatedPreview && startupState() == StartupState::missingCopy) {
@@ -4781,6 +4934,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (screenshot && option(L"--history")) showHistoryPage();
     if (screenshot && option(L"--settings")) showSettingsPage();
     if (screenshot && option(L"--dynamic")) showDynamicPage();
+    if (screenshot && option(L"--goal")) showGoalPage();
     if (screenshot && option(L"--lab")) showLabPage();
     if (demo) for (size_t i = 0; i + 1 < args.size(); ++i) if (args[i] == L"--card-png") {
         const bool saved = exportShareCard(args[i + 1], false);

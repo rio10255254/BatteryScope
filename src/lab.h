@@ -162,7 +162,8 @@ std::vector<ExperimentResult> analyze(const std::vector<Block>& blocks);
 // brightness, display and backgroundEco are used by the automatic test only:
 // display turns the screen off for a block, backgroundEco puts every background
 // app of this user in EcoQoS (the "App Nap" idea).
-enum class Knob { cpuBoost, energyPreference, refreshRate, powerMode, brightness, display, backgroundEco, count };
+// darkMode switches Windows' app theme (light or dark); on an OLED panel a dark page draws much less power.
+enum class Knob { cpuBoost, energyPreference, refreshRate, powerMode, brightness, display, backgroundEco, darkMode, count };
 constexpr int ManualKnobs = 4; // the first four can also be run one at a time from the menu
 const wchar_t* knobKey(Knob knob); // stable id used in files: cpu-boost, epp, refresh, power-mode
 struct KnobPlan {
@@ -248,6 +249,9 @@ struct Step {
 // The automatic test: each knob under the workloads it can affect. With a
 // browser it uses real web browsing, video and typing; without one, built-in loads.
 std::vector<Step> automaticPlan(bool browser);
+// About 25 minutes: power mode in every activity (detection is scored on all of them),
+// dark mode and brightness on a light page; 30-second blocks.
+std::vector<Step> quickPlan(bool browser);
 std::wstring experimentKey(Knob knob, Workload workload); // "cpu-boost" or "cpu-boost@scroll"
 
 class Controller {

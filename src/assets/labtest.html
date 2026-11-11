@@ -28,6 +28,14 @@
   #video { position: fixed; left: 0; top: 40px; width: 100%; height: calc(100% - 40px); background: #000; object-fit: contain; display: none; }
   #doc { min-height: 80vh; outline: none; background: #f7f7f5; color: #222; padding: 48px 64px; border-radius: 6px; margin-top: 20px;
     font: 16px/1.7 Calibri, "Microsoft JhengHei UI", sans-serif; }
+  /* Windows dark mode (the dark-mode step) turns the page dark, as sites that follow it do. */
+  @media (prefers-color-scheme: dark) {
+    html, body { background: #15171c; color: #d8dce3; }
+    article h1 { color: #f1f3f6; } article h2 { color: #e6e9ee; } article .meta { color: #8b93a1; }
+    .card { border-color: #2c323b; background: #1b1e24; }
+    .ad { background: linear-gradient(90deg, #28323f, #3b4a5c, #28323f); background-size: 200% 100%; }
+    #doc { background: #1e2026; color: #e3e5e8; }
+  }
 </style>
 </head>
 <body>

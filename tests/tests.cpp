@@ -415,6 +415,13 @@ int wmain(int argc, wchar_t** argv) {
         auto results = lab::analyze(blocks);
         check(results.size() == 1 && results[0].battery.pairs == 3 && std::abs(results[0].battery.difference + 1) < 1e-9
             && results[0].arm1 == L"60 Hz", "results pair blocks by run and pair, skipping incomplete pairs");
+        for (int pair = 0; pair < 3; ++pair) for (int arm = 0; arm < 2; ++arm) {
+            lab::Block b; b.experiment = L"refresh"; b.run = 2; b.pair = pair; b.arm = arm; b.armName = arm ? L"60 Hz" : L"90 Hz";
+            b.battery = arm ? 7 : 7.5; b.seconds = 100; blocks.push_back(b);
+        }
+        results = lab::analyze(blocks);
+        check(results.size() == 2 && results[0].battery.pairs == 3 && results[1].battery.pairs == 3,
+            "runs that compared different settings are not pooled into one result");
         lab::Breakdown breakdown;
         auto onBattery = labSample(0, 9, 4, 1.5, lab::Context::interactive); onBattery.dgpuState = 0; onBattery.dgpuApps = L"game.exe;chrome.exe";
         breakdown.add(onBattery, 10); breakdown.add(pluggedSample, 10);
@@ -476,10 +483,20 @@ int wmain(int argc, wchar_t** argv) {
         // Automatic test plan and its preparation phase.
         const auto browserPlan = lab::automaticPlan(true), builtInPlan = lab::automaticPlan(false);
         auto noScreenOff = [](const std::vector<lab::Step>& plan) { return std::none_of(plan.begin(), plan.end(), [](const lab::Step& step) { return step.knob == lab::Knob::display; }); };
-        check(browserPlan.size() == 17 && noScreenOff(browserPlan) && noScreenOff(builtInPlan)
+        check(browserPlan.size() == 16 && noScreenOff(browserPlan) && noScreenOff(builtInPlan)
             && std::any_of(browserPlan.begin(), browserPlan.end(), [](const lab::Step& step) { return step.knob == lab::Knob::powerMode && step.workload == lab::Workload::sustained; })
             && std::all_of(browserPlan.begin(), browserPlan.end(), [](const lab::Step& step) { return step.pairs == 3 && step.blockSeconds == 45; }),
             "the automatic test covers every setting it can measure, without screen-off (standby would end it)");
+        {
+            const auto quick = lab::quickPlan(true);
+            double seconds = 0; for (const auto& step : quick) seconds += step.prepareSeconds + step.pairs * 2 * step.blockSeconds;
+            check(quick.size() == 7 && seconds <= 30 * 60 && noScreenOff(quick)
+                && std::any_of(quick.begin(), quick.end(), [](const lab::Step& step) { return step.workload == lab::Workload::video; })
+                && std::any_of(quick.begin(), quick.end(), [](const lab::Step& step) { return step.knob == lab::Knob::darkMode; }),
+                "the quick test takes under half an hour and still covers every activity and dark mode");
+        }
+        check(std::any_of(browserPlan.begin(), browserPlan.end(), [](const lab::Step& step) { return step.knob == lab::Knob::darkMode && step.workload == lab::Workload::browse; })
+            && lab::knobKey(lab::Knob::darkMode) == std::wstring(L"dark-mode"), "dark mode is measured on a browsed page");
         check(std::any_of(browserPlan.begin(), browserPlan.end(), [](const lab::Step& step) { return step.workload == lab::Workload::video && step.prepareSeconds >= 15; })
             && std::none_of(builtInPlan.begin(), builtInPlan.end(), [](const lab::Step& step) { return step.workload == lab::Workload::video; }),
             "real video runs only with a browser, after time to record the clip");
