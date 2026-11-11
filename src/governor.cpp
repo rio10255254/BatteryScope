@@ -29,6 +29,7 @@ Activity stretched(Activity a) {
     }
 }
 constexpr DWORD Efficiency = 0, Balanced = 1, Performance = 2; // PowerMode
+constexpr DWORD FirmwareBalanced = 0, Silent = 2;               // ASUS firmware mode
 // Values parsed from the lab's arm names, which BatteryScope itself writes.
 std::optional<DWORD> armValue(Setting setting, const std::wstring& name) {
     auto number = [&]() -> std::optional<DWORD> {
@@ -47,6 +48,11 @@ std::optional<DWORD> armValue(Setting setting, const std::wstring& name) {
         if (name == L"Boost 開") return 2u;
         return std::nullopt;
     case Setting::energyPreference: case Setting::refreshRate: return number();
+    case Setting::firmwareMode:
+        if (name == L"靜音") return 2u;
+        if (name == L"平衡") return 0u;
+        if (name == L"Turbo") return 1u;
+        return std::nullopt;
     default: return std::nullopt;
     }
 }
@@ -65,6 +71,7 @@ lab::Knob knobFor(Setting s) {
     case Setting::powerMode: return lab::Knob::powerMode;
     case Setting::energyPreference: return lab::Knob::energyPreference;
     case Setting::cpuBoost: return lab::Knob::cpuBoost;
+    case Setting::firmwareMode: return lab::Knob::asusMode;
     default: return lab::Knob::refreshRate;
     }
 }
@@ -84,6 +91,7 @@ std::vector<Evidence> learn(const std::vector<lab::ExperimentResult>& results) {
         else if (knob == L"epp") setting = Setting::energyPreference;
         else if (knob == L"cpu-boost") setting = Setting::cpuBoost;
         else if (knob == L"refresh") setting = Setting::refreshRate;
+        else if (knob == L"asus-mode") setting = Setting::firmwareMode;
         if (!setting) continue;
         // Which arm used less power, and what choosing it costs.
         const bool secondSaves = r.battery.difference < 0;
@@ -114,13 +122,27 @@ double Governor::minimumGap(Setting s) {
     switch (s) {
     case Setting::energyPreference: return 4;
     case Setting::refreshRate: return 30;
+    case Setting::firmwareMode: return 20; // the fans follow it, so it should not flap
     default: return 8;
     }
 }
 int Governor::direction(Setting s, DWORD a, DWORD b) {
     if (a == b) return 0;
     if (s == Setting::energyPreference) return b < a ? 1 : -1; // lower EPP favours performance
+    if (s == Setting::firmwareMode) {                            // silent < balanced < turbo
+        auto order = [](DWORD v) { return v == 2 ? 0 : v == 0 ? 1 : 2; };
+        return order(b) > order(a) ? 1 : -1;
+    }
     return b > a ? 1 : -1;                                     // power mode, boost, refresh rate
+}
+void Governor::hold(Setting s) {
+    held_[size_t(s)] = true;
+    pausedUntil_[size_t(s)] = UINT64_MAX;
+    lastSet_[size_t(s)].reset(); // the user's value is kept when plugging in
+}
+void Governor::release(Setting s) {
+    held_[size_t(s)] = false;
+    pausedUntil_[size_t(s)] = 0; changedAt_[size_t(s)] = 0;
 }
 void Governor::note(const std::wstring& text) {
     log.push_back(text);
@@ -137,14 +159,15 @@ Profile Governor::profileFor(Activity activity, int stretch) const {
     // for a few milliseconds of response, and CPU Boost cost about 5 W in light use. So
     // everything except a burst, heavy work and calls runs in efficiency with Boost off;
     // bursts and heavy work get balanced and the user's own Boost setting.
-    case Activity::idle: set(Setting::powerMode, Efficiency); set(Setting::energyPreference, 90u); set(Setting::cpuBoost, 0u); set(Setting::refreshRate, low); break;
-    case Activity::reading: set(Setting::powerMode, Efficiency); set(Setting::energyPreference, 80u); set(Setting::cpuBoost, 0u); set(Setting::refreshRate, low); break;
-    case Activity::media: set(Setting::powerMode, Efficiency); set(Setting::energyPreference, 80u); set(Setting::cpuBoost, 0u); set(Setting::refreshRate, low); break;
-    case Activity::interactive: set(Setting::powerMode, Efficiency); set(Setting::energyPreference, 70u); set(Setting::cpuBoost, 0u); set(Setting::refreshRate, top); break;
-    case Activity::responsive: set(Setting::powerMode, Efficiency); set(Setting::energyPreference, 50u); set(Setting::cpuBoost, 0u); set(Setting::refreshRate, top); break;
-    case Activity::burst: set(Setting::powerMode, Balanced); set(Setting::energyPreference, 33u); set(Setting::refreshRate, top); break;
-    case Activity::call: set(Setting::powerMode, Balanced); set(Setting::energyPreference, 55u); set(Setting::cpuBoost, 0u); break;
-    case Activity::heavy: set(Setting::powerMode, Balanced); set(Setting::energyPreference, 30u); break;
+    // ASUS laptops: the firmware's silent mode for light use, balanced for bursts, calls and heavy work.
+    case Activity::idle: set(Setting::powerMode, Efficiency); set(Setting::energyPreference, 90u); set(Setting::cpuBoost, 0u); set(Setting::refreshRate, low); set(Setting::firmwareMode, Silent); break;
+    case Activity::reading: set(Setting::powerMode, Efficiency); set(Setting::energyPreference, 80u); set(Setting::cpuBoost, 0u); set(Setting::refreshRate, low); set(Setting::firmwareMode, Silent); break;
+    case Activity::media: set(Setting::powerMode, Efficiency); set(Setting::energyPreference, 80u); set(Setting::cpuBoost, 0u); set(Setting::refreshRate, low); set(Setting::firmwareMode, Silent); break;
+    case Activity::interactive: set(Setting::powerMode, Efficiency); set(Setting::energyPreference, 70u); set(Setting::cpuBoost, 0u); set(Setting::refreshRate, top); set(Setting::firmwareMode, Silent); break;
+    case Activity::responsive: set(Setting::powerMode, Efficiency); set(Setting::energyPreference, 50u); set(Setting::cpuBoost, 0u); set(Setting::refreshRate, top); set(Setting::firmwareMode, Silent); break;
+    case Activity::burst: set(Setting::powerMode, Balanced); set(Setting::energyPreference, 33u); set(Setting::refreshRate, top); set(Setting::firmwareMode, FirmwareBalanced); break;
+    case Activity::call: set(Setting::powerMode, Balanced); set(Setting::energyPreference, 55u); set(Setting::cpuBoost, 0u); set(Setting::firmwareMode, FirmwareBalanced); break;
+    case Activity::heavy: set(Setting::powerMode, Balanced); set(Setting::energyPreference, 30u); set(Setting::firmwareMode, FirmwareBalanced); break;
     default: break; // game: everything as the user had it
     }
     // Lab evidence: a vetoed saving leaves the setting alone; a proven one is used.
@@ -173,6 +196,7 @@ Decision Governor::update(const Input& in) {
             for (size_t s = 0; s < Settings; ++s) if (lastSet_[s] && originals_[s]) d.apply[s] = originals_[s];
             for (const auto& app : throttled_) d.ecoOff.push_back(app);
             throttled_.clear(); busySince_.clear(); lastSet_ = {};
+            held_ = {}; pausedUntil_ = {}; // holds and pauses last one battery session
             active_ = false; d.restore = true; d.reason = L"插電：已還原";
             note(d.reason);
         }

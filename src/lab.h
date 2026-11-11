@@ -163,7 +163,8 @@ std::vector<ExperimentResult> analyze(const std::vector<Block>& blocks);
 // display turns the screen off for a block, backgroundEco puts every background
 // app of this user in EcoQoS (the "App Nap" idea).
 // darkMode switches Windows' app theme (light or dark); on an OLED panel a dark page draws much less power.
-enum class Knob { cpuBoost, energyPreference, refreshRate, powerMode, brightness, display, backgroundEco, darkMode, count };
+// asusMode is the ASUS firmware performance mode (silent / balanced / turbo), on ASUS laptops only.
+enum class Knob { cpuBoost, energyPreference, refreshRate, powerMode, brightness, display, backgroundEco, darkMode, asusMode, count };
 constexpr int ManualKnobs = 4; // the first four can also be run one at a time from the menu
 const wchar_t* knobKey(Knob knob); // stable id used in files: cpu-boost, epp, refresh, power-mode
 struct KnobPlan {
@@ -210,6 +211,9 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+// Programs using the discrete GPU in these "GPU Engine" counter instances (by process
+// name), or empty; checked before the discrete GPU is switched off.
+std::vector<std::wstring> discreteGpuUsers(const std::vector<std::pair<std::wstring, double>>& gpu, const std::vector<ProcessRow>& processes);
 // EcoQoS for one process (no priority change), checked against its start time.
 DWORD setProcessEco(uint32_t pid, uint64_t created, bool on);
 

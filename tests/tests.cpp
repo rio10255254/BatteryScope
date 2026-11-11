@@ -3,6 +3,7 @@
 #include "../src/update.h"
 #include "../src/lab.h"
 #include "../src/governor.h"
+#include "../src/asus.h"
 #include "../src/motion.h"
 #include "../src/i18n.h"
 #include <shellapi.h>
@@ -483,17 +484,34 @@ int wmain(int argc, wchar_t** argv) {
         // Automatic test plan and its preparation phase.
         const auto browserPlan = lab::automaticPlan(true), builtInPlan = lab::automaticPlan(false);
         auto noScreenOff = [](const std::vector<lab::Step>& plan) { return std::none_of(plan.begin(), plan.end(), [](const lab::Step& step) { return step.knob == lab::Knob::display; }); };
-        check(browserPlan.size() == 16 && noScreenOff(browserPlan) && noScreenOff(builtInPlan)
+        check(browserPlan.size() == 19 && noScreenOff(browserPlan) && noScreenOff(builtInPlan)
             && std::any_of(browserPlan.begin(), browserPlan.end(), [](const lab::Step& step) { return step.knob == lab::Knob::powerMode && step.workload == lab::Workload::sustained; })
             && std::all_of(browserPlan.begin(), browserPlan.end(), [](const lab::Step& step) { return step.pairs == 3 && step.blockSeconds == 45; }),
             "the automatic test covers every setting it can measure, without screen-off (standby would end it)");
         {
             const auto quick = lab::quickPlan(true);
             double seconds = 0; for (const auto& step : quick) seconds += step.prepareSeconds + step.pairs * 2 * step.blockSeconds;
-            check(quick.size() == 7 && seconds <= 30 * 60 && noScreenOff(quick)
+            check(quick.size() == 9 && seconds <= 30 * 60 && noScreenOff(quick)
                 && std::any_of(quick.begin(), quick.end(), [](const lab::Step& step) { return step.workload == lab::Workload::video; })
                 && std::any_of(quick.begin(), quick.end(), [](const lab::Step& step) { return step.knob == lab::Knob::darkMode; }),
                 "the quick test takes under half an hour and still covers every activity and dark mode");
+        }
+        {
+            // ASUS firmware answers: bit 16 marks a present device, the value is the low 16 bits.
+            check(asus::decode(0x00010002).present && asus::decode(0x00010002).value() == 2 && !asus::decode(0xFFFFFFFE).present && !asus::decode(0x2).present,
+                "ASUS firmware readings are decoded and absent devices recognised");
+            check(lab::knobKey(lab::Knob::asusMode) == std::wstring(L"asus-mode") && gov::knobFor(gov::Setting::firmwareMode) == lab::Knob::asusMode,
+                "the ASUS performance mode is both an experiment and a dynamic saving setting");
+            gov::Governor fw;
+            check(fw.profileFor(gov::Activity::reading, 0).values[size_t(gov::Setting::firmwareMode)] == DWORD(2)
+                && fw.profileFor(gov::Activity::heavy, 0).values[size_t(gov::Setting::firmwareMode)] == DWORD(0)
+                && !fw.profileFor(gov::Activity::game, 0).values[size_t(gov::Setting::firmwareMode)],
+                "silent firmware mode for light use, balanced for heavy work, untouched in games");
+            lab::ExperimentResult silent; silent.experiment = L"asus-mode@browse"; silent.arm0 = L"平衡"; silent.arm1 = L"靜音";
+            silent.battery = lab::comparePairs({{14, 12.5}, {14.2, 12.6}, {13.9, 12.4}});
+            const auto silentEvidence = gov::learn({silent});
+            check(!silentEvidence.empty() && silentEvidence[0].setting == gov::Setting::firmwareMode && silentEvidence[0].savingValue == 2 && silentEvidence[0].approved,
+                "a measured silent-mode saving becomes evidence for the firmware setting");
         }
         check(std::any_of(browserPlan.begin(), browserPlan.end(), [](const lab::Step& step) { return step.knob == lab::Knob::darkMode && step.workload == lab::Workload::browse; })
             && lab::knobKey(lab::Knob::darkMode) == std::wstring(L"dark-mode"), "dark mode is measured on a browsed page");
@@ -703,6 +721,21 @@ int wmain(int argc, wchar_t** argv) {
             check(fast.activity() == Activity::reading, "and saves once it has held");
             fi.actual[size_t(Setting::powerMode)] = 2; // the user picks best performance
             auto overridden = feed(Activity::reading, 1);
+            // A value the user chose in BatteryScope is held for the battery session, then handed back.
+            {
+                gov::Governor h; gov::Input hi; hi.onBattery = true; hi.actual = {DWORD(2), DWORD(60), DWORD(0), DWORD(120)}; hi.detected = Activity::reading; hi.ms = 1000;
+                auto apply = [&](const gov::Decision& d) { for (size_t i = 0; i < d.apply.size(); ++i) if (d.apply[i]) hi.actual[i] = *d.apply[i]; };
+                apply(h.update(hi));
+                check(hi.actual[size_t(Setting::powerMode)] == DWORD(0), "reading saves power");
+                hi.actual[size_t(Setting::powerMode)] = 1; h.hold(Setting::powerMode); // the user picks balanced
+                for (int i = 0; i < 30; ++i) { hi.ms += 60000; apply(h.update(hi)); }
+                check(hi.actual[size_t(Setting::powerMode)] == DWORD(1) && h.held(Setting::powerMode), "a held setting is left alone, even after half an hour");
+                h.release(Setting::powerMode); hi.ms += 60000; apply(h.update(hi));
+                check(hi.actual[size_t(Setting::powerMode)] == DWORD(0), "handed back, it is managed again at once");
+                h.hold(Setting::powerMode); hi.actual[size_t(Setting::powerMode)] = 1;
+                hi.onBattery = false; hi.ms += 1000; auto plugged = h.update(hi);
+                check(!plugged.apply[size_t(Setting::powerMode)] && !h.held(Setting::powerMode), "plugging in keeps the held value and ends the hold");
+            }
             // Bursts, low battery and a vetoed efficiency mode.
             {
                 gov::Detector burstDetector; gov::Observation bo; bo.ms = 1000; bo.idleSeconds = 0; bo.activeSeconds = 0.5; bo.lastInput = gov::InputKind::click;
