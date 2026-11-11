@@ -282,6 +282,238 @@ void card(HDC dc, RECT rect, COLORREF color, int radius) {
 int textWidth(HDC dc, const std::wstring& text, HFONT face) {
     font(dc, fontFor(face, text)); SIZE size{}; GetTextExtentPoint32W(dc, text.c_str(), int(text.size()), &size); return size.cx;
 }
+// ----- Menus -----
+// One menu look for the whole app instead of the Windows popup menu: the same
+// surface, borders, fonts and pixel or smooth style as the panel, larger rows,
+// a check pill for options that are on, and submenus that open in place with a
+// back row (no flyouts drifting off the panel). Works with the mouse, the
+// keyboard (arrows, Enter, Esc, Left/Backspace for back) and touch.
+struct MenuItem {
+    int id = 0;                       // command sent on choose; 0 for separators and submenus
+    std::wstring label, hint;         // hint: a short value on the right, e.g. "開"
+    bool checked = false, disabled = false, separator = false;
+    std::vector<MenuItem> children;   // non-empty: a submenu
+};
+MenuItem menuItem(int id, const std::wstring& label, bool checked = false, bool disabled = false) {
+    MenuItem item; item.id = id; item.label = label; item.checked = checked; item.disabled = disabled; return item;
+}
+MenuItem menuSeparator() { MenuItem item; item.separator = true; return item; }
+MenuItem submenu(const std::wstring& label, std::vector<MenuItem> children, bool disabled = false) {
+    MenuItem item; item.label = label; item.children = std::move(children); item.disabled = disabled; return item;
+}
+struct MenuState {
+    std::vector<const std::vector<MenuItem>*> levels; // the open level is last
+    std::vector<std::wstring> titles;
+    int hover = -1, chosen = 0;
+    bool done = false;
+    const std::vector<MenuItem>& items() const { return *levels.back(); }
+    bool nested() const { return levels.size() > 1; }
+};
+constexpr wchar_t PopupClass[] = L"BatteryScope.Menu.v1";
+int menuRowHeight(const MenuItem& item) { return item.separator ? sp(11) : sp(36); }
+int menuHeaderHeight(const MenuState& state) { return state.nested() ? sp(38) : 0; }
+int menuPadding() { return sp(6); }
+SIZE menuSize(HDC dc, const MenuState& state) {
+    int width = sp(212), height = menuPadding() * 2 + menuHeaderHeight(state);
+    for (const auto& item : state.items()) {
+        height += menuRowHeight(item);
+        if (!item.separator) width = std::max(width, textWidth(dc, item.label, normalFont) + sp(item.children.empty() ? 92 : 64));
+    }
+    if (state.nested()) width = std::max(width, textWidth(dc, state.titles.back(), strongFont) + sp(64));
+    return {std::min(width, sp(340)), height};
+}
+// Row rectangles in client coordinates; index -1 is the back header.
+RECT menuRow(const MenuState& state, int index, int width) {
+    int y = menuPadding();
+    if (index < 0) return {menuPadding(), y, width - menuPadding(), y + menuHeaderHeight(state)};
+    y += menuHeaderHeight(state);
+    for (int i = 0; i < index; ++i) y += menuRowHeight(state.items()[size_t(i)]);
+    return {menuPadding(), y, width - menuPadding(), y + menuRowHeight(state.items()[size_t(index)])};
+}
+void drawMenuArrow(HDC dc, int x, int y, int size, COLORREF color, bool left) {
+    // A small chevron; pixel style draws it from square cells.
+    if (pixelStyle) {
+        const int u = std::max(2, size / 4);
+        for (int i = 0; i < 3; ++i) {
+            const int cx = left ? x + (2 - i) * u : x + i * u;
+            fill(dc, {cx, y + i * u, cx + u, y + i * u + u}, color);
+            fill(dc, {cx, y + (4 - i) * u, cx + u, y + (4 - i) * u + u}, color);
+        }
+        return;
+    }
+    HPEN pen = CreatePen(PS_SOLID, std::max(1, sp(2)), color); HGDIOBJ old = SelectObject(dc, pen);
+    const int h = size / 2;
+    if (left) { MoveToEx(dc, x + h, y, nullptr); LineTo(dc, x, y + h); LineTo(dc, x + h + 1, y + size + 1); }
+    else { MoveToEx(dc, x, y, nullptr); LineTo(dc, x + h, y + h); LineTo(dc, x - 1, y + size + 1); }
+    SelectObject(dc, old); DeleteObject(pen);
+}
+void paintMenu(HDC dc, const MenuState& state, RECT client) {
+    const int width = client.right - client.left;
+    fill(dc, client, Background);
+    card(dc, client, Surface, 12);
+    if (!pixelStyle) outline(dc, client, blend(Border, Surface, .2), 12);
+    if (state.nested()) {
+        const RECT header = menuRow(state, -1, width);
+        if (state.hover == -2) rounded(dc, header, blend(Surface, Selected, .55), 8);
+        drawMenuArrow(dc, header.left + sp(12), (header.top + header.bottom) / 2 - sp(5), sp(10), Muted, true);
+        drawText(dc, state.titles.back(), {header.left + sp(30), header.top, header.right - sp(10), header.bottom}, Ink, pixelStyle ? normalFont : strongFont);
+        fill(dc, {header.left + sp(4), header.bottom - 1, header.right - sp(4), header.bottom}, Border);
+    }
+    for (int i = 0; i < int(state.items().size()); ++i) {
+        const auto& item = state.items()[size_t(i)];
+        const RECT row = menuRow(state, i, width);
+        if (item.separator) { fill(dc, {row.left + sp(8), (row.top + row.bottom) / 2, row.right - sp(8), (row.top + row.bottom) / 2 + 1}, Border); continue; }
+        const bool hot = i == state.hover && !item.disabled;
+        if (hot) rounded(dc, {row.left, row.top + sp(1), row.right, row.bottom - sp(1)}, theme.highContrast ? Selected : blend(Surface, Selected, .6), 8);
+        const COLORREF text = item.disabled ? blend(Muted, Surface, .35) : hot && theme.highContrast ? theme.selectedInk : Ink;
+        int right = row.right - sp(12);
+        if (!item.children.empty()) { drawMenuArrow(dc, right - sp(6), (row.top + row.bottom) / 2 - sp(5), sp(10), item.disabled ? text : Muted, false); right -= sp(18); }
+        else if (item.checked || !item.hint.empty()) {
+            // An "on" pill for checked options, or the item's value.
+            const std::wstring value = !item.hint.empty() ? item.hint : std::wstring(tr(L"開"));
+            const int pillWidth = std::max(sp(34), textWidth(dc, value, smallFont) + sp(16));
+            const RECT pill{right - pillWidth, row.top + sp(8), right, row.bottom - sp(8)};
+            rounded(dc, pill, item.checked ? blend(Green, Surface, theme.highContrast ? 0 : .25) : blend(Surface, Border, .9), 6);
+            drawText(dc, value, pill, item.checked ? theme.accentInk : Muted, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            right = pill.left - sp(8);
+        }
+        drawText(dc, item.label, {row.left + sp(12), row.top, right, row.bottom}, text, normalFont);
+    }
+}
+LRESULT CALLBACK menuProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    auto* state = reinterpret_cast<MenuState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    auto hitTest = [&](POINT pt) {
+        RECT client{}; GetClientRect(window, &client);
+        if (state->nested()) { const RECT header = menuRow(*state, -1, client.right); if (PtInRect(&header, pt)) return -2; }
+        for (int i = 0; i < int(state->items().size()); ++i) { const RECT row = menuRow(*state, i, client.right); if (PtInRect(&row, pt)) return i; }
+        return -1;
+    };
+    switch (message) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps{}; HDC target = BeginPaint(window, &ps); RECT r{}; GetClientRect(window, &r);
+        HDC dc = CreateCompatibleDC(target); HBITMAP bitmap = CreateCompatibleBitmap(target, r.right, r.bottom);
+        HGDIOBJ old = SelectObject(dc, bitmap);
+        if (state) paintMenu(dc, *state, r);
+        BitBlt(target, 0, 0, r.right, r.bottom, dc, 0, 0, SRCCOPY);
+        SelectObject(dc, old); DeleteObject(bitmap); DeleteDC(dc); EndPaint(window, &ps); return 0;
+    }
+    case WM_MOUSEMOVE: {
+        if (!state) break;
+        const int hit = hitTest({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+        if (hit != state->hover) { state->hover = hit; InvalidateRect(window, nullptr, FALSE); }
+        TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0}; TrackMouseEvent(&tracking);
+        return 0;
+    }
+    case WM_MOUSELEAVE: if (state && state->hover >= 0) { state->hover = -1; InvalidateRect(window, nullptr, FALSE); } return 0;
+    case WM_LBUTTONUP: case WM_RBUTTONUP: {
+        if (!state) break;
+        const int hit = hitTest({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+        if (hit == -2) { PostMessageW(window, WM_KEYDOWN, VK_LEFT, 0); return 0; }
+        if (hit >= 0) { state->hover = hit; PostMessageW(window, WM_KEYDOWN, VK_RETURN, 0); }
+        return 0;
+    }
+    case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: {
+        // With the mouse captured, a press outside the menu arrives here too and closes it.
+        RECT client{}; GetClientRect(window, &client);
+        const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        if (state && !PtInRect(&client, pt)) { state->done = true; PostMessageW(window, WM_NULL, 0, 0); }
+        return 0;
+    }
+    case WM_ACTIVATE: case WM_CAPTURECHANGED: // switched to another window, or capture lost
+        if (state && (message == WM_CAPTURECHANGED ? HWND(lp) != window : LOWORD(wp) == WA_INACTIVE)) {
+            state->done = true; PostMessageW(window, WM_NULL, 0, 0);
+        }
+        return 0;
+    case WM_KEYDOWN: {
+        if (!state) break;
+        const auto& items = state->items();
+        auto move = [&](int step) {
+            for (int n = 0, i = state->hover; n < int(items.size()); ++n) {
+                i = (i + step + int(items.size())) % int(items.size());
+                if (!items[size_t(i)].separator && !items[size_t(i)].disabled) { state->hover = i; break; }
+            }
+        };
+        if (wp == VK_DOWN) move(1);
+        else if (wp == VK_UP) move(state->hover < 0 ? 0 : -1);
+        else if (wp == VK_ESCAPE && !state->nested()) state->done = true;
+        else if ((wp == VK_LEFT || wp == VK_BACK || wp == VK_ESCAPE) && state->nested()) {
+            state->levels.pop_back(); state->titles.pop_back(); state->hover = -1;
+        } else if ((wp == VK_RETURN || wp == VK_SPACE || wp == VK_RIGHT) && state->hover >= 0 && state->hover < int(items.size())) {
+            const auto& item = items[size_t(state->hover)];
+            if (item.disabled || item.separator) return 0;
+            if (!item.children.empty()) { state->levels.push_back(&item.children); state->titles.push_back(item.label); state->hover = -1; }
+            else if (wp != VK_RIGHT) { state->chosen = item.id; state->done = true; }
+        } else return 0;
+        // Resize for the level now open, keeping the top-left corner in place.
+        RECT bounds{}; GetWindowRect(window, &bounds);
+        HDC dc = GetDC(window); const SIZE size = menuSize(dc, *state); ReleaseDC(window, dc);
+        MONITORINFO monitor{}; monitor.cbSize = sizeof(monitor);
+        GetMonitorInfoW(MonitorFromRect(&bounds, MONITOR_DEFAULTTONEAREST), &monitor);
+        const int top = std::min(bounds.top, monitor.rcWork.bottom - size.cy), left = std::min(bounds.left, monitor.rcWork.right - size.cx);
+        SetWindowPos(window, nullptr, left, top, size.cx, size.cy, SWP_NOZORDER | SWP_NOACTIVATE);
+        InvalidateRect(window, nullptr, FALSE);
+        return 0;
+    }
+    }
+    return DefWindowProcW(window, message, wp, lp);
+}
+// Shows the menu at a screen point (opening upward or leftward to stay on
+// screen) and returns the chosen command, or 0. Runs its own message loop.
+int showMenu(const std::vector<MenuItem>& items, POINT at, HWND owner) {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{}; wc.cbSize = sizeof(wc); wc.lpfnWndProc = menuProc; wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = PopupClass; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW); wc.style = CS_DROPSHADOW;
+        registered = RegisterClassExW(&wc) != 0;
+    }
+    MenuState state; state.levels.push_back(&items); state.titles.push_back(L"");
+    HDC screen = GetDC(nullptr); const SIZE size = menuSize(screen, state); ReleaseDC(nullptr, screen);
+    MONITORINFO monitor{}; monitor.cbSize = sizeof(monitor);
+    GetMonitorInfoW(MonitorFromPoint(at, MONITOR_DEFAULTTONEAREST), &monitor);
+    const RECT work = monitor.rcWork;
+    int x = at.x, y = at.y;
+    if (x + size.cx > work.right) x = std::max(work.left, at.x - size.cx);
+    if (y + size.cy > work.bottom) y = std::max(work.top, at.y - size.cy);
+    HWND window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, PopupClass, L"", WS_POPUP, x, y, size.cx, size.cy, owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!window) return 0;
+    SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(&state));
+    if (!pixelStyle) { DWORD corners = 2; DwmSetWindowAttribute(window, 33, &corners, sizeof(corners)); }
+    ShowWindow(window, SW_SHOW); SetForegroundWindow(window); SetFocus(window); SetCapture(window);
+    MSG message;
+    while (!state.done && GetMessageW(&message, nullptr, 0, 0)) {
+        // A click anywhere else closes the menu without passing the click on.
+        if ((message.message == WM_LBUTTONDOWN || message.message == WM_RBUTTONDOWN || message.message == WM_NCLBUTTONDOWN) && message.hwnd != window) { state.done = true; break; }
+        if (message.message == WM_KEYDOWN && message.hwnd != window) message.hwnd = window;
+        TranslateMessage(&message); DispatchMessageW(&message);
+        if (message.message == WM_QUIT) { PostQuitMessage(int(message.wParam)); break; }
+    }
+    SetWindowLongPtrW(window, GWLP_USERDATA, 0);
+    if (GetCapture() == window) ReleaseCapture();
+    DestroyWindow(window);
+    return state.chosen;
+}
+// The same rendering into a bitmap file, for screenshots and checks.
+bool captureMenu(const std::vector<MenuItem>& items, const std::wstring& path, int open) {
+    MenuState state; state.levels.push_back(&items); state.titles.push_back(L"");
+    if (open >= 0 && open < int(items.size()) && !items[size_t(open)].children.empty()) {
+        state.levels.push_back(&items[size_t(open)].children); state.titles.push_back(items[size_t(open)].label);
+    }
+    state.hover = 1;
+    HDC screen = GetDC(nullptr); const SIZE size = menuSize(screen, state);
+    HDC dc = CreateCompatibleDC(screen);
+    BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(info.bmiHeader); info.bmiHeader.biWidth = size.cx; info.bmiHeader.biHeight = size.cy;
+    info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32;
+    void* pixels = nullptr; HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+    HGDIOBJ old = SelectObject(dc, bitmap);
+    paintMenu(dc, state, {0, 0, size.cx, size.cy}); GdiFlush();
+    BITMAPFILEHEADER file{}; file.bfType = 0x4d42; file.bfOffBits = sizeof(file) + sizeof(BITMAPINFOHEADER); file.bfSize = file.bfOffBits + size.cx * size.cy * 4;
+    std::ofstream output(std::filesystem::path(path), std::ios::binary);
+    output.write(reinterpret_cast<char*>(&file), sizeof(file)); output.write(reinterpret_cast<char*>(&info.bmiHeader), sizeof(info.bmiHeader));
+    output.write(static_cast<char*>(pixels), size.cx * size.cy * 4);
+    const bool ok = output.good();
+    SelectObject(dc, old); DeleteObject(bitmap); DeleteDC(dc); ReleaseDC(nullptr, screen);
+    return ok;
+}
 // "About 1 h 5 min"; empty when there is no usable estimate.
 std::wstring durationText(Value hours) {
     if (!hours || *hours >= 100) return {};
@@ -1609,12 +1841,8 @@ LRESULT CALLBACK miniProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_NCHITTEST: { LRESULT hit = DefWindowProcW(window, message, wp, lp); return hit == HTCLIENT ? HTCAPTION : hit; }
     case WM_NCLBUTTONDBLCLK: showMain(); return 0;
     case WM_NCRBUTTONUP: case WM_CONTEXTMENU: {
-        HMENU menu = CreatePopupMenu();
-        AppendMenuW(menu, MF_STRING, MiniOpenId, tr(L"開啟面板"));
-        AppendMenuW(menu, MF_STRING, MiniToggleId, tr(L"隱藏迷你視窗"));
-        POINT point{}; GetCursorPos(&point); SetForegroundWindow(window);
-        const int chosen = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, window, nullptr);
-        DestroyMenu(menu);
+        POINT point{}; GetCursorPos(&point);
+        const int chosen = showMenu({menuItem(MiniOpenId, tr(L"開啟面板")), menuItem(MiniToggleId, tr(L"隱藏迷你視窗"))}, point, window);
         if (chosen == MiniOpenId) showMain(); else if (chosen == MiniToggleId) PostMessageW(mainWindow, WM_COMMAND, MiniToggleId, 0);
         return 0;
     }
@@ -2886,52 +3114,59 @@ void activateSettingRow(int index) {
     if (inlinePage == InlinePage::settings) InvalidateRect(settingsList, nullptr, FALSE);
 }
 
-void openMenu(POINT point) {
+// The ⋯ menu (also the tray icon's right-click menu).
+std::vector<MenuItem> mainMenuItems() {
     const bool preview = demo || isolatedPreview;
-    HMENU menu = CreatePopupMenu();
+    std::vector<MenuItem> items;
     if (availableUpdate) {
-        AppendMenuW(menu, MF_STRING | (updateBusy ? MF_GRAYED : 0), UpdateInstallId, (tr(L"安裝更新 ") + availableUpdate->version + L"…").c_str());
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        auto update = menuItem(UpdateInstallId, tr(L"安裝更新 ") + availableUpdate->version, false, updateBusy);
+        update.hint = tr(L"新版本"); update.checked = true;
+        items.push_back(update); items.push_back(menuSeparator());
     }
-    AppendMenuW(menu, MF_STRING, PowerModeId, tr(L"電源模式…"));
-    AppendMenuW(menu, MF_STRING | (dynamicEnabled ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), DynamicToggleId, tr(L"動態省電"));
-    AppendMenuW(menu, MF_STRING, DynamicPageId, tr(L"動態省電狀態…"));
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, PowerDetailsId, tr(L"電池與充電詳情"));
-    AppendMenuW(menu, MF_STRING, HistoryId, tr(L"歷史紀錄（7 天）"));
-    AppendMenuW(menu, MF_STRING, LedgerId, tr(L"本次累計耗能"));
-    AppendMenuW(menu, MF_STRING, ReviewCandidatesId, tr(L"找出耗電的背景程式…"));
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    HMENU labMenu = CreatePopupMenu();
+    items.push_back(menuItem(PowerModeId, tr(L"電源模式")));
+    auto dynamic = menuItem(DynamicToggleId, tr(L"動態省電"), dynamicEnabled, preview);
+    if (!dynamicEnabled) dynamic.hint = tr(L"關");
+    items.push_back(dynamic);
+    items.push_back(menuItem(DynamicPageId, tr(L"動態省電狀態")));
+    items.push_back(menuSeparator());
+    items.push_back(menuItem(PowerDetailsId, tr(L"電池與充電詳情")));
+    items.push_back(menuItem(HistoryId, tr(L"歷史紀錄（7 天）")));
+    items.push_back(menuItem(LedgerId, tr(L"本次累計耗能")));
+    items.push_back(menuItem(ReviewCandidatesId, tr(L"找出耗電的背景程式")));
+    items.push_back(menuSeparator());
     const auto labStatus = labController ? labController->status() : bs::lab::Controller::Status{};
-    AppendMenuW(labMenu, MF_STRING | (preview || (labStatus.running && !labStatus.plan) ? MF_GRAYED : 0), LabAutoId,
-        labStatus.running && labStatus.plan ? tr(L"停止自動測試") : tr(L"一鍵自動測試（約 1.5 小時，結束自動匯出）"));
-    AppendMenuW(labMenu, MF_STRING, LabPageId, tr(L"查看實驗室…"));
-    AppendMenuW(labMenu, MF_STRING | (labStatus.recording ? MF_CHECKED : 0) | (preview ? MF_GRAYED : 0), LabRecordId, tr(L"記錄詳細資料"));
-    HMENU single = CreatePopupMenu();
+    std::vector<MenuItem> lab;
+    auto automatic = menuItem(LabAutoId, labStatus.running && labStatus.plan ? tr(L"停止自動測試") : tr(L"一鍵自動測試"), false,
+        preview || (labStatus.running && !labStatus.plan));
+    if (!(labStatus.running && labStatus.plan)) automatic.hint = tr(L"約 1.5 小時");
+    lab.push_back(automatic);
+    lab.push_back(menuItem(LabPageId, tr(L"查看實驗室")));
+    lab.push_back(menuItem(LabRecordId, tr(L"記錄詳細資料"), labStatus.recording, preview));
+    std::vector<MenuItem> single;
     const wchar_t* experimentNames[] = {tr(L"CPU Boost 開／關"), tr(L"處理器能源偏好"), tr(L"螢幕更新率"), tr(L"電源模式")};
     for (int i = 0; i < bs::lab::ManualKnobs; ++i)
-        AppendMenuW(single, MF_STRING | (preview || labStatus.running ? MF_GRAYED : 0) |
-            (labStatus.running && !labStatus.plan && int(labStatus.knob) == i ? MF_CHECKED : 0), LabExperimentId + i, experimentNames[i]);
-    AppendMenuW(single, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(single, MF_STRING | (labStatus.running && !labStatus.plan ? 0 : MF_GRAYED), LabStopId, tr(L"停止實驗並還原"));
-    AppendMenuW(labMenu, MF_POPUP | (preview ? MF_GRAYED : 0), reinterpret_cast<UINT_PTR>(single), tr(L"單項實驗"));
-    AppendMenuW(labMenu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(labMenu, MF_STRING | (preview ? MF_GRAYED : 0), LabExportId, tr(L"一鍵匯出（壓縮檔＋複製摘要）"));
-    AppendMenuW(labMenu, MF_STRING | (preview ? MF_GRAYED : 0), LabFolderId, tr(L"開啟資料夾"));
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(labMenu), tr(L"省電實驗室"));
-    HMENU tools = CreatePopupMenu();
-    AppendMenuW(tools, MF_STRING | (preview ? MF_GRAYED : 0), ExportCsvId, tr(L"匯出 CSV…"));
-    AppendMenuW(tools, MF_STRING | (preview ? MF_GRAYED : 0), ShareCardId, tr(L"分享今日卡片…"));
-    AppendMenuW(tools, MF_STRING | (miniEnabled ? MF_CHECKED : 0), MiniToggleId, tr(L"迷你浮動視窗"));
-    AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(tools), tr(L"工具"));
-    AppendMenuW(menu, MF_STRING, SettingsPageId, tr(L"設定…"));
-    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu, MF_STRING, TrayShow, tr(L"顯示面板"));
-    AppendMenuW(menu, MF_STRING | (pendingAction ? MF_GRAYED : 0), TrayExit, tr(L"結束 BatteryScope"));
-    SetForegroundWindow(mainWindow);
-    TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, 0, mainWindow, nullptr);
-    DestroyMenu(menu); PostMessageW(mainWindow, WM_NULL, 0, 0);
+        single.push_back(menuItem(LabExperimentId + i, experimentNames[i], labStatus.running && !labStatus.plan && int(labStatus.knob) == i, preview || labStatus.running));
+    single.push_back(menuSeparator());
+    single.push_back(menuItem(LabStopId, tr(L"停止實驗並還原"), false, !(labStatus.running && !labStatus.plan)));
+    lab.push_back(submenu(tr(L"單項實驗"), single, preview));
+    lab.push_back(menuSeparator());
+    lab.push_back(menuItem(LabExportId, tr(L"一鍵匯出（壓縮檔＋摘要）"), false, preview));
+    lab.push_back(menuItem(LabFolderId, tr(L"開啟資料夾"), false, preview));
+    items.push_back(submenu(tr(L"省電實驗室"), lab));
+    std::vector<MenuItem> tools;
+    tools.push_back(menuItem(ExportCsvId, tr(L"匯出 CSV"), false, preview));
+    tools.push_back(menuItem(ShareCardId, tr(L"分享今日卡片"), false, preview));
+    tools.push_back(menuItem(MiniToggleId, tr(L"迷你浮動視窗"), miniEnabled));
+    items.push_back(submenu(tr(L"工具"), tools));
+    items.push_back(menuItem(SettingsPageId, tr(L"設定")));
+    items.push_back(menuSeparator());
+    items.push_back(menuItem(TrayShow, tr(L"顯示面板")));
+    items.push_back(menuItem(TrayExit, tr(L"結束 BatteryScope"), false, pendingAction));
+    return items;
+}
+void openMenu(POINT point) {
+    const auto items = mainMenuItems();
+    if (const int chosen = showMenu(items, point, mainWindow)) SendMessageW(mainWindow, WM_COMMAND, chosen, 0);
 }
 void applyLanguage(bool useEnglish) {
     english = useEnglish;
@@ -3688,6 +3923,16 @@ bool panelSelfTest(const std::wstring& path) {
         if (icon) DestroyIcon(icon);
     }
     check("all_nine_icon_sizes_load", sizesOK);
+    {
+        // The custom menu renders every level and keeps the panel's look.
+        const auto items = mainMenuItems();
+        const auto file = std::filesystem::temp_directory_path() / L"BatteryScope-menu-check.bmp";
+        bool menuOK = !items.empty();
+        for (int i = -1; i < int(items.size()); ++i)
+            if (i < 0 || !items[size_t(i)].children.empty()) menuOK &= captureMenu(items, file.wstring(), i) && std::filesystem::file_size(file) > 1000;
+        std::error_code ignored; std::filesystem::remove(file, ignored);
+        check("custom_menu_renders_all_levels", menuOK);
+    }
     const UINT actualDpi = dpi;
     bool dpiIconsOK = true;
     for (UINT testDpi : {96u,120u,144u,192u}) {
@@ -4231,7 +4476,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
         if (message.message == WM_TIMER && message.wParam == 91) {
             KillTimer(window, 91);
-            shotOK = trayTest ? panelSelfTest(args[1]) : captureWindow(args[1]); DestroyWindow(window); continue;
+            if (screenshot && (option(L"--menu") || option(L"--menu-lab"))) {
+                // The ⋯ menu, or its lab submenu opened in place.
+                const auto items = mainMenuItems();
+                int open = -1;
+                for (int i = 0; option(L"--menu-lab") && i < int(items.size()); ++i) if (items[size_t(i)].label == tr(L"省電實驗室")) open = i;
+                shotOK = captureMenu(items, args[1], open);
+            } else shotOK = trayTest ? panelSelfTest(args[1]) : captureWindow(args[1]);
+            DestroyWindow(window); continue;
         }
         if (!IsDialogMessageW(window, &message)) { TranslateMessage(&message); DispatchMessageW(&message); }
     }
