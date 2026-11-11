@@ -7,6 +7,7 @@
 #endif
 #include <windows.h>
 #include "model.h"
+#include "activity.h"
 #include <array>
 #include <map>
 #include <memory>
@@ -198,6 +199,12 @@ public:
     SignalReader(const SignalReader&) = delete;
     SignalReader& operator=(const SignalReader&) = delete;
     Signals read(Value systemCpu);
+    // Everything the activity detector reads itself (see activity.h): the above
+    // plus the foreground program, sound per program, how much the screen is
+    // changing and whether the session is locked. Raw input, the display state
+    // and GPU engines come from the app.
+    gov::Observation observe(Value systemCpu);
+    const std::wstring& lastForeground() const; // lower-case exe of the last program other than BatteryScope
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -15,8 +15,8 @@
 
 From the **[Releases page](https://github.com/rio10255254/BatteryScope/releases/latest)**:
 
-- **Installer (recommended):** `BatteryScope-0.14.0-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
-- **Portable:** `BatteryScope-0.14.0-win64.zip`; extract it and run `BatteryScope.exe`.
+- **Installer (recommended):** `BatteryScope-0.15.0-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
+- **Portable:** `BatteryScope-0.15.0-win64.zip`; extract it and run `BatteryScope.exe`.
 
 Requires Windows 10 version 1703 or later (Windows 11 recommended), 64-bit. The program is not code-signed; if SmartScreen appears the first time, choose **More info → Run anyway**. It lives in the notification area, where the icon shows the battery percentage; click it to show or hide the panel.
 
@@ -52,7 +52,7 @@ Details follow.
 
 ## Using it
 
-1. Download `BatteryScope-0.14.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
+1. Download `BatteryScope-0.15.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
 2. Click its battery icon in the notification area to show or hide the panel. Esc hides it; monitoring continues at a lower frequency.
 3. Open **⋯ → Language / 語言 → English** to switch immediately. The setting persists for your Windows account. Selection and scroll position are retained.
 4. Use Background and Show filters, the mouse wheel, arrow keys, Home/End, or Page Up/Down. Enter or double-click opens details.
@@ -99,13 +99,24 @@ The power mode button at the top right shows **the Windows power mode in effect 
 
 Turn it on from **⋯ → Dynamic power saving** or the settings page. On battery it adjusts power mode, processor energy preference, and CPU Boost to what you are doing (refresh rate switching is a separate option because the screen blinks when it switches):
 
-- **Activity:** idle, reading (10 s without input), in use (3 s after input), interactive, video or music, calls, heavy work, and full-screen games, from input time, sound, microphone/camera, full screen, and CPU use only.
-- **Fast up, slow down:** moves toward performance are immediate; moves toward saving wait until the activity has held for 6 s, and each setting has a minimum gap between changes.
+- **Activity:** idle, reading, in use, interactive, video or music, calls, heavy work, and full-screen games. The detector weighs many signals, gives each activity a confidence, keeps only those at 60% or more, and picks the most demanding of them:
+  - **Keyboard and mouse (instant):** typing, clicking, or scrolling switches to "in use" at once, without waiting for the one-second check; moving the pointer alone does not.
+  - **Foreground program (instant):** a program switch re-runs detection at once, and the program is categorised by name (browser, documents, development, chat, media, creative/compute, game).
+  - **Screen:** whether the foreground window fills the screen (borderless full screen counts) and how many frames the compositor draws (whether anything is moving).
+  - **GPU (every 2 s):** 3D, compute, and video decode engine use, so muted video is recognised and borderless games are found by "fills the screen + heavy 3D".
+  - **Sound:** which program is playing; microphone or camera in use means a call.
+  - **Other:** the CPU must be busy for 4 s to count as heavy (short spikes do not); a locked screen or display off is always idle.
+  - Only timings, program names, and device states are read: no screenshots, no screen or text content, and no record of which keys were pressed.
+- **App rules:** Settings → App rules sets "always save power", "always balanced", "performance first", or "leave alone" per program; programs in the performance list count as "performance first". When you (or G-Helper) move a setting the same way twice in the same program, the rule is learned and applied, and can be changed or forgotten in the same place.
+- **Fast up, slow down:** moves toward performance are immediate (0.3 s between changes of a setting); moves toward saving wait until the activity has held for 6 s, longer when the detector is less sure (up to 12 s), and each setting has a minimum gap between changes.
 - **Respects others:** a setting changed by G-Helper or you is left alone for 10 minutes.
 - **Learns from the lab:** a saving is used only after an experiment on this PC proved it saves power without more late frames or slower responses; a proven cost vetoes it.
 - **Battery target:** with a 3, 5, or 8 hour target, each activity uses the next more saving profile when the estimate falls short.
 - **Background apps** busy for 30 s get efficiency mode (EcoQoS) until they come to the front.
 - **Restore:** plugging in, a full-screen game, turning it off, or quitting restores your settings, as does the next start after a crash. It pauses while the lab measures.
+- **Status page:** ⋯ → Dynamic power saving status shows the detected activity and confidence, its reasons, the other candidates, the foreground program and its rule, the target settings, and recent changes.
+- **Detection accuracy:** during the automatic test, detection is scored against the activity actually running; the export summary shows the accuracy and `detection-log.csv` has every second.
+- Diagnostics: `BatteryScope.exe --detect-test 30` prints what the detector sees for 30 seconds (without the GPU).
 
 ## Power lab (experimental)
 
@@ -152,7 +163,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-To avoid replacing a running executable, use `-OutputDirectory dist/v0.14.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
+To avoid replacing a running executable, use `-OutputDirectory dist/v0.15.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
 
 ```powershell
 .\dist\BatteryScope.exe --demo

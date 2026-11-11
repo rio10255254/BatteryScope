@@ -31,7 +31,8 @@
 namespace {
 using namespace bs;
 constexpr UINT SampleMessage = WM_APP + 1, TrayMessage = WM_APP + 2, ActionMessage = WM_APP + 3, RefreshMessage = WM_APP + 4,
-    PowerModeMessage = WM_APP + 5, UpdateMessage = WM_APP + 6, UpdateDownloadedMessage = WM_APP + 7, LabExportMessage = WM_APP + 8;
+    PowerModeMessage = WM_APP + 5, UpdateMessage = WM_APP + 6, UpdateDownloadedMessage = WM_APP + 7, LabExportMessage = WM_APP + 8,
+    GovernorNowMessage = WM_APP + 9; // input or a program switch: re-run the governor now
 constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, DetailsId = 104,
     BackgroundId = 105, AllId = 106, StartupId = 107, HideId = 108, MenuId = 109,
     LanguageZhId = 110, LanguageEnId = 111, PowerDetailsId = 112, PowerModeId = 113,
@@ -150,6 +151,14 @@ void showDynamicPage();
 std::unique_ptr<bs::lab::Controller> labController;
 std::unique_ptr<bs::lab::WorkloadEngine> labEngine; // the automatic test's loads and window
 bool autoTestActive = false;
+// GPU engine use for the activity detector, sampled by the worker while sensing is on.
+std::atomic<bool> governorGpu{false};
+std::mutex governorGpuMutex;
+bs::gov::GpuActivity governorGpuLatest;
+uint64_t governorGpuAt = 0;
+bs::gov::DetectionTally detectionTally; // activity detection scored during the automatic test
+void flushDetectionLog();
+std::string utf8(const std::wstring& text);
 void exportLab();
 // Learned charging curve and detected charge limit, saved under HKCU\Software\BatteryScope.
 ChargeCurve chargeCurve;
@@ -2211,6 +2220,10 @@ std::wstring labPageText() {
                     signedNumber(r.energyPerWork.difference / r.energyPerWork.mean0 * 100, 0) + L"%";
         }
     }
+    if (!detectionTally.empty()) {
+        c += tr(L"\n\n自動偵測準確率（自動測試期間，對照實際執行的情境）") + detectionTally.summary();
+        c += tr(L"\n影片應判斷為「看影片」，高負載為「高負載」，瀏覽與文書為「閱讀」或「一般操作」，靜止畫面為「閒置」或「閱讀」。");
+    }
     c += tr(L"\n\n說明：記錄時每 2 秒取樣一次，本身也會用一點電，但兩種設定都一樣，不影響比較。螢幕更新率實驗每 2 分鐘切換一次，畫面會短暫閃一下。掉格數來自 Windows 畫面合成器，部分全螢幕或可變更新率畫面可能不計入。");
     return c;
 }
@@ -2221,6 +2234,11 @@ void exportLab() {
     labController->flushNow();
     const std::wstring folder = bs::lab::labFolder();
     if (folder.empty()) { setNotice(tr(L"找不到實驗室資料夾。")); return; }
+    flushDetectionLog();
+    if (!detectionTally.empty()) {
+        std::ofstream out(std::filesystem::path(folder) / L"detection.csv", std::ios::binary | std::ios::trunc);
+        out << "\xEF\xBB\xBF" << utf8(detectionTally.csv());
+    }
     std::wstring summary = L"BatteryScope " BS_VERSION_STRING L"\r\n" + labPageText();
     OSVERSIONINFOW os{}; os.dwOSVersionInfoSize = sizeof(os);
     using RtlGetVersion = LONG (WINAPI*)(OSVERSIONINFOW*);
@@ -2520,6 +2538,11 @@ bool saveHistory(const DailyHistory& history) {
     if (!writeUtf8(temporary, history.save())) return false;
     return MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
 }
+void publishGovernorGpu(const std::vector<std::pair<std::wstring, double>>& instances, uint64_t now) {
+    auto summary = bs::gov::summarizeGpu(instances);
+    std::lock_guard<std::mutex> lock(governorGpuMutex);
+    governorGpuLatest = std::move(summary); governorGpuAt = now;
+}
 void sampleLoop() {
     Collector collector;
     EnergyReader energyReader;
@@ -2533,7 +2556,7 @@ void sampleLoop() {
     SamplingPolicy policy;
     Snapshot state;
     state.days = history.recent(14);
-    uint64_t nextProcess = 0, nextPower = 0;
+    uint64_t nextProcess = 0, nextPower = 0, nextGpu = 0;
     bool previousHidden = false, qosInitialized = false;
     // Power lab: undo a setting left changed by a crash, then sample every two seconds while it is on.
     if (labController) bs::lab::restoreInterrupted();
@@ -2572,10 +2595,11 @@ void sampleLoop() {
             if (historyEnabled) { history.addApps(state.processes, state.energy, collector.sampleMs(), localDate()); historyDirty = true; }
             // GPU utilization is only shown in the panel, so it is sampled only while visible.
             state.gpuKnown = false;
-            if (background && !labActive) gpu.reset();
+            if (background && !labActive && !governorGpu) gpu.reset();
             else if (gpu.available()) {
                 std::unordered_map<uint32_t, double> usage;
                 if (gpu.sample(usage)) {
+                    publishGovernorGpu(gpu.instances(), now); nextGpu = now + 2000;
                     state.gpuKnown = true;
                     for (auto& row : state.processes) { auto found = usage.find(row.pid); row.gpuPercent = found != usage.end() ? found->second : 0.0; }
                 }
@@ -2616,6 +2640,12 @@ void sampleLoop() {
             } else labLast = 0;
             changed = processSampled = true;
         }
+        // The activity detector needs the GPU engines every 2 seconds, even while hidden.
+        if (governorGpu && now >= nextGpu && gpu.available()) {
+            std::unordered_map<uint32_t, double> usage;
+            if (gpu.sample(usage)) publishGovernorGpu(gpu.instances(), now);
+            nextGpu = now + 2000;
+        }
         if (clearHistoryRequest.exchange(false)) {
             history.clear(); historyDirty = false;
             const std::wstring path = historyPath();
@@ -2641,6 +2671,7 @@ void sampleLoop() {
             PostMessageW(mainWindow, SampleMessage, 0, 0);
         }
         now = GetTickCount64(); uint64_t next = std::min(nextProcess, nextPower);
+        if (governorGpu) next = std::min(next, std::max(nextGpu, now + 500));
         std::unique_lock<std::mutex> lock(wakeMutex);
         wake.wait_for(lock, std::chrono::milliseconds(next > now ? next - now : 1));
     }
@@ -2889,10 +2920,199 @@ void stopGovernor() {
     bs::gov::Input off; off.ms = GetTickCount64(); off.onBattery = false;
     applyDecision(governor.update(off));
 }
+// ----- Activity sensing -----
+// Raw keyboard and mouse input (timing and kind only; key codes are never read),
+// foreground switches and the display state arrive as events, so a boost does not
+// wait for the next one-second tick. Sensing runs while dynamic saving is on, and
+// during the automatic test, where detection is scored against the known activity.
+bs::gov::Detector detector;
+bs::gov::Assessment lastAssessment;
+std::string detectionLog;                 // CSV lines written during the automatic test
+uint64_t lastActiveInputMs = 0, lastPointerMs = 0, lastRawInputMs = 0, lastImmediateMs = 0, lastTallyMs = 0;
+bs::gov::InputKind lastActiveKind = bs::gov::InputKind::none;
+bool sensing = false, rawInputOn = false, displayOff = false;
+HWINEVENTHOOK foregroundHook = nullptr;
+HPOWERNOTIFY displayNotify = nullptr;
+std::map<std::wstring, bs::gov::AppRule> appRules;   // the user's own rules, lower-case exe -> rule
+struct Learned { DWORD up = 0, down = 0; };
+std::map<std::wstring, Learned> appLearned;           // user overrides seen per program
+std::map<std::wstring, uint64_t> learnedAt;
+constexpr wchar_t AppRulesKey[] = L"Software\\BatteryScope\\AppRules";
+constexpr wchar_t AppLearnedKey[] = L"Software\\BatteryScope\\AppLearned";
+bs::gov::AppRule learnedRule(const Learned& l) {
+    if (l.up >= 2 && l.up > l.down) return bs::gov::AppRule::performance;
+    if (l.down >= 2 && l.down > l.up) return bs::gov::AppRule::saving;
+    return bs::gov::AppRule::automatic;
+}
+void loadAppRules() {
+    appRules.clear(); appLearned.clear();
+    for (const wchar_t* path : {AppRulesKey, AppLearnedKey}) {
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, path, 0, KEY_READ, &key) != ERROR_SUCCESS) continue;
+        for (DWORD i = 0;; ++i) {
+            wchar_t name[260]; DWORD length = 260, type = 0, value = 0, size = sizeof(value);
+            if (RegEnumValueW(key, i, name, &length, nullptr, &type, reinterpret_cast<BYTE*>(&value), &size) != ERROR_SUCCESS) break;
+            if (type != REG_DWORD) continue;
+            if (path == AppRulesKey) { if (value > 0 && value < DWORD(bs::gov::AppRule::count)) appRules[name] = bs::gov::AppRule(value); }
+            else appLearned[name] = {value & 0xffff, value >> 16};
+        }
+        RegCloseKey(key);
+    }
+}
+void saveAppRule(const std::wstring& exe, bs::gov::AppRule rule) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, AppRulesKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) return;
+    if (rule == bs::gov::AppRule::automatic) { RegDeleteValueW(key, exe.c_str()); appRules.erase(exe); }
+    else { const DWORD v = DWORD(rule); RegSetValueExW(key, exe.c_str(), 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v), sizeof(v)); appRules[exe] = rule; }
+    RegCloseKey(key);
+}
+void saveLearned(const std::wstring& exe) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, AppLearnedKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) return;
+    auto it = appLearned.find(exe);
+    if (it == appLearned.end()) RegDeleteValueW(key, exe.c_str());
+    else { const DWORD v = std::min<DWORD>(it->second.up, 0xffff) | (std::min<DWORD>(it->second.down, 0xffff) << 16); RegSetValueExW(key, exe.c_str(), 0, REG_DWORD, reinterpret_cast<const BYTE*>(&v), sizeof(v)); }
+    RegCloseKey(key);
+}
+void refreshDetectorRules() {
+    std::map<std::wstring, bs::gov::AppRule> rules = appRules, learned;
+    // The performance list (automatic power mode rules) counts as performance rules.
+    for (const auto& name : performanceApps) rules.emplace(name, bs::gov::AppRule::performance);
+    for (const auto& [exe, l] : appLearned) if (auto rule = learnedRule(l); rule != bs::gov::AppRule::automatic) learned[exe] = rule;
+    detector.setRules(std::move(rules), std::move(learned));
+}
+// The user (or G-Helper) moved a setting away from the governor's value while this
+// program was in front: two moves the same way teach a rule for the program.
+void learnOverride(const std::wstring& exe, int way, uint64_t now) {
+    if (exe.empty() || !way || appRules.count(exe)) return;
+    auto& at = learnedAt[exe];
+    if (at && now - at < 600000) return; // one lesson per program per 10 minutes
+    at = now;
+    auto& l = appLearned[exe];
+    const auto before = learnedRule(l);
+    (way > 0 ? l.up : l.down) += 1;
+    saveLearned(exe); refreshDetectorRules();
+    if (const auto after = learnedRule(l); after != before && after != bs::gov::AppRule::automatic)
+        setNotice(exe + tr(L"：學到了，之後這個程式改用「") + tr(bs::gov::ruleKey(after)) + tr(L"」。可在「設定 → 程式規則」修改。"));
+}
+void onRawInput(const RAWINPUT& raw) {
+    using bs::gov::InputKind;
+    const uint64_t now = GetTickCount64();
+    lastRawInputMs = now;
+    InputKind kind = InputKind::pointer;
+    if (raw.header.dwType == RIM_TYPEKEYBOARD) {
+        if (raw.data.keyboard.Flags & RI_KEY_BREAK) return; // key release
+        kind = InputKind::typing;
+    } else if (raw.header.dwType == RIM_TYPEMOUSE) {
+        const USHORT flags = raw.data.mouse.usButtonFlags;
+        if (flags & (RI_MOUSE_WHEEL | RI_MOUSE_HWHEEL)) kind = InputKind::scroll;
+        else if (flags & (RI_MOUSE_LEFT_BUTTON_DOWN | RI_MOUSE_RIGHT_BUTTON_DOWN | RI_MOUSE_MIDDLE_BUTTON_DOWN | RI_MOUSE_BUTTON_4_DOWN | RI_MOUSE_BUTTON_5_DOWN)) kind = InputKind::click;
+    } else return;
+    if (kind == InputKind::pointer) { lastPointerMs = now; return; } // the common case, kept cheap
+    lastActiveInputMs = now; lastActiveKind = kind;
+    // Boost now instead of at the next tick, at most every 150 ms.
+    if (dynamicEnabled && bs::gov::rank(governor.activity()) < bs::gov::rank(bs::gov::Activity::responsive) && now - lastImmediateMs >= 150) {
+        lastImmediateMs = now; PostMessageW(mainWindow, GovernorNowMessage, 0, 0);
+    }
+}
+void CALLBACK foregroundChanged(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD) {
+    const uint64_t now = GetTickCount64();
+    if (now - lastImmediateMs >= 150) { lastImmediateMs = now; PostMessageW(mainWindow, GovernorNowMessage, 0, 0); }
+}
+bool planRunning() {
+    if (!labController) return false;
+    const auto st = labController->status();
+    return st.running && st.plan;
+}
+// Starts or stops sensing to match what needs it.
+void updateSensing() {
+    const bool want = (dynamicEnabled || planRunning()) && !demo && !isolatedPreview && mainWindow;
+    if (want == sensing) return;
+    sensing = want; governorGpu = want;
+    if (want) {
+        RAWINPUTDEVICE devices[2] = {{0x01, 0x06, RIDEV_INPUTSINK, mainWindow}, {0x01, 0x02, RIDEV_INPUTSINK, mainWindow}};
+        rawInputOn = RegisterRawInputDevices(devices, 2, sizeof(RAWINPUTDEVICE)) != FALSE;
+        foregroundHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, foregroundChanged, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        constexpr GUID ConsoleDisplayState = {0x6FE69556, 0x704A, 0x47A0, {0x8F, 0x24, 0xC2, 0x8D, 0x93, 0x6F, 0xDA, 0x47}};
+        displayNotify = RegisterPowerSettingNotification(mainWindow, &ConsoleDisplayState, DEVICE_NOTIFY_WINDOW_HANDLE);
+        SetTimer(mainWindow, GovernorTimer, 1000, nullptr);
+        wake.notify_one();
+    } else {
+        if (rawInputOn) {
+            RAWINPUTDEVICE devices[2] = {{0x01, 0x06, RIDEV_REMOVE, nullptr}, {0x01, 0x02, RIDEV_REMOVE, nullptr}};
+            RegisterRawInputDevices(devices, 2, sizeof(RAWINPUTDEVICE));
+        }
+        rawInputOn = false;
+        if (foregroundHook) { UnhookWinEvent(foregroundHook); foregroundHook = nullptr; }
+        if (displayNotify) { UnregisterPowerSettingNotification(displayNotify); displayNotify = nullptr; }
+        KillTimer(mainWindow, GovernorTimer);
+    }
+}
+std::string utf8(const std::wstring& text) {
+    if (text.empty()) return {};
+    std::string out(size_t(WideCharToMultiByte(CP_UTF8, 0, text.c_str(), int(text.size()), nullptr, 0, nullptr, nullptr)), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), int(text.size()), out.data(), int(out.size()), nullptr, nullptr);
+    return out;
+}
+void flushDetectionLog() {
+    if (detectionLog.empty()) return;
+    const std::wstring folder = bs::lab::labFolder();
+    if (folder.empty()) return;
+    const auto path = std::filesystem::path(folder) / L"detection-log.csv";
+    std::error_code error;
+    const bool fresh = !std::filesystem::exists(path, error);
+    std::ofstream out(path, std::ios::binary | std::ios::app);
+    if (fresh) out << "\xEF\xBB\xBFtime,workload,activity,confidence,reason,foreground,category,full_screen,idle_s,active_s,fps,cpu,gpu_3d,video_decode,audio,foreground_audio,call,locked\r\n";
+    out << detectionLog;
+    detectionLog.clear();
+}
 void governorTick() {
-    if (!dynamicEnabled || demo || isolatedPreview) return;
+    if (demo || isolatedPreview) return;
+    const bool testing = planRunning();
+    if (!dynamicEnabled && !testing) { updateSensing(); return; }
     if (!signalReader) signalReader = std::make_unique<bs::lab::SignalReader>();
     const uint64_t now = GetTickCount64();
+    Value systemCpu;
+    if (current.energy.ready) {
+        double busy = 0; for (const auto& core : current.energy.cores) busy += core.busyLogicalCores;
+        systemCpu = busy * 100 / std::max<DWORD>(1, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
+    }
+    // Detection: the reader's signals plus raw input, the display and the GPU.
+    auto o = signalReader->observe(systemCpu);
+    if (rawInputOn) {
+        // Input Windows saw but raw input did not (e.g. some touch input) counts as active.
+        const uint64_t lastInput = now - uint64_t(o.idleSeconds * 1000);
+        const uint64_t active = lastInput > lastRawInputMs + 500 ? lastInput : lastActiveInputMs;
+        o.activeSeconds = active ? (now - active) / 1000.0 : 1e6;
+        o.lastInput = o.activeSeconds && *o.activeSeconds < bs::gov::Detector::ResponsiveSeconds ? lastActiveKind
+            : lastPointerMs && now - lastPointerMs < 10000 ? bs::gov::InputKind::pointer : lastActiveKind;
+    }
+    o.displayOff = displayOff;
+    {
+        std::lock_guard<std::mutex> lock(governorGpuMutex);
+        if (governorGpuAt && now - governorGpuAt < 10000) o.gpu = governorGpuLatest;
+    }
+    lastAssessment = detector.assess(o);
+    if (testing) {
+        // The automatic test knows what it is running: score the detection against it.
+        const auto st = labController->status();
+        const double seconds = lastTallyMs ? std::min(5.0, (now - lastTallyMs) / 1000.0) : 1;
+        lastTallyMs = now;
+        const std::wstring workload = bs::lab::workloadKey(st.workload);
+        if (!st.paused && st.knob != bs::lab::Knob::display) {
+            detectionTally.add(workload, lastAssessment.activity, seconds);
+            const auto& g = o.gpu.total;
+            wchar_t line[512];
+            swprintf(line, 512, L"%llu,%ls,%ls,%.2f,\"%ls\",%ls,%ls,%d,%.0f,%.0f,%.0f,%.0f,%.0f,%.0f,%d,%d,%d,%d\r\n",
+                static_cast<unsigned long long>(now), workload.c_str(), bs::gov::activityKey(lastAssessment.activity), lastAssessment.confidence,
+                lastAssessment.reason.c_str(), o.foregroundExe.c_str(), bs::gov::categoryKey(lastAssessment.category), int(o.foregroundCoversScreen),
+                o.idleSeconds, o.activeSeconds.value_or(-1), o.framesPerSecond.value_or(-1), o.systemCpu.value_or(-1), g.engine3d, g.decode,
+                int(o.audio), int(o.foregroundAudio), int(o.call), int(o.locked));
+            detectionLog += utf8(line);
+            if (detectionLog.size() > 64 * 1024) flushDetectionLog();
+        }
+    } else lastTallyMs = 0;
+    if (!dynamicEnabled) return;
     bs::gov::Options options;
     options.refreshRate = dynamicRefresh; options.backgroundEco = dynamicEco;
     if (dynamicTarget) options.targetHours = double(dynamicTarget);
@@ -2907,13 +3127,9 @@ void governorTick() {
         in.onBattery = p.present && p.acKnown && !p.onAc && !p.charging;
     }
     if (labController && labController->status().running) in.onBattery = false; // the lab owns the settings while it measures
-    Value systemCpu;
-    if (current.energy.ready) {
-        double busy = 0; for (const auto& core : current.energy.cores) busy += core.busyLogicalCores;
-        systemCpu = busy * 100 / std::max<DWORD>(1, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
-    }
-    const auto signals = signalReader->read(systemCpu);
-    in.context = bs::lab::classify(signals); in.idleSeconds = signals.idleSeconds;
+    in.context = bs::lab::classify({o.idleSeconds, o.audio, o.call, o.exclusiveFullscreen, systemCpu});
+    in.idleSeconds = o.idleSeconds;
+    in.detected = lastAssessment.activity; in.confidence = lastAssessment.confidence;
     in.hoursLeft = current.power.hoursRemaining;
     for (size_t i = 0; i < in.actual.size(); ++i) {
         DWORD value = 0;
@@ -2923,15 +3139,19 @@ void governorTick() {
     if (HWND window = GetForegroundWindow()) GetWindowThreadProcessId(window, &foreground);
     for (const auto& row : current.processes)
         if (row.measured && row.actionable && row.services.empty() && row.pid != GetCurrentProcessId())
-            in.apps.push_back({row.pid, row.created, row.name, row.averageCpu, row.pid == foreground});
-    applyDecision(governor.update(in));
+            in.apps.push_back({row.pid, row.created, row.name, row.averageCpu, row.pid == foreground || row.pid == o.foregroundPid});
+    const auto decision = governor.update(in);
+    applyDecision(decision);
+    int way = 0; for (const auto& [setting, direction] : decision.overrides) way += direction;
+    if (way) learnOverride(o.foregroundExe, way > 0 ? 1 : -1, now);
     if (inlinePage == InlinePage::dynamic && !hidden && now - labPageShownAt >= 3000) showDynamicPage();
 }
 void setDynamic(bool on) {
     dynamicEnabled = on;
     if (!writeSetting(L"Dynamic", on ? 1 : 0)) setNotice(tr(L"無法儲存設定。"));
-    if (on) { SetTimer(mainWindow, GovernorTimer, 1000, nullptr); governorTick(); setNotice(tr(L"動態省電已開啟：用電池時依你正在做的事自動調整。")); }
-    else { KillTimer(mainWindow, GovernorTimer); stopGovernor(); setNotice(tr(L"動態省電已關閉，設定已還原。")); }
+    updateSensing();
+    if (on) { governorTick(); setNotice(tr(L"動態省電已開啟：用電池時依你正在做的事自動調整。")); }
+    else { stopGovernor(); setNotice(tr(L"動態省電已關閉，設定已還原。")); }
 }
 std::wstring settingValueName(bs::gov::Setting setting, DWORD value) {
     switch (setting) {
@@ -2947,6 +3167,26 @@ void showDynamicPage() {
     c += tr(L"\n\n狀態：") + std::wstring(dynamicEnabled ? tr(L"開啟") : tr(L"關閉"));
     if (dynamicEnabled) {
         c += tr(L"\n目前判斷：") + std::wstring(tr(bs::gov::activityKey(governor.activity())));
+        const auto& a = lastAssessment;
+        auto reasonText = [](const std::wstring& reason) {
+            const std::wstring rule = L" · 程式規則：";
+            const size_t at = reason.find(rule);
+            if (at == std::wstring::npos) return std::wstring(tr(reason.c_str()));
+            return tr(reason.substr(0, at).c_str()) + std::wstring(tr(rule.c_str())) + tr(reason.substr(at + rule.size()).c_str());
+        };
+        c += tr(L"\n偵測結果：") + std::wstring(tr(bs::gov::activityKey(a.activity))) + tr(L"（把握 ") + number(a.confidence * 100, 0) + (english ? L"%) · " : L"%）· ") + reasonText(a.reason);
+        if (bs::gov::rank(a.activity) < bs::gov::rank(governor.activity())) c += tr(L"\n（等狀態穩定幾秒後才會切到較省電的設定）");
+        std::wstring others;
+        for (const auto& k : a.candidates) {
+            if (k.activity == a.activity || others.size() > 200) continue;
+            others += (others.empty() ? L"" : L"、") + std::wstring(tr(bs::gov::activityKey(k.activity))) + L" " + number(k.confidence * 100, 0) + L"%";
+        }
+        if (!others.empty()) c += tr(L"\n其他可能：") + others;
+        if (signalReader && !signalReader->lastForeground().empty()) {
+            c += tr(L"\n前景程式：") + signalReader->lastForeground() + L"（" + tr(bs::gov::categoryKey(a.category)) + L"）· " + tr(L"規則：") + tr(bs::gov::ruleKey(a.rule));
+            if (a.learnedRule) c += tr(L"（學到的）");
+        }
+        c += tr(L"\n偵測方式：") + std::wstring(rawInputOn ? tr(L"鍵盤滑鼠即時偵測") : tr(L"每秒檢查")) + tr(L" · 前景程式切換即時偵測 · 顯示卡每 2 秒");
         const auto profile = governor.profileFor(governor.activity(), false);
         c += tr(L"\n目標設定：");
         bool any = false;
@@ -2959,6 +3199,7 @@ void showDynamicPage() {
         for (size_t i = 0; i < profile.values.size(); ++i)
             if (!governor.managing(bs::gov::Setting(i), now)) c += L"\n" + std::wstring(names[i]) + tr(L"：被其他程式改動，暫停管理中");
     }
+    c += tr(L"\n\n只讀取時間、程式名稱和裝置使用狀態，不截圖、不讀畫面或文字內容，也不記錄按了哪些鍵。");
     c += tr(L"\n\n選項：切換螢幕更新率 ") + std::wstring(dynamicRefresh ? tr(L"開") : tr(L"關")) + tr(L" · 背景程式效率模式 ") +
         std::wstring(dynamicEco ? tr(L"開") : tr(L"關")) + tr(L" · 續航目標 ") + (dynamicTarget ? std::to_wstring(dynamicTarget) + tr(L" 小時") : std::wstring(tr(L"無")));
     const auto evidence = labController ? bs::gov::learn(labController->status().results) : std::vector<bs::gov::Evidence>{};
@@ -2988,12 +3229,12 @@ void showDynamicPage() {
 // Every option in one scrolling list, grouped into sections. A row shows its
 // value; clicking it switches or cycles the value through the same commands
 // the menus used.
-enum class Row { section, dynamic, dynamicRefresh, dynamicEco, target, autoSaver, perfApps, lowBattery, chargeReminder, drainAlert,
+enum class Row { section, dynamic, dynamicRefresh, dynamicEco, target, appRules, autoSaver, perfApps, lowBattery, chargeReminder, drainAlert,
     sleepAlert, theme, style, mascot, trayPercent, mini, language, startup, hotkey, history, clearHistory, updates, checkNow };
 struct SettingRow { Row row; const wchar_t* label; };
 const SettingRow settingRows[] = {
     {Row::section, L"省電"}, {Row::dynamic, L"動態省電（實驗功能）"}, {Row::dynamicRefresh, L"動態切換螢幕更新率"}, {Row::dynamicEco, L"背景程式自動效率模式"},
-    {Row::target, L"續航目標"}, {Row::autoSaver, L"低電量時自動省電"}, {Row::perfApps, L"效能清單"},
+    {Row::target, L"續航目標"}, {Row::appRules, L"程式規則"}, {Row::autoSaver, L"低電量時自動省電"}, {Row::perfApps, L"效能清單"},
     {Row::section, L"提醒"}, {Row::lowBattery, L"低電量提醒"}, {Row::chargeReminder, L"充電提醒"}, {Row::drainAlert, L"背景耗電提醒"}, {Row::sleepAlert, L"睡眠耗電提醒"},
     {Row::section, L"外觀"}, {Row::theme, L"主題"}, {Row::style, L"風格"}, {Row::mascot, L"電池小精靈"}, {Row::trayPercent, L"系統匣顯示電量"},
     {Row::mini, L"迷你浮動視窗"}, {Row::language, L"語言 / Language"},
@@ -3009,6 +3250,10 @@ std::wstring rowValue(Row row) {
     case Row::target: return dynamicTarget ? std::to_wstring(dynamicTarget) + tr(L" 小時") : std::wstring(tr(L"無"));
     case Row::autoSaver: return percentOrOff(autoSaverThreshold);
     case Row::perfApps: return std::to_wstring(performanceApps.size()) + tr(L" 個");
+    case Row::appRules: {
+        size_t learned = 0; for (const auto& [exe, l] : appLearned) learned += learnedRule(l) != bs::gov::AppRule::automatic && !appRules.count(exe);
+        return std::to_wstring(appRules.size() + learned) + tr(L" 個");
+    }
     case Row::lowBattery: return percentOrOff(lowBatteryThreshold);
     case Row::chargeReminder: return percentOrOff(chargeReminderTarget);
     case Row::drainAlert: return onOff(drainAlerts);
@@ -3108,8 +3353,45 @@ void drawSettingRow(const DRAWITEMSTRUCT& item) {
     rounded(dc, pill, on ? blend(Green, Surface, theme.highContrast ? 0 : .25) : blend(Surface, Border, .9), 8);
     drawText(dc, value, pill, on ? theme.accentInk : Muted, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
 }
+// Per-program rules in one menu: the program last in front first, then every
+// rule, each with the five choices; learned rules can be kept, changed or forgotten.
+void showAppRulesMenu() {
+    using bs::gov::AppRule;
+    if (!signalReader) signalReader = std::make_unique<bs::lab::SignalReader>();
+    signalReader->observe(std::nullopt);
+    const std::wstring currentApp = signalReader->lastForeground();
+    std::vector<std::wstring> apps;
+    if (!currentApp.empty()) apps.push_back(currentApp);
+    for (const auto& [exe, rule] : appRules) if (exe != currentApp) apps.push_back(exe);
+    for (const auto& [exe, l] : appLearned) if (learnedRule(l) != AppRule::automatic && !appRules.count(exe) && exe != currentApp) apps.push_back(exe);
+    constexpr int Base = 6000, Forget = 15;
+    std::vector<MenuItem> items;
+    for (size_t i = 0; i < apps.size() && i < 60; ++i) {
+        bool learned = false;
+        const AppRule rule = detector.ruleFor(apps[i], &learned);
+        std::vector<MenuItem> choices;
+        for (int r = 0; r < int(AppRule::count); ++r) choices.push_back(menuItem(Base + int(i) * 16 + r, tr(bs::gov::ruleKey(AppRule(r))), rule == AppRule(r)));
+        if (appLearned.count(apps[i])) { choices.push_back(menuSeparator()); choices.push_back(menuItem(Base + int(i) * 16 + Forget, tr(L"忘記學到的習慣"))); }
+        MenuItem entry = submenu((i == 0 && apps[i] == currentApp ? tr(L"目前程式：") : std::wstring()) + apps[i], choices);
+        if (i == 0 && apps[i] == currentApp && apps.size() > 1) { items.push_back(entry); items.push_back(menuSeparator()); continue; }
+        items.push_back(entry);
+    }
+    if (items.empty()) items.push_back(menuItem(0, tr(L"還沒有規則：先切到想設定的程式，再回來這裡"), false, true));
+    POINT point{}; GetCursorPos(&point);
+    const int chosen = showMenu(items, point, mainWindow);
+    if (chosen < Base) return;
+    const size_t index = size_t(chosen - Base) / 16; const int choice = (chosen - Base) % 16;
+    if (index >= apps.size()) return;
+    const std::wstring& exe = apps[index];
+    if (choice == Forget) { appLearned.erase(exe); saveLearned(exe); }
+    else saveAppRule(exe, AppRule(choice));
+    refreshDetectorRules();
+    setNotice(exe + L"：" + (choice == Forget ? std::wstring(tr(L"已忘記學到的習慣")) : std::wstring(tr(bs::gov::ruleKey(AppRule(choice))))));
+    if (dynamicEnabled) governorTick();
+}
 void activateSettingRow(int index) {
     if (index < 0 || size_t(index) >= std::size(settingRows) || demo || isolatedPreview) return;
+    if (settingRows[index].row == Row::appRules) { showAppRulesMenu(); if (inlinePage == InlinePage::settings) InvalidateRect(settingsList, nullptr, FALSE); return; }
     if (const int command = rowCommand(settingRows[index].row)) SendMessageW(mainWindow, WM_COMMAND, command, 0);
     if (inlinePage == InlinePage::settings) InvalidateRect(settingsList, nullptr, FALSE);
 }
@@ -3287,7 +3569,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         }, window);
         refreshPowerButton();
         if (!demo && !isolatedPreview) SetTimer(window, UpdateTimer, 60 * 1000, nullptr); // first check a minute after start
-        if (!demo && !isolatedPreview) { restoreGovernorAfterCrash(); if (dynamicEnabled) SetTimer(window, GovernorTimer, 1000, nullptr); }
+        if (!demo && !isolatedPreview) { restoreGovernorAfterCrash(); loadAppRules(); refreshDetectorRules(); updateSensing(); }
         return 0;
     }
     case WM_MEASUREITEM:
@@ -3411,7 +3693,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         }
         if (id == ClearPerfAppsId) {
             if (demo || isolatedPreview) return 0;
-            performanceApps.clear(); writeNames(L"PerformanceApps", performanceApps);
+            performanceApps.clear(); writeNames(L"PerformanceApps", performanceApps); refreshDetectorRules();
             setNotice(tr(L"已清空效能清單。")); applyAutoPowerRules();
             return 0;
         }
@@ -3436,6 +3718,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             const std::wstring name = lowerName(row.name);
             const bool add = !performanceApps.count(name);
             if (add) performanceApps.insert(name); else performanceApps.erase(name);
+            refreshDetectorRules();
             if (!writeNames(L"PerformanceApps", performanceApps)) setNotice(tr(L"無法儲存設定。"));
             else setNotice(add ? tr(L"已加入效能清單：執行時會自動切到效能模式。") : tr(L"已移出效能清單。"));
             applyAutoPowerRules();
@@ -3573,7 +3856,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if ((id == LabAutoId || id == LabAutoStartId) && labController && labEngine) {
             if (autoTestActive && id == LabAutoStartId) return 0; // already running
             if (autoTestActive) { // second click: stop
-                labController->stop(); labEngine->stop(); autoTestActive = false;
+                labController->stop(); labEngine->stop(); autoTestActive = false; updateSensing(); flushDetectionLog();
                 setNotice(tr(L"自動測試已停止，設定已還原。"));
                 std::thread([target = mainWindow] { bs::lab::writeSystemSnapshot(bs::lab::labFolder()); PostMessageW(target, LabExportMessage, 1, 0); }).detach();
                 return 0;
@@ -3581,6 +3864,9 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             const DWORD result = labController->startPlan(bs::lab::automaticPlan(!bs::lab::WorkloadEngine::browserPath().empty()));
             if (result) { setNotice(tr(L"無法開始自動測試：") + errorText(result)); showLabPage(); return 0; }
             autoTestActive = true;
+            detectionTally = {}; detectionLog.clear(); lastTallyMs = 0;
+            { std::error_code ignored; std::filesystem::remove(std::filesystem::path(bs::lab::labFolder()) / L"detection-log.csv", ignored); }
+            updateSensing();
             hideMain();
             labEngine->start(labController.get());
             wake.notify_one();
@@ -3650,7 +3936,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             if (aborted) labController->stop();
             if (aborted || !labController->status().running) {
                 // Finished or stopped: close the test window, export everything, show the results.
-                labEngine->stop(); autoTestActive = false;
+                labEngine->stop(); autoTestActive = false; updateSensing(); flushDetectionLog();
                 // A snapshot of power plans, battery report, hardware and processes goes with the export;
                 // it runs after the test so it never disturbs a measurement.
                 setNotice(tr(L"正在收集系統資訊並匯出…"));
@@ -3686,7 +3972,22 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         }
         resetSamples = true; wake.notify_one(); updateButtons(); return 0;
     }
+    case WM_INPUT: {
+        RAWINPUT raw{}; UINT size = sizeof(raw);
+        if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &raw, &size, sizeof(RAWINPUTHEADER)) != UINT(-1)) onRawInput(raw);
+        return DefWindowProcW(window, message, wp, lp);
+    }
+    case GovernorNowMessage: governorTick(); return 0;
     case WM_POWERBROADCAST:
+        if (wp == PBT_POWERSETTINGCHANGE && lp) {
+            const auto* setting = reinterpret_cast<const POWERBROADCAST_SETTING*>(lp);
+            constexpr GUID ConsoleDisplayState = {0x6FE69556, 0x704A, 0x47A0, {0x8F, 0x24, 0xC2, 0x8D, 0x93, 0x6F, 0xDA, 0x47}};
+            if (IsEqualGUID(setting->PowerSetting, ConsoleDisplayState) && setting->DataLength >= sizeof(DWORD)) {
+                displayOff = *reinterpret_cast<const DWORD*>(setting->Data) == 0;
+                PostMessageW(window, GovernorNowMessage, 0, 0);
+            }
+            return TRUE;
+        }
         if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND || wp == PBT_APMPOWERSTATUSCHANGE) { resetSamples = true; wake.notify_one(); }
         return TRUE;
     case PowerModeMessage:
@@ -3736,6 +4037,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         KillTimer(window, MotionTimer); motionTimerRunning = false;
         KillTimer(window, NoticeTimer); KillTimer(window, UpdateTimer); KillTimer(window, GovernorTimer);
         if (dynamicEnabled && !demo && !isolatedPreview) stopGovernor();
+        dynamicEnabled = false; autoTestActive = false; updateSensing();
         if (labEngine) labEngine->stop();
         registerPanelHotkey(false);
         setMiniWindow(false);
@@ -4328,6 +4630,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (args.size() == 2 && args[0] == L"--diagnose") return diagnostic(args[1]);
     // Self-test of the automatic test's local server and browser launch: runs the
     // engine without a test for the given seconds and writes the port to stdout.
+    // Prints what the activity detector sees once a second (no GPU engines, no
+    // raw input): a quick check that every signal can be read on this PC.
+    if (args.size() == 2 && args[0] == L"--detect-test") {
+        bs::lab::SignalReader reader; bs::gov::Detector probe;
+        const int seconds = std::clamp(_wtoi(args[1].c_str()), 1, 600);
+        for (int i = 0; i < seconds; ++i) {
+            const auto o = reader.observe(std::nullopt);
+            const auto a = probe.assess(o);
+            printf("%s %.2f fg=%s full=%d idle=%.0f fps=%.0f audio=%d fgaudio=%d call=%d locked=%d d3d=%d | %s\n",
+                utf8(bs::gov::activityKey(a.activity)).c_str(), a.confidence, utf8(o.foregroundExe).c_str(), int(o.foregroundCoversScreen), o.idleSeconds,
+                o.framesPerSecond.value_or(-1), int(o.audio), int(o.foregroundAudio), int(o.call), int(o.locked), int(o.exclusiveFullscreen), utf8(a.reason).c_str());
+            fflush(stdout);
+            Sleep(1000);
+        }
+        return 0;
+    }
     if (args.size() == 2 && args[0] == L"--lab-engine-test") {
         bs::lab::WorkloadEngine engine;
         engine.start(nullptr);

@@ -583,6 +583,92 @@ int wmain(int argc, wchar_t** argv) {
             check(learnedProfile.values[size_t(Setting::cpuBoost)] == DWORD(0) && !learnedProfile.values[size_t(Setting::energyPreference)],
                 "an approved saving is used and a costly one is left to the user");
         }
+        // Activity detector v2.
+        {
+            using gov::Activity;
+            gov::Detector detector;
+            auto observe = [](double idle, std::optional<double> active, gov::InputKind kind) {
+                gov::Observation o; o.ms = 5000000; o.idleSeconds = idle; o.activeSeconds = active; o.lastInput = kind;
+                o.foregroundExe = L"chrome.exe"; o.foregroundPid = 40; o.systemCpu = 5; o.framesPerSecond = 0; o.gpu.known = true;
+                return o;
+            };
+            auto o = observe(1, 1, gov::InputKind::typing);
+            check(detector.assess(o).activity == Activity::responsive, "typing makes the detector responsive at once");
+            o = observe(1, 40, gov::InputKind::pointer);
+            auto pointer = detector.assess(o);
+            check(pointer.activity == Activity::interactive && pointer.reason == L"只移動游標", "moving the pointer alone does not trigger the input boost");
+            o = observe(1, std::nullopt, gov::InputKind::none);
+            check(detector.assess(o).activity == Activity::responsive, "without raw input, any recent input counts as active");
+            o = observe(30, 30, gov::InputKind::scroll);
+            auto reading = detector.assess(o);
+            check(reading.activity == Activity::reading && reading.confidence >= .8 && reading.category == gov::Category::browser,
+                "a pause in a browser is confidently reading");
+            o = observe(300, 300, gov::InputKind::none);
+            check(detector.assess(o).activity == Activity::idle, "a long pause with a still screen is idle");
+            o.framesPerSecond = 40;
+            check(detector.assess(o).activity == Activity::reading, "a long pause while the screen keeps moving is watching, not idle");
+            o = observe(30, 30, gov::InputKind::none); o.gpu.total.decode = 8;
+            auto muted = detector.assess(o);
+            check(muted.activity == Activity::media && muted.reason.find(L"靜音") != std::wstring::npos, "muted video is found through the video decoder");
+            o = observe(1, 1, gov::InputKind::click); o.foregroundExe = L"cyberpunk2077.exe"; o.foregroundCoversScreen = true;
+            o.gpu.processes[40].engine3d = 70;
+            auto game = detector.assess(o);
+            check(game.activity == Activity::game && game.category == gov::Category::game, "a borderless full-screen game is recognised");
+            o.foregroundExe = L"unknown.exe"; o.gpu.processes[40].engine3d = 45;
+            check(detector.assess(o).activity == Activity::game, "an unknown program filling the screen with heavy 3D is treated as a game");
+            o.call = true;
+            check(detector.assess(o).activity == Activity::game, "voice chat while gaming stays a game");
+            o = observe(1, 1, gov::InputKind::click); o.foregroundCoversScreen = true; o.gpu.total.decode = 5; o.gpu.processes[40] = {30, 5, 0};
+            check(detector.assess(o).activity != Activity::game, "a full-screen browser video is not a game");
+            o = observe(0, 0, gov::InputKind::typing); o.locked = true;
+            check(detector.assess(o).activity == Activity::idle, "a locked screen is idle whatever else happens");
+            gov::Detector busy;
+            o = observe(30, 30, gov::InputKind::none); o.systemCpu = 60; o.ms = 1000;
+            check(busy.assess(o).activity == Activity::reading, "a short CPU spike is not heavy yet");
+            o.ms = 6000;
+            check(busy.assess(o).activity == Activity::heavy, "sustained CPU load is heavy");
+            gov::Detector ruled;
+            ruled.setRules({{L"chrome.exe", gov::AppRule::performance}}, {{L"word.exe", gov::AppRule::saving}});
+            o = observe(30, 30, gov::InputKind::none);
+            auto ruledResult = ruled.assess(o);
+            check(ruledResult.activity == Activity::heavy && ruledResult.rule == gov::AppRule::performance && !ruledResult.learnedRule,
+                "a performance rule lifts the program's activity");
+            bool learnedFlag = false;
+            check(ruled.ruleFor(L"WORD.EXE", &learnedFlag) == gov::AppRule::saving && learnedFlag, "learned rules match regardless of case");
+            check(gov::categoryOf(L"Hogwarts-Win64-Shipping.exe") == gov::Category::game && gov::categoryOf(L"code.exe") == gov::Category::code,
+                "program categories come from the executable name");
+            auto gpuSummary = gov::summarizeGpu({{L"pid_40_luid_0x0_0x1_phys_0_eng_0_engtype_3D", 30}, {L"pid_41_luid_0x0_0x1_phys_0_eng_0_engtype_3D", 20},
+                {L"pid_40_luid_0x0_0x1_phys_0_eng_5_engtype_VideoDecode", 6}, {L"pid_9_luid_0x0_0x2_phys_0_eng_0_engtype_3D", 15}});
+            check(nearlyEqual(gpuSummary.total.engine3d, 50) && nearlyEqual(gpuSummary.total.decode, 6) && nearlyEqual(gpuSummary.processes[40].engine3d, 30),
+                "GPU engines are summed per adapter and per process");
+            // Detection is scored against the automatic test's known activities.
+            gov::DetectionTally tally;
+            tally.add(L"video", Activity::media, 90); tally.add(L"video", Activity::reading, 10); tally.add(L"sustained", Activity::heavy, 100);
+            check(nearlyEqual(*tally.accuracy(L"video"), .9) && nearlyEqual(*tally.overall(), 190.0 / 200) && tally.summary().find(L"閱讀") != std::wstring::npos,
+                "detection accuracy is measured per activity and names the most common mistake");
+            // The governor uses the detection and its confidence.
+            using gov::Setting;
+            gov::Governor fast; gov::Input fi; fi.onBattery = true; fi.actual = {DWORD(1), DWORD(60), DWORD(0), DWORD(120)};
+            uint64_t t = 9000000;
+            auto feed = [&](Activity a, double confidence) {
+                fi.ms = t; fi.detected = a; fi.confidence = confidence;
+                auto d = fast.update(fi);
+                for (size_t i = 0; i < d.apply.size(); ++i) if (d.apply[i]) fi.actual[i] = *d.apply[i];
+                t += 1000; return d;
+            };
+            for (int i = 0; i < 8; ++i) feed(Activity::reading, 1);
+            check(fi.actual[size_t(Setting::energyPreference)] == DWORD(80), "the governor follows the detector");
+            feed(Activity::responsive, 1);
+            check(fi.actual[size_t(Setting::energyPreference)] == DWORD(40), "a boost is applied within one sample even right after a saving change");
+            for (int i = 0; i < 7; ++i) feed(Activity::reading, .6);
+            check(fast.activity() == Activity::responsive, "an unsure detection waits longer before saving power");
+            for (int i = 0; i < 4; ++i) feed(Activity::reading, .6);
+            check(fast.activity() == Activity::reading, "and saves once it has held");
+            fi.actual[size_t(Setting::powerMode)] = 2; // the user picks best performance
+            auto overridden = feed(Activity::reading, 1);
+            check(overridden.overrides.size() == 1 && overridden.overrides[0].first == Setting::powerMode && overridden.overrides[0].second == 1,
+                "a user override toward performance is reported for learning");
+        }
         CpuAttributor slowEstimator;
         report.cores = heterogeneous; report.coreWatts = 5; report.ready = true; report.intervalSeconds = 20;
         a.cpu = 25; a.fixedCoreBusy.clear(); b.cpu = 25; energyRows = {a,b};

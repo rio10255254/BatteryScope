@@ -1,4 +1,5 @@
 #pragma once
+#include "activity.h"
 #include "lab.h"
 #include <array>
 #include <deque>
@@ -10,11 +11,13 @@
 // the actual settings, feeds them in with each sample, and applies the decision.
 //
 // Layers, from fast to slow:
-//   1. Activity: the lab's context, refined to "reading" (no input for 10 s)
-//      and to "responsive" for 3 s after any input (input boost).
+//   1. Activity: from the Detector (activity.h) when given, otherwise the lab's
+//      context refined to "reading" and "responsive" by input timing.
 //   2. Hysteresis: a move toward more performance is immediate; a move toward
-//      saving power waits until the activity has held for a few seconds.
-//   3. Per-setting pacing: a minimum time between changes of each setting.
+//      saving power waits until the activity has held for a few seconds, longer
+//      when the detector is less sure.
+//   3. Per-setting pacing: a minimum time between changes of each setting,
+//      except a change toward performance, which only waits a moment.
 //   4. Ownership: when something else (the user, G-Helper) changes a setting
 //      the governor set, it stops touching that setting for 10 minutes.
 //   5. Learning: a lab result that proves a saving without a smoothness or
@@ -23,9 +26,6 @@
 //   6. Battery target: when the time left falls short of the target, each
 //      activity uses the next more saving profile.
 namespace bs::gov {
-
-enum class Activity { idle, reading, responsive, interactive, media, call, heavy, game, count };
-const wchar_t* activityKey(Activity activity); // a Chinese UI string
 
 // The settings the governor manages; a subset of the lab's knobs.
 enum class Setting { powerMode, energyPreference, cpuBoost, refreshRate, count };
@@ -57,6 +57,8 @@ struct Input {
     // The settings as they are now (from the actuators), or nullopt if unreadable.
     std::array<std::optional<DWORD>, size_t(Setting::count)> actual{};
     std::vector<BackgroundApp> apps;
+    std::optional<Activity> detected;  // from the Detector; overrides context and idleSeconds
+    double confidence = 1;
 };
 
 struct Decision {
@@ -64,6 +66,9 @@ struct Decision {
     std::vector<std::pair<uint32_t, uint64_t>> ecoOn, ecoOff;           // background apps to throttle / release
     bool restore = false;          // put every original back (plugged in, disabled, game)
     std::wstring reason;
+    // Settings someone else changed away from the governor's value this sample:
+    // +1 toward more performance, -1 toward saving. Used to learn per-app rules.
+    std::vector<std::pair<Setting, int>> overrides;
 };
 
 // What the lab proved for one setting under one activity.
@@ -81,6 +86,7 @@ class Governor {
 public:
     static constexpr double SettleSeconds = 6, ResponsiveSeconds = 3, ReadingAfterSeconds = 10;
     static constexpr double OwnershipPauseSeconds = 600;
+    static constexpr double BoostGapSeconds = .3;  // between changes toward performance
     Governor();
     void setOptions(const Options& options) { options_ = options; }
     const Options& options() const { return options_; }
@@ -97,6 +103,8 @@ public:
     std::deque<std::wstring> log; // newest last, at most 30 entries
 private:
     static double minimumGap(Setting setting);
+    // +1 when value b gives more performance than a, -1 when less, 0 when equal.
+    static int direction(Setting setting, DWORD a, DWORD b);
     void note(const std::wstring& text);
     Options options_;
     std::vector<Evidence> evidence_;
@@ -105,6 +113,7 @@ private:
     bool active_ = false;
     std::array<std::optional<DWORD>, size_t(Setting::count)> originals_{}, lastSet_{};
     std::array<uint64_t, size_t(Setting::count)> changedAt_{}, pausedUntil_{};
+    std::array<int, size_t(Setting::count)> rankAtChange_{};
     std::set<std::pair<uint32_t, uint64_t>> throttled_;
     std::map<std::pair<uint32_t, uint64_t>, uint64_t> busySince_;
 };

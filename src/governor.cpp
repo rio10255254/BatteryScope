@@ -4,18 +4,6 @@
 namespace bs::gov {
 namespace {
 constexpr size_t Settings = size_t(Setting::count);
-// Higher means more performance; moving up is immediate, moving down waits.
-int rank(Activity a) {
-    switch (a) {
-    case Activity::idle: return 0;
-    case Activity::reading: case Activity::media: return 1;
-    case Activity::interactive: case Activity::call: return 2;
-    case Activity::responsive: return 3;
-    case Activity::heavy: return 4;
-    case Activity::game: return 5;
-    default: return 2;
-    }
-}
 Activity derive(const Input& in) {
     switch (in.context) {
     case lab::Context::game: return Activity::game;
@@ -33,6 +21,7 @@ Activity derive(const Input& in) {
 Activity stretched(Activity a) {
     switch (a) {
     case Activity::heavy: case Activity::responsive: return Activity::interactive;
+    case Activity::exempt: return a;
     case Activity::interactive: return Activity::reading;
     case Activity::reading: case Activity::media: return Activity::idle;
     default: return a;
@@ -70,19 +59,6 @@ std::vector<Activity> activitiesFor(const std::wstring& workload) {
 }
 }
 
-const wchar_t* activityKey(Activity a) {
-    switch (a) {
-    case Activity::idle: return L"閒置";
-    case Activity::reading: return L"閱讀";
-    case Activity::responsive: return L"操作中";
-    case Activity::interactive: return L"一般操作";
-    case Activity::media: return L"看影片／聽音樂";
-    case Activity::call: return L"視訊／通話";
-    case Activity::heavy: return L"高負載";
-    case Activity::game: return L"全螢幕遊戲";
-    default: return L"";
-    }
-}
 lab::Knob knobFor(Setting s) {
     switch (s) {
     case Setting::powerMode: return lab::Knob::powerMode;
@@ -133,6 +109,11 @@ double Governor::minimumGap(Setting s) {
     default: return 8;
     }
 }
+int Governor::direction(Setting s, DWORD a, DWORD b) {
+    if (a == b) return 0;
+    if (s == Setting::energyPreference) return b < a ? 1 : -1; // lower EPP favours performance
+    return b > a ? 1 : -1;                                     // power mode, boost, refresh rate
+}
 void Governor::note(const std::wstring& text) {
     log.push_back(text);
     while (log.size() > 30) log.pop_front();
@@ -181,14 +162,16 @@ Decision Governor::update(const Input& in) {
         return d;
     }
     if (!active_) {
-        active_ = true; originals_ = in.actual; lastSet_ = {}; changedAt_ = {};
-        activity_ = candidate_ = derive(in); candidateSince_ = in.ms;
+        active_ = true; originals_ = in.actual; lastSet_ = {}; changedAt_ = {}; rankAtChange_ = {};
+        activity_ = candidate_ = in.detected ? *in.detected : derive(in); candidateSince_ = in.ms;
         note(L"開始管理（用電池）");
     }
-    const Activity raw = derive(in);
+    const Activity raw = in.detected ? *in.detected : derive(in);
     if (raw != candidate_) { candidate_ = raw; candidateSince_ = in.ms; }
-    if (rank(raw) > rank(activity_)) activity_ = raw;                                       // fast attack
-    else if (raw != activity_ && in.ms - candidateSince_ >= SettleSeconds * 1000) activity_ = raw; // slow decay
+    // A less certain detection must hold longer before power is saved on it.
+    const double settle = SettleSeconds / std::clamp(in.confidence, .5, 1.0);
+    if (rank(raw) > rank(activity_)) activity_ = raw;                                         // fast attack
+    else if (raw != activity_ && in.ms - candidateSince_ >= uint64_t(settle * 1000)) activity_ = raw; // slow decay
     const bool stretch = options_.targetHours && in.hoursLeft && *in.hoursLeft < *options_.targetHours;
     const Profile profile = profileFor(activity_, stretch);
     for (size_t s = 0; s < Settings; ++s) {
@@ -196,6 +179,7 @@ Decision Governor::update(const Input& in) {
         // Someone else changed what the governor set: hand the setting back for a while.
         if (lastSet_[s] && *in.actual[s] != *lastSet_[s] && in.ms >= pausedUntil_[s]) {
             pausedUntil_[s] = in.ms + uint64_t(OwnershipPauseSeconds * 1000);
+            if (const int way = direction(Setting(s), *lastSet_[s], *in.actual[s])) d.overrides.push_back({Setting(s), way});
             originals_[s] = in.actual[s]; lastSet_[s].reset();
             note(L"設定被其他程式或使用者改動，暫停管理 10 分鐘");
             continue;
@@ -203,8 +187,10 @@ Decision Governor::update(const Input& in) {
         if (in.ms < pausedUntil_[s]) continue;
         const std::optional<DWORD> target = profile.values[s] ? profile.values[s] : originals_[s];
         if (!target || *target == *in.actual[s]) continue;
-        if (changedAt_[s] && in.ms - changedAt_[s] < uint64_t(minimumGap(Setting(s)) * 1000)) continue;
-        d.apply[s] = target; lastSet_[s] = target; changedAt_[s] = in.ms;
+        // Toward performance (the activity rose since the last change) only waits a moment.
+        const double gap = rank(activity_) > rankAtChange_[s] ? BoostGapSeconds : minimumGap(Setting(s));
+        if (changedAt_[s] && in.ms - changedAt_[s] < uint64_t(gap * 1000)) continue;
+        d.apply[s] = target; lastSet_[s] = target; changedAt_[s] = in.ms; rankAtChange_[s] = rank(activity_);
     }
     // Background apps busy for 30 s get efficiency mode until they come to the front.
     std::set<std::pair<uint32_t, uint64_t>> seen;
