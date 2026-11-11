@@ -119,6 +119,28 @@ Turn it on from **⋯ → Dynamic power saving** or the settings page. On batter
 - **Detection accuracy:** during the automatic test, detection is scored against the activity actually running; the export summary shows the accuracy and `detection-log.csv` has every second.
 - Diagnostics: `BatteryScope.exe --detect-test 30` prints what the detector sees for 30 seconds (without the GPU).
 
+## Interface (0.18)
+
+Tabs along the bottom of the panel:
+- **Apps** (the ranking)
+- **Saving**
+- **Battery**
+- **ASUS** (ASUS laptops only)
+- **Lab**
+- **Setup**
+
+Each tab shows live charts on top and clickable control rows below. A row switches its setting, or opens its choices in place. Arrows select a row, Enter runs it, and Esc returns to the ranking.
+
+The ⋯ menu keeps only quick switches and tools: dynamic saving, hand back manual settings, power mode, ASUS performance mode, tools, and quit. While dynamic saving runs, the header pill shows "Dynamic · activity"; clicking it opens the Saving tab.
+
+**Who controls each setting**, in order:
+1. The lab, while it measures.
+2. A power mode or ASUS mode you chose in BatteryScope, for this battery session; you can hand it back.
+3. Dynamic saving, following app rules and the current activity.
+4. When dynamic saving is off: the low-battery switch and the performance list.
+
+Programs you put in efficiency mode yourself are left alone.
+
 ## ASUS hardware (0.18, ASUS laptops)
 
 **⋯ → ASUS hardware** reads and writes firmware settings through the ASUS ATKACPI driver (ASUS System Control Interface, which Armoury Crate and G-Helper also use). G-Helper is not needed:
@@ -132,7 +154,15 @@ Turn it on from **⋯ → Dynamic power saving** or the settings page. On batter
   - When Fn keys or another program change it, it pauses for 10 minutes, and two changes are at least 20 s apart so the fans do not flap.
 - **Experiments:** the quick and full tests measure what silent mode saves (skipped on other PCs). Only a proven saving is used.
 - Diagnostics: `BatteryScope.exe --asus-dump` prints every firmware value read.
+- **GPU automatic:** Eco on battery and standard when plugged in, like G-Helper's Optimized mode. It waits until no program uses the discrete GPU.
+- **Charge limit:** remembered and re-applied at startup and after sleep.
+- **Keyboard backlight:** off, low, medium, or high. On battery it can turn off after 30 s idle and come back at a touch.
+- **ASUS keys:** BatteryScope can handle the backlight keys, the performance mode key (Fn+F5), and the ROG key. The ROG key can open BatteryScope, cycle the mode, or do nothing. Recent key codes are listed.
+- **ASUS services:**
+  - Stop and disable every ASUS and Armoury Crate service in one step, with administrator rights. The original start types are saved, so one step restores them.
+  - Stopping them makes BatteryScope handle the ASUS keys.
 - Fan curves and power-limit changes come once these readings are confirmed on your model.
+- Lid lighting (Slash) comes once the ASUS HID devices that `--asus-dump` lists are confirmed.
 
 ## Power lab (experimental)
 

@@ -6,7 +6,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <atomic>
 #include <cstdint>
+#include <thread>
 #include <optional>
 #include <string>
 #include <vector>
@@ -32,6 +34,7 @@ constexpr uint32_t PptApuSppt = 0x001200B0, PptPlatformSppt = 0x001200B1;
 constexpr uint32_t PptFppt = 0x001200C1;             // fast limit
 constexpr uint32_t NvDynamicBoost = 0x001200C0, NvTempTarget = 0x001200C2;
 constexpr uint32_t CpuFanCurve = 0x00110024, GpuFanCurve = 0x00110025, MidFanCurve = 0x00110032;
+constexpr uint32_t KeyboardBacklight = 0x00050021;   // level 0-3; written with bit 7 set
 }
 
 // Values as the firmware reports them. DSTS sets bit 16 ("present") on a
@@ -71,6 +74,7 @@ struct Snapshot {
     std::optional<unsigned> cpuTemp, gpuTemp;         // degrees C
     std::vector<std::pair<const wchar_t*, unsigned>> limits; // watts: label, value
     std::vector<std::pair<uint32_t, uint32_t>> raw;           // every device read: id, raw answer
+    std::optional<unsigned> keyboard;                         // backlight level 0-3
 };
 Snapshot read();
 std::wstring dump(const Snapshot& snapshot); // plain text for diagnosis
@@ -81,4 +85,35 @@ DWORD setMode(Mode mode);
 DWORD setChargeLimit(unsigned percent);     // 20..100
 DWORD setGpuEco(bool eco);
 DWORD setOverdrive(bool on);
+DWORD setKeyboardBacklight(unsigned level); // 0-3
+
+// ASUS and Armoury Crate services. Stopping and starting them needs administrator
+// rights (BatteryScope runs itself elevated for it); their start types are saved
+// so starting restores exactly what was there.
+struct Service { std::wstring name, display; bool running = false; DWORD startType = 0; };
+std::vector<Service> services();
+DWORD stopServices(bool keepOff);   // keepOff: also set them to disabled until started again
+DWORD startServices();
+bool servicesKeptOff();             // stopServices(true) was used and not undone
+
+// The keys ASUS firmware reports itself (Fn+F5, the ROG key, keyboard backlight
+// keys...), as WMI events from the ATK driver. Each key's code is posted to the
+// window as `message` with the code in wParam.
+namespace key {
+constexpr unsigned KeyboardUp = 0xC4, KeyboardDown = 0xC5, Mode = 0xAE, Rog = 0x38, MicMute = 0x7C, Touchpad = 0x6B;
+}
+const wchar_t* keyName(unsigned code); // Chinese UI string, or nullptr for an unknown key
+class Hotkeys {
+public:
+    ~Hotkeys() { stop(); }
+    void start(HWND target, UINT message);
+    void stop();
+    bool running() const { return thread_.joinable(); }
+private:
+    std::thread thread_;
+    std::atomic<bool> stop_{false};
+};
+
+// HID interfaces of ASUS devices (keyboard, lighting), for diagnosis: "VID_0B05&PID_19B6 usage FF31:0076".
+std::vector<std::wstring> hidDevices();
 }
