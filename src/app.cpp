@@ -5643,6 +5643,8 @@ void showPerformancePage() {
         std::vector<double> series;
         for (const auto& [ms, value] : cpuPowerHistory) if (value && !cpuPowerHistory.empty() && cpuPowerHistory.back().first - ms <= 5 * 60000) series.push_back(*value);
         if (series.size() > 120) series.erase(series.begin(), series.end() - 120);
+        if (series.empty() && (demo || isolatedPreview))
+            for (int i = 0; i < 100; ++i) series.push_back(5.0 + 3.0 * std::sin(i / 6.0) + (i % 17 == 0 ? 9.0 : 0.0) + (i > 70 && i < 80 ? 12.0 : 0.0));
         v.push_back(vSeries(tr(L"近 5 分鐘"), std::move(series), limits.spl, watts ? tr(L"現在 ") + valueText(watts, L" W") : std::wstring()));
     }
     // GPU.
