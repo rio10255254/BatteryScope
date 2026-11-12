@@ -1223,9 +1223,15 @@ std::wstring etaLabel(const ChargeEta& eta) {
     if (eta.target < 100) return tr(L"至 ") + std::to_wstring(eta.target) + tr(L"% 上限") + (eta.curve ? tr(L" · 依充電曲線") : tr(L" · 依目前速度"));
     return eta.curve ? tr(L"至充滿 · 依充電曲線") : tr(L"至充滿 · 依目前速度");
 }
+// The panel's layout by the height above the tab bar: compact panels drop the 30-minute
+// chart (and minimal ones more). Painting and the list position must agree on it, or the
+// list sits below an empty gap where the chart would be.
+bool compactLayout(int height) { return height < px(600) - tabBarHeight(); }
+bool minimalLayout(int height) { return height < px(480) - tabBarHeight(); }
 int listTop() {
     RECT r{}; GetClientRect(mainWindow, &r);
-    return sp(r.bottom < px(480) ? 270 : r.bottom < px(600) ? 308 : 366);
+    const int h = r.bottom - tabBarHeight();
+    return sp(minimalLayout(h) ? 270 : compactLayout(h) ? 308 : 366);
 }
 // ----- Popups: the key display, notices in the panel and notifications -----
 // Small layered windows painted in the panel's style (pixel or smooth, dark or light).
@@ -2308,7 +2314,7 @@ void paint(HDC dc, RECT bounds) {
     drawTabs(dc, bounds);
     // Everything else sits above the tab bar.
     const int w = bounds.right, h = bounds.bottom - tabBarHeight(), margin = sp(18), right = w - margin;
-    const bool compact = h < px(600), minimal = h < px(480);
+    const bool compact = compactLayout(h), minimal = minimalLayout(h);
     const int top = listTop();
     if (headerIcon) DrawIconEx(dc, margin, sp(15), headerIcon, sp(22), sp(22), 0, nullptr, DI_NORMAL);
     drawText(dc, L"BatteryScope", {margin + sp(30), sp(11), w - sp(98), sp(40)}, Ink, titleFont);
@@ -6595,6 +6601,11 @@ bool panelSelfTest(const std::wstring& path) {
     GetWindowTextW(inlineText, goalBody.data(), int(goalBody.size()));
     check("goal_page_shows_goal_and_tips", inlinePage == InlinePage::goal && goalBody.find(L"10 W") != std::wstring::npos && goalBody.find(L"1. ") != std::wstring::npos);
     SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
+    {
+        // The default panel has room for the 30-minute chart, and the list starts below it with no gap.
+        RECT client{}; GetClientRect(mainWindow, &client);
+        check("default_panel_shows_chart_without_gap", !compactLayout(client.bottom - tabBarHeight()) && listTop() == sp(366));
+    }
     SendMessageW(mainWindow, WM_COMMAND, GoalPageId, 0);
     const auto switches = std::count_if(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::action && b.toggle >= 0; });
     check("saving_tab_switches_each_saving", inlinePage == InlinePage::goal && switches >= 3);

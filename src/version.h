@@ -5,6 +5,6 @@
    Also included by app.rc, so keep it to plain preprocessor definitions. */
 #define BS_VERSION_MAJOR 0
 #define BS_VERSION_MINOR 21
-#define BS_VERSION_PATCH 0
-#define BS_VERSION_STRING "0.21.0"
+#define BS_VERSION_PATCH 1
+#define BS_VERSION_STRING "0.21.1"
 #endif
