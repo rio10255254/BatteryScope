@@ -65,9 +65,11 @@ public:
     std::optional<Reading> get(uint32_t device) const;      // nullopt: the call itself failed
     // DEVS; returns the firmware's answer (1 usually means accepted), nullopt when the call failed.
     std::optional<uint32_t> set(uint32_t device, uint32_t value) const;
+    std::optional<uint32_t> set(uint32_t device, const std::vector<uint8_t>& values) const; // DEVS with a byte payload
+    std::optional<std::vector<uint8_t>> getBuffer(uint32_t device, uint32_t argument) const; // DSTS, all 16 bytes of the answer
     bool init() const;   // INIT: what G-Helper calls before listening for keys
 private:
-    std::optional<uint32_t> call(uint32_t method, const std::vector<uint8_t>& args) const;
+    std::optional<uint32_t> call(uint32_t method, const std::vector<uint8_t>& args, std::vector<uint8_t>* raw = nullptr) const;
     HANDLE handle_ = INVALID_HANDLE_VALUE;
 };
 
@@ -121,6 +123,26 @@ DWORD firmwareKey(FirmwareKey key);
 // Puts back what BatteryScope remembers (mode, charge limit, keyboard, Fn lock):
 // after a restart, sleep, or ASUS software having changed it.
 void reapply(bool mode, bool charge);
+
+// Fan curves and CPU power limits, as G-Helper writes them. The firmware resets both whenever
+// the performance mode changes, so BatteryScope writes them again after every mode change
+// (fans 0.1 s after, power 1.1 s after, on a worker thread). Presets only, inside the
+// factory range: fan curves are the firmware's own curves of another mode, power limits stay
+// at or below what balanced allows.
+enum class FanPreset { factory, quiet, standard, strong };
+enum class PowerPreset { factory, saver, light, standard };
+struct PowerLimits { unsigned spl = 0, sppt = 0, fppt = 0; }; // watts: sustained, slow boost, fast boost
+PowerLimits powerLimits(PowerPreset preset);   // 0s for factory
+const wchar_t* fanPresetKey(FanPreset preset);  // Chinese UI string
+struct Tuning { FanPreset fans = FanPreset::factory; PowerPreset power = PowerPreset::factory; };
+Tuning tuning();                                // remembered
+bool fanCurvesSupported();
+bool powerLimitsSupported();
+// A fan curve the firmware holds for a mode: 8 temperatures (°C) then 8 duties (%); empty when unreadable.
+std::vector<uint8_t> factoryFanCurve(bool gpu, Mode mode);
+bool validFanCurve(const std::vector<uint8_t>& curve);
+// Applies and remembers. Blocks for up to 3 s (a factory reset re-sets the mode): call it off the UI thread.
+DWORD setTuning(Tuning tuning);
 
 // HID packets, as G-Helper sends them. Each starts with its report id; the
 // sender pads it to the interface's feature report length.

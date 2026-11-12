@@ -98,7 +98,7 @@ Acpi::Acpi() {
     handle_ = CreateFileW(L"\\\\.\\ATKACPI", GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 }
 Acpi::~Acpi() { if (handle_ != INVALID_HANDLE_VALUE) CloseHandle(handle_); }
-std::optional<uint32_t> Acpi::call(uint32_t method, const std::vector<uint8_t>& a) const {
+std::optional<uint32_t> Acpi::call(uint32_t method, const std::vector<uint8_t>& a, std::vector<uint8_t>* raw) const {
     if (handle_ == INVALID_HANDLE_VALUE) return std::nullopt;
     std::vector<uint8_t> in(8 + a.size());
     const uint32_t length = uint32_t(a.size());
@@ -107,6 +107,7 @@ std::optional<uint32_t> Acpi::call(uint32_t method, const std::vector<uint8_t>& 
     uint8_t out[16]{}; DWORD returned = 0;
     if (!DeviceIoControl(handle_, ControlCode, in.data(), DWORD(in.size()), out, sizeof(out), &returned, nullptr)) return std::nullopt;
     uint32_t result = 0; std::memcpy(&result, out, 4);
+    if (raw) raw->assign(out, out + sizeof(out));
     return result;
 }
 std::optional<Reading> Acpi::get(uint32_t device) const {
@@ -115,6 +116,17 @@ std::optional<Reading> Acpi::get(uint32_t device) const {
     return decode(*result);
 }
 std::optional<uint32_t> Acpi::set(uint32_t device, uint32_t value) const { return call(Devs, args(device, value)); }
+std::optional<uint32_t> Acpi::set(uint32_t device, const std::vector<uint8_t>& values) const {
+    std::vector<uint8_t> a(4 + values.size());
+    std::memcpy(a.data(), &device, 4);
+    if (!values.empty()) std::memcpy(a.data() + 4, values.data(), values.size());
+    return call(Devs, a);
+}
+std::optional<std::vector<uint8_t>> Acpi::getBuffer(uint32_t device, uint32_t argument) const {
+    std::vector<uint8_t> raw;
+    if (!call(Dsts, args(device, argument), &raw)) return std::nullopt;
+    return raw;
+}
 bool Acpi::init() const { return call(Init, std::vector<uint8_t>(8, 0)).has_value(); }
 
 Remembered remembered() {
@@ -378,9 +390,10 @@ DWORD writeBlind(uint32_t device, uint32_t value) {
     return *answer == 0 || *answer == 0xFFFFFFFE || *answer == 0xFFFFFFFF ? ERROR_GEN_FAILURE : ERROR_SUCCESS;
 }
 }
+namespace { void applyAfterMode(Mode mode); }
 DWORD setMode(Mode mode) {
     const DWORD status = writeBlind(device::ThermalPolicy, DWORD(mode));
-    if (status == ERROR_SUCCESS) store(L"Mode", DWORD(mode));
+    if (status == ERROR_SUCCESS) { store(L"Mode", DWORD(mode)); applyAfterMode(mode); }
     return status;
 }
 DWORD setChargeLimit(unsigned percent) {
@@ -430,6 +443,114 @@ DWORD firmwareKey(FirmwareKey key) {
     Acpi acpi;
     if (!acpi.available()) return ERROR_NOT_SUPPORTED;
     return acpi.set(device::UniversalControl, uint32_t(key)) ? ERROR_SUCCESS : ERROR_GEN_FAILURE;
+}
+// ----- Fan curves and power limits -----
+namespace {
+constexpr uint32_t CpuFanCurveDevice = 0x00110024, GpuFanCurveDevice = 0x00110025;
+constexpr uint32_t PowerSpl = 0x001200A3, PowerSppt = 0x001200A0, PowerFppt = 0x001200C1;
+std::atomic<unsigned> tuningGeneration{0};
+bool present(uint32_t device) {
+    Acpi acpi;
+    const auto r = acpi.available() ? acpi.get(device) : std::nullopt;
+    return r && r->present;
+}
+DWORD writeFans(Mode mode, FanPreset preset) {
+    if (preset == FanPreset::factory) return ERROR_SUCCESS;
+    const Mode source = preset == FanPreset::quiet ? Mode::silent : preset == FanPreset::strong ? Mode::turbo : Mode::balanced;
+    (void)mode;
+    const auto cpu = factoryFanCurve(false, source), gpu = factoryFanCurve(true, source);
+    if (!validFanCurve(cpu)) return ERROR_NOT_SUPPORTED;
+    Acpi acpi;
+    const auto a = acpi.set(CpuFanCurveDevice, cpu);
+    const auto b = validFanCurve(gpu) ? acpi.set(GpuFanCurveDevice, gpu) : std::optional<uint32_t>(1u);
+    return a == 1u && b == 1u ? ERROR_SUCCESS : ERROR_GEN_FAILURE;
+}
+DWORD writePower(PowerPreset preset) {
+    const PowerLimits limits = powerLimits(preset);
+    if (!limits.spl) return ERROR_SUCCESS;
+    Acpi acpi;
+    if (!present(PowerSpl)) return ERROR_NOT_SUPPORTED;
+    bool ok = acpi.set(PowerSpl, limits.spl) == 1u;
+    if (present(PowerSppt)) ok = acpi.set(PowerSppt, limits.sppt) == 1u && ok;
+    if (present(PowerFppt)) ok = acpi.set(PowerFppt, limits.fppt) == 1u && ok;
+    return ok ? ERROR_SUCCESS : ERROR_GEN_FAILURE;
+}
+// After a mode change: fans, then power limits, as G-Helper times it. A newer change cancels an older one.
+void applyAfterMode(Mode mode) {
+    const Tuning t = tuning();
+    if (t.fans == FanPreset::factory && t.power == PowerPreset::factory) return;
+    const unsigned generation = ++tuningGeneration;
+    std::thread([mode, t, generation] {
+        Sleep(100);
+        if (generation != tuningGeneration) return;
+        writeFans(mode, t.fans);
+        Sleep(1000);
+        if (generation != tuningGeneration) return;
+        writePower(t.power);
+    }).detach();
+}
+}
+PowerLimits powerLimits(PowerPreset preset) {
+    switch (preset) {
+    case PowerPreset::saver: return {15, 20, 25};
+    case PowerPreset::light: return {25, 30, 35};
+    case PowerPreset::standard: return {45, 54, 65};
+    default: return {};
+    }
+}
+const wchar_t* fanPresetKey(FanPreset preset) {
+    switch (preset) {
+    case FanPreset::quiet: return L"安靜";
+    case FanPreset::standard: return L"標準";
+    case FanPreset::strong: return L"強力";
+    default: return L"原廠";
+    }
+}
+Tuning tuning() {
+    Tuning t;
+    if (auto v = load(L"FanPreset"); v && *v <= DWORD(FanPreset::strong)) t.fans = FanPreset(*v);
+    if (auto v = load(L"PowerPreset"); v && *v <= DWORD(PowerPreset::standard)) t.power = PowerPreset(*v);
+    return t;
+}
+bool fanCurvesSupported() { return validFanCurve(factoryFanCurve(false, Mode::balanced)); }
+bool powerLimitsSupported() { return present(PowerSpl); }
+std::vector<uint8_t> factoryFanCurve(bool gpu, Mode mode) {
+    // The firmware numbers fan modes with turbo and silent swapped.
+    const uint32_t fanMode = mode == Mode::turbo ? 2 : mode == Mode::silent ? 1 : 0;
+    Acpi acpi;
+    if (!acpi.available()) return {};
+    auto raw = acpi.getBuffer(gpu ? GpuFanCurveDevice : CpuFanCurveDevice, fanMode);
+    if (!raw || raw->size() < 16) return {};
+    raw->resize(16);
+    return validFanCurve(*raw) ? *raw : std::vector<uint8_t>{};
+}
+bool validFanCurve(const std::vector<uint8_t>& c) {
+    if (c.size() != 16 || std::all_of(c.begin(), c.end(), [](uint8_t v) { return v == 0; })) return false;
+    for (int i = 0; i < 8; ++i) if (c[size_t(i)] > 110 || c[size_t(i) + 8] > 100) return false; // temperatures in °C, duties in %
+    return true;
+}
+DWORD setTuning(Tuning t) {
+    const Tuning before = tuning();
+    store(L"FanPreset", DWORD(t.fans)); store(L"PowerPreset", DWORD(t.power));
+    ++tuningGeneration; // any pending re-apply is now stale
+    const Mode mode = remembered().mode.value_or(Mode::balanced);
+    // Back to factory: the G14 2024 keeps custom limits through a re-set of the same mode, so
+    // switch to another mode first (G-Helper's workaround), then back; that resets the fans too.
+    if ((before.power != PowerPreset::factory && t.power == PowerPreset::factory) || (before.fans != FanPreset::factory && t.fans == FanPreset::factory)) {
+        const DWORD other = mode == Mode::turbo ? DWORD(Mode::balanced) : DWORD(Mode::turbo);
+        if (writeBlind(device::ThermalPolicy, other) != ERROR_SUCCESS) return ERROR_NOT_SUPPORTED;
+        Sleep(1500);
+        writeBlind(device::ThermalPolicy, DWORD(mode));
+        Sleep(100);
+    }
+    DWORD status = writeFans(mode, t.fans);
+    if (status == ERROR_GEN_FAILURE) writeBlind(device::ThermalPolicy, DWORD(mode)); // refused: back to the mode's own curve
+    if (t.power != PowerPreset::factory) {
+        Sleep(t.fans != FanPreset::factory ? 1000 : 0);
+        const DWORD power = writePower(t.power);
+        if (power != ERROR_SUCCESS && status == ERROR_SUCCESS) status = power;
+    }
+    return status;
 }
 void reapply(bool mode, bool charge) {
     const Remembered memory = remembered();

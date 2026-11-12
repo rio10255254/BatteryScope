@@ -9,6 +9,7 @@
 #include "asus.h"
 #include "ui.h"
 #include <commctrl.h>
+#include <pdh.h>
 #include <shellapi.h>
 #include <shlobj.h>
 #include <uxtheme.h>
@@ -40,7 +41,8 @@ constexpr UINT SampleMessage = WM_APP + 1, TrayMessage = WM_APP + 2, ActionMessa
     GpuUsersMessage = WM_APP + 10,   // programs found on the discrete GPU (before switching it off)
     SectionRefreshMessage = WM_APP + 11, AsusKeyMessage = WM_APP + 12, AsusServicesMessage = WM_APP + 13,
     OsdMessage = WM_APP + 14,      // a key's result from the key worker: wParam what, lParam the level (-1 unknown)
-    PopupClickMessage = WM_APP + 15; // a notification was clicked: wParam its BalloonTarget
+    PopupClickMessage = WM_APP + 15, // a notification was clicked: wParam its BalloonTarget
+    TuningDoneMessage = WM_APP + 16; // fan or power preset applied: wParam the status
 constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, DetailsId = 104,
     BackgroundId = 105, AllId = 106, StartupId = 107, HideId = 108, MenuId = 109,
     LanguageZhId = 110, LanguageEnId = 111, PowerDetailsId = 112, PowerModeId = 113,
@@ -63,7 +65,8 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     RogOpenId = 226, RogModeId = 227, RogNoneId = 228, ServicesStopId = 229, ServicesStartId = 230,
     ServicesDefaultsId = 231, FnLockId = 232, FnCLockId = 233, FnCNoneId = 234, HwSlashMenuId = 235, SlashToggleId = 236, SlashBatteryId = 237,
     SlashBright1Id = 238 /* ..240 */, SlashIntervalId = 241 /* ..246 */, SlashModeId = 250 /* ..265 */,
-    RefreshAutoId = 266, DarkModeId = 267, AutoSaverCycleId = 268,
+    RefreshAutoId = 266, DarkModeId = 267, AutoSaverCycleId = 268, PerfPageId = 269, FanMenuId = 270, PowerLimitMenuId = 271,
+    FanPreset0Id = 272 /* ..275 */, PowerPreset0Id = 276 /* ..279 */, CpuBoostToggleId = 280, WinModeMenuId = 281,
     SettingsListId = 300,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1, FnKeyHotkey = 10 /* ..20: F1-F11 under the software Fn lock */;
@@ -114,7 +117,7 @@ void* effectiveWatch = nullptr;
 PowerModes powerModes;
 HWND modeButtons[6] = {}, restoreModesButton = nullptr, energySettingsButton = nullptr;
 bool isolatedPreview = false;
-enum class InlinePage { none, process, power, candidates, ledger, powerMode, history, perfApps, lab, settings, dynamic, goal, hardware, confirm, error };
+enum class InlinePage { none, process, power, candidates, ledger, powerMode, history, perfApps, lab, settings, dynamic, goal, hardware, performance, confirm, error };
 unsigned lowBatteryThreshold = 0; // percent; 0 = off
 LowBatteryMonitor lowBattery;
 bool hotkeyEnabled = false, hotkeyRegistered = false;
@@ -159,6 +162,7 @@ uint64_t performanceSeenAt = 0;
 bool showMascot = true, miniEnabled = false;
 unsigned sampleTick = 0;
 RECT mascotRect{};
+RECT batteryCardsRect{}; // the two cards under the battery: a click opens its history
 HWND miniWindow = nullptr;
 const wchar_t* MiniClassName = L"BatteryScope.Mini.v1";
 std::wstring lowerName(std::wstring text) {
@@ -174,6 +178,7 @@ void refreshPowerModeControls();
 void showLabPage();
 void showSettingsPage();
 void showDynamicPage();
+void showPerformancePage();
 int pluggedRefresh();
 bool powerModeHeld();      // dynamic saving is leaving the battery power mode to the user
 void showGoalPage();
@@ -601,13 +606,14 @@ struct VBar {
     std::vector<VSegment> segments;     // stacked parts instead of one fill
 };
 struct VBlock {
-    enum class Kind { heading, note, meter, bars, series, chips, legend, action } kind = Kind::note;
+    enum class Kind { heading, note, meter, bars, series, chips, legend, action, segments } kind = Kind::note;
     std::wstring title, text, value;
     double amount = 0, goal = 0, scale = 0;
     std::vector<VBar> bars;
     std::vector<double> series;
     std::vector<std::pair<std::wstring, COLORREF>> items; // chips (colour 0 = neutral) and legend entries
-    int toggle = -1;                    // action rows: -1 a command or menu, 0/1 a switch that is off/on
+    int toggle = -1;                    // action rows: -1 a command or menu, 0/1 a switch that is off/on; segments: the selected one
+    std::vector<int> commands;          // segments: one command per choice
 };
 VBlock vHeading(const std::wstring& title) { VBlock b; b.kind = VBlock::Kind::heading; b.title = title; return b; }
 VBlock vNote(const std::wstring& text) { VBlock b; b.kind = VBlock::Kind::note; b.text = text; return b; }
@@ -624,6 +630,12 @@ VBlock vLegend(std::vector<std::pair<std::wstring, COLORREF>> entries) { VBlock 
 // `highlight` colours the value (e.g. green for a saving state).
 VBlock vAction(const std::wstring& title, const std::wstring& value, int command, COLORREF highlight = 0) {
     VBlock b; b.kind = VBlock::Kind::action; b.title = title; b.value = value; b.amount = command; b.goal = highlight; return b;
+}
+// A row of choices, one of them selected (-1: none), like the performance mode.
+VBlock vSegments(std::vector<std::wstring> labels, std::vector<int> commands, int selected) {
+    VBlock b; b.kind = VBlock::Kind::segments; b.toggle = selected; b.commands = std::move(commands);
+    for (auto& label : labels) b.items.push_back({std::move(label), 0});
+    return b;
 }
 // A switch: clicking it runs `command`, which turns the setting on or off. `detail` is a short
 // line under the title (what it does, or what it saves).
@@ -668,6 +680,7 @@ int blockHeight(HDC dc, const VBlock& b, int width, bool first) {
     case VBlock::Kind::chips: return chipRowsHeight(dc, b, width) + sp(4);
     case VBlock::Kind::legend: return sp(24);
     case VBlock::Kind::action: return b.text.empty() ? sp(44) : sp(56);
+    case VBlock::Kind::segments: return sp(46);
     }
     return 0;
 }
@@ -747,6 +760,8 @@ void paintVisual(HDC dc, RECT client) {
         const int rise = int(std::lround((1 - appear) * sp(14)));
         if (y + h < 0 || y > client.bottom) {
             if (b.kind == VBlock::Kind::action) visualHits.push_back({{0, y + sp(3), width, y + h - sp(3)}, int(b.amount), i});
+            if (b.kind == VBlock::Kind::segments)
+                for (size_t k = 0; k < b.commands.size(); ++k) visualHits.push_back({{0, y + sp(4), width, y + h - sp(4)}, b.commands[k], i});
             y += h; continue;
         }
         paintFade = appear;
@@ -903,6 +918,33 @@ void paintVisual(HDC dc, RECT client) {
                 const int mid = (row.top + row.bottom) / 2;
                 drawText(dc, b.title, {row.left + sp(12), mid - sp(19), right, mid + sp(1)}, ink, normalFont);
                 drawText(dc, b.text, {row.left + sp(12), mid + sp(1), right, mid + sp(19)}, Muted, smallFont);
+            }
+            break;
+        }
+        case VBlock::Kind::segments: {
+            // A track with one cell per choice; the selected one's highlight slides to a new choice.
+            const int n = int(b.commands.size());
+            const RECT bar{0, top + sp(4), width, top + h - sp(4)};
+            rounded(dc, bar, blend(Surface, Background, .6), 10);
+            if (!n) break;
+            const int pad = sp(3), cell = (bar.right - bar.left - pad * 2) / n;
+            if (b.toggle >= 0) {
+                auto [it, fresh] = visualKnobs.try_emplace(100000 + int(i));
+                if (fresh) { it->second.from = it->second.to = b.toggle; it->second.duration = 0; }
+                else if (std::abs(it->second.to - b.toggle) > .01) it->second.move(b.toggle, now, canAnimate() ? 240 : 0);
+                if (it->second.active(now)) visualAnimating = true;
+                const int left = bar.left + pad + int(std::lround(it->second.value(now) * cell));
+                rounded(dc, {left, bar.top + pad, left + cell, bar.bottom - pad}, theme.highContrast ? Selected : faded(theme.accentSoft), 8);
+            }
+            for (int k = 0; k < n; ++k) {
+                const RECT face{bar.left + pad + k * cell, bar.top + pad, bar.left + pad + (k + 1) * cell, bar.bottom - pad};
+                const int index = int(visualHits.size());
+                visualHits.push_back({{face.left, y + sp(4) + pad, face.right, y + h - sp(4) - pad}, b.commands[size_t(k)], i});
+                const bool on = k == b.toggle;
+                if ((index == visualHover || index == visualFocus) && !on) rounded(dc, face, blend(Surface, Selected, .5), 8);
+                if (index == visualFocus && GetFocus() == visualView) outline(dc, face, Green, 8);
+                drawText(dc, b.items[size_t(k)].first, face, on ? (theme.highContrast ? theme.selectedInk : Green) : Ink, on ? strongFont : normalFont,
+                    DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
             }
             break;
         }
@@ -1086,10 +1128,11 @@ std::wstring candidatesText();
 // ASUS hardware (on ASUS laptops), the lab and settings. Each section is one page
 // with live charts on top and its controls as rows below; the ⋯ menu keeps only
 // quick switches and tools.
-enum class Tab { ranking, saving, battery, hardware, lab, settings };
+enum class Tab { ranking, saving, battery, hardware, lab, settings, performance };
 int tabBarHeight() { return sp(54); }
 std::vector<Tab> visibleTabs() {
-    std::vector<Tab> tabs{Tab::ranking, Tab::saving, Tab::battery};
+    // Home is the performance dashboard; the battery tab holds the battery and the programs using it.
+    std::vector<Tab> tabs{Tab::performance, Tab::saving, Tab::ranking};
     if (asusAvailable) tabs.push_back(Tab::hardware);
     tabs.push_back(Tab::lab); tabs.push_back(Tab::settings);
     return tabs;
@@ -1097,22 +1140,23 @@ std::vector<Tab> visibleTabs() {
 const wchar_t* tabLabel(Tab tab) {
     // Short words of their own: a tab is a sixth of the panel wide.
     switch (tab) {
+    case Tab::performance: return english ? L"Perf" : L"效能";
     case Tab::saving: return english ? L"Saving" : L"省電";
-    case Tab::battery: return english ? L"Battery" : L"電池";
     case Tab::hardware: return english ? L"ASUS" : L"硬體";
     case Tab::lab: return english ? L"Lab" : L"實驗";
     case Tab::settings: return english ? L"Setup" : L"設定";
-    default: return english ? L"Apps" : L"排行";
+    default: return english ? L"Battery" : L"電池";
     }
 }
 bool sectionPage(InlinePage page) {
     return page == InlinePage::goal || page == InlinePage::history || page == InlinePage::ledger || page == InlinePage::hardware ||
-        page == InlinePage::lab || page == InlinePage::settings;
+        page == InlinePage::lab || page == InlinePage::settings || page == InlinePage::performance;
 }
 Tab activeTab() {
     switch (inlinePage) {
     case InlinePage::goal: case InlinePage::dynamic: case InlinePage::powerMode: return Tab::saving;
-    case InlinePage::history: case InlinePage::ledger: case InlinePage::power: case InlinePage::candidates: return Tab::battery;
+    case InlinePage::performance: return Tab::performance;
+    case InlinePage::history: case InlinePage::ledger: case InlinePage::power: case InlinePage::candidates: return Tab::ranking;
     case InlinePage::hardware: return Tab::hardware;
     case InlinePage::lab: return Tab::lab;
     case InlinePage::settings: case InlinePage::perfApps: return Tab::settings;
@@ -1122,6 +1166,7 @@ Tab activeTab() {
 int tabCommand(Tab tab) {
     switch (tab) {
     case Tab::saving: return GoalPageId;
+    case Tab::performance: return PerfPageId;
     case Tab::battery: return HistoryId;
     case Tab::hardware: return HardwarePageId;
     case Tab::lab: return LabPageId;
@@ -1817,6 +1862,9 @@ void showMain() {
     ShowWindow(mainWindow, SW_SHOWNORMAL); stepMotion(now);
     SetForegroundWindow(mainWindow); wake.notify_one();
     if (panelMotion.active(now)) armMotionTimer();
+    // Home is the performance dashboard: the first time the panel opens it starts there.
+    static bool homeShown = false;
+    if (!homeShown && !demo && !isolatedPreview) { homeShown = true; if (inlinePage == InlinePage::none) showPerformancePage(); }
 }
 void hideMain() {
     if (!panelTargetShown && hidden) return;
@@ -2063,7 +2111,7 @@ void layout() {
     MoveWindow(menuButton, w - sp(92), sp(16), sp(32), sp(30), TRUE);
     MoveWindow(hideButton, w - sp(52), sp(16), sp(32), sp(30), TRUE);
     const bool fullPage = inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history || inlinePage == InlinePage::lab || inlinePage == InlinePage::ledger || inlinePage == InlinePage::hardware ||
-        inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic || inlinePage == InlinePage::goal ||
+        inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic || inlinePage == InlinePage::goal || inlinePage == InlinePage::performance ||
         inlinePage == InlinePage::confirm || inlinePage == InlinePage::error;
     const bool section = sectionPage(inlinePage);
     const int textTop = inlinePage == InlinePage::powerMode ? sp(318) : section ? sp(146) : fullPage ? sp(128) : top - sp(37);
@@ -2331,7 +2379,7 @@ void paint(HDC dc, RECT bounds) {
     drawText(dc, demo ? tr(L"示範資料 · 關閉操作已停用") : tr(L"電池與背景活動"), {margin + sp(30), sp(39), w - sp(96), sp(60)}, Muted, smallFont);
     if (inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history || inlinePage == InlinePage::ledger || inlinePage == InlinePage::hardware ||
         inlinePage == InlinePage::lab || inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic || inlinePage == InlinePage::goal ||
-        inlinePage == InlinePage::confirm || inlinePage == InlinePage::error) {
+        inlinePage == InlinePage::performance || inlinePage == InlinePage::confirm || inlinePage == InlinePage::error) {
         card(dc, {margin, sp(74), right, h - sp(14)}, Surface, 14);
         drawText(dc, inlineTitle, {margin + sp(14), sp(84), right - sp(14), sp(114)}, Ink, titleFont);
         fill(dc, {margin + sp(14), sp(119), right - sp(14), sp(119) + 1}, Border);
@@ -2391,6 +2439,8 @@ void paint(HDC dc, RECT bounds) {
         const int gap = sp(8), half = (right - margin - gap) / 2;
         const RECT rateCard{margin, sp(187), margin + half, sp(228)}, timeCard{margin + half + gap, sp(187), right, sp(228)};
         card(dc, rateCard, Surface, 12); card(dc, timeCard, Surface, 12);
+        batteryCardsRect = desktop ? RECT{} : RECT{rateCard.left, rateCard.top, timeCard.right, timeCard.bottom};
+        if (!desktop) drawMenuArrow(dc, timeCard.right - sp(16), (timeCard.top + timeCard.bottom) / 2 - sp(4), sp(8), Muted, false); // opens the details
         // Plugged in without charging, battery health is more useful than a rate.
         const auto health = batteryHealth(p);
         const bool showHealth = plugged && !p.charging && health;
@@ -2400,9 +2450,9 @@ void paint(HDC dc, RECT bounds) {
             drawText(dc, tr(L"CPU 核心"), {rateCard.left + sp(12), rateCard.top + sp(4), rateCard.right - sp(8), rateCard.top + sp(20)}, Muted, smallFont);
             drawText(dc, energyLive ? valueText(current.energy.coreWatts, L" W") : std::wstring(L"—"),
                 {rateCard.left + sp(12), rateCard.top + sp(19), rateCard.right - sp(8), rateCard.bottom - sp(3)}, Ink, strongFont);
-            drawText(dc, tr(L"未歸因給程式"), {timeCard.left + sp(12), timeCard.top + sp(4), timeCard.right - sp(8), timeCard.top + sp(20)}, Muted, smallFont);
+            drawText(dc, tr(L"未歸因給程式"), {timeCard.left + sp(12), timeCard.top + sp(4), timeCard.right - sp(22), timeCard.top + sp(20)}, Muted, smallFont);
             drawText(dc, energyLive ? valueText(current.energy.unassignedCpuWatts, L" W") : std::wstring(L"—"),
-                {timeCard.left + sp(12), timeCard.top + sp(19), timeCard.right - sp(8), timeCard.bottom - sp(3)}, Ink, strongFont);
+                {timeCard.left + sp(12), timeCard.top + sp(19), timeCard.right - sp(22), timeCard.bottom - sp(3)}, Ink, strongFont);
         } else {
         drawText(dc, p.charging ? tr(L"充電速度") : showHealth ? tr(L"電池健康度") : plugged ? tr(L"電池狀態") : tr(L"耗電速度"),
             {rateCard.left + sp(12), rateCard.top + sp(4), rateCard.right - sp(8), rateCard.top + sp(20)}, Muted, smallFont);
@@ -2414,8 +2464,8 @@ void paint(HDC dc, RECT bounds) {
         if (auto text = p.charging ? durationText(eta.hours) : remainingText(m); !text.empty()) remaining = text;
         // Plugged in without charging there is no time to show, so show stored energy instead.
         drawText(dc, plugged ? (p.charging ? etaLabel(eta) : tr(L"剩餘容量")) : tr(L"近 5 分鐘 ") + valueText(m.averageWatts, L" W"),
-            {timeCard.left + sp(12), timeCard.top + sp(4), timeCard.right - sp(8), timeCard.top + sp(20)}, Muted, smallFont);
-        drawText(dc, remaining, {timeCard.left + sp(12), timeCard.top + sp(19), timeCard.right - sp(8), timeCard.bottom - sp(3)}, Ink, strongFont);
+            {timeCard.left + sp(12), timeCard.top + sp(4), timeCard.right - sp(22), timeCard.top + sp(20)}, Muted, smallFont);
+        drawText(dc, remaining, {timeCard.left + sp(12), timeCard.top + sp(19), timeCard.right - sp(22), timeCard.bottom - sp(3)}, Ink, strongFont);
         }
     }
     if (!compact) {
@@ -3640,6 +3690,92 @@ void publishGovernorGpu(const std::vector<std::pair<std::wstring, double>>& inst
     std::lock_guard<std::mutex> lock(governorGpuMutex);
     governorGpuLatest = std::move(summary); governorGpuAt = now;
 }
+// ----- Performance readings for the home page -----
+// What the performance dashboard shows that the regular snapshot does not: CPU clock, integrated
+// and discrete GPU use, the discrete GPU's power state and, only while it is awake anyway, its
+// temperature, clock and power from NVIDIA's driver (reading it would otherwise keep it awake).
+struct PerfReading {
+    uint64_t ms = 0;
+    Value cpuMhz, igpu, dgpu, nvTemp, nvClock, nvWatts, nvLoad;
+    int dgpuState = -1;          // 0 awake (D0) ... 3 asleep (D3), 9 off (Eco), -1 unknown
+    std::wstring dgpuApps;       // programs using it, ";"-separated
+};
+std::mutex perfMutex;
+PerfReading perfLatest;
+// The processor's clock: Windows' "% Processor Performance" times the base clock, as Task Manager shows it.
+class CpuClock {
+public:
+    ~CpuClock() { if (query_) PdhCloseQuery(query_); }
+    Value read() {
+        if (!opened_) {
+            opened_ = true;
+            if (PdhOpenQueryW(nullptr, 0, &query_) != ERROR_SUCCESS) { query_ = nullptr; return std::nullopt; }
+            if (PdhAddEnglishCounterW(query_, L"\\Processor Information(_Total)\\% Processor Performance", 0, &counter_) != ERROR_SUCCESS) {
+                PdhCloseQuery(query_); query_ = nullptr; return std::nullopt;
+            }
+            base_ = baseMhz();
+        }
+        if (!query_ || !base_ || PdhCollectQueryData(query_) != ERROR_SUCCESS) return std::nullopt;
+        PDH_FMT_COUNTERVALUE value{};
+        if (PdhGetFormattedCounterValue(counter_, PDH_FMT_DOUBLE, nullptr, &value) != ERROR_SUCCESS || value.CStatus != ERROR_SUCCESS) return std::nullopt;
+        return base_ * value.doubleValue / 100;
+    }
+private:
+    static double baseMhz() {
+        struct Info { ULONG number, maxMhz, currentMhz, mhzLimit, maxIdleState, currentIdleState; };
+        LONG (WINAPI* information)(int, PVOID, ULONG, PVOID, ULONG) = nullptr;
+        if (HMODULE module = LoadLibraryExW(L"powrprof.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
+            FARPROC symbol = GetProcAddress(module, "CallNtPowerInformation");
+            std::memcpy(&information, &symbol, sizeof(information));
+        }
+        if (!information) return 0;
+        std::vector<Info> cpus(std::max<DWORD>(1, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)));
+        if (information(11 /* ProcessorInformation */, nullptr, 0, cpus.data(), ULONG(cpus.size() * sizeof(Info))) != 0) return 0;
+        return double(cpus.front().maxMhz);
+    }
+    PDH_HQUERY query_ = nullptr; PDH_HCOUNTER counter_ = nullptr; double base_ = 0; bool opened_ = false;
+};
+// NVIDIA's management library, from the driver; only asked while the GPU is already awake.
+struct NvReading { Value temp, clock, watts, load; };
+NvReading readNvidia() {
+    struct Api {
+        int (*init)() = nullptr; int (*shutdown)() = nullptr; int (*handle)(unsigned, void**) = nullptr;
+        int (*temperature)(void*, int, unsigned*) = nullptr; int (*clock)(void*, int, unsigned*) = nullptr;
+        int (*power)(void*, unsigned*) = nullptr; int (*utilization)(void*, unsigned*) = nullptr;
+    };
+    static const Api api = [] {
+        Api a; HMODULE module = LoadLibraryExW(L"nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        auto bind = [&](const char* name, auto& target) { FARPROC symbol = module ? GetProcAddress(module, name) : nullptr; std::memcpy(&target, &symbol, sizeof(target)); };
+        bind("nvmlInit_v2", a.init); bind("nvmlShutdown", a.shutdown); bind("nvmlDeviceGetHandleByIndex_v2", a.handle);
+        bind("nvmlDeviceGetTemperature", a.temperature); bind("nvmlDeviceGetClockInfo", a.clock);
+        bind("nvmlDeviceGetPowerUsage", a.power); bind("nvmlDeviceGetUtilizationRates", a.utilization);
+        return a;
+    }();
+    NvReading r;
+    if (!api.init || !api.shutdown || !api.handle || api.init() != 0) return r;
+    void* device = nullptr;
+    if (api.handle(0, &device) == 0) {
+        unsigned value = 0, rates[2]{};
+        if (api.temperature && api.temperature(device, 0, &value) == 0) r.temp = value;
+        if (api.clock && api.clock(device, 0, &value) == 0) r.clock = value;
+        if (api.power && api.power(device, &value) == 0) r.watts = value / 1000.0;
+        if (api.utilization && api.utilization(device, rates) == 0) r.load = rates[0];
+    }
+    api.shutdown();
+    return r;
+}
+void publishPerf(const bs::lab::Sample& sample, CpuClock& clock, uint64_t now) {
+    PerfReading r;
+    r.ms = now; r.cpuMhz = clock.read(); r.igpu = sample.igpuPercent; r.dgpu = sample.dgpuPercent;
+    r.dgpuState = sample.dgpuState; r.dgpuApps = sample.dgpuApps;
+    // Awake and in use: asking the driver costs nothing more then.
+    if (r.dgpuState == 0 && ((r.dgpu && *r.dgpu >= 1) || !r.dgpuApps.empty())) {
+        const auto nv = readNvidia();
+        r.nvTemp = nv.temp; r.nvClock = nv.clock; r.nvWatts = nv.watts; r.nvLoad = nv.load;
+    }
+    std::lock_guard<std::mutex> lock(perfMutex);
+    perfLatest = std::move(r);
+}
 void sampleLoop() {
     Collector collector;
     EnergyReader energyReader;
@@ -3659,6 +3795,7 @@ void sampleLoop() {
     if (labController) bs::lab::restoreInterrupted();
     std::unique_ptr<bs::lab::Probe> labProbe;
     uint64_t labLast = 0;
+    CpuClock cpuClock;
     while (!quit) {
         auto now = GetTickCount64(); bool background = hidden.load(), processSampled = false;
         const bool labActive = labController && labController->active();
@@ -3731,10 +3868,20 @@ void sampleLoop() {
                 if (state.energy.ready && !state.energy.timingMismatch) { sample.packageWatts = state.energy.packageWatts; sample.coreWatts = state.energy.coreWatts; }
                 sample.systemCpu = systemCpu;
                 labProbe->read(sample, gpu.instances(), state.processes);
+                publishPerf(sample, cpuClock, now);
                 if (labEngine) sample.workload = labEngine->take();
                 labController->onSample(sample, labLast && now > labLast ? (now - labLast) / 1000.0 : 0);
                 labLast = now;
-            } else labLast = 0;
+            } else {
+                labLast = 0;
+                // The performance page's readings, while the panel is open.
+                if (!background) {
+                    if (!labProbe) labProbe = std::make_unique<bs::lab::Probe>();
+                    bs::lab::Sample sample; sample.ms = now; sample.systemCpu = systemCpu;
+                    labProbe->read(sample, gpu.instances(), state.processes);
+                    publishPerf(sample, cpuClock, now);
+                }
+            }
             changed = processSampled = true;
         }
         // The activity detector needs the GPU engines every 2 seconds, even while hidden.
@@ -5391,6 +5538,163 @@ void showHardwarePage() {
     v.push_back(vNote(tr(L"這台的韌體不會回報效能模式與充電上限：顯示的是 BatteryScope 最後設定的值，開機與睡眠喚醒後會自動重設。效能模式選「自動」時由動態省電管理；手動選的模式在這次用電池期間保留。華碩軟體停止後，亮度、鍵盤背光、觸控板、麥克風、睡眠、Fn 鎖定（Fn+C、Fn+Esc）、效能模式與 ROG 鍵都由 BatteryScope 接手。Fn 鎖定開啟時，F1–F11 不按 Fn 就是快捷功能。")));
     showChartPage(InlinePage::hardware, tr(L"華碩硬體"), hardwareText(h), std::move(v));
 }
+// ----- The performance dashboard (home) -----
+// One look at what the machine is doing and the controls that change it: a battery line, the
+// performance mode, CPU (power, temperature, clock, load), GPU (integrated use; the discrete
+// GPU's state, and its readings only while it is awake anyway), fans with their preset, the CPU
+// power limit preset, and quick switches. The battery itself and the programs using it are on
+// the battery tab.
+std::vector<MenuItem> fanMenuItems() {
+    const auto t = bs::asus::tuning();
+    const bool preview = demo || isolatedPreview;
+    std::vector<MenuItem> items;
+    const std::pair<bs::asus::FanPreset, const wchar_t*> rows[] = {
+        {bs::asus::FanPreset::factory, L"原廠（跟隨效能模式）"}, {bs::asus::FanPreset::quiet, L"安靜（靜音模式的曲線）"},
+        {bs::asus::FanPreset::standard, L"標準（平衡模式的曲線）"}, {bs::asus::FanPreset::strong, L"強力（Turbo 的曲線）"}};
+    for (const auto& [preset, label] : rows) items.push_back(menuItem(FanPreset0Id + int(preset), tr(label), t.fans == preset, preview));
+    return items;
+}
+std::vector<MenuItem> powerLimitMenuItems() {
+    const auto t = bs::asus::tuning();
+    const bool preview = demo || isolatedPreview;
+    std::vector<MenuItem> items;
+    items.push_back(menuItem(PowerPreset0Id, tr(L"原廠（跟隨效能模式）"), t.power == bs::asus::PowerPreset::factory, preview));
+    const std::pair<bs::asus::PowerPreset, const wchar_t*> rows[] = {
+        {bs::asus::PowerPreset::saver, L"省電"}, {bs::asus::PowerPreset::light, L"輕量"}, {bs::asus::PowerPreset::standard, L"標準"}};
+    for (const auto& [preset, label] : rows) {
+        const auto limits = bs::asus::powerLimits(preset);
+        auto item = menuItem(PowerPreset0Id + int(preset), tr(label), t.power == preset, preview);
+        item.hint = std::to_wstring(limits.spl) + L"／" + std::to_wstring(limits.fppt) + L" W";
+        items.push_back(item);
+    }
+    return items;
+}
+std::wstring powerPresetText(bs::asus::PowerPreset preset) {
+    if (preset == bs::asus::PowerPreset::factory) return tr(L"原廠");
+    return std::to_wstring(bs::asus::powerLimits(preset).spl) + L" W";
+}
+std::wstring perfPageText() {
+    PerfReading perf; { std::lock_guard<std::mutex> lock(perfMutex); perf = perfLatest; }
+    std::wstring c = tr(L"CPU 功耗：") + valueText(current.energy.packageWatts, L" W");
+    if (perf.cpuMhz) c += tr(L"\nCPU 時脈：") + number(*perf.cpuMhz / 1000, 2) + L" GHz";
+    if (perf.igpu) c += tr(L"\n內顯使用率：") + number(*perf.igpu, 0) + L"%";
+    c += tr(L"\n獨顯狀態：") + std::to_wstring(perf.dgpuState);
+    return c;
+}
+void showPerformancePage() {
+    const bool preview = demo || isolatedPreview;
+    PerfReading perf; { std::lock_guard<std::mutex> lock(perfMutex); perf = perfLatest; }
+    bs::asus::Snapshot h = asusAvailable ? asusNow() : bs::asus::Snapshot{};
+    if (preview) {
+        perf.cpuMhz = 3120; perf.igpu = 14; perf.dgpuState = 9;
+        h.driver = true; h.modeDevice = true; h.mode = bs::asus::Mode::silent; h.gpuEco = true; h.cpuTemp = 52; h.cpuFan = 28; h.gpuFan = 0;
+        h.keyboardDevice = true; h.keyboard = 1;
+    }
+    std::vector<VBlock> v;
+    // The battery in one line.
+    if (!current.history.empty()) {
+        const auto& p = current.history.back();
+        std::vector<std::pair<std::wstring, COLORREF>> chips;
+        if (p.percent) chips.push_back({valueText(p.percent, L"%", 0), *p.percent <= 20 ? theme.warn : Green});
+        const bool plugged = p.acKnown && (p.onAc || p.charging);
+        if (p.charging) chips.push_back({tr(L"充電 ") + valueText(calculateCharging(current.history).watts, L" W"), Green});
+        else if (plugged) chips.push_back({tr(L"插電"), 0});
+        else chips.push_back({tr(L"耗電 ") + valueText(current.power.currentWatts, L" W"), 0});
+        if (!plugged) if (auto left = remainingText(current.power); !left.empty()) chips.push_back({left, 0});
+        v.push_back(vChips(std::move(chips)));
+    }
+    // The performance mode: ASUS's firmware modes, else Windows' power mode for the current source.
+    v.push_back(vHeading(tr(L"效能模式")));
+    if (asusAvailable && h.modeDevice) {
+        const bool autoMode = dynamicEnabled && !governor.held(bs::gov::Setting::firmwareMode);
+        std::vector<std::wstring> labels; std::vector<int> commands;
+        if (dynamicEnabled) { labels.push_back(tr(L"自動")); commands.push_back(AsusAutoId); }
+        labels.push_back(tr(L"靜音")); commands.push_back(AsusSilentId);
+        labels.push_back(tr(L"平衡")); commands.push_back(AsusBalancedId);
+        labels.push_back(L"Turbo"); commands.push_back(AsusTurboId);
+        int selected = -1;
+        if (autoMode) selected = 0;
+        else if (h.mode) selected = (dynamicEnabled ? 1 : 0) + (*h.mode == bs::asus::Mode::silent ? 0 : *h.mode == bs::asus::Mode::balanced ? 1 : 2);
+        v.push_back(vSegments(std::move(labels), std::move(commands), selected));
+    } else {
+        const bool plugged = !current.history.empty() && current.history.back().acKnown && current.history.back().onAc;
+        const auto modes = queryPowerModes();
+        const int base = plugged ? ModeAcEfficiencyId : ModeDcEfficiencyId;
+        const bool known = plugged ? modes.acKnown : modes.dcKnown;
+        const PowerMode mode = plugged ? modes.ac : modes.dc;
+        v.push_back(vSegments({tr(L"效率"), tr(L"平衡"), tr(L"效能")}, {base, base + 1, base + 2},
+            known && mode != PowerMode::other ? int(mode) : -1));
+    }
+    // CPU.
+    v.push_back(vHeading(L"CPU"));
+    {
+        std::vector<std::pair<std::wstring, COLORREF>> chips;
+        if (h.cpuTemp) chips.push_back({std::to_wstring(*h.cpuTemp) + L" °C", *h.cpuTemp >= 90 ? theme.danger : *h.cpuTemp >= 80 ? theme.warn : COLORREF(0)});
+        if (perf.cpuMhz) chips.push_back({number(*perf.cpuMhz / 1000, 2) + L" GHz", 0});
+        double busy = 0; for (const auto& core : current.energy.cores) busy += core.busyLogicalCores;
+        if (current.energy.ready) chips.push_back({tr(L"負載 ") + number(busy * 100 / std::max<DWORD>(1, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)), 0) + L"%", 0});
+        DWORD boost = 0;
+        if (bs::lab::readKnob(bs::lab::Knob::cpuBoost, boost) == ERROR_SUCCESS) chips.push_back({boost ? tr(L"Boost 開") : tr(L"Boost 關"), boost ? theme.warn : Green});
+        v.push_back(vChips(std::move(chips)));
+        const Value watts = current.energy.packageWatts ? current.energy.packageWatts : current.energy.coreWatts;
+        const auto limits = bs::asus::powerLimits(bs::asus::tuning().power);
+        v.push_back(vMeter(tr(L"功耗"), valueText(watts, L" W") + (limits.spl ? L" / " + std::to_wstring(limits.spl) + L" W" : std::wstring()),
+            watts.value_or(0), limits.spl, std::max(30.0, double(limits.fppt))));
+        std::vector<double> series;
+        for (const auto& [ms, value] : cpuPowerHistory) if (value && !cpuPowerHistory.empty() && cpuPowerHistory.back().first - ms <= 5 * 60000) series.push_back(*value);
+        if (series.size() > 120) series.erase(series.begin(), series.end() - 120);
+        v.push_back(vSeries(tr(L"近 5 分鐘"), std::move(series), limits.spl, watts ? tr(L"現在 ") + valueText(watts, L" W") : std::wstring()));
+    }
+    // GPU.
+    v.push_back(vHeading(L"GPU"));
+    {
+        v.push_back(vMeter(tr(L"內顯使用率"), perf.igpu ? number(*perf.igpu, 0) + L"%" : std::wstring(L"—"), perf.igpu.value_or(0), 0, 100));
+        std::vector<std::pair<std::wstring, COLORREF>> chips;
+        const bool eco = h.gpuEco.value_or(false) || perf.dgpuState == 9;
+        if (eco) chips.push_back({tr(L"獨顯 Eco（斷電）"), Green});
+        else if (perf.dgpuState >= 1) chips.push_back({tr(L"獨顯休眠中"), Green});
+        else if (perf.dgpuState == 0) chips.push_back({tr(L"獨顯使用中") + (perf.nvLoad ? L" " + number(*perf.nvLoad, 0) + L"%" : std::wstring()), theme.warn});
+        else chips.push_back({tr(L"獨顯狀態未知"), 0});
+        if (perf.nvTemp) chips.push_back({number(*perf.nvTemp, 0) + L" °C", 0});
+        if (perf.nvClock) chips.push_back({number(*perf.nvClock, 0) + L" MHz", 0});
+        if (perf.nvWatts) chips.push_back({number(*perf.nvWatts, 1) + L" W", 0});
+        v.push_back(vChips(std::move(chips)));
+        if (!perf.dgpuApps.empty()) {
+            std::wstring apps = perf.dgpuApps;
+            std::replace(apps.begin(), apps.end(), L';', L'、');
+            v.push_back(vNote(tr(L"正在用獨顯：") + apps));
+        }
+        if (asusAvailable && h.gpuEco) v.push_back(vAction(tr(L"獨顯模式"), (gpuAuto ? tr(L"自動") + std::wstring(L" · ") : std::wstring()) + (*h.gpuEco ? L"Eco" : tr(L"標準")),
+            HwGpuMenuId, *h.gpuEco ? Green : COLORREF(0)));
+    }
+    // Fans and power limits (ASUS).
+    if (asusAvailable && h.driver) {
+        v.push_back(vHeading(tr(L"風扇與功耗")));
+        if (h.cpuFan || h.gpuFan || h.midFan) {
+            std::vector<VBar> bars;
+            if (h.cpuFan) bars.push_back({L"CPU", *h.cpuFan ? std::to_wstring(*h.cpuFan * 100) + L" RPM" : std::wstring(tr(L"停止")), double(*h.cpuFan), 0, 0, {}});
+            if (h.gpuFan) bars.push_back({tr(L"獨顯"), *h.gpuFan ? std::to_wstring(*h.gpuFan * 100) + L" RPM" : std::wstring(tr(L"停止")), double(*h.gpuFan), 0, 0, {}});
+            if (h.midFan) bars.push_back({tr(L"中間"), *h.midFan ? std::to_wstring(*h.midFan * 100) + L" RPM" : std::wstring(tr(L"停止")), double(*h.midFan), 0, 0, {}});
+            v.push_back(vBars(std::move(bars), 70));
+        }
+        const auto t = bs::asus::tuning();
+        v.push_back(vAction(tr(L"風扇模式"), tr(bs::asus::fanPresetKey(t.fans)), FanMenuId, t.fans == bs::asus::FanPreset::quiet ? Green : COLORREF(0)));
+        v.push_back(vAction(tr(L"CPU 功耗上限"), powerPresetText(t.power), PowerLimitMenuId, t.power == bs::asus::PowerPreset::saver ? Green : COLORREF(0)));
+    }
+    // Quick switches.
+    v.push_back(vHeading(tr(L"快速開關")));
+    {
+        const int top = pluggedRefresh();
+        v.push_back(vToggle(tr(L"用電池時 60 Hz"), top > 60 ? tr(L"插電自動回到 ") + std::to_wstring(top) + L" Hz" : std::wstring(tr(L"插電自動回到最高更新率")), refreshAuto, RefreshAutoId));
+        DWORD boost = 0;
+        if (bs::lab::readKnob(bs::lab::Knob::cpuBoost, boost) == ERROR_SUCCESS)
+            v.push_back(vToggle(tr(L"CPU Boost（用電池時）"), tr(L"關閉可省 2–5 W，短暫運算稍慢"), boost != 0, CpuBoostToggleId));
+        v.push_back(vToggle(tr(L"動態省電"), tr(L"依你正在做的事自動調整"), dynamicEnabled, DynamicToggleId));
+        if (asusAvailable && h.keyboardDevice) v.push_back(vAction(tr(L"鍵盤背光"), h.keyboard ? std::wstring(keyboardLevelName(*h.keyboard)) : std::wstring(tr(L"未設定")), HwKeyboardMenuId));
+    }
+    v.push_back(vNote(tr(L"風扇與功耗只提供原廠範圍內的預設：風扇曲線取自韌體各模式自己的曲線，功耗上限不超過平衡模式。每次切換效能模式後會自動重新套用，選「原廠」即還原。獨顯只有在已經醒著時才讀取溫度與時脈，不會為了顯示把它叫醒。")));
+    showChartPage(InlinePage::performance, tr(L"效能"), perfPageText(), std::move(v));
+}
 // The ⋯ menu (also the tray icon's right-click menu).
 // The ⋯ menu (also the tray icon's right-click menu): quick switches and tools. The
 // sections themselves are the tabs at the bottom of the panel.
@@ -5856,6 +6160,31 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (id == DynamicPageId) { showMain(); showDynamicPage(); return 0; }
         if (id == GoalPageId) { showMain(); showGoalPage(); return 0; }
         if (id == HardwarePageId) { showMain(); showHardwarePage(); return 0; }
+        if (id == PerfPageId) { showMain(); showPerformancePage(); return 0; }
+        if (id == FanMenuId || id == PowerLimitMenuId) {
+            if (!asusAvailable) return 0;
+            if (const int chosen = showMenu(id == FanMenuId ? fanMenuItems() : powerLimitMenuItems(), menuAnchor(), mainWindow)) SendMessageW(window, WM_COMMAND, chosen, 0);
+            return 0;
+        }
+        if ((id >= FanPreset0Id && id <= FanPreset0Id + 3) || (id >= PowerPreset0Id && id <= PowerPreset0Id + 3)) {
+            if (demo || isolatedPreview || !asusAvailable) return 0;
+            auto t = bs::asus::tuning();
+            if (id >= PowerPreset0Id) t.power = bs::asus::PowerPreset(id - PowerPreset0Id); else t.fans = bs::asus::FanPreset(id - FanPreset0Id);
+            // Writing fans and limits takes up to 3 s (a return to factory re-sets the mode): off the UI thread.
+            HWND target = window;
+            std::thread([target, t] { PostMessageW(target, TuningDoneMessage, bs::asus::setTuning(t), 0); }).detach();
+            setNotice(tr(L"正在套用…"));
+            return 0;
+        }
+        if (id == CpuBoostToggleId) {
+            if (demo || isolatedPreview) return 0;
+            DWORD boost = 0;
+            if (bs::lab::readKnob(bs::lab::Knob::cpuBoost, boost) == ERROR_SUCCESS && bs::lab::applyKnob(bs::lab::Knob::cpuBoost, boost ? 0 : 2) == ERROR_SUCCESS) {
+                if (dynamicEnabled) governor.hold(bs::gov::Setting::cpuBoost); // a choice made here holds for this battery session
+                setNotice(boost ? tr(L"用電池時 CPU Boost 已關閉。") : tr(L"用電池時 CPU Boost 已開啟。"));
+            }
+            return 0;
+        }
         if (id == HwModeMenuId || id == HwGpuMenuId || id == HwChargeMenuId || id == HwKeyboardMenuId || id == HwKeysMenuId || id == HwServicesMenuId || id == HwSlashMenuId) {
             if (!asusAvailable) return 0;
             const auto items = id == HwModeMenuId ? modeMenuItems() : id == HwGpuMenuId ? gpuMenuItems() : id == HwChargeMenuId ? chargeMenuItems() :
@@ -6119,6 +6448,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         applyGpuAuto();
         applyRefreshAuto();
         if (inlinePage == InlinePage::hardware && !hidden) showHardwarePage();
+        if (inlinePage == InlinePage::performance && !hidden) showPerformancePage();
         if (inlinePage == InlinePage::goal && !hidden && GetTickCount64() - goalPageShownAt >= 10000) showGoalPage();
         return 0;
     }
@@ -6158,6 +6488,12 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         break;
     case GpuUsersMessage: finishGpuEco(reinterpret_cast<std::vector<std::wstring>*>(lp)); return 0;
     case AsusKeyMessage: handleAsusKey(unsigned(wp), lp != 0); return 0;
+    case TuningDoneMessage:
+        setNotice(wp == ERROR_SUCCESS ? std::wstring(tr(L"風扇與功耗設定已套用。")) : wp == ERROR_NOT_SUPPORTED ? std::wstring(tr(L"這台電腦不支援這個設定。"))
+            : tr(L"韌體沒有接受這個設定，已回到原廠。"));
+        asusReadAt = 0;
+        if (inlinePage == InlinePage::performance) showPerformancePage();
+        return 0;
     case PopupClickMessage:
         showMain();
         if (BalloonTarget(wp) == BalloonTarget::candidates) showReviewCandidates();
@@ -6186,6 +6522,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (inlinePage == InlinePage::goal) showGoalPage();
         else if (inlinePage == InlinePage::history) showHistoryPage();
         else if (inlinePage == InlinePage::hardware) showHardwarePage();
+        else if (inlinePage == InlinePage::performance) showPerformancePage();
         else if (inlinePage == InlinePage::lab) showLabPage();
         else if (inlinePage == InlinePage::settings && settingsList) InvalidateRect(settingsList, nullptr, FALSE);
         InvalidateRect(window, nullptr, FALSE); // the tabs
@@ -6221,6 +6558,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             }
         }
         if (PtInRect(&mascotRect, point)) { setNotice(mascotLine()); ++sampleTick; InvalidateRect(window, nullptr, FALSE); return 0; }
+        // The battery cards open the battery's history and health.
+        if (inlinePage == InlinePage::none && PtInRect(&batteryCardsRect, point)) { SendMessageW(window, WM_COMMAND, HistoryId, 0); return 0; }
         break;
     }
     case WM_HOTKEY:
@@ -6606,6 +6945,14 @@ bool panelSelfTest(const std::wstring& path) {
         RECT client{}; GetClientRect(mainWindow, &client);
         check("default_panel_shows_chart_without_gap", !compactLayout(client.bottom - tabBarHeight()) && listTop() == sp(366));
     }
+    // Home: the performance dashboard, with the mode as segments, fans and power presets; the battery tab holds history.
+    SendMessageW(mainWindow, WM_COMMAND, PerfPageId, 0);
+    check("performance_page_is_its_own_tab", inlinePage == InlinePage::performance && activeTab() == Tab::performance && visibleTabs().front() == Tab::performance
+        && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::segments && b.commands.size() >= 3; })
+        && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::action && int(b.amount) == FanMenuId; }));
+    SendMessageW(mainWindow, WM_COMMAND, HistoryId, 0);
+    check("battery_history_belongs_to_the_battery_tab", activeTab() == Tab::ranking);
+    SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
     SendMessageW(mainWindow, WM_COMMAND, GoalPageId, 0);
     const auto switches = std::count_if(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::action && b.toggle >= 0; });
     check("saving_tab_switches_each_saving", inlinePage == InlinePage::goal && switches >= 3);
@@ -7048,6 +7395,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (screenshot && option(L"--dynamic")) showDynamicPage();
     if (screenshot && option(L"--goal")) showGoalPage();
     if (screenshot && option(L"--hardware")) showHardwarePage();
+    if (screenshot && option(L"--performance")) showPerformancePage();
     if (screenshot && option(L"--lab")) showLabPage();
     if (demo) for (size_t i = 0; i + 1 < args.size(); ++i) if (args[i] == L"--popups-bmp") {
         const bool saved = capturePopups(args[i + 1]);
