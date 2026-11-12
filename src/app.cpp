@@ -2419,7 +2419,7 @@ void paint(HDC dc, RECT bounds) {
         }
     }
     if (!compact) {
-        RECT chart{margin, sp(236), right, sp(284)};
+        RECT chart{margin, sp(234), right, sp(278)}; // leaves room above the ranking's heading
         card(dc, chart, Surface, 12);
         const bool chargingChart = p.charging;
         auto chartPower = [chargingChart](const PowerSample& point) -> Value {
