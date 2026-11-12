@@ -1,4 +1,5 @@
 #include "lab.h"
+#include "stability.h"
 #include "platform.h"
 #include "asus.h"
 #include <cfgmgr32.h>
@@ -279,6 +280,7 @@ DWORD setDarkMode(bool dark) {
 }
 }
 void setProtectedJob(HANDLE job) { protectedJob = job; }
+bool runPowerShell(const std::wstring& script, std::string& output, DWORD timeoutMs) { return powershell(script, output, timeoutMs); }
 void writeSystemSnapshot(const std::wstring& folder) {
     SYSTEMTIME t{}; GetLocalTime(&t);
     wchar_t name[64]; swprintf(name, 64, L"system-%04u%02u%02u-%02u%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute);
@@ -344,6 +346,8 @@ DWORD readKnob(Knob knob, DWORD& value) {
 }
 std::vector<int> availableRefreshRates() { return refreshRates(); }
 DWORD applyKnob(Knob knob, DWORD value) {
+    // Noted before the write: if the write takes the system down, the black box shows it.
+    stability::note(std::wstring(L"knob ") + knobKey(knob) + L"=" + std::to_wstring(value));
     switch (knob) {
     case Knob::cpuBoost: return writeProcessor(BoostMode, value);
     case Knob::energyPreference: return writeProcessor(EnergyPreference, value);
