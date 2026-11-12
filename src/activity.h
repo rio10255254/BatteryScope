@@ -46,7 +46,10 @@ struct GpuActivity {
     bool known = false;
     EngineUse total;                            // the busiest adapter's engines
     std::unordered_map<uint32_t, EngineUse> processes;
+    std::vector<std::wstring> engineTypes;      // every engine type seen, lower case (for diagnosis)
 };
+// Video decoding engines: "VideoDecode" (Intel, NVIDIA) and AMD's "Video Codec" (VCN, decode and encode in one).
+bool decodeEngine(const std::wstring& lowerType);
 GpuActivity summarizeGpu(const std::vector<std::pair<std::wstring, double>>& instances);
 
 struct Observation {
@@ -67,6 +70,8 @@ struct Observation {
     GpuActivity gpu;
     Value framesPerSecond;                      // frames the compositor drew; ~0 when nothing moves (nullopt when the counter does not work)
     Value compositorGpu;                        // 3D engine use of the compositor (dwm.exe); preferred over framesPerSecond
+    EngineUse foregroundGpu;                    // the foreground program's GPU use over all its processes (a browser draws in its GPU process)
+    Value busiestCores;                         // logical processors kept busy by the busiest program (services and Windows maintenance left out)
 };
 
 struct Candidate { Activity activity; double confidence; std::wstring reason; };
@@ -84,6 +89,7 @@ class Detector {
 public:
     static constexpr double MinConfidence = .6;     // weaker candidates are ignored
     static constexpr double HeavyAfterSeconds = 4;  // busy this long before "heavy"
+    static constexpr double HeavyCores = 1.6;       // one program keeping this many logical processors busy is heavy work too
     static constexpr double ResponsiveSeconds = 3, ReadingAfterSeconds = 10, IdleAfterSeconds = 120;
     void setRules(std::map<std::wstring, AppRule> rules, std::map<std::wstring, AppRule> learned) { rules_ = std::move(rules); learned_ = std::move(learned); }
     AppRule ruleFor(const std::wstring& exe, bool* learned = nullptr) const;

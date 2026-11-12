@@ -3699,17 +3699,31 @@ std::string utf8(const std::wstring& text) {
     WideCharToMultiByte(CP_UTF8, 0, text.c_str(), int(text.size()), out.data(), int(out.size()), nullptr, nullptr);
     return out;
 }
+constexpr char DetectionHeader[] = "\xEF\xBB\xBFtime,workload,activity,confidence,reason,foreground,category,full_screen,idle_s,active_s,fps,cpu,gpu_3d,video_decode,"
+    "audio,foreground_audio,call,locked,compositor_gpu,foreground_3d,foreground_decode,busiest_cores,busiest\r\n";
+std::set<std::wstring> gpuEngineTypes; // every GPU engine type seen, for gpu-engines.txt
+std::wstring busiestProgram;           // the program behind Observation::busiestCores
 void flushDetectionLog() {
     if (detectionLog.empty()) return;
     const std::wstring folder = bs::lab::labFolder();
     if (folder.empty()) return;
     const auto path = std::filesystem::path(folder) / L"detection-log.csv";
     std::error_code error;
+    if (std::filesystem::exists(path, error)) {
+        // A log from an older version has other columns: keep it beside the new one.
+        std::ifstream in(path, std::ios::binary); std::string first; std::getline(in, first); in.close();
+        if (first + "\n" != DetectionHeader) std::filesystem::rename(path, std::filesystem::path(folder) / L"detection-log-old.csv", error);
+    }
     const bool fresh = !std::filesystem::exists(path, error);
     std::ofstream out(path, std::ios::binary | std::ios::app);
-    if (fresh) out << "\xEF\xBB\xBFtime,workload,activity,confidence,reason,foreground,category,full_screen,idle_s,active_s,fps,cpu,gpu_3d,video_decode,audio,foreground_audio,call,locked,compositor_gpu\r\n";
+    if (fresh) out << DetectionHeader;
     out << detectionLog;
     detectionLog.clear();
+    // The GPU engine types this PC reports, to check which ones count as video decoding.
+    if (!gpuEngineTypes.empty()) {
+        std::ofstream types(std::filesystem::path(folder) / L"gpu-engines.txt", std::ios::binary | std::ios::trunc);
+        for (const auto& type : gpuEngineTypes) types << utf8(type) << (bs::gov::decodeEngine(type) ? "  (video decoding)" : "") << "\r\n";
+    }
 }
 void governorTick() {
     if (demo || isolatedPreview) return;
@@ -3744,6 +3758,33 @@ void governorTick() {
             o.compositorGpu = it != o.gpu.processes.end() ? it->second.engine3d : 0.0;
             break;
         }
+        // The foreground program's GPU use over all its processes: browsers draw and decode
+        // video in a separate GPU process, not in the one that owns the window.
+        if (!o.foregroundExe.empty())
+            for (const auto& row : current.processes) {
+                if (_wcsicmp(row.name.c_str(), o.foregroundExe.c_str()) != 0) continue;
+                auto it = o.gpu.processes.find(row.pid);
+                if (it == o.gpu.processes.end()) continue;
+                o.foregroundGpu.engine3d = std::min(100.0, o.foregroundGpu.engine3d + it->second.engine3d);
+                o.foregroundGpu.decode = std::min(100.0, o.foregroundGpu.decode + it->second.decode);
+                o.foregroundGpu.compute = std::min(100.0, o.foregroundGpu.compute + it->second.compute);
+            }
+        for (const auto& type : o.gpu.engineTypes) gpuEngineTypes.insert(type);
+    }
+    // The busiest program, in logical processors: heavy work on a few threads is a small share
+    // of 16. Services and Windows' own maintenance (updates, indexing, scans) do not count.
+    {
+        static const wchar_t* const maintenance[] = {L"tiworker.exe", L"trustedinstaller.exe", L"searchprotocolhost.exe", L"searchfilterhost.exe",
+            L"compattelrunner.exe", L"mousocoreworker.exe", L"msmpeng.exe", L"mpdefendercoreservice.exe", L"system", L"registry", L"memory compression", L"wmiprvse.exe"};
+        const double processors = double(std::max<DWORD>(1, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)));
+        double busiest = 0; std::wstring busiestName;
+        for (const auto& row : current.processes) {
+            if (!row.measured || !row.services.empty()) continue;
+            if (std::any_of(std::begin(maintenance), std::end(maintenance), [&](const wchar_t* name) { return _wcsicmp(row.name.c_str(), name) == 0; })) continue;
+            const double cores = row.cpu * processors / 100;
+            if (cores > busiest) { busiest = cores; busiestName = row.name; }
+        }
+        if (!current.processes.empty()) { o.busiestCores = busiest; busiestProgram = busiestName; }
     }
     lastAssessment = detector.assess(o);
     if (testing) {
@@ -3755,12 +3796,13 @@ void governorTick() {
         if (!st.paused && st.knob != bs::lab::Knob::display) {
             detectionTally.add(workload, lastAssessment.activity, seconds);
             const auto& g = o.gpu.total;
-            wchar_t line[512];
-            swprintf(line, 512, L"%llu,%ls,%ls,%.2f,\"%ls\",%ls,%ls,%d,%.0f,%.0f,%.1f,%.0f,%.0f,%.0f,%d,%d,%d,%d,%.1f\r\n",
+            wchar_t line[768];
+            swprintf(line, 768, L"%llu,%ls,%ls,%.2f,\"%ls\",%ls,%ls,%d,%.0f,%.0f,%.1f,%.0f,%.0f,%.0f,%d,%d,%d,%d,%.1f,%.1f,%.1f,%.2f,%ls\r\n",
                 static_cast<unsigned long long>(now), workload.c_str(), bs::gov::activityKey(lastAssessment.activity), lastAssessment.confidence,
                 lastAssessment.reason.c_str(), o.foregroundExe.c_str(), bs::gov::categoryKey(lastAssessment.category), int(o.foregroundCoversScreen),
                 o.idleSeconds, o.activeSeconds.value_or(-1), o.framesPerSecond.value_or(-1), o.systemCpu.value_or(-1), g.engine3d, g.decode,
-                int(o.audio), int(o.foregroundAudio), int(o.call), int(o.locked), o.compositorGpu.value_or(-1));
+                int(o.audio), int(o.foregroundAudio), int(o.call), int(o.locked), o.compositorGpu.value_or(-1),
+                o.foregroundGpu.engine3d, o.foregroundGpu.decode, o.busiestCores.value_or(-1), busiestProgram.c_str());
             detectionLog += utf8(line);
             if (detectionLog.size() > 64 * 1024) flushDetectionLog();
         }

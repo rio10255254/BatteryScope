@@ -109,19 +109,28 @@ const wchar_t* inputKey(InputKind k) {
     }
 }
 
+bool decodeEngine(const std::wstring& type) {
+    return type.find(L"decode") != std::wstring::npos || type.find(L"codec") != std::wstring::npos;
+}
 GpuActivity summarizeGpu(const std::vector<std::pair<std::wstring, double>>& instances) {
     GpuActivity g; g.known = true;
     // Engines are summed per adapter and type, then the busiest adapter counts.
     std::map<std::pair<std::wstring, std::wstring>, double> perAdapter;
     for (const auto& [name, percent] : instances) {
         uint32_t pid = 0; std::wstring engine;
-        if (!std::isfinite(percent) || percent <= 0 || !parseGpuInstance(name, pid, engine)) continue;
+        if (!parseGpuInstance(name, pid, engine)) continue;
+        {
+            std::wstring kind = lower(engine);
+            while (!kind.empty() && (iswdigit(kind.back()) || kind.back() == L'_' || kind.back() == L' ')) kind.pop_back(); // "compute_1", "video codec 0"
+            if (!kind.empty() && std::find(g.engineTypes.begin(), g.engineTypes.end(), kind) == g.engineTypes.end()) g.engineTypes.push_back(kind);
+        }
+        if (!std::isfinite(percent) || percent <= 0) continue;
         const size_t luid = name.find(L"luid_"), phys = name.find(L"_phys_");
         const std::wstring adapter = luid != std::wstring::npos && phys != std::wstring::npos && phys > luid ? name.substr(luid, phys - luid) : L"";
         const std::wstring type = lower(engine);
         auto& use = g.processes[pid];
         if (type == L"3d") { use.engine3d = std::min(100.0, use.engine3d + percent); perAdapter[{adapter, L"3d"}] += percent; }
-        else if (type.rfind(L"videodecode", 0) == 0) { use.decode = std::min(100.0, use.decode + percent); perAdapter[{adapter, L"decode"}] += percent; }
+        else if (decodeEngine(type)) { use.decode = std::min(100.0, use.decode + percent); perAdapter[{adapter, L"decode"}] += percent; }
         else if (type.rfind(L"compute", 0) == 0) { use.compute = std::min(100.0, use.compute + percent); perAdapter[{adapter, L"compute"}] += percent; }
     }
     for (const auto& [key, sum] : perAdapter) {
@@ -148,18 +157,30 @@ Assessment Detector::assess(const Observation& o) {
     a.category = categoryOf(o.foregroundExe);
     a.rule = ruleFor(o.foregroundExe, &a.learnedRule);
     auto& c = a.candidates;
-    const EngineUse fg = [&] { auto it = o.gpu.processes.find(o.foregroundPid); return it != o.gpu.processes.end() ? it->second : EngineUse{}; }();
+    const EngineUse fg = [&] {
+        auto it = o.gpu.processes.find(o.foregroundPid);
+        EngineUse use = it != o.gpu.processes.end() ? it->second : EngineUse{};
+        use.engine3d = std::max(use.engine3d, o.foregroundGpu.engine3d);
+        use.decode = std::max(use.decode, o.foregroundGpu.decode);
+        use.compute = std::max(use.compute, o.foregroundGpu.compute);
+        return use;
+    }();
     const bool decoding = o.gpu.known && decodeBusy(o.gpu.total);
-    const double cpu = o.systemCpu.value_or(0);
+    const double cpu = o.systemCpu.value_or(0), cores = o.busiestCores.value_or(0);
     // "Active" input: a key, click or wheel. Without raw input, any input counts.
     const double active = o.activeSeconds.value_or(o.idleSeconds);
-    // Whether anything on screen is moving: the compositor's GPU use when known (the frame
-    // counter stays near 0.5 per second on some PCs whatever is shown), else its frame count.
-    const bool screenStatic = o.compositorGpu ? *o.compositorGpu < 1.5 : o.framesPerSecond && *o.framesPerSecond < 5;
-    const bool screenMoving = o.compositorGpu ? *o.compositorGpu >= 4 : o.framesPerSecond && *o.framesPerSecond >= 10;
+    // Whether anything on screen is moving: the foreground program drawing with the GPU, or the
+    // compositor's GPU use (the frame counter stays near 0.5 per second on some PCs whatever is
+    // shown), else its frame count. On panels where the browser presents directly (multiplane
+    // overlays, as on the G14 2024) the compositor shows nothing: the program's own 3D use does.
+    const bool screenMoving = (o.gpu.known && fg.engine3d >= 3) || (o.compositorGpu ? *o.compositorGpu >= 4 : o.framesPerSecond && *o.framesPerSecond >= 10);
+    const bool screenStatic = !screenMoving && (o.compositorGpu ? *o.compositorGpu < 1.5 : o.framesPerSecond && *o.framesPerSecond < 5);
 
-    // Sustained busy time, so a short spike (opening a program) is not "heavy".
-    if (cpu >= 25) { if (!busySince_) busySince_ = o.ms ? o.ms : 1; } else busySince_ = 0;
+    // Sustained busy time, so a short spike (opening a program) is not "heavy". The whole
+    // processor a quarter busy, or one program keeping more than one and a half logical
+    // processors busy (2 of 16 threads is only 12% of the whole, yet clearly heavy work).
+    const bool cpuBusy = cpu >= 25 || cores >= HeavyCores;
+    if (cpuBusy) { if (!busySince_) busySince_ = o.ms ? o.ms : 1; } else busySince_ = 0;
     if (o.gpu.known && std::max(o.gpu.total.engine3d, o.gpu.total.compute) >= 40 && !o.foregroundCoversScreen) { if (!gpuBusySince_) gpuBusySince_ = o.ms ? o.ms : 1; }
     else if (o.gpu.known) gpuBusySince_ = 0;
     const double busyFor = busySince_ ? (o.ms - busySince_) / 1000.0 : 0, gpuBusyFor = gpuBusySince_ ? (o.ms - gpuBusySince_) / 1000.0 : 0;
@@ -177,14 +198,17 @@ Assessment Detector::assess(const Observation& o) {
     // Input or a switch with the CPU jumping: a program opening or a page loading, worth a short boost.
     if ((active < ResponsiveSeconds || o.foregroundSwitchSeconds < ResponsiveSeconds) && cpu >= 30)
         c.push_back({Activity::burst, .95, L"剛開啟或載入（CPU 尖峰）"});
-    if (busyFor >= HeavyAfterSeconds) c.push_back({Activity::heavy, std::min(.95, .65 + (cpu - 25) / 100), L"CPU 持續忙碌"});
+    if (busyFor >= HeavyAfterSeconds) {
+        if (cpu >= 25) c.push_back({Activity::heavy, std::min(.95, .65 + (cpu - 25) / 100), L"CPU 持續忙碌"});
+        else c.push_back({Activity::heavy, std::min(.9, .7 + (cores - HeavyCores) / 10), L"程式持續使用多個處理器"});
+    }
     if (gpuBusyFor >= HeavyAfterSeconds) c.push_back({Activity::heavy, .75, L"顯示卡持續運算"});
     if (a.category == Category::creative && cpu >= 15) c.push_back({Activity::heavy, .75, L"創作／運算程式忙碌中"});
     if (decoding && (o.idleSeconds >= 5 || o.foregroundCoversScreen))
         c.push_back({Activity::media, o.foregroundCoversScreen ? .95 : .9, o.audio ? L"正在播放影片" : L"正在播放影片（靜音）"});
     else if (o.audio && o.idleSeconds >= 20)
         c.push_back({Activity::media, a.category == Category::video ? .9 : .75, L"正在播放聲音"});
-    const bool idle = o.idleSeconds >= IdleAfterSeconds && !o.audio && !decoding && cpu < 15 && !screenMoving;
+    const bool idle = o.idleSeconds >= IdleAfterSeconds && !o.audio && !decoding && cpu < 15 && cores < HeavyCores && !screenMoving;
     if (idle) c.push_back({Activity::idle, screenStatic ? .9 : .7, L"超過 2 分鐘沒操作、畫面靜止"});
     else if (o.idleSeconds >= ReadingAfterSeconds) {
         const bool readable = a.category == Category::browser || a.category == Category::document || a.category == Category::code;

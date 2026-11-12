@@ -7,6 +7,7 @@
 #include "../src/motion.h"
 #include "../src/i18n.h"
 #include <shellapi.h>
+#include <algorithm>
 #include <cctype>
 #include <fstream>
 #include <iostream>
@@ -724,6 +725,23 @@ int wmain(int argc, wchar_t** argv) {
                 {L"pid_40_luid_0x0_0x1_phys_0_eng_5_engtype_VideoDecode", 6}, {L"pid_9_luid_0x0_0x2_phys_0_eng_0_engtype_3D", 15}});
             check(nearlyEqual(gpuSummary.total.engine3d, 50) && nearlyEqual(gpuSummary.total.decode, 6) && nearlyEqual(gpuSummary.processes[40].engine3d, 30),
                 "GPU engines are summed per adapter and per process");
+            // From the 2026-11-12 full test on the G14 2024 (Radeon 780M, OLED at 120 Hz).
+            auto amd = gov::summarizeGpu({{L"pid_40_luid_0x0_0x1_phys_0_eng_4_engtype_Video Codec 0", 7}, {L"pid_40_luid_0x0_0x1_phys_0_eng_0_engtype_3D", 8},
+                {L"pid_41_luid_0x0_0x1_phys_0_eng_1_engtype_Compute_1", 0}});
+            check(nearlyEqual(amd.total.decode, 7) && gov::decodeEngine(L"videodecode") && !gov::decodeEngine(L"videoencode") && !gov::decodeEngine(L"3d")
+                && std::find(amd.engineTypes.begin(), amd.engineTypes.end(), L"video codec") != amd.engineTypes.end()
+                && std::find(amd.engineTypes.begin(), amd.engineTypes.end(), L"compute") != amd.engineTypes.end(),
+                "AMD's \"Video Codec\" engine counts as video decoding, and every engine type is listed");
+            gov::Detector twoThreads;
+            o = observe(300, 300, gov::InputKind::none); o.systemCpu = 17; o.busiestCores = 2.0; o.ms = 1000;
+            twoThreads.assess(o); o.ms = 6000;
+            check(twoThreads.assess(o).activity == Activity::heavy, "one program keeping 2 of 16 threads busy is heavy work although the whole CPU is only 17% busy");
+            o.busiestCores = 1.0; o.ms = 12000;
+            check(twoThreads.assess(o).activity != Activity::heavy, "one busy thread is not");
+            o = observe(300, 300, gov::InputKind::none); o.compositorGpu = 0; o.framesPerSecond = 1; o.foregroundGpu.engine3d = 12;
+            check(detector.assess(o).activity == Activity::reading, "a browser drawing on its own (the compositor shows nothing on an overlay) is a moving screen, not idle");
+            o.foregroundGpu.engine3d = 0;
+            check(detector.assess(o).activity == Activity::idle, "and a page that stopped drawing is idle");
             // Detection is scored against the automatic test's known activities.
             gov::DetectionTally tally;
             tally.add(L"video", Activity::media, 90); tally.add(L"video", Activity::reading, 10); tally.add(L"sustained", Activity::heavy, 100);

@@ -223,8 +223,11 @@ struct WorkloadEngine::Impl {
         else if (!post && path == "/state") {
             DEVMODEW mode{}; mode.dmSize = sizeof(mode);
             const int hz = EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) ? int(mode.dmDisplayFrequency) : 60;
+            // The Windows app theme (the dark-mode step switches it), for the page to follow.
+            DWORD light = 1, size = sizeof(light);
+            RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize", L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &light, &size);
             const std::string json = "{\"scenario\":\"" + utf8(workloadKey(current())) + (current() == Workload::none ? "none" : "") +
-                "\",\"refresh\":" + std::to_string(hz) + ",\"caption\":" + jsonString(utf8(caption())) + "}";
+                "\",\"refresh\":" + std::to_string(hz) + ",\"dark\":" + (light ? "0" : "1") + ",\"caption\":" + jsonString(utf8(caption())) + "}";
             respond(client, "application/json", json);
         } else if (post && path == "/m") {
             WorkloadMetrics m;
