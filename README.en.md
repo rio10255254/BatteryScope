@@ -15,8 +15,8 @@
 
 From the **[Releases page](https://github.com/rio10255254/BatteryScope/releases/latest)**:
 
-- **Installer (recommended):** `BatteryScope-0.23.0-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
-- **Portable:** `BatteryScope-0.23.0-win64.zip`; extract it and run `BatteryScope.exe`.
+- **Installer (recommended):** `BatteryScope-0.23.1-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
+- **Portable:** `BatteryScope-0.23.1-win64.zip`; extract it and run `BatteryScope.exe`.
 
 Requires Windows 10 version 1703 or later (Windows 11 recommended), 64-bit. The program is not code-signed; if SmartScreen appears the first time, choose **More info → Run anyway**. It lives in the notification area, where the icon shows the battery percentage; click it to show or hide the panel.
 
@@ -53,7 +53,7 @@ Details follow.
 
 ## Using it
 
-1. Download `BatteryScope-0.23.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
+1. Download `BatteryScope-0.23.1-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
 2. Click its battery icon in the notification area to show or hide the panel. Esc hides it; monitoring continues at a lower frequency.
 3. Open **⋯ → Language / 語言 → English** to switch immediately. The setting persists for your Windows account. Selection and scroll position are retained.
 4. Use Background and Show filters, the mouse wheel, arrow keys, Home/End, or Page Up/Down. Enter or double-click opens details.
@@ -169,13 +169,17 @@ When the PC shows a blue screen, restarts on its own, freezes or the screen flas
   - display driver resets (Display 4101, LiveKernelEvent 141/117);
   - hardware errors (WHEA) and disk errors (disk, stornvme, Ntfs, volmgr).
 
-  The records of one crash become one incident, matched with the black box's last state before it. New records are read again every 15 minutes.
+  The records of one crash become one incident, matched with the black box's last state before it. Two crashes stay two however close together they are.
+  - Each incident shows when the PC actually went down (the time 6008 records), not when it next started.
+  - It marks crashes where Windows could not write the dump (volmgr 161), which means the system disk could no longer be written at that moment.
+  - A program that keeps crashing keeps only its newest 20 records, so it cannot push the system's records out. New records are read again every 15 minutes.
 - **Freeze detection:** a high-priority thread wakes once a second. With the screen on, if the whole PC does not let it run for 2.5 seconds or more, that is a freeze. The time is measured on a clock that excludes sleep, and the 30 seconds around sleep or screen changes are skipped.
   - If the panel stops responding for 30 seconds, BatteryScope saves a dump of itself.
   - If BatteryScope crashes, it leaves `crash-*.txt` and a dump.
+- **Drivers known to cause blue screens:** if National Instruments PCI bridge drivers (LabVIEW, PXI: nipcibrd, nipbcfk) are installed, the Stability page warns and explains how to remove them safely.
 - **Notifications:** a new blue screen, unexpected shutdown or freeze shows a notification that opens the Stability page. The Perf tab also shows a warning row when something happened in the last 7 days.
 - **Stability page** (the warning row, or ⋯ → Stability and problem reports): counts for the last 30 days, and for each incident the stop code's name, where to look and the state at the time. Plus these actions:
-  - **Create a report:** saves `BatteryScope-report-date.zip` to the desktop and copies the summary for pasting. It holds the summary, the black box, the full event records, BatteryScope's own dumps, drivers and disks (with the SSD firmware), Windows' reliability history, the last 3 days of system errors, installed updates, power settings and the battery report.
+  - **Create a report:** saves `BatteryScope-report-date.zip` to the desktop and copies the summary for pasting. It holds the summary (with the drivers and updates installed in the last 7 days, and each dump's stop code and drivers), the black box, the full event records, BatteryScope's own dumps, drivers and disks (with the SSD firmware), Windows' reliability history, the last 3 days of system errors, installed updates, power settings and the battery report.
   - **Report with blue screen dumps:** also copies, with administrator rights, the latest five dumps from `C:\Windows\Minidump` and the latest two from LiveKernelReports (64 MB or less).
   - **Mark a problem that just happened:** after a stutter, a crash or anything odd, marks that moment and the state before it. It is also in the ⋯ menu.
 - Everything stays on this PC. Nothing is uploaded; you decide whether and to whom to give a report.
@@ -252,7 +256,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-To avoid replacing a running executable, use `-OutputDirectory dist/v0.23.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
+To avoid replacing a running executable, use `-OutputDirectory dist/v0.23.1`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
 
 ```powershell
 .\dist\BatteryScope.exe --demo

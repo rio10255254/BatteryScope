@@ -1136,6 +1136,13 @@ inline const std::map<std::wstring_view, const wchar_t*> translations = {
     {L"偵測到 ", L"Detected "},
     {L" 個穩定性問題", L" stability problems"},
     {L"。點此查看並建立回報。", L". Click to see it and create a report."},
+    // 0.23.1
+    {L"Windows 在 ", L"Windows logged it at "},
+    {L" 重新開機時記錄", L" on the next start"},
+    {L"Windows 沒能寫下傾印檔：當機當下系統磁碟已經無法寫入", L"Windows could not write the crash dump: the system disk could no longer be written at the moment of the crash"},
+    {L"\n已安裝、已知會造成藍屏的驅動：\n", L"\nInstalled drivers known to cause blue screens:\n"},
+    {L"可能有關的驅動", L"Drivers that may be involved"},
+    {L"：National Instruments（LabVIEW／PXI）的 PCI 橋接驅動，掛在所有 PCI 橋接器上（包括 SSD 所在的那一個），已知會在睡眠與喚醒時造成 0x9F 藍屏。用不到 NI 的硬體時，請用 NI Package Manager 移除「PXI Platform Services」或 NI 的 PCI 橋接驅動；不要直接停用，可能導致無法開機。", L": National Instruments (LabVIEW, PXI) PCI bridge drivers. They attach to every PCI bridge, the SSD's included, and are known to cause 0x9F blue screens on sleep and wake. If you do not use NI hardware, remove PXI Platform Services or NI's PCI bridge driver with NI Package Manager; do not just disable it, which can stop Windows from starting."},
 };
 inline const wchar_t* tr(const wchar_t* text) {
     if (!english) return text;

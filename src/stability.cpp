@@ -6,6 +6,8 @@
 #include <dbghelp.h>
 
 #include <algorithm>
+#include <array>
+#include <iterator>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
@@ -391,7 +393,7 @@ std::optional<LogEvent> parseEventXml(const std::wstring& xml) {
     }
     return e;
 }
-std::wstring eventQueryXml(uint64_t sinceUtc) {
+std::wstring eventQueryXml(uint64_t sinceUtc, Channel channel) {
     FILETIME ft{DWORD(sinceUtc & 0xFFFFFFFF), DWORD(sinceUtc >> 32)};
     SYSTEMTIME t{}; FileTimeToSystemTime(&ft, &t);
     wchar_t since[40];
@@ -399,28 +401,72 @@ std::wstring eventQueryXml(uint64_t sinceUtc) {
     const std::wstring time = std::wstring(L" and TimeCreated[@SystemTime&gt;='") + since + L"']";
     // One small Select per source: Windows rejects event queries with too many terms, and
     // the results of all Selects come back together.
-    const wchar_t* system[] = {
-        L"Provider[@Name='Microsoft-Windows-Kernel-Power'] and EventID=41",
-        L"Provider[@Name='EventLog'] and EventID=6008",
-        L"Provider[@Name='Microsoft-Windows-WER-SystemErrorReporting']",
-        L"Provider[@Name='Microsoft-Windows-WHEA-Logger'] and Level&lt;=3",
-        L"Provider[@Name='Display'] and EventID=4101",
-        L"(Provider[@Name='nvlddmkm'] or Provider[@Name='amdkmdag'] or Provider[@Name='amdwddmg']) and Level&lt;=2",
-        L"Provider[@Name='disk'] and (EventID=7 or EventID=11 or EventID=51 or EventID=153 or EventID=154)",
-        L"(Provider[@Name='stornvme'] or Provider[@Name='storahci']) and (EventID=11 or EventID=129)",
-        L"Provider[@Name='Ntfs'] and (EventID=55 or EventID=98 or EventID=140)",
-        L"Provider[@Name='volmgr'] and (EventID=46 or EventID=161 or EventID=162)",
-        L"Provider[@Name='Microsoft-Windows-Kernel-Processor-Power'] and EventID=37",
-    };
-    const wchar_t* application[] = {
-        L"Provider[@Name='Application Error'] and EventID=1000",
-        L"Provider[@Name='Application Hang'] and EventID=1002",
-        L"Provider[@Name='Windows Error Reporting'] and EventID=1001",
+    static const std::vector<std::pair<const wchar_t*, const wchar_t*>> selects[] = {
+        { // system
+            {L"System", L"Provider[@Name='Microsoft-Windows-Kernel-Power'] and EventID=41"},
+            {L"System", L"Provider[@Name='EventLog'] and EventID=6008"},
+            {L"System", L"Provider[@Name='Microsoft-Windows-WER-SystemErrorReporting']"},
+            {L"System", L"Provider[@Name='Microsoft-Windows-WHEA-Logger'] and Level&lt;=3"},
+            {L"System", L"Provider[@Name='Display'] and EventID=4101"},
+            {L"System", L"(Provider[@Name='nvlddmkm'] or Provider[@Name='amdkmdag'] or Provider[@Name='amdwddmg']) and Level&lt;=2"},
+            {L"System", L"Provider[@Name='disk'] and (EventID=7 or EventID=11 or EventID=51 or EventID=153 or EventID=154)"},
+            {L"System", L"(Provider[@Name='stornvme'] or Provider[@Name='storahci']) and (EventID=11 or EventID=129)"},
+            {L"System", L"Provider[@Name='Ntfs'] and (EventID=55 or EventID=98 or EventID=140)"},
+            {L"System", L"Provider[@Name='volmgr'] and (EventID=46 or EventID=161 or EventID=162)"},
+            {L"System", L"Provider[@Name='Microsoft-Windows-Kernel-Processor-Power'] and EventID=37"},
+        },
+        { // application
+            {L"Application", L"Provider[@Name='Application Error'] and EventID=1000"},
+            {L"Application", L"Provider[@Name='Application Hang'] and EventID=1002"},
+            {L"Application", L"Provider[@Name='Windows Error Reporting'] and EventID=1001"},
+        },
+        { // installs
+            {L"System", L"Provider[@Name='Microsoft-Windows-WindowsUpdateClient'] and EventID=19"},
+            {L"Application", L"Provider[@Name='MsiInstaller'] and (EventID=1033 or EventID=1034 or EventID=1035)"},
+        },
     };
     std::wstring xml = L"<QueryList><Query Id='0'>";
-    for (const wchar_t* condition : system) xml += L"<Select Path='System'>*[System[" + std::wstring(condition) + time + L"]]</Select>";
-    for (const wchar_t* condition : application) xml += L"<Select Path='Application'>*[System[" + std::wstring(condition) + time + L"]]</Select>";
+    for (const auto& [path, condition] : selects[int(channel)])
+        xml += std::wstring(L"<Select Path='") + path + L"'>*[System[" + condition + time + L"]]</Select>";
     return xml + L"</Query></QueryList>";
+}
+std::optional<uint64_t> parseShutdownTime(const std::wstring& timeText, const std::wstring& dateText, uint64_t loggedUtc) {
+    auto numbers = [](const std::wstring& text) {
+        std::vector<int> out; int value = -1;
+        for (wchar_t c : text) {
+            if (c >= L'0' && c <= L'9') value = (value < 0 ? 0 : value * 10) + (c - L'0');
+            else if (value >= 0) { out.push_back(value); value = -1; }
+        }
+        if (value >= 0) out.push_back(value);
+        return out;
+    };
+    const auto t = numbers(timeText), d = numbers(dateText);
+    if (t.size() < 2 || d.size() != 3) return std::nullopt;
+    int hour = t[0];
+    const int minute = t[1], second = t.size() > 2 ? t[2] : 0;
+    const bool pm = timeText.find(L"下午") != std::wstring::npos || timeText.find(L"午後") != std::wstring::npos || timeText.find(L"오후") != std::wstring::npos ||
+        timeText.find(L"PM") != std::wstring::npos || timeText.find(L"pm") != std::wstring::npos;
+    const bool am = timeText.find(L"上午") != std::wstring::npos || timeText.find(L"午前") != std::wstring::npos || timeText.find(L"오전") != std::wstring::npos ||
+        timeText.find(L"AM") != std::wstring::npos || timeText.find(L"am") != std::wstring::npos;
+    if (pm && hour < 12) hour += 12;
+    if (am && hour == 12) hour = 0;
+    // The year has four digits; the other two are month and day in the PC's order. Try both orders.
+    std::vector<std::array<int, 3>> candidates; // year, month, day
+    if (d[0] >= 1000) candidates.push_back({d[0], d[1], d[2]});
+    else if (d[2] >= 1000) { candidates.push_back({d[2], d[0], d[1]}); candidates.push_back({d[2], d[1], d[0]}); }
+    std::optional<uint64_t> best;
+    for (const auto& c : candidates) {
+        if (c[1] < 1 || c[1] > 12 || c[2] < 1 || c[2] > 31 || hour > 23 || minute > 59 || second > 60) continue;
+        SYSTEMTIME local{}; local.wYear = WORD(c[0]); local.wMonth = WORD(c[1]); local.wDay = WORD(c[2]);
+        local.wHour = WORD(hour); local.wMinute = WORD(minute); local.wSecond = WORD(second);
+        SYSTEMTIME utc{}; FILETIME ft{};
+        if (!TzSpecificLocalTimeToSystemTime(nullptr, &local, &utc) || !SystemTimeToFileTime(&utc, &ft)) continue;
+        const uint64_t value = fileTimeValue(ft);
+        // Before the record (it is written at the next start), and within a week of it.
+        if (value > loggedUtc + 60 * Second || value + 7ull * 86400 * Second < loggedUtc) continue;
+        if (!best || value > *best) best = value;
+    }
+    return best;
 }
 namespace {
 // Windows Error Reporting files many reports; only crashes, hangs and live kernel dumps matter here.
@@ -430,13 +476,21 @@ bool interestingReport(const LogEvent& e) {
     const std::wstring& name = e.data[2].second;
     return name == L"LiveKernelEvent" || name == L"BlueScreen" || name == L"APPCRASH" || name == L"AppHangB1" || name == L"AppHangXProcB1" || name == L"MoAppCrash";
 }
-} // namespace
-std::vector<LogEvent> readEvents(uint64_t sinceUtc, bool withMessages, size_t limit) {
+// The program a crash or hang record is about, so a crash loop can be capped.
+std::wstring crashingApp(const LogEvent& e) {
+    if (e.provider == L"Windows Error Reporting") return e.data.size() > 5 ? e.data[2].second + L"/" + e.data[5].second : std::wstring();
+    if (e.provider == L"Application Error" || e.provider == L"Application Hang") {
+        std::wstring app = e.value(L"AppName");
+        return app.empty() && !e.data.empty() ? e.data[0].second : app;
+    }
+    return {};
+}
+std::vector<LogEvent> runQuery(const std::wstring& query, bool withMessages, size_t limit) {
     std::vector<LogEvent> out;
-    const std::wstring query = eventQueryXml(sinceUtc);
     EVT_HANDLE results = EvtQuery(nullptr, nullptr, query.c_str(), EvtQueryChannelPath | EvtQueryReverseDirection | EvtQueryTolerateQueryErrors);
     if (!results) return out;
     std::unordered_map<std::wstring, EVT_HANDLE> publishers;
+    std::unordered_map<std::wstring, int> perApp;
     std::vector<wchar_t> buffer(16384);
     EVT_HANDLE batch[32];
     DWORD returned = 0;
@@ -449,7 +503,10 @@ std::vector<LogEvent> readEvents(uint64_t sinceUtc, bool withMessages, size_t li
                 EvtRender(nullptr, batch[i], EvtRenderEventXml, DWORD(buffer.size() * sizeof(wchar_t)), buffer.data(), &used, &properties);
             }
             auto e = used ? parseEventXml(std::wstring(buffer.data())) : std::nullopt;
-            if (e && interestingReport(*e) && out.size() < limit) {
+            bool keep = e && interestingReport(*e) && out.size() < limit;
+            // One program crashing over and over: the newest 20 of each kind are enough.
+            if (keep) if (const std::wstring app = crashingApp(*e); !app.empty() && ++perApp[e->provider + L"|" + app] > 20) keep = false;
+            if (keep) {
                 if (withMessages) {
                     auto found = publishers.find(e->provider);
                     if (found == publishers.end()) found = publishers.emplace(e->provider, EvtOpenPublisherMetadata(nullptr, e->provider.c_str(), nullptr, 0, 0)).first;
@@ -471,7 +528,73 @@ std::vector<LogEvent> readEvents(uint64_t sinceUtc, bool withMessages, size_t li
     }
     for (auto& [name, handle] : publishers) if (handle) EvtClose(handle);
     EvtClose(results);
+    // Repeats beyond the cap, so a report still shows how often it happened.
+    for (const auto& [key, count] : perApp) if (count > 20) {
+        LogEvent note; note.provider = L"BatteryScope"; note.channel = L"Application";
+        note.message = key + L": " + std::to_wstring(count) + L" records, the newest 20 kept";
+        out.push_back(note);
+    }
     return out;
+}
+} // namespace
+std::vector<LogEvent> readEvents(uint64_t sinceUtc, bool withMessages, size_t limit) {
+    // The system's own records first, each channel within its own limit.
+    auto out = runQuery(eventQueryXml(sinceUtc, Channel::system), withMessages, limit);
+    auto apps = runQuery(eventQueryXml(sinceUtc, Channel::application), withMessages, limit / 2);
+    out.insert(out.end(), std::make_move_iterator(apps.begin()), std::make_move_iterator(apps.end()));
+    std::stable_sort(out.begin(), out.end(), [](const LogEvent& a, const LogEvent& b) { return a.time > b.time; });
+    return out;
+}
+std::vector<LogEvent> readInstalls(uint64_t sinceUtc) { return runQuery(eventQueryXml(sinceUtc, Channel::installs), false, 300); }
+std::vector<std::pair<std::wstring, std::wstring>> knownTroubleDrivers() {
+    // Kept to drivers with a documented pattern; each must be installed and not disabled.
+    static const std::pair<const wchar_t*, const wchar_t*> known[] = {
+        {L"nipcibrd", L"National Instruments PCI bridge driver (LabVIEW, PXI Platform Services): known DRIVER_POWER_STATE_FAILURE (0x9F) on sleep and wake"},
+        {L"nipbcfk", L"National Instruments PCI bridge filter (PXI Platform Services), attached to PCI bridges"},
+    };
+    std::vector<std::pair<std::wstring, std::wstring>> out;
+    for (const auto& [name, why] : known) {
+        DWORD start = 0, bytes = sizeof(start);
+        const std::wstring key = std::wstring(L"SYSTEM\\CurrentControlSet\\Services\\") + name;
+        if (RegGetValueW(HKEY_LOCAL_MACHINE, key.c_str(), L"Start", RRF_RT_REG_DWORD, nullptr, &start, &bytes) == ERROR_SUCCESS && start != 4)
+            out.emplace_back(std::wstring(name) + L".sys", why);
+    }
+    return out;
+}
+std::wstring summarizeKernelDump(const std::wstring& path) {
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return {};
+    std::string data(4u << 20, '\0');
+    DWORD read = 0;
+    ReadFile(file, data.data(), DWORD(data.size()), &read, nullptr);
+    CloseHandle(file);
+    data.resize(read);
+    if (read < 0x60 || data.compare(0, 8, "PAGEDU64") != 0) return {};
+    uint32_t code = 0; uint64_t p[4]{};
+    std::memcpy(&code, data.data() + 0x38, 4);
+    std::memcpy(p, data.data() + 0x40, sizeof(p));
+    wchar_t head[200];
+    swprintf(head, 200, L"0x%X %ls (0x%llX, 0x%llX, 0x%llX, 0x%llX)", code, bugcheckName(code) ? bugcheckName(code) : L"?",
+        static_cast<unsigned long long>(p[0]), static_cast<unsigned long long>(p[1]), static_cast<unsigned long long>(p[2]), static_cast<unsigned long long>(p[3]));
+    // Driver objects named in the crash data, in the order they appear: the first ones are
+    // usually the device stack the stop code is about.
+    std::vector<std::wstring> drivers;
+    const std::string marker("\\\0D\0r\0i\0v\0e\0r\0\\\0", 16);
+    for (size_t at = data.find(marker); at != std::string::npos && drivers.size() < 16; at = data.find(marker, at + 2)) {
+        std::wstring name;
+        for (size_t i = at + marker.size(); i + 1 < data.size() && name.size() < 32; i += 2) {
+            const wchar_t c = wchar_t(uint8_t(data[i]) | (uint8_t(data[i + 1]) << 8));
+            if (!(iswalnum(c) || c == L'_' || c == L'-') || c > 0x7F) break;
+            name += c;
+        }
+        if (name.size() >= 2 && std::find(drivers.begin(), drivers.end(), name) == drivers.end()) drivers.push_back(name);
+    }
+    std::wstring text = head;
+    if (!drivers.empty()) {
+        text += L"\r\n  drivers in the crash data:";
+        for (const auto& d : drivers) text += L" " + d;
+    }
+    return text;
 }
 
 // ---- Incidents.
@@ -513,7 +636,10 @@ int shutdownRank(Kind k) {
 }
 uint64_t distance(uint64_t a, uint64_t b) { return a > b ? a - b : b - a; }
 bool sameIncident(const Incident& a, const Incident& b) {
-    if (shutdownRank(a.kind) && shutdownRank(b.kind)) return distance(a.time, b.time) <= 10 * 60 * Second;
+    // One crash's records are written within two minutes of the next start; two crashes with
+    // different stop codes are never the same one.
+    if (shutdownRank(a.kind) && shutdownRank(b.kind))
+        return distance(a.time, b.time) <= 2 * 60 * Second && (!a.code || !b.code || a.code == b.code);
     if (a.kind != b.kind) return false;
     if (a.kind == Kind::freeze && a.seconds > 0 && b.seconds > 0) return distance(a.time, b.time) <= 20 * Second;
     return distance(a.time, b.time) <= 3 * 60 * Second;
@@ -526,6 +652,8 @@ void absorb(Incident& into, const Incident& other) {
     if (into.context.empty()) into.context = other.context;
     if (into.recentWrites.empty()) into.recentWrites = other.recentWrites;
     into.sleeping = into.sleeping || other.sleeping;
+    into.dumpFailed = into.dumpFailed || other.dumpFailed;
+    if (!into.wentDown) into.wentDown = other.wentDown;
     into.seconds = std::max(into.seconds, other.seconds);
     // Keep the earlier time: it is closer to when it happened.
     into.time = std::min(into.time, other.time);
@@ -536,17 +664,25 @@ std::vector<Incident> incidentsFromEvents(const std::vector<LogEvent>& source) {
     std::vector<LogEvent> events = source;
     std::sort(events.begin(), events.end(), [](const LogEvent& a, const LogEvent& b) { return a.time < b.time; });
     std::vector<Incident> out;
-    auto add = [&](Incident incident) {
+    // The crash a boot-time record belongs to: the one logged within two minutes before it.
+    auto crashNear = [&](uint64_t time) -> Incident* {
         for (auto it = out.rbegin(); it != out.rend(); ++it)
-            if (sameIncident(*it, incident) || ((incident.kind == Kind::hardwareError || incident.kind == Kind::diskError || incident.kind == Kind::graphicsReset)
-                && it->kind == incident.kind && distance(it->time, incident.time) <= 10 * 60 * Second)) {
-                Incident merged = *it; absorb(merged, incident); *it = merged; return;
-            }
+            if (shutdownRank(it->kind) && it->time <= time + 30 * Second && time <= it->time + 2 * 60 * Second) return &*it;
+        return nullptr;
+    };
+    auto add = [&](Incident incident) {
+        // Warnings that come in bursts are one incident per ten minutes.
+        if (incident.kind == Kind::hardwareError || incident.kind == Kind::diskError || incident.kind == Kind::graphicsReset)
+            for (auto it = out.rbegin(); it != out.rend(); ++it)
+                if (it->kind == incident.kind && distance(it->time, incident.time) <= 10 * 60 * Second) { absorb(*it, incident); return; }
+        for (auto it = out.rbegin(); it != out.rend(); ++it)
+            if (!shutdownRank(incident.kind) && sameIncident(*it, incident)) { absorb(*it, incident); return; }
         out.push_back(std::move(incident));
     };
     for (const auto& e : events) {
         Incident i; i.time = e.time;
         if (e.provider == L"Microsoft-Windows-Kernel-Power" && e.id == 41) {
+            // Each 41 is a start after a crash: always its own incident.
             const uint32_t code = normalizeBugcheck(uint32_t(parseNumber(e.value(L"BugcheckCode")).value_or(0)));
             const bool held = isTrue(e.value(L"LongPowerButtonPressDetected"));
             const bool button = parseNumber(e.value(L"PowerButtonTimestamp")).value_or(0) != 0;
@@ -560,17 +696,31 @@ std::vector<Incident> incidentsFromEvents(const std::vector<LogEvent>& source) {
                     e.value(L"BugcheckParameter3").c_str(), e.value(L"BugcheckParameter4").c_str());
                 i.detail = text;
             }
-            add(i);
+            if (Incident* earlier = crashNear(e.time); earlier && !earlier->code && earlier->kind == Kind::powerLoss && earlier->time >= e.time - 30 * Second) {
+                Incident merged = i; absorb(merged, *earlier); *earlier = merged; // a 6008 that came first
+            } else out.push_back(i);
         } else if (e.provider == L"Microsoft-Windows-WER-SystemErrorReporting") {
             std::wstring p1 = e.value(L"param1");
             if (p1.empty() && !e.data.empty()) p1 = e.data[0].second;
             const uint32_t code = normalizeBugcheck(uint32_t(parseNumber(p1.substr(0, p1.find(L' '))).value_or(0)));
             if (!code) continue;
             i.kind = code == 0x1C8 || code == 0xE2 ? Kind::forcedOff : Kind::blueScreen; i.code = code; i.detail = p1;
-            add(i);
+            // Written after sign-in, up to some minutes after the start.
+            Incident* crash = nullptr;
+            for (auto it = out.rbegin(); it != out.rend() && !crash; ++it)
+                if (shutdownRank(it->kind) && it->time <= e.time && e.time <= it->time + 15 * 60 * Second && (!it->code || it->code == code)) crash = &*it;
+            if (crash) absorb(*crash, i); else out.push_back(i);
         } else if (e.provider == L"EventLog" && e.id == 6008) {
             i.kind = Kind::powerLoss;
-            add(i);
+            if (e.data.size() >= 2) if (auto down = parseShutdownTime(e.data[0].second, e.data[1].second, e.time)) i.wentDown = *down;
+            if (Incident* crash = crashNear(e.time)) absorb(*crash, i); else out.push_back(i);
+        } else if (e.provider == L"volmgr" && (e.id == 161 || e.id == 162 || e.id == 46)) {
+            // The crash dump could not be written: part of the crash, not a disk error of its own.
+            if (Incident* crash = crashNear(e.time)) { crash->dumpFailed = true; continue; }
+            i.kind = Kind::diskError; i.dumpFailed = true;
+            i.detail = L"volmgr " + std::to_wstring(e.id);
+            out.push_back(i); // matched with the next start's 41 below, never merged with another
+
         } else if (e.provider == L"Display" || e.provider == L"nvlddmkm" || e.provider == L"amdkmdag" || e.provider == L"amdwddmg") {
             i.kind = Kind::graphicsReset;
             i.detail = e.provider + L" " + std::to_wstring(e.id);
@@ -588,7 +738,7 @@ std::vector<Incident> incidentsFromEvents(const std::vector<LogEvent>& source) {
             const std::wstring errorSource = e.value(L"ErrorSource");
             if (!errorSource.empty()) i.detail += L" source " + errorSource;
             add(i);
-        } else if (e.provider == L"disk" || e.provider == L"stornvme" || e.provider == L"storahci" || e.provider == L"Ntfs" || e.provider == L"volmgr") {
+        } else if (e.provider == L"disk" || e.provider == L"stornvme" || e.provider == L"storahci" || e.provider == L"Ntfs") {
             i.kind = Kind::diskError;
             i.detail = e.provider + L" " + std::to_wstring(e.id);
             for (const auto& [name, value] : e.data)
@@ -608,6 +758,15 @@ std::vector<Incident> incidentsFromEvents(const std::vector<LogEvent>& source) {
             add(i);
         }
     }
+    // volmgr 161 is logged a moment before the 41 of the same start: fold those in now.
+    for (auto it = out.begin(); it != out.end();) {
+        if (it->kind == Kind::diskError && it->dumpFailed && it->detail.rfind(L"volmgr", 0) == 0) {
+            auto crash = std::find_if(out.begin(), out.end(), [&](const Incident& c) {
+                return shutdownRank(c.kind) && c.time >= it->time && c.time <= it->time + 60 * Second; });
+            if (crash != out.end()) { crash->dumpFailed = true; it = out.erase(it); continue; }
+        }
+        ++it;
+    }
     return out;
 }
 std::vector<Incident> merge(std::vector<Incident> known, const std::vector<Incident>& found, std::vector<Incident>* added) {
@@ -626,7 +785,7 @@ std::vector<Incident> merge(std::vector<Incident> known, const std::vector<Incid
 std::wstring saveLine(const Incident& i) {
     wchar_t head[96];
     swprintf(head, 96, L"%llu\t%ls\t%lu\t%.1f\t%d\t", static_cast<unsigned long long>(i.time), kindKey(i.kind), static_cast<unsigned long>(i.code), i.seconds, int(i.sleeping));
-    return head + oneLine(i.detail) + L"\t" + oneLine(i.context) + L"\t" + oneLine(i.recentWrites);
+    return head + oneLine(i.detail) + L"\t" + oneLine(i.context) + L"\t" + oneLine(i.recentWrites) + L"\t" + std::to_wstring(i.wentDown) + L"\t" + (i.dumpFailed ? L"1" : L"0");
 }
 std::optional<Incident> loadLine(const std::wstring& line) {
     std::vector<std::wstring> parts;
@@ -646,6 +805,7 @@ std::optional<Incident> loadLine(const std::wstring& line) {
     i.seconds = std::wcstod(parts[3].c_str(), nullptr);
     i.sleeping = parts[4] == L"1";
     i.detail = parts[5]; i.context = parts[6]; i.recentWrites = parts[7];
+    if (parts.size() >= 10) { i.wentDown = parseNumber(parts[8]).value_or(0); i.dumpFailed = parts[9] == L"1"; } // 0.23.1 and later
     return i;
 }
 void attachContext(Incident& incident, const std::vector<Record>& records) {

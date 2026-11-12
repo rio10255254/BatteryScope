@@ -15,8 +15,8 @@
 
 到 **[Releases 頁面](https://github.com/rio10255254/BatteryScope/releases/latest)** 下載：
 
-- **安裝版（建議）**：`BatteryScope-0.23.0-setup.exe`。不需要管理員權限，安裝到 `%LOCALAPPDATA%\Programs\BatteryScope`，會建立開始功能表捷徑，可選擇桌面捷徑與登入時啟動，並可從「設定 → 應用程式」解除安裝。
-- **免安裝版**：`BatteryScope-0.23.0-win64.zip`，解壓後執行 `BatteryScope.exe`。
+- **安裝版（建議）**：`BatteryScope-0.23.1-setup.exe`。不需要管理員權限，安裝到 `%LOCALAPPDATA%\Programs\BatteryScope`，會建立開始功能表捷徑，可選擇桌面捷徑與登入時啟動，並可從「設定 → 應用程式」解除安裝。
+- **免安裝版**：`BatteryScope-0.23.1-win64.zip`，解壓後執行 `BatteryScope.exe`。
 
 需要 Windows 10 1703 以上（建議 Windows 11），64 位元。程式沒有數位簽章，第一次開啟若出現 SmartScreen，點「其他資訊 → 仍要執行」。開啟後在右下角系統匣，圖示會顯示電量百分比；點圖示開關面板。
 
@@ -55,7 +55,7 @@
 
 ## 使用方式
 
-1. 從 [GitHub Releases](https://github.com/rio10255254/BatteryScope/releases/latest) 下載 `BatteryScope-0.23.0-win64.zip`，解壓後執行 `BatteryScope.exe`。已編譯版本適用 Windows 10（1703 以上）與 Windows 11 的 x64 筆電與桌機。
+1. 從 [GitHub Releases](https://github.com/rio10255254/BatteryScope/releases/latest) 下載 `BatteryScope-0.23.1-win64.zip`，解壓後執行 `BatteryScope.exe`。已編譯版本適用 Windows 10（1703 以上）與 Windows 11 的 x64 筆電與桌機。
    升級時先從系統匣結束舊版，再執行新版；程式會避免同時啟動多個正式監測視窗。
 2. 目前耗電顯示電池回報的整機放電功率；資料累積後顯示平均功率、耗電速度與預估續航。
 3. 硬體能源資料可用時，下方依「估計 CPU W」由高到低列出前 10 個程序／服務。每張卡片第二行顯示類型、PID 與核心分攤模型範圍。點「僅背景」切換背景篩選，點「顯示」切換前 10 名／全部；滑鼠滾輪或鍵盤上下鍵瀏覽。若能源資料不可用，會明確退回 CPU / I/O 活動排行。
@@ -118,11 +118,12 @@
 電腦藍屏、突然重開、凍結或畫面閃黑時，BatteryScope 會記下發生了什麼、當時在做什麼，一鍵就能把資料交給開發者：
 
 - **黑盒子**：每 10 秒把電量、耗電、CPU 溫度與功耗、效能模式、風扇與功耗預設、獨顯狀態、更新率、動態省電的判斷、實驗步驟與前景程式寫進 `%LOCALAPPDATA%\BatteryScope\stability\blackbox.bin`。檔案固定 360 KB、保留最近 2 小時，每筆直接寫到磁碟（write-through），藍屏或強制關機也不會遺失。BatteryScope 每次寫入硬體設定（華碩 ACPI、電源設定、更新率、亮度）**之前**都會先記一筆，所以當機前 BatteryScope 是否剛改過什麼一目了然。
-- **開機後讀取 Windows 記錄**：藍屏（Kernel-Power 41、BugCheck 1001，附停止代碼與參數）、沒有藍屏的意外關機（6008）、長按電源鍵強制關機、電池耗盡、顯示驅動重置（Display 4101、LiveKernelEvent 141／117）、硬體錯誤（WHEA）、磁碟錯誤（disk、stornvme、Ntfs、volmgr）。同一次當機的多筆記錄合成一件，並對上黑盒子裡當機前最後的狀態。之後每 15 分鐘再讀一次新記錄。
+- **開機後讀取 Windows 記錄**：藍屏（Kernel-Power 41、BugCheck 1001，附停止代碼與參數）、沒有藍屏的意外關機（6008）、長按電源鍵強制關機、電池耗盡、顯示驅動重置（Display 4101、LiveKernelEvent 141／117）、硬體錯誤（WHEA）、磁碟錯誤（disk、stornvme、Ntfs、volmgr）。同一次當機的多筆記錄合成一件（兩次當機再接近也分開算），顯示實際當機的時間（6008 記下的時間，而不是下次開機的時間），標出 Windows 沒能寫下傾印檔的情況（volmgr 161，表示當機當下系統磁碟已無法寫入），並對上黑盒子裡當機前最後的狀態。同一個程式反覆當掉只保留最新 20 筆，不會把系統記錄擠掉。之後每 15 分鐘再讀一次新記錄。
 - **凍結偵測**：一個高優先權的執行緒每秒醒來一次；螢幕開著時如果整台電腦有 2.5 秒以上沒讓它執行（以不含睡眠時間的計時器計算，避開睡眠與螢幕關閉前後 30 秒），就記為一次凍結。面板本身 30 秒沒回應會存一份 BatteryScope 自己的傾印檔；BatteryScope 當掉時也會留下 `crash-*.txt` 與傾印檔。
+- **已知會造成藍屏的驅動**：裝了 National Instruments（LabVIEW／PXI）的 PCI 橋接驅動（nipcibrd、nipbcfk）時，穩定性頁會提醒並說明怎麼安全移除。
 - **通知**：發現新的藍屏、意外關機或凍結時跳出通知，點一下打開「穩定性」頁；首頁「效能」也會在 7 天內有問題時顯示一行提醒。
 - **穩定性頁**（首頁的提醒列或「⋯ → 穩定性與問題回報」）：最近 30 天的次數、每一件的停止代碼名稱與可能的方向（儲存裝置、顯示卡、睡眠喚醒…）、當時狀態，以及：
-  - **建立回報包**：桌面產生 `BatteryScope-report-日期.zip`，摘要同時複製到剪貼簿可直接貼上。內含摘要、黑盒子、事件記錄全文、BatteryScope 自己的傾印檔、驅動程式與磁碟資訊（含 SSD 韌體）、Windows 可靠性記錄、近 3 天系統錯誤、已安裝更新、電源設定與電池報告。
+  - **建立回報包**：桌面產生 `BatteryScope-report-日期.zip`，摘要同時複製到剪貼簿可直接貼上。內含摘要（附最近 7 天安裝的驅動與更新、傾印檔的停止代碼與相關驅動）、黑盒子、事件記錄全文、BatteryScope 自己的傾印檔、驅動程式與磁碟資訊（含 SSD 韌體）、Windows 可靠性記錄、近 3 天系統錯誤、已安裝更新、電源設定與電池報告。
   - **含藍屏傾印檔的回報**：另外經管理員權限複製 `C:\Windows\Minidump` 最近 5 個與 LiveKernelReports 最近 2 個（64 MB 以下）傾印檔。
   - **記錄剛剛發生的問題**：卡頓、閃退或任何異常後按一下，把那個時間點與之前的狀態標記起來（也在「⋯」選單裡）。
 - 只讀取本機記錄，不會自動上傳任何東西；回報包要不要給人、給誰由你決定。
@@ -259,7 +260,7 @@
 .\build.ps1 -Test
 ```
 
-舊版仍在執行時，可使用 `./build.ps1 -Test -OutputDirectory dist/v0.23.0` 編譯到獨立目錄，避免覆寫使用中的 EXE。
+舊版仍在執行時，可使用 `./build.ps1 -Test -OutputDirectory dist/v0.23.1` 編譯到獨立目錄，避免覆寫使用中的 EXE。
 
 預設尋找 PATH 上的 `g++.exe`，其次使用 `C:\mingw64\bin\g++.exe`，並使用同目錄的 `windres.exe`。產出 `dist\BatteryScope.exe`。
 
