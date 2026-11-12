@@ -342,6 +342,7 @@ DWORD readKnob(Knob knob, DWORD& value) {
     default: return ERROR_INVALID_PARAMETER;
     }
 }
+std::vector<int> availableRefreshRates() { return refreshRates(); }
 DWORD applyKnob(Knob knob, DWORD value) {
     switch (knob) {
     case Knob::cpuBoost: return writeProcessor(BoostMode, value);

@@ -177,6 +177,7 @@ struct KnobPlan {
 KnobPlan planKnob(Knob knob);
 DWORD applyKnob(Knob knob, DWORD value);
 DWORD readKnob(Knob knob, DWORD& value);
+std::vector<int> availableRefreshRates();  // at the current resolution, lowest first
 
 // Reads the signals of one sample that are not part of the regular snapshot.
 class Probe {
