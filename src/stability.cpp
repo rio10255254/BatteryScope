@@ -585,8 +585,8 @@ std::vector<Incident> incidentsFromEvents(const std::vector<LogEvent>& source) {
         } else if (e.provider == L"Microsoft-Windows-WHEA-Logger") {
             i.kind = Kind::hardwareError;
             i.detail = L"WHEA " + std::to_wstring(e.id);
-            const std::wstring source = e.value(L"ErrorSource");
-            if (!source.empty()) i.detail += L" source " + source;
+            const std::wstring errorSource = e.value(L"ErrorSource");
+            if (!errorSource.empty()) i.detail += L" source " + errorSource;
             add(i);
         } else if (e.provider == L"disk" || e.provider == L"stornvme" || e.provider == L"storahci" || e.provider == L"Ntfs" || e.provider == L"volmgr") {
             i.kind = Kind::diskError;
@@ -853,17 +853,17 @@ int copySystemDumps(const std::wstring& target, std::wstring& listing) {
     const auto dumps = findDumps(denied);
     std::error_code error;
     std::filesystem::create_directories(target, error);
-    int copied = 0, small = 0, live = 0;
+    int copied = 0, minidumps = 0, liveDumps = 0;
     const uint64_t cutoff = nowUtc() - 30ull * 86400 * Second;
     for (const auto& d : dumps) {
         wchar_t line[64]; swprintf(line, 64, L"  %.1f MB  ", double(d.size) / (1024.0 * 1024.0));
         listing += localTimeText(d.time) + line + d.path;
         const bool isLive = d.path.find(L"LiveKernelReports") != std::wstring::npos;
         // Small dumps: the latest five; live kernel dumps: the latest two under 64 MB.
-        const bool take = d.time >= cutoff && (isLive ? live < 2 && d.size <= 64ull << 20 : small < 5 && d.size <= 128ull << 20);
+        const bool take = d.time >= cutoff && (isLive ? liveDumps < 2 && d.size <= 64ull << 20 : minidumps < 5 && d.size <= 128ull << 20);
         if (take) {
             const std::wstring name = (isLive ? L"live-" : L"") + std::filesystem::path(d.path).filename().wstring();
-            if (CopyFileW(d.path.c_str(), (std::filesystem::path(target) / name).c_str(), FALSE)) { ++copied; (isLive ? live : small)++; listing += L"  (copied)"; }
+            if (CopyFileW(d.path.c_str(), (std::filesystem::path(target) / name).c_str(), FALSE)) { ++copied; ++(isLive ? liveDumps : minidumps); listing += L"  (copied)"; }
         }
         listing += L"\r\n";
     }
