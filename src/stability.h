@@ -91,9 +91,21 @@ struct LogEvent {
     std::wstring value(const std::wstring& name) const;
 };
 std::optional<LogEvent> parseEventXml(const std::wstring& xml);
-std::wstring eventQueryXml(uint64_t sinceUtc);
+enum class Channel { system, application, installs };
+std::wstring eventQueryXml(uint64_t sinceUtc, Channel channel);
+// 6008's "unexpected shutdown at" time, written in the PC's own date and time format: as UTC,
+// the reading closest before the record itself.
+std::optional<uint64_t> parseShutdownTime(const std::wstring& time, const std::wstring& date, uint64_t loggedUtc);
 // Reads the events that matter since a time, newest first. withMessages formats each one's text.
+// Each channel has its own limit, and one program's repeated crashes are kept to 20, so a
+// crash loop of one app cannot push the system's records out.
 std::vector<LogEvent> readEvents(uint64_t sinceUtc, bool withMessages, size_t limit = 2000);
+// Driver and update installs (Windows Update 19, Windows Installer 1033/1034/1035), newest first.
+std::vector<LogEvent> readInstalls(uint64_t sinceUtc);
+// Third-party kernel drivers installed here that are known to cause blue screens: name and why.
+std::vector<std::pair<std::wstring, std::wstring>> knownTroubleDrivers();
+// A kernel minidump's stop code, parameters, and the drivers named in its crash data.
+std::wstring summarizeKernelDump(const std::wstring& path);
 
 // ---- Incidents.
 enum class Kind {
@@ -122,6 +134,9 @@ struct Incident {
     std::wstring context;        // the black box heartbeat before it
     std::wstring recentWrites;   // hardware writes in the minute before it
     bool sleeping = false;       // went down while asleep or entering sleep
+    uint64_t wentDown = 0;       // when it went down (6008's last-alive time); time is when Windows logged it
+    bool dumpFailed = false;     // Windows could not write the crash dump (volmgr 161/162/46)
+    uint64_t when() const { return wentDown ? wentDown : time; }
     std::wstring key() const;    // stable identity for merging
 };
 // Groups the boot-time records of one crash (41, 1001, 6008) into one incident.

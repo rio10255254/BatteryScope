@@ -5776,10 +5776,8 @@ std::wstring heartbeatText() {
     DWORD hz = 0;
     if (bs::lab::readKnob(bs::lab::Knob::refreshRate, hz) == ERROR_SUCCESS && hz) add(L"hz", std::to_wstring(hz));
     if (dynamicEnabled) add(L"act", bs::gov::activityKey(governor.activity()));
-    if (labController && labController->active()) {
-        const auto s = labController->status();
+    if (labController) if (const auto s = labController->status(); s.running)
         add(L"lab", std::wstring(bs::lab::knobKey(s.knob)) + L"/" + std::to_wstring(s.arm));
-    }
     add(L"fg", foregroundExe());
     if (displayOff) add(L"disp", L"off");
     return t;
@@ -5883,6 +5881,8 @@ std::wstring incidentLines(const bs::stability::Incident& i) {
         const wchar_t* name = bs::stability::bugcheckName(i.code);
         line((name ? std::wstring(name) : std::wstring(tr(L"未知代碼"))) + L" · " + areaName(incidentArea(i)));
     }
+    if (i.wentDown && i.time > i.wentDown + 60 * bs::stability::Second) line(tr(L"Windows 在 ") + bs::stability::localTimeText(i.time).substr(11) + tr(L" 重新開機時記錄"));
+    if (i.dumpFailed) line(tr(L"Windows 沒能寫下傾印檔：當機當下系統磁碟已經無法寫入"));
     if (i.sleeping) line(tr(L"發生在睡眠或喚醒時"));
     if (!i.context.empty()) line(tr(L"當時：") + contextText(i.context));
     if (!i.recentWrites.empty()) line(tr(L"之前 BatteryScope 寫入：") + i.recentWrites);
@@ -5895,6 +5895,7 @@ std::vector<bs::stability::Incident> demoIncidents() {
     Incident a; a.kind = Kind::blueScreen; a.code = 0x154; a.time = now - 3 * 3600 * Second;
     a.context = localTimeText(a.time - 40 * Second, true) + L" ac=0 pct=62 w=11.4 cpu=6.2 load=9 t=58 mode=silent fanp=0 ppt=0 eco=1 hz=60 act=閱讀 fg=msedge.exe";
     a.detail = L"0x154 (0xffffb10c7a5e8000, 0xffffd38f4b3cf7a0, 0x2, 0x0)";
+    a.wentDown = a.time - 70 * Second; a.dumpFailed = true;
     Incident b; b.kind = Kind::freeze; b.seconds = 6.4; b.time = now - 26 * 3600 * Second;
     b.context = localTimeText(b.time - 8 * Second, true) + L" ac=1 pct=80 cpu=14.0 load=31 t=71 mode=balanced eco=0 dgpu=on hz=120 fg=Code.exe";
     Incident c; c.kind = Kind::graphicsReset; c.time = now - 26 * 3600 * Second + 20 * Second; c.detail = L"amdkmdag 4101";
@@ -5934,9 +5935,9 @@ std::wstring stabilitySummary() {
     int shown = 0;
     t += tr(L"\n最近 30 天：\n");
     for (const auto& i : list) {
-        if (i.time < since || shown >= 25) continue;
+        if (i.when() < since || shown >= 25) continue;
         ++shown;
-        t += L"- " + localTimeText(i.time) + L"  " + incidentTitle(i) + L"\n";
+        t += L"- " + localTimeText(i.when()) + L"  " + incidentTitle(i) + L"\n";
         std::wstring lines = incidentLines(i);
         if (i.kind == Kind::blueScreen && !i.detail.empty()) lines += L"\n" + i.detail;
         size_t start = 0;
@@ -5948,6 +5949,10 @@ std::wstring stabilitySummary() {
         }
     }
     if (!shown) t += tr(L"（沒有記錄）\n");
+    if (const auto drivers = knownTroubleDrivers(); !drivers.empty()) {
+        t += tr(L"\n已安裝、已知會造成藍屏的驅動：\n");
+        for (const auto& [name, why] : drivers) t += L"- " + name + L": " + why + L"\n";
+    }
     // The settings BatteryScope controls right now.
     t += tr(L"\n目前設定：");
     t += tr(L"動態省電 ") + std::wstring(dynamicEnabled ? tr(L"開") : tr(L"關"));
@@ -5983,7 +5988,7 @@ void showStabilityPage() {
     v.push_back(vHeading(tr(L"最近 30 天")));
     {
         int counts[int(Kind::count)]{};
-        for (const auto& i : list) if (i.time >= since) ++counts[int(i.kind)];
+        for (const auto& i : list) if (i.when() >= since) ++counts[int(i.kind)];
         const int shutdowns = counts[int(Kind::powerLoss)] + counts[int(Kind::forcedOff)] + counts[int(Kind::batteryEmpty)];
         std::vector<std::pair<std::wstring, COLORREF>> chips;
         auto chip = [&](const std::wstring& label, int n, bool bad) { chips.push_back({label + L" " + std::to_wstring(n), n && bad ? theme.warn : n ? COLORREF(0) : Green}); };
@@ -6001,14 +6006,23 @@ void showStabilityPage() {
     std::set<bs::stability::Area> areas;
     int listed = 0;
     for (const auto& i : list) {
-        if (i.time < since || listed >= 8) continue;
+        if (i.when() < since || listed >= 8) continue;
         if (!listed) v.push_back(vHeading(tr(L"最近的問題")));
         ++listed;
         const bool bad = serious(i.kind);
-        v.push_back(vChips({{shortTime(i.time), 0}, {incidentTitle(i), bad ? theme.warn : COLORREF(0)}}));
+        v.push_back(vChips({{shortTime(i.when()), 0}, {incidentTitle(i), bad ? theme.warn : COLORREF(0)}}));
         const std::wstring lines = incidentLines(i);
         if (!lines.empty()) v.push_back(vNote(lines));
         if (bad || i.kind == Kind::diskError) areas.insert(incidentArea(i));
+        if (i.dumpFailed) areas.insert(bs::stability::Area::storage);
+    }
+    const auto drivers = (demo || isolatedPreview) ? std::vector<std::pair<std::wstring, std::wstring>>{{L"nipcibrd.sys", L"National Instruments PCI bridge driver"}}
+        : knownTroubleDrivers();
+    if (!drivers.empty()) {
+        v.push_back(vHeading(tr(L"可能有關的驅動")));
+        std::wstring names;
+        for (const auto& d : drivers) names += (names.empty() ? L"" : L"、") + d.first;
+        v.push_back(vNote(names + tr(L"：National Instruments（LabVIEW／PXI）的 PCI 橋接驅動，掛在所有 PCI 橋接器上（包括 SSD 所在的那一個），已知會在睡眠與喚醒時造成 0x9F 藍屏。用不到 NI 的硬體時，請用 NI Package Manager 移除「PXI Platform Services」或 NI 的 PCI 橋接驅動；不要直接停用，可能導致無法開機。")));
     }
     if (!areas.empty()) {
         v.push_back(vHeading(tr(L"可能的方向")));
@@ -6028,7 +6042,7 @@ std::optional<VBlock> stabilityRow(bool warningsOnly) {
     const auto list = stabilityIncidents();
     const uint64_t since = nowUtc() - 7ull * 86400 * Second;
     int count = 0; const Incident* latest = nullptr;
-    for (const auto& i : list) if (i.time >= since && serious(i.kind) && i.kind != Kind::appHang) { ++count; if (!latest) latest = &i; }
+    for (const auto& i : list) if (i.when() >= since && serious(i.kind) && i.kind != Kind::appHang) { ++count; if (!latest) latest = &i; }
     if (count) return vAction(tr(L"穩定性 · 7 天 ") + std::to_wstring(count) + tr(L" 次"), incidentTitle(*latest), StabilityPageId, theme.warn);
     if (warningsOnly) return std::nullopt;
     return vAction(tr(L"穩定性與問題回報"), tr(L"正常"), StabilityPageId);
@@ -6147,6 +6161,15 @@ void startStability() {
     blackBox().write(L"start v=" BS_VERSION_STRING);
     { std::lock_guard<std::mutex> lock(stab::mutex); stab::incidents = loadIncidents(); }
     stab::lastScanUtc = readQwordSetting(L"StabilityScan");
+    if (readSetting(L"StabilityFormat", 0) < 2) {
+        // 0.23.0 merged crashes minutes apart and missed shutdown times: read Windows' records again.
+        std::lock_guard<std::mutex> lock(stab::mutex);
+        stab::incidents.erase(std::remove_if(stab::incidents.begin(), stab::incidents.end(), [](const Incident& i) {
+            return i.kind != Kind::freeze && i.kind != Kind::appHang && i.kind != Kind::manual; }), stab::incidents.end());
+        saveIncidents(stab::incidents);
+        stab::lastScanUtc = 0;
+        writeSetting(L"StabilityFormat", 2);
+    }
     stab::uiBeatMs = stab::powerChangeMs = GetTickCount64();
     stab::powerChangeMs = GetTickCount64() - 60000; // a fresh start is not a power change
     stab::started = stab::running = true;
@@ -6281,6 +6304,36 @@ void buildReport(bool withDumps) {
             }
             writeUtf8File(dir / L"dumps-list.txt", listing.empty() ? std::wstring(L"(no dumps found)\n") : listing);
         }
+        // What the copied dumps say, and what was installed in the week before: added to the summary.
+        std::wstring extra;
+        {
+            std::wstring dumpText;
+            for (const auto& entry : std::filesystem::recursive_directory_iterator(dir, error)) {
+                if (entry.path().extension() != L".dmp" || entry.path().filename().wstring().rfind(L"crash-", 0) == 0 || entry.path().filename().wstring().rfind(L"hang-", 0) == 0) continue;
+                const std::wstring text = summarizeKernelDump(entry.path().wstring());
+                if (!text.empty()) dumpText += L"- " + entry.path().filename().wstring() + L": " + text + L"\n";
+            }
+            if (!dumpText.empty()) { extra += L"\nBlue screen dumps:\n" + dumpText; writeUtf8File(dir / L"dumps-summary.txt", dumpText); }
+            std::wstring installs;
+            for (const auto& e : readInstalls(nowUtc() - 7ull * 86400 * Second)) {
+                std::wstring what;
+                if (e.provider == L"MsiInstaller") {
+                    if (e.data.size() < 2) continue;
+                    what = (e.id == 1034 ? L"removed " : e.id == 1035 ? L"reconfigured " : L"installed ") + e.data[0].second + L" " + e.data[1].second;
+                } else {
+                    what = e.value(L"updateTitle");
+                    if (what.empty() && !e.data.empty()) what = e.data[0].second;
+                    what = L"Windows Update: " + what;
+                }
+                installs += L"- " + localTimeText(e.time) + L"  " + what + L"\n";
+            }
+            if (!installs.empty()) { extra += L"\nInstalled in the last 7 days:\n" + installs; writeUtf8File(dir / L"installs.txt", installs); }
+            if (!extra.empty()) {
+                writeUtf8File(dir / L"summary.txt", summary + extra);
+                std::lock_guard<std::mutex> lock(stab::mutex);
+                stab::reportSummary = summary + extra;
+            }
+        }
         // Drivers, disks, Windows' reliability history and recent errors.
         {
             std::wstring quoted; for (wchar_t c : dir.wstring()) { quoted += c; if (c == L'\'') quoted += L'\''; }
@@ -6329,7 +6382,7 @@ void notifyStability() {
         if (!onlyFreezes || !stab::lastFreezeNotice || tick - stab::lastFreezeNotice > 30 * 60 * 1000) {
             if (onlyFreezes) stab::lastFreezeNotice = tick;
             const std::wstring title = fresh.size() == 1 ? tr(L"偵測到：") + incidentTitle(top) : tr(L"偵測到 ") + std::to_wstring(fresh.size()) + tr(L" 個穩定性問題");
-            std::wstring body = shortTime(top.time) + L" · " + (fresh.size() == 1 && top.kind == Kind::blueScreen && bugcheckName(top.code) ? std::wstring(bugcheckName(top.code)) : incidentTitle(top));
+            std::wstring body = shortTime(top.when()) + L" · " + (fresh.size() == 1 && top.kind == Kind::blueScreen && bugcheckName(top.code) ? std::wstring(bugcheckName(top.code)) : incidentTitle(top));
             body += tr(L"。點此查看並建立回報。");
             showBalloon(title, body, BalloonTarget::stability);
         }

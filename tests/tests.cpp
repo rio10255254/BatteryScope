@@ -9,6 +9,8 @@
 #include "../src/i18n.h"
 #include <shellapi.h>
 #include <algorithm>
+#include <cstring>
+#include <filesystem>
 #include <cctype>
 #include <fstream>
 #include <iostream>
@@ -666,8 +668,58 @@ int wmain(int argc, wchar_t** argv) {
             StallMeter meter;
             check(!meter.feed(1000, 1000, true, 60000) && !meter.feed(3000, 1000, true, 60000) && meter.feed(4500, 1000, true, 60000) == 3.5 &&
                 !meter.feed(9000, 1000, false, 60000) && !meter.feed(9000, 1000, true, 5000), "freezes count only with the screen on and away from power changes");
-            const auto query = eventQueryXml(expected);
-            check(query.find(L"<Select Path='System'>") != std::wstring::npos && query.find(L"<Select Path='Application'>") != std::wstring::npos &&
+            // The G14's own report (2026-11-12): two 0xEF crashes eight minutes apart, each with its
+            // 6008 and a failed dump (volmgr 161 logged just before the 41), stay two incidents.
+            auto at = [&](int hour, int minute, int second) {
+                SYSTEMTIME local{2026, 11, 4, 12, WORD(hour), WORD(minute), WORD(second), 0}, utc{}; FILETIME f{};
+                TzSpecificLocalTimeToSystemTime(nullptr, &local, &utc); SystemTimeToFileTime(&utc, &f);
+                return (uint64_t(f.dwHighDateTime) << 32) | f.dwLowDateTime;
+            };
+            auto crash41 = [&](uint64_t time, const wchar_t* code) { return event(L"Microsoft-Windows-Kernel-Power", 41, time, {{L"BugcheckCode", code}}); };
+            const std::vector<LogEvent> day{
+                event(L"volmgr", 161, at(17, 9, 28), {{L"", L"\\Device\\HarddiskVolume3"}}), crash41(at(17, 9, 29), L"239"),
+                event(L"EventLog", 6008, at(17, 9, 44), {{L"", L"下午 05:08:31"}, {L"", L"\u200E2026/\u200E11/\u200E12"}}),
+                event(L"volmgr", 161, at(17, 17, 7), {{L"", L"\\Device\\HarddiskVolume3"}}), crash41(at(17, 17, 9), L"239"),
+                event(L"EventLog", 6008, at(17, 17, 20), {{L"", L"下午 05:09:44"}, {L"", L"\u200E2026/\u200E11/\u200E12"}}),
+                event(L"Microsoft-Windows-WER-SystemErrorReporting", 1001, at(17, 18, 30), {{L"param1", L"0x000000ef (0xffff848a92ee9140, 0x0, 0x0, 0x0)"}})};
+            const auto two = incidentsFromEvents(day);
+            check(two.size() == 2 && two[0].kind == Kind::blueScreen && two[1].kind == Kind::blueScreen && two[0].code == 0xEF && two[1].code == 0xEF &&
+                two[0].dumpFailed && two[1].dumpFailed && two[0].wentDown == at(17, 8, 31) && two[1].wentDown == at(17, 9, 44) && two[1].when() == at(17, 9, 44),
+                "two crashes minutes apart stay two, each with its shutdown time and failed dump");
+            check(merge(two, two).size() == 2, "re-reading the same records adds nothing");
+            check(parseShutdownTime(L"6:25:20 PM", L"11/12/2026", at(18, 26, 40)) == at(18, 25, 20) &&
+                parseShutdownTime(L"18:25:20", L"12.11.2026", at(18, 26, 40)) == at(18, 25, 20) &&
+                parseShutdownTime(L"上午 12:05:00", L"2026/11/12", at(18, 26, 40)) == at(0, 5, 0) && !parseShutdownTime(L"x", L"y", at(18, 26, 40)),
+                "6008's shutdown time reads in Chinese, US and European formats");
+            Incident oldFormat; oldFormat.kind = Kind::blueScreen; oldFormat.time = expected; oldFormat.code = 0x154;
+            std::wstring oldLine = saveLine(oldFormat);
+            oldLine = oldLine.substr(0, oldLine.rfind(L'\t')); oldLine = oldLine.substr(0, oldLine.rfind(L'\t')); // as 0.23.0 wrote it
+            const auto fromOld = loadLine(oldLine);
+            Incident full = oldFormat; full.wentDown = expected - 90 * Second; full.dumpFailed = true;
+            const auto fromNew = loadLine(saveLine(full));
+            check(fromOld && fromOld->code == 0x154 && !fromOld->wentDown && fromNew && fromNew->wentDown == full.wentDown && fromNew->dumpFailed,
+                "incidents saved by 0.23.0 still load; the shutdown time and failed dump are kept");
+            {
+                std::string dump(0x3000, '\0');
+                std::memcpy(dump.data(), "PAGEDU64", 8);
+                const uint32_t code9f = 0x9F; const uint64_t params[4] = {3, 0xffffd5860f5ec360ull, 0xfffff20d9e287a00ull, 0xffffd5860fcf1aa0ull};
+                std::memcpy(dump.data() + 0x38, &code9f, 4); std::memcpy(dump.data() + 0x40, params, sizeof(params));
+                size_t offset = 0x1000;
+                for (const wchar_t* name : {L"\\Driver\\pci", L"\\Driver\\ACPI", L"\\Driver\\nipbcfk", L"\\Driver\\nipcibrd", L"\\Driver\\pci"}) {
+                    const size_t bytes = wcslen(name) * 2;
+                    std::memcpy(dump.data() + offset, name, bytes); offset += bytes + 40;
+                }
+                const std::wstring dumpPath = std::wstring(temp) + L"bs-dump-test.dmp";
+                { std::ofstream out(std::filesystem::path(dumpPath), std::ios::binary); out << dump; }
+                const auto text = summarizeKernelDump(dumpPath);
+                DeleteFileW(dumpPath.c_str());
+                check(text.find(L"0x9F DRIVER_POWER_STATE_FAILURE (0x3,") == 0 && text.find(L"pci ACPI nipbcfk nipcibrd") != std::wstring::npos,
+                    "a kernel minidump gives its stop code and the drivers in its crash data");
+            }
+            const auto query = eventQueryXml(expected, Channel::system);
+            const auto appQuery = eventQueryXml(expected, Channel::application);
+            check(query.find(L"<Select Path='System'>") != std::wstring::npos && appQuery.find(L"<Select Path='Application'>") != std::wstring::npos &&
+                query.find(L"Path='Application'") == std::wstring::npos && eventQueryXml(expected, Channel::installs).find(L"MsiInstaller") != std::wstring::npos &&
                 query.find(L"@SystemTime&gt;='2026-11-12T08:09:31.000Z'") != std::wstring::npos && query.find(L">=") == std::wstring::npos, "the event query is valid XML");
         }
         check(std::any_of(browserPlan.begin(), browserPlan.end(), [](const lab::Step& step) { return step.knob == lab::Knob::darkMode && step.workload == lab::Workload::browse; })
