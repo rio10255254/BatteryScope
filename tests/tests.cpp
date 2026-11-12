@@ -522,6 +522,14 @@ int wmain(int argc, wchar_t** argv) {
                 "turning the Slash off only wakes it and switches it off");
             check(asus::slashModes().size() == 16 && std::none_of(asus::slashModes().begin(), asus::slashModes().end(), [](asus::SlashMode m) { return std::wstring(asus::slashModeName(m)) == L"?"; }),
                 "every Slash mode has a name");
+            // Fan curves: 8 temperatures then 8 duties, as the firmware hands them out; power presets stay at or below balanced.
+            check(asus::validFanCurve({30, 40, 50, 60, 70, 80, 90, 100, 0, 0, 10, 20, 35, 50, 70, 90})
+                && !asus::validFanCurve(Bytes(16, 0)) && !asus::validFanCurve({30, 40, 50}) && !asus::validFanCurve({30, 40, 50, 60, 70, 80, 90, 200, 0, 0, 10, 20, 35, 50, 70, 90})
+                && !asus::validFanCurve({30, 40, 50, 60, 70, 80, 90, 100, 0, 0, 10, 20, 35, 50, 70, 150}), "only plausible fan curves are written");
+            const auto saver = asus::powerLimits(asus::PowerPreset::saver), standard = asus::powerLimits(asus::PowerPreset::standard);
+            check(asus::powerLimits(asus::PowerPreset::factory).spl == 0 && saver.spl < saver.sppt && saver.sppt < saver.fppt
+                && standard.spl <= 45 && standard.fppt <= 65 && asus::powerLimits(asus::PowerPreset::light).spl > saver.spl,
+                "CPU power presets rise in order and stay within the balanced range");
             check(asus::nextMode(asus::Mode::silent) == asus::Mode::balanced && asus::nextMode(asus::Mode::balanced) == asus::Mode::turbo && asus::nextMode(asus::Mode::turbo) == asus::Mode::silent,
                 "Fn+F5 cycles silent, balanced, turbo");
             check(asus::key::optimization(asus::key::BrightnessUp) && asus::key::optimization(asus::key::Touchpad) && !asus::key::optimization(asus::key::Mode)
