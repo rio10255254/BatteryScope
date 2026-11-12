@@ -9,6 +9,7 @@
 #include <setupapi.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <cstdlib>
 #include <cstring>
 #include <cwctype>
 #include <tlhelp32.h>
@@ -347,7 +348,13 @@ DWORD applyKnob(Knob knob, DWORD value) {
     case Knob::energyPreference: return writeProcessor(EnergyPreference, value);
     case Knob::refreshRate: return setRefresh(int(value));
     case Knob::powerMode: { GUID replaced{}; return overridePowerMode(false, PowerMode(value), replaced); }
-    case Knob::brightness: { const DWORD status = setBrightness(value); if (!status) brightnessValue = value; return status; }
+    case Knob::brightness: {
+        DWORD status = setBrightness(value);
+        // A panel that takes the call but keeps its level would make the comparison meaningless.
+        if (!status) { const int now = readBrightness(); if (now >= 0 && std::abs(now - int(value)) > 2) status = ERROR_NOT_SUPPORTED; }
+        if (!status) brightnessValue = value;
+        return status;
+    }
     case Knob::display: displayValue = value ? 1 : 0; return setDisplay(value != 0);
     case Knob::backgroundEco: backgroundEcoValue = value ? 1 : 0; return setBackgroundEco(value != 0);
     case Knob::darkMode: return setDarkMode(value != 0);

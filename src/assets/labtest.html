@@ -2,6 +2,7 @@
 <html lang="zh-Hant">
 <head>
 <meta charset="utf-8">
+<meta name="color-scheme" content="light dark">
 <title>BatteryScope 自動測試</title>
 <!--
   BatteryScope power lab: realistic, repeatable activities run in a separate
@@ -28,14 +29,14 @@
   #video { position: fixed; left: 0; top: 40px; width: 100%; height: calc(100% - 40px); background: #000; object-fit: contain; display: none; }
   #doc { min-height: 80vh; outline: none; background: #f7f7f5; color: #222; padding: 48px 64px; border-radius: 6px; margin-top: 20px;
     font: 16px/1.7 Calibri, "Microsoft JhengHei UI", sans-serif; }
-  /* Windows dark mode (the dark-mode step) turns the page dark, as sites that follow it do. */
-  @media (prefers-color-scheme: dark) {
-    html, body { background: #15171c; color: #d8dce3; }
-    article h1 { color: #f1f3f6; } article h2 { color: #e6e9ee; } article .meta { color: #8b93a1; }
-    .card { border-color: #2c323b; background: #1b1e24; }
-    .ad { background: linear-gradient(90deg, #28323f, #3b4a5c, #28323f); background-size: 200% 100%; }
-    #doc { background: #1e2026; color: #e3e5e8; }
-  }
+  /* Windows dark mode (the dark-mode step) turns the page dark, as sites that follow it do. BatteryScope
+     reports the Windows app theme in /state: the browser's own appearance setting (Edge can be set to
+     dark whatever Windows uses) must not keep the page dark, or brightness would cost nothing to measure. */
+  html.dark, html.dark body { background: #15171c; color: #d8dce3; }
+  html.dark article h1 { color: #f1f3f6; } html.dark article h2 { color: #e6e9ee; } html.dark article .meta { color: #8b93a1; }
+  html.dark .card { border-color: #2c323b; background: #1b1e24; }
+  html.dark .ad { background: linear-gradient(90deg, #28323f, #3b4a5c, #28323f); background-size: 200% 100%; }
+  html.dark #doc { background: #1e2026; color: #e3e5e8; }
 </style>
 </head>
 <body>
@@ -200,6 +201,7 @@ async function poll() {
   try {
     const state = await (await fetch('/state', { cache: 'no-store' })).json();
     refresh = state.refresh || refresh; caption = state.caption || caption; showHud();
+    document.documentElement.classList.toggle('dark', !!state.dark);
     if (state.scenario !== scenario) switchTo(state.scenario);
     const body = JSON.stringify(m);
     for (const k in m) m[k] = 0;
