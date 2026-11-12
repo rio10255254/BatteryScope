@@ -4,6 +4,7 @@
 #include "../src/lab.h"
 #include "../src/governor.h"
 #include "../src/asus.h"
+#include "../src/stability.h"
 #include "../src/motion.h"
 #include "../src/i18n.h"
 #include <shellapi.h>
@@ -549,6 +550,125 @@ int wmain(int argc, wchar_t** argv) {
             const auto silentEvidence = gov::learn({silent});
             check(!silentEvidence.empty() && silentEvidence[0].setting == gov::Setting::firmwareMode && silentEvidence[0].savingValue == 2 && silentEvidence[0].approved,
                 "a measured silent-mode saving becomes evidence for the firmware setting");
+        }
+        // ---- Stability monitor.
+        {
+            using namespace bs::stability;
+            SYSTEMTIME st{2026, 11, 4, 12, 8, 9, 31, 500}; FILETIME ft{}; SystemTimeToFileTime(&st, &ft);
+            const uint64_t expected = (uint64_t(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+            check(parseIsoUtc(L"2026-11-12T08:09:31.5000000Z") == expected && parseIsoUtc(L"1601-01-01T00:00:00Z") == 0ull && !parseIsoUtc(L"garbage"),
+                "event times parse to FILETIME ticks");
+            check(std::wstring(bugcheckName(0x154)) == L"UNEXPECTED_STORE_EXCEPTION" && bugcheckArea(0x154) == Area::storage &&
+                normalizeBugcheck(0x1000007E) == 0x7E && bugcheckArea(0xEF) == Area::system && bugcheckArea(0x116) == Area::graphics && !bugcheckName(0x12345),
+                "stop codes are named and grouped");
+            Record r; r.seq = 42; r.time = expected; r.boot = expected - 100; r.pid = 1234; r.text = L"hb ac=0 pct=74 act=瀏覽 fg=msedge.exe";
+            const std::string slot = encodeSlot(r);
+            const auto back = decodeSlot(slot.data(), slot.size());
+            check(slot.size() == SlotBytes && back && back->seq == 42 && back->time == expected && back->pid == 1234 && back->text == r.text,
+                "black box slots round-trip, Chinese included");
+            std::string torn = slot; torn[60] = torn[60] == 'x' ? 'y' : 'x';
+            Record longRecord = r; longRecord.text = std::wstring(900, L'字');
+            const std::string longSlot = encodeSlot(longRecord);
+            const auto longBack = decodeSlot(longSlot.data(), longSlot.size());
+            check(!decodeSlot(torn.data(), torn.size()) && longSlot.size() == SlotBytes && longBack && !longBack->text.empty() && longBack->text.size() < 900,
+                "torn slots are rejected and long lines are cut on a character boundary");
+            const auto f = fields(L"hb ac=0 pct=74 w=9.8 fg=a_b.exe");
+            check(f.at(L"ac") == L"0" && f.at(L"pct") == L"74" && f.at(L"fg") == L"a_b.exe" && !f.count(L"hb"), "heartbeat fields parse");
+
+            wchar_t temp[MAX_PATH]; GetTempPathW(MAX_PATH, temp);
+            const std::wstring boxPath = std::wstring(temp) + L"bs-blackbox-test.bin";
+            DeleteFileW(boxPath.c_str());
+            {
+                BlackBox box; check(box.open(boxPath), "black box opens");
+                for (int i = 0; i < int(BlackBox::Slots) + 10; ++i) box.write(L"hb n=" + std::to_wstring(i));
+                const auto all = box.records();
+                check(all.size() == BlackBox::Slots && all.front().text == L"hb n=10" && all.back().text == L"hb n=" + std::to_wstring(BlackBox::Slots + 9),
+                    "the black box keeps the newest records in order when it wraps");
+                box.close();
+                BlackBox again; again.open(boxPath); again.write(L"start");
+                const auto more = again.records();
+                check(more.back().text == L"start" && more.back().seq == all.back().seq + 1, "a reopened black box continues the sequence");
+                again.close();
+            }
+            DeleteFileW(boxPath.c_str());
+
+            auto rec = [](uint64_t seq, uint64_t time, const wchar_t* text) { Record x; x.seq = seq; x.time = time; x.boot = 5; x.pid = 7; x.text = text; return x; };
+            const uint64_t t0 = 100000 * Second;
+            std::vector<Record> session{rec(1, t0, L"start v=1"), rec(2, t0 + 10 * Second, L"hb ac=0 pct=55 w=9.0"), rec(3, t0 + 20 * Second, L"ev acpi 0x00110024=1E")};
+            check(classify(session, t0 + 3600 * Second).ending == Ending::systemDown && classify(session, t0 - 3600 * Second).ending == Ending::appEnded,
+                "a later boot means the system went down; the same boot means the app ended");
+            auto clean = session; clean.push_back(rec(4, t0 + 30 * Second, L"exit quit"));
+            auto asleep = session; asleep.push_back(rec(4, t0 + 30 * Second, L"ev suspend"));
+            auto empty = session; empty.push_back(rec(4, t0 + 30 * Second, L"hb ac=0 pct=2 w=7.0"));
+            auto hung = session; hung.push_back(rec(4, t0 + 30 * Second, L"ev hang ui 31s"));
+            const auto previous = classify(session, t0 + 3600 * Second);
+            check(classify(clean, t0 + 3600 * Second).ending == Ending::clean && classify(asleep, t0 + 3600 * Second).ending == Ending::systemDownAsleep &&
+                classify(empty, t0 + 3600 * Second).ending == Ending::batteryEmpty && classify(hung, t0 - 3600 * Second).ending == Ending::appHung &&
+                previous.lastHeartbeat == L"ac=0 pct=55 w=9.0" && previous.tail.size() == 3,
+                "the previous session's ending: clean, asleep, battery empty, hung");
+
+            const std::wstring kp41 = L"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Microsoft-Windows-Kernel-Power' Guid='{331c3b3a}'/>"
+                L"<EventID>41</EventID><Version>9</Version><Level>1</Level><TimeCreated SystemTime='2026-11-12T08:09:31.5000000Z'/><Channel>System</Channel></System>"
+                L"<EventData><Data Name='BugcheckCode'>340</Data><Data Name='BugcheckParameter1'>0xffffb10c7a5e8000</Data><Data Name='BugcheckParameter2'>0x1</Data>"
+                L"<Data Name='BugcheckParameter3'>0x2</Data><Data Name='BugcheckParameter4'>0x0</Data><Data Name='SleepInProgress'>0</Data><Data Name='PowerButtonTimestamp'>0</Data>"
+                L"<Data Name='ConnectedStandbyInProgress'>false</Data><Data Name='CsEntryScenarioInstanceId'/><Data Name='LongPowerButtonPressDetected'>false</Data></EventData></Event>";
+            const auto e41 = parseEventXml(kp41);
+            check(e41 && e41->provider == L"Microsoft-Windows-Kernel-Power" && e41->id == 41 && e41->level == 1 && e41->channel == L"System" && e41->time == expected &&
+                e41->value(L"BugcheckCode") == L"340" && e41->value(L"CsEntryScenarioInstanceId").empty() && e41->value(L"LongPowerButtonPressDetected") == L"false",
+                "a Kernel-Power 41 record parses");
+            auto event = [](const wchar_t* provider, uint32_t id, uint64_t time, std::vector<std::pair<std::wstring, std::wstring>> data) {
+                LogEvent e; e.provider = provider; e.id = id; e.time = time; e.data = std::move(data); return e;
+            };
+            const auto bugcheck = event(L"Microsoft-Windows-WER-SystemErrorReporting", 1001, expected + 40 * Second,
+                {{L"param1", L"0x00000154 (0xffffb10c7a5e8000, 0x1, 0x2, 0x0)"}, {L"param2", L"C:\\Windows\\MEMORY.DMP"}});
+            const auto unexpected = event(L"EventLog", 6008, expected + 2 * Second, {{L"", L"16:08:55"}});
+            const auto one = incidentsFromEvents({*e41, bugcheck, unexpected});
+            check(one.size() == 1 && one[0].kind == Kind::blueScreen && one[0].code == 0x154 && one[0].time == expected,
+                "41, BugCheck 1001 and 6008 of one crash become one blue screen");
+            auto heldOff = *e41; heldOff.data = {{L"BugcheckCode", L"0"}, {L"LongPowerButtonPressDetected", L"true"}};
+            auto cut = *e41; cut.data = {{L"BugcheckCode", L"0"}, {L"PowerButtonTimestamp", L"0"}}; cut.time = expected + 86400 * Second;
+            auto held = incidentsFromEvents({heldOff}), lost = incidentsFromEvents({cut});
+            check(held.size() == 1 && held[0].kind == Kind::forcedOff && lost.size() == 1 && lost[0].kind == Kind::powerLoss,
+                "no stop code: a held power button is a forced shutdown, otherwise a power loss");
+            const std::wstring wer = L"<Event><System><Provider Name='Windows Error Reporting'/><EventID Qualifiers='0'>1001</EventID><Level>4</Level>"
+                L"<TimeCreated SystemTime='2026-11-12T09:00:00.0000000Z'/><Channel>Application</Channel></System><EventData><Data>0</Data><Data></Data>"
+                L"<Data>LiveKernelEvent</Data><Data>Not available</Data><Data>0</Data><Data>141</Data><Data>ffff8a8f</Data></EventData></Event>";
+            const auto live = parseEventXml(wer);
+            const auto display = event(L"Display", 4101, expected + 3 * 86400 * Second, {{L"", L"amdkmdag"}, {L"", L""}});
+            const auto other = event(L"Application Error", 1000, expected + 4 * 86400 * Second, {{L"AppName", L"game.exe"}, {L"ExceptionCode", L"c0000005"}});
+            const auto mine = event(L"Application Error", 1000, expected + 5 * 86400 * Second, {{L"", L"BatteryScope.exe"}, {L"", L"0.23"}, {L"", L"0"}, {L"", L"x"}, {L"", L"0"}, {L"", L"0"}, {L"", L"c0000005"}});
+            const auto mixed = incidentsFromEvents({*live, display, other, mine});
+            check(live && live->data.size() == 7 && mixed.size() == 3 && mixed[0].kind == Kind::graphicsReset && mixed[0].detail == L"LiveKernelEvent 141" &&
+                mixed[1].kind == Kind::graphicsReset && mixed[1].detail == L"amdkmdag 4101" && mixed[2].kind == Kind::appCrash && mixed[2].detail == L"exception c0000005",
+                "live kernel dumps and display resets are graphics resets; only BatteryScope's own crashes count");
+            std::vector<LogEvent> whea;
+            for (int i = 0; i < 30; ++i) whea.push_back(event(L"Microsoft-Windows-WHEA-Logger", 17, expected + uint64_t(i) * 10 * Second, {{L"ErrorSource", L"4"}}));
+            check(incidentsFromEvents(whea).size() == 1, "a burst of corrected hardware errors is one incident");
+
+            Incident fromBox; fromBox.kind = Kind::powerLoss; fromBox.time = expected - 30 * Second; fromBox.context = L"16:08:55 ac=0";
+            std::vector<Incident> added;
+            const auto merged = merge({}, {fromBox, one[0]}, &added);
+            check(merged.size() == 1 && merged[0].kind == Kind::blueScreen && merged[0].code == 0x154 && merged[0].context == L"16:08:55 ac=0" &&
+                added.size() == 1 && added[0].kind == Kind::blueScreen, "the black box's view and Windows' record of one crash merge");
+            check(merge(merged, {one[0]}).size() == 1, "a crash already known is not added again");
+            const auto line = saveLine(merged[0]);
+            const auto loaded = loadLine(line);
+            check(loaded && loaded->kind == Kind::blueScreen && loaded->code == 0x154 && loaded->time == merged[0].time && loaded->context == merged[0].context && !loadLine(L"x\ty"),
+                "incidents save and load");
+
+            std::vector<Record> box{rec(1, expected - 50 * Second, L"hb ac=0 pct=60 mode=silent"), rec(2, expected - 45 * Second, L"ev acpi 0x00110024=1E28"),
+                rec(3, expected - 44 * Second, L"ev display off"), rec(4, expected - 40 * Second, L"hb ac=0 pct=60 mode=silent fanp=1")};
+            Incident crash = one[0]; crash.context.clear();
+            attachContext(crash, box);
+            check(crash.context.find(L"fanp=1") != std::wstring::npos && crash.recentWrites.find(L"acpi 0x00110024=1E28") != std::wstring::npos &&
+                crash.recentWrites.find(L"display") == std::wstring::npos, "a crash gets the last heartbeat and the hardware writes before it");
+
+            StallMeter meter;
+            check(!meter.feed(1000, 1000, true, 60000) && !meter.feed(3000, 1000, true, 60000) && meter.feed(4500, 1000, true, 60000) == 3.5 &&
+                !meter.feed(9000, 1000, false, 60000) && !meter.feed(9000, 1000, true, 5000), "freezes count only with the screen on and away from power changes");
+            const auto query = eventQueryXml(expected);
+            check(query.find(L"<Select Path='System'>") != std::wstring::npos && query.find(L"<Select Path='Application'>") != std::wstring::npos &&
+                query.find(L"@SystemTime&gt;='2026-11-12T08:09:31.000Z'") != std::wstring::npos && query.find(L">=") == std::wstring::npos, "the event query is valid XML");
         }
         check(std::any_of(browserPlan.begin(), browserPlan.end(), [](const lab::Step& step) { return step.knob == lab::Knob::darkMode && step.workload == lab::Workload::browse; })
             && lab::knobKey(lab::Knob::darkMode) == std::wstring(L"dark-mode"), "dark mode is measured on a browsed page");

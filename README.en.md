@@ -15,8 +15,8 @@
 
 From the **[Releases page](https://github.com/rio10255254/BatteryScope/releases/latest)**:
 
-- **Installer (recommended):** `BatteryScope-0.22.0-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
-- **Portable:** `BatteryScope-0.22.0-win64.zip`; extract it and run `BatteryScope.exe`.
+- **Installer (recommended):** `BatteryScope-0.23.0-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
+- **Portable:** `BatteryScope-0.23.0-win64.zip`; extract it and run `BatteryScope.exe`.
 
 Requires Windows 10 version 1703 or later (Windows 11 recommended), 64-bit. The program is not code-signed; if SmartScreen appears the first time, choose **More info → Run anyway**. It lives in the notification area, where the icon shows the battery percentage; click it to show or hide the panel.
 
@@ -44,6 +44,7 @@ Per-app watt accuracy depends on the energy data the CPU provides (see below); P
 - **7-day history:** daily discharge chart, a daily grade and achievements, and a shareable summary card.
 - **Helpful alerts:** low battery, background drain, sleep drain, and charge-level reminders.
 - **Power lab (experimental):** records where battery power goes (CPU cores, the rest of the CPU, display/dGPU/rest) per activity, and runs alternating A/B experiments that measure how much CPU Boost, processor energy preference, screen refresh rate, and power mode actually save on this PC, and whether they cost smoothness.
+- **Stability and problem reports:** blue screens, unexpected shutdowns, freezes and display driver resets are recorded with their stop code and what was going on (a black box); one click saves a report to the desktop and copies a summary.
 - **Small and quiet:** tray resident, a mini floating window, the Ctrl+Alt+B shortcut, CSV export; no network access except the daily update check, no telemetry or background service.
 
 ![Share today's card](docs/screenshots/card-en.png)
@@ -52,7 +53,7 @@ Details follow.
 
 ## Using it
 
-1. Download `BatteryScope-0.22.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
+1. Download `BatteryScope-0.23.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
 2. Click its battery icon in the notification area to show or hide the panel. Esc hides it; monitoring continues at a lower frequency.
 3. Open **⋯ → Language / 語言 → English** to switch immediately. The setting persists for your Windows account. Selection and scroll position are retained.
 4. Use Background and Show filters, the mouse wheel, arrow keys, Home/End, or Page Up/Down. Enter or double-click opens details.
@@ -144,7 +145,7 @@ Fans and power limits are written again after every performance mode change, and
 
 **Battery**: the battery cards, the 30-minute chart and the program ranking. Clicking the battery cards opens history, health, the charge limit and exports.
 
-The ⋯ menu keeps only quick switches and tools: dynamic saving, hand back manual settings, power mode, ASUS performance mode, tools, and quit. While dynamic saving runs, the header pill shows "Dynamic · activity"; clicking it opens the Saving tab.
+The ⋯ menu keeps only quick switches and tools: dynamic saving, hand back manual settings, power mode, ASUS performance mode, tools, stability and problem reports, mark a problem that just happened, and quit. While dynamic saving runs, the header pill shows "Dynamic · activity"; clicking it opens the Saving tab.
 
 **Who controls each setting**, in order:
 1. The lab, while it measures.
@@ -153,6 +154,31 @@ The ⋯ menu keeps only quick switches and tools: dynamic saving, hand back manu
 4. When dynamic saving is off: the low-battery switch and the performance list.
 
 Programs you put in efficiency mode yourself are left alone.
+
+## Stability and problem reports (0.23)
+
+When the PC shows a blue screen, restarts on its own, freezes or the screen flashes black, BatteryScope records what happened and what was going on, and hands it over in one click.
+
+- **Black box:** every 10 seconds it writes the charge, power draw, CPU temperature and power, performance mode, fan and power presets, discrete GPU state, refresh rate, dynamic saving's activity, the lab step and the foreground app to `%LOCALAPPDATA%\BatteryScope\stability\blackbox.bin`.
+  - The file is a fixed 360 KB and keeps the last two hours.
+  - Each record is written through to the disk, so a blue screen or a forced shutdown does not lose it.
+  - BatteryScope also records every hardware write *before* making it: ASUS ACPI, power settings, refresh rate and brightness. So you can see whether BatteryScope had just changed something before a crash.
+- **Windows' records, read after each start:**
+  - blue screens, with stop code and parameters (Kernel-Power 41, BugCheck 1001);
+  - unexpected shutdowns without one (6008), a held power button, and an empty battery;
+  - display driver resets (Display 4101, LiveKernelEvent 141/117);
+  - hardware errors (WHEA) and disk errors (disk, stornvme, Ntfs, volmgr).
+
+  The records of one crash become one incident, matched with the black box's last state before it. New records are read again every 15 minutes.
+- **Freeze detection:** a high-priority thread wakes once a second. With the screen on, if the whole PC does not let it run for 2.5 seconds or more, that is a freeze. The time is measured on a clock that excludes sleep, and the 30 seconds around sleep or screen changes are skipped.
+  - If the panel stops responding for 30 seconds, BatteryScope saves a dump of itself.
+  - If BatteryScope crashes, it leaves `crash-*.txt` and a dump.
+- **Notifications:** a new blue screen, unexpected shutdown or freeze shows a notification that opens the Stability page. The Perf tab also shows a warning row when something happened in the last 7 days.
+- **Stability page** (the warning row, or ⋯ → Stability and problem reports): counts for the last 30 days, and for each incident the stop code's name, where to look and the state at the time. Plus these actions:
+  - **Create a report:** saves `BatteryScope-report-date.zip` to the desktop and copies the summary for pasting. It holds the summary, the black box, the full event records, BatteryScope's own dumps, drivers and disks (with the SSD firmware), Windows' reliability history, the last 3 days of system errors, installed updates, power settings and the battery report.
+  - **Report with blue screen dumps:** also copies, with administrator rights, the latest five dumps from `C:\Windows\Minidump` and the latest two from LiveKernelReports (64 MB or less).
+  - **Mark a problem that just happened:** after a stutter, a crash or anything odd, marks that moment and the state before it. It is also in the ⋯ menu.
+- Everything stays on this PC. Nothing is uploaded; you decide whether and to whom to give a report.
 
 ## ASUS hardware (0.18, ASUS laptops)
 
@@ -226,7 +252,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-To avoid replacing a running executable, use `-OutputDirectory dist/v0.22.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
+To avoid replacing a running executable, use `-OutputDirectory dist/v0.23.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
 
 ```powershell
 .\dist\BatteryScope.exe --demo

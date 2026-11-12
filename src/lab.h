@@ -230,6 +230,8 @@ void setProtectedJob(HANDLE job);
 // Power plans, battery report, hardware, display, processes, startup apps and
 // running tasks, written to <folder>\system-<time>. Takes up to a minute.
 void writeSystemSnapshot(const std::wstring& folder);
+// Runs a PowerShell script (passed encoded, nothing to quote) and captures its output.
+bool runPowerShell(const std::wstring& script, std::string& output, DWORD timeoutMs);
 
 // How the controller reads and changes settings; replaced by a fake in tests.
 struct Actuator {

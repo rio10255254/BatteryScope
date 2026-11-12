@@ -7,6 +7,7 @@
 #include "lab.h"
 #include "governor.h"
 #include "asus.h"
+#include "stability.h"
 #include "ui.h"
 #include <commctrl.h>
 #include <pdh.h>
@@ -42,7 +43,9 @@ constexpr UINT SampleMessage = WM_APP + 1, TrayMessage = WM_APP + 2, ActionMessa
     SectionRefreshMessage = WM_APP + 11, AsusKeyMessage = WM_APP + 12, AsusServicesMessage = WM_APP + 13,
     OsdMessage = WM_APP + 14,      // a key's result from the key worker: wParam what, lParam the level (-1 unknown)
     PopupClickMessage = WM_APP + 15, // a notification was clicked: wParam its BalloonTarget
-    TuningDoneMessage = WM_APP + 16; // fan or power preset applied: wParam the status
+    TuningDoneMessage = WM_APP + 16, // fan or power preset applied: wParam the status
+    StabilityMessage = WM_APP + 17,  // 0: incidents found (see stab::news); 2: report built, lParam zipped
+    StabilityPingMessage = WM_APP + 18; // the stability thread checking that the panel's thread answers
 constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, DetailsId = 104,
     BackgroundId = 105, AllId = 106, StartupId = 107, HideId = 108, MenuId = 109,
     LanguageZhId = 110, LanguageEnId = 111, PowerDetailsId = 112, PowerModeId = 113,
@@ -67,6 +70,7 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     SlashBright1Id = 238 /* ..240 */, SlashIntervalId = 241 /* ..246 */, SlashModeId = 250 /* ..265 */,
     RefreshAutoId = 266, DarkModeId = 267, AutoSaverCycleId = 268, PerfPageId = 269, FanMenuId = 270, PowerLimitMenuId = 271,
     FanPreset0Id = 272 /* ..275 */, PowerPreset0Id = 276 /* ..279 */, CpuBoostToggleId = 280, WinModeMenuId = 281,
+    StabilityPageId = 282, ReportId = 283, ReportFullId = 284, MarkProblemId = 285, StabilityFolderId = 286,
     SettingsListId = 300,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1, FnKeyHotkey = 10 /* ..20: F1-F11 under the software Fn lock */;
@@ -117,7 +121,7 @@ void* effectiveWatch = nullptr;
 PowerModes powerModes;
 HWND modeButtons[6] = {}, restoreModesButton = nullptr, energySettingsButton = nullptr;
 bool isolatedPreview = false;
-enum class InlinePage { none, process, power, candidates, ledger, powerMode, history, perfApps, lab, settings, dynamic, goal, hardware, performance, confirm, error };
+enum class InlinePage { none, process, power, candidates, ledger, powerMode, history, perfApps, lab, settings, dynamic, goal, hardware, performance, stability, confirm, error };
 unsigned lowBatteryThreshold = 0; // percent; 0 = off
 LowBatteryMonitor lowBattery;
 bool hotkeyEnabled = false, hotkeyRegistered = false;
@@ -125,7 +129,7 @@ bool trayPercent = true;          // show the battery percentage as the notifica
 bool drainAlerts = false;         // notify about sustained high-power background work
 std::set<std::pair<uint32_t, uint64_t>> drainNotified;
 uint64_t lastDrainAlert = 0;
-enum class BalloonTarget { none, candidates, powerDetails, update };
+enum class BalloonTarget { none, candidates, powerDetails, update, stability };
 bool updateChecks = true; // daily update check, on unless turned off
 bool updateAuto = true;    // install a new version by itself (after any running test)
 bool updateDeferred = false;
@@ -179,6 +183,9 @@ void showLabPage();
 void showSettingsPage();
 void showDynamicPage();
 void showPerformancePage();
+void showStabilityPage();
+struct VBlock;
+std::optional<VBlock> stabilityRow(bool warningsOnly); // the performance page's stability line
 int pluggedRefresh();
 bool powerModeHeld();      // dynamic saving is leaving the battery power mode to the user
 void showGoalPage();
@@ -207,6 +214,7 @@ const bs::asus::Snapshot& asusNow() {
 void flushDetectionLog();
 std::string utf8(const std::wstring& text);
 void exportLab();
+std::wstring zipFolderToDesktop(const std::wstring& folder, const std::wstring& stem); // the zip's path, or empty
 // Learned charging curve and detected charge limit, saved under HKCU\Software\BatteryScope.
 ChargeCurve chargeCurve;
 std::optional<int> chargeLimit;
@@ -222,7 +230,7 @@ std::optional<ProcessRow> pendingForceRow;
 std::wstring notice = tr(L"正在讀取電池與程序資料…");
 uint64_t noticeUntil = 0;
 std::deque<uint64_t> actionMarks;
-constexpr UINT_PTR MotionTimer = 92, NoticeTimer = 93, UpdateTimer = 94, GovernorTimer = 95, KeyboardTimer = 96, AsusTimer = 97;
+constexpr UINT_PTR MotionTimer = 92, NoticeTimer = 93, UpdateTimer = 94, GovernorTimer = 95, KeyboardTimer = 96, AsusTimer = 97, StabilityTimer = 98;
 constexpr int PanelWidth = 360, PanelHeight = 640, RowHeight = 51;
 bool motionEnabled = true, suppressMotion = false, panelTargetShown = false, motionTimerRunning = false;
 double motionNow() {
@@ -1150,12 +1158,12 @@ const wchar_t* tabLabel(Tab tab) {
 }
 bool sectionPage(InlinePage page) {
     return page == InlinePage::goal || page == InlinePage::history || page == InlinePage::ledger || page == InlinePage::hardware ||
-        page == InlinePage::lab || page == InlinePage::settings || page == InlinePage::performance;
+        page == InlinePage::lab || page == InlinePage::settings || page == InlinePage::performance || page == InlinePage::stability;
 }
 Tab activeTab() {
     switch (inlinePage) {
     case InlinePage::goal: case InlinePage::dynamic: case InlinePage::powerMode: return Tab::saving;
-    case InlinePage::performance: return Tab::performance;
+    case InlinePage::performance: case InlinePage::stability: return Tab::performance;
     case InlinePage::history: case InlinePage::ledger: case InlinePage::power: case InlinePage::candidates: return Tab::ranking;
     case InlinePage::hardware: return Tab::hardware;
     case InlinePage::lab: return Tab::lab;
@@ -2111,7 +2119,7 @@ void layout() {
     MoveWindow(menuButton, w - sp(92), sp(16), sp(32), sp(30), TRUE);
     MoveWindow(hideButton, w - sp(52), sp(16), sp(32), sp(30), TRUE);
     const bool fullPage = inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history || inlinePage == InlinePage::lab || inlinePage == InlinePage::ledger || inlinePage == InlinePage::hardware ||
-        inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic || inlinePage == InlinePage::goal || inlinePage == InlinePage::performance ||
+        inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic || inlinePage == InlinePage::goal || inlinePage == InlinePage::performance || inlinePage == InlinePage::stability ||
         inlinePage == InlinePage::confirm || inlinePage == InlinePage::error;
     const bool section = sectionPage(inlinePage);
     const int textTop = inlinePage == InlinePage::powerMode ? sp(318) : section ? sp(146) : fullPage ? sp(128) : top - sp(37);
@@ -2379,7 +2387,7 @@ void paint(HDC dc, RECT bounds) {
     drawText(dc, demo ? tr(L"示範資料 · 關閉操作已停用") : tr(L"電池與背景活動"), {margin + sp(30), sp(39), w - sp(96), sp(60)}, Muted, smallFont);
     if (inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history || inlinePage == InlinePage::ledger || inlinePage == InlinePage::hardware ||
         inlinePage == InlinePage::lab || inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic || inlinePage == InlinePage::goal ||
-        inlinePage == InlinePage::performance || inlinePage == InlinePage::confirm || inlinePage == InlinePage::error) {
+        inlinePage == InlinePage::performance || inlinePage == InlinePage::stability || inlinePage == InlinePage::confirm || inlinePage == InlinePage::error) {
         card(dc, {margin, sp(74), right, h - sp(14)}, Surface, 14);
         drawText(dc, inlineTitle, {margin + sp(14), sp(84), right - sp(14), sp(114)}, Ink, titleFont);
         fill(dc, {margin + sp(14), sp(119), right - sp(14), sp(119) + 1}, Border);
@@ -3280,26 +3288,8 @@ void exportLab() {
         }
         CloseClipboard();
     }
-    // Zip with the tar.exe that ships with Windows 10 1803 and later.
-    PWSTR desktop = nullptr;
-    constexpr GUID DesktopFolder = {0xB4BFCC3A, 0xDB2C, 0x424C, {0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41}};
-    std::wstring target;
-    if (SUCCEEDED(SHGetKnownFolderPath(DesktopFolder, 0, nullptr, &desktop)) && desktop) target = desktop;
-    CoTaskMemFree(desktop);
-    SYSTEMTIME t{}; GetLocalTime(&t);
-    wchar_t name[64]; swprintf(name, 64, L"\\BatteryScope-lab-%04u%02u%02u-%02u%02u.zip", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute);
-    target += name;
-    wchar_t system[MAX_PATH]{}; GetSystemDirectoryW(system, MAX_PATH);
-    std::wstring command = L"\"" + std::wstring(system) + L"\\tar.exe\" -a -c -f \"" + target + L"\" -C \"" + folder + L"\" .";
-    STARTUPINFOW startup{}; startup.cb = sizeof(startup);
-    PROCESS_INFORMATION process{};
-    bool zipped = false;
-    if (CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
-        DWORD code = 1;
-        if (WaitForSingleObject(process.hProcess, 30000) == WAIT_OBJECT_0) GetExitCodeProcess(process.hProcess, &code);
-        CloseHandle(process.hThread); CloseHandle(process.hProcess);
-        zipped = code == 0 && GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES;
-    }
+    const std::wstring target = zipFolderToDesktop(folder, L"BatteryScope-lab");
+    const bool zipped = !target.empty();
     if (zipped) {
         const std::wstring select = L"/select,\"" + target + L"\"";
         ShellExecuteW(nullptr, L"open", L"explorer.exe", select.c_str(), nullptr, SW_SHOWNORMAL);
@@ -5603,6 +5593,7 @@ void showPerformancePage() {
         if (!plugged) if (auto left = remainingText(current.power); !left.empty()) chips.push_back({left, 0});
         v.push_back(vChips(std::move(chips)));
     }
+    if (auto warning = stabilityRow(true)) v.push_back(std::move(*warning));
     // The performance mode: ASUS's firmware modes, else Windows' power mode for the current source.
     v.push_back(vHeading(tr(L"效能模式")));
     if (asusAvailable && h.modeDevice) {
@@ -5694,8 +5685,657 @@ void showPerformancePage() {
         v.push_back(vToggle(tr(L"動態省電"), tr(L"依你正在做的事自動調整"), dynamicEnabled, DynamicToggleId));
         if (asusAvailable && h.keyboardDevice) v.push_back(vAction(tr(L"鍵盤背光"), h.keyboard ? std::wstring(keyboardLevelName(*h.keyboard)) : std::wstring(tr(L"未設定")), HwKeyboardMenuId));
     }
+    if (!stabilityRow(true)) if (auto row = stabilityRow(false)) v.push_back(std::move(*row));
     v.push_back(vNote(tr(L"風扇與功耗只提供原廠範圍內的預設：風扇曲線取自韌體各模式自己的曲線，功耗上限不超過平衡模式。每次切換效能模式後會自動重新套用，選「原廠」即還原。獨顯只有在已經醒著時才讀取溫度與時脈，不會為了顯示把它叫醒。")));
     showChartPage(InlinePage::performance, tr(L"效能"), perfPageText(), std::move(v));
+}
+// ----- Stability: crashes, freezes and problem reports -----
+// A black box (stability.h) keeps the last two hours on disk; a high-priority
+// thread notices whole-system freezes and a hung panel, and reads Windows' own
+// crash records. The stability page lists what happened and builds a report.
+namespace stab {
+using namespace bs::stability;
+std::mutex mutex;                    // incidents, news, summary
+std::vector<Incident> incidents;     // newest first
+std::vector<Incident> news;          // found since the last notification
+std::vector<Record> previousRecords; // the black box as found at startup
+PreviousSession previous;
+std::thread thread;
+std::mutex waitMutex;
+std::condition_variable waitCv;
+std::atomic<bool> running{false}, rescan{false}, reportBusy{false}, screenOn{true};
+std::atomic<uint64_t> powerChangeMs{0}, uiBeatMs{0}, lastScanUtc{0};
+std::wstring reportSummary, reportPath; // guarded by mutex
+uint64_t lastFreezeNotice = 0;
+bool started = false;
+}
+uint64_t readQwordSetting(const wchar_t* name) {
+    uint64_t value = 0; DWORD bytes = sizeof(value);
+    return RegGetValueW(HKEY_CURRENT_USER, L"Software\\BatteryScope", name, RRF_RT_REG_QWORD, nullptr, &value, &bytes) == ERROR_SUCCESS ? value : 0;
+}
+void writeQwordSetting(const wchar_t* name, uint64_t value) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\BatteryScope", 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) return;
+    RegSetValueExW(key, name, 0, REG_QWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value));
+    RegCloseKey(key);
+}
+std::wstring foregroundExe() {
+    HWND foreground = GetForegroundWindow();
+    DWORD pid = 0; if (foreground) GetWindowThreadProcessId(foreground, &pid);
+    if (!pid) return {};
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return {};
+    wchar_t path[MAX_PATH]; DWORD size = MAX_PATH;
+    std::wstring name;
+    if (QueryFullProcessImageNameW(process, 0, path, &size)) name = std::filesystem::path(path).filename().wstring();
+    CloseHandle(process);
+    return name;
+}
+// One line of state every 10 seconds: what was going on just before a crash.
+std::wstring heartbeatText() {
+    std::wstring t = L"hb";
+    auto add = [&](const wchar_t* key, std::wstring value) {
+        if (value.empty()) return;
+        for (auto& c : value) if (c == L' ' || c == L'\t') c = L'_';
+        t += L' '; t += key; t += L'='; t += value;
+    };
+    if (!current.history.empty()) {
+        const auto& p = current.history.back();
+        if (p.acKnown) add(L"ac", p.onAc || p.charging ? L"1" : L"0");
+        if (p.percent) add(L"pct", number(*p.percent, 0));
+        if (p.watts) add(L"w", number(*p.watts, 1));
+    }
+    const Value cpu = current.energy.packageWatts ? current.energy.packageWatts : current.energy.coreWatts;
+    if (current.energy.ready && cpu) add(L"cpu", number(*cpu, 1));
+    if (current.energy.ready) {
+        double busy = 0; for (const auto& core : current.energy.cores) busy += core.busyLogicalCores;
+        add(L"load", number(busy * 100 / std::max<DWORD>(1, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)), 0));
+    }
+    {
+        PerfReading perf; { std::lock_guard<std::mutex> lock(perfMutex); perf = perfLatest; }
+        if (perf.ms && GetTickCount64() - perf.ms < 30000) {
+            if (perf.cpuMhz) add(L"mhz", number(*perf.cpuMhz, 0));
+            if (perf.igpu) add(L"igpu", number(*perf.igpu, 0));
+            if (perf.nvTemp) add(L"gput", number(*perf.nvTemp, 0));
+        }
+        if (perf.ms) add(L"dgpu", perf.dgpuState == 9 ? L"eco" : perf.dgpuState >= 1 ? L"sleep" : perf.dgpuState == 0 ? L"on" : L"");
+    }
+    if (asusAvailable) {
+        // No firmware calls of its own: temperatures only when the panel read them lately, settings as remembered.
+        if (asusReadAt && GetTickCount64() - asusReadAt < 60000) {
+            if (asusState.cpuTemp) add(L"t", std::to_wstring(*asusState.cpuTemp));
+            if (asusState.cpuFan) add(L"fan", std::to_wstring(*asusState.cpuFan * 100));
+            if (asusState.gpuEco) add(L"eco", *asusState.gpuEco ? L"1" : L"0");
+        }
+        const auto remembered = bs::asus::remembered();
+        if (remembered.mode) add(L"mode", *remembered.mode == bs::asus::Mode::silent ? L"silent" : *remembered.mode == bs::asus::Mode::turbo ? L"turbo" : L"balanced");
+        const auto tuning = bs::asus::tuning();
+        add(L"fanp", std::to_wstring(int(tuning.fans)));
+        add(L"ppt", std::to_wstring(int(tuning.power)));
+    }
+    DWORD hz = 0;
+    if (bs::lab::readKnob(bs::lab::Knob::refreshRate, hz) == ERROR_SUCCESS && hz) add(L"hz", std::to_wstring(hz));
+    if (dynamicEnabled) add(L"act", bs::gov::activityKey(governor.activity()));
+    if (labController && labController->active()) {
+        const auto s = labController->status();
+        add(L"lab", std::wstring(bs::lab::knobKey(s.knob)) + L"/" + std::to_wstring(s.arm));
+    }
+    add(L"fg", foregroundExe());
+    if (displayOff) add(L"disp", L"off");
+    return t;
+}
+void writeHeartbeat() { if (stab::started) bs::stability::blackBox().write(heartbeatText()); }
+
+// ---- Wording.
+std::wstring incidentTitle(const bs::stability::Incident& i) {
+    using K = bs::stability::Kind;
+    switch (i.kind) {
+    case K::blueScreen: { wchar_t code[16]; swprintf(code, 16, L" 0x%X", i.code); return tr(L"藍屏") + std::wstring(code); }
+    case K::powerLoss: return tr(L"意外關機（沒有藍屏）");
+    case K::forcedOff: return tr(L"強制關機（長按電源鍵）");
+    case K::batteryEmpty: return tr(L"電池耗盡關機");
+    case K::freeze: return i.seconds > 0 ? tr(L"系統凍結 ") + number(i.seconds, 1) + tr(L" 秒") : std::wstring(tr(L"系統元件逾時（已恢復）"));
+    case K::graphicsReset: return tr(L"顯示驅動程式重置");
+    case K::hardwareError: return tr(L"硬體錯誤（WHEA）");
+    case K::diskError: return tr(L"磁碟錯誤");
+    case K::appCrash: return tr(L"BatteryScope 當掉");
+    case K::appHang: return tr(L"BatteryScope 沒有回應");
+    default: return tr(L"手動記錄的問題");
+    }
+}
+bs::stability::Area incidentArea(const bs::stability::Incident& i) {
+    using K = bs::stability::Kind; using A = bs::stability::Area;
+    switch (i.kind) {
+    case K::blueScreen: return bs::stability::bugcheckArea(i.code);
+    case K::forcedOff: return A::freeze;
+    case K::graphicsReset: return A::graphics;
+    case K::hardwareError: return A::processor;
+    case K::diskError: return A::storage;
+    case K::freeze: return i.code ? bs::stability::bugcheckArea(i.code) : A::freeze;
+    default: return A::unknown;
+    }
+}
+const wchar_t* areaName(bs::stability::Area a) {
+    using A = bs::stability::Area;
+    switch (a) {
+    case A::storage: return tr(L"儲存裝置");
+    case A::memory: return tr(L"記憶體");
+    case A::graphics: return tr(L"顯示卡");
+    case A::power: return tr(L"睡眠與喚醒");
+    case A::processor: return tr(L"處理器硬體");
+    case A::driver: return tr(L"驅動程式");
+    case A::system: return tr(L"系統程序");
+    case A::freeze: return tr(L"凍結");
+    default: return tr(L"不明");
+    }
+}
+const wchar_t* areaHint(bs::stability::Area a) {
+    using A = bs::stability::Area;
+    switch (a) {
+    case A::storage: return tr(L"儲存裝置：常見原因是 SSD 韌體、儲存控制器或 AMD 晶片組驅動。更新 SSD 韌體與 AMD 晶片組驅動，並確認 SSD 健康度。");
+    case A::memory: return tr(L"記憶體：更新 BIOS；仍出現時用「Windows 記憶體診斷」檢查。");
+    case A::graphics: return tr(L"顯示卡：更新 AMD 與 NVIDIA 顯示驅動；先關閉獨顯自動 Eco，看是否改善。");
+    case A::power: return tr(L"睡眠與喚醒：更新晶片組驅動與 BIOS；可先關閉 PCI Express 連結狀態電源管理測試。");
+    case A::processor: return tr(L"處理器硬體：風扇與功耗先設回原廠並更新 BIOS；持續出現建議送修。");
+    case A::driver: return tr(L"驅動程式：傾印檔能看出是哪個驅動，請建立含傾印檔的回報。");
+    case A::system: return tr(L"系統程序：常和儲存裝置錯誤一起出現；更新 SSD 韌體與晶片組驅動。");
+    case A::freeze: return tr(L"凍結：整台電腦停住後被強制關機。回報裡的黑盒子會顯示凍結前在做什麼。");
+    default: return tr(L"沒有藍屏代碼的突然斷電：多半是整機凍結後長按電源鍵、電池耗盡或韌體重置。");
+    }
+}
+std::wstring shortTime(uint64_t utc) {
+    const std::wstring t = bs::stability::localTimeText(utc);
+    return t.size() >= 16 ? t.substr(5, 11) : t; // 11-12 16:09
+}
+std::wstring contextText(const std::wstring& context) {
+    // "2026-11-12 16:08:55 ac=0 pct=74 w=9.8 ..." as words.
+    const auto f = bs::stability::fields(context);
+    auto get = [&](const wchar_t* k) { auto it = f.find(k); std::wstring v = it == f.end() ? std::wstring() : it->second; std::replace(v.begin(), v.end(), L'_', L' '); return v; };
+    std::vector<std::wstring> parts;
+    if (context.size() >= 19 && context[4] == L'-') parts.push_back(context.substr(11, 8));
+    if (get(L"ac") == L"0") parts.push_back(tr(L"用電池 ") + get(L"pct") + L"%" + (get(L"w").empty() ? std::wstring() : L" " + get(L"w") + L" W"));
+    else if (get(L"ac") == L"1") parts.push_back(tr(L"插電 ") + get(L"pct") + L"%");
+    std::wstring cpu = L"CPU";
+    if (!get(L"t").empty()) cpu += L" " + get(L"t") + L"°C";
+    if (!get(L"cpu").empty()) cpu += L" " + get(L"cpu") + L" W";
+    if (!get(L"load").empty()) cpu += L" " + get(L"load") + L"%";
+    if (cpu != L"CPU") parts.push_back(cpu);
+    const std::wstring mode = get(L"mode");
+    if (!mode.empty()) parts.push_back(mode == L"silent" ? tr(L"靜音") : mode == L"turbo" ? std::wstring(L"Turbo") : std::wstring(tr(L"平衡")));
+    if (!get(L"fanp").empty() && get(L"fanp") != L"0") parts.push_back(tr(L"自訂風扇"));
+    if (!get(L"ppt").empty() && get(L"ppt") != L"0") parts.push_back(tr(L"自訂功耗"));
+    const std::wstring dgpu = get(L"dgpu");
+    if (dgpu == L"on") parts.push_back(tr(L"獨顯使用中"));
+    else if (get(L"eco") == L"1" || dgpu == L"eco") parts.push_back(tr(L"獨顯 Eco"));
+    if (!get(L"hz").empty()) parts.push_back(get(L"hz") + L" Hz");
+    if (!get(L"act").empty()) parts.push_back(tr(get(L"act").c_str()));
+    if (!get(L"lab").empty()) parts.push_back(tr(L"實驗中 ") + get(L"lab"));
+    if (!get(L"fg").empty()) parts.push_back(get(L"fg"));
+    if (get(L"disp") == L"off") parts.push_back(tr(L"螢幕關閉"));
+    std::wstring out;
+    for (const auto& p : parts) out += (out.empty() ? L"" : L" · ") + p;
+    return out;
+}
+std::wstring incidentLines(const bs::stability::Incident& i) {
+    std::wstring t;
+    auto line = [&](const std::wstring& s) { if (!s.empty()) t += (t.empty() ? L"" : L"\n") + s; };
+    if (i.kind == bs::stability::Kind::blueScreen || (i.kind == bs::stability::Kind::forcedOff && i.code)) {
+        const wchar_t* name = bs::stability::bugcheckName(i.code);
+        line((name ? std::wstring(name) : std::wstring(tr(L"未知代碼"))) + L" · " + areaName(incidentArea(i)));
+    }
+    if (i.sleeping) line(tr(L"發生在睡眠或喚醒時"));
+    if (!i.context.empty()) line(tr(L"當時：") + contextText(i.context));
+    if (!i.recentWrites.empty()) line(tr(L"之前 BatteryScope 寫入：") + i.recentWrites);
+    if (!i.detail.empty() && i.kind != bs::stability::Kind::blueScreen) line(i.detail);
+    return t;
+}
+std::vector<bs::stability::Incident> demoIncidents() {
+    using namespace bs::stability;
+    const uint64_t now = nowUtc();
+    Incident a; a.kind = Kind::blueScreen; a.code = 0x154; a.time = now - 3 * 3600 * Second;
+    a.context = localTimeText(a.time - 40 * Second, true) + L" ac=0 pct=62 w=11.4 cpu=6.2 load=9 t=58 mode=silent fanp=0 ppt=0 eco=1 hz=60 act=閱讀 fg=msedge.exe";
+    a.detail = L"0x154 (0xffffb10c7a5e8000, 0xffffd38f4b3cf7a0, 0x2, 0x0)";
+    Incident b; b.kind = Kind::freeze; b.seconds = 6.4; b.time = now - 26 * 3600 * Second;
+    b.context = localTimeText(b.time - 8 * Second, true) + L" ac=1 pct=80 cpu=14.0 load=31 t=71 mode=balanced eco=0 dgpu=on hz=120 fg=Code.exe";
+    Incident c; c.kind = Kind::graphicsReset; c.time = now - 26 * 3600 * Second + 20 * Second; c.detail = L"amdkmdag 4101";
+    Incident d; d.kind = Kind::powerLoss; d.time = now - 5 * 86400 * Second;
+    return {a, b, c, d};
+}
+std::vector<bs::stability::Incident> stabilityIncidents() {
+    if (demo || isolatedPreview) return demoIncidents();
+    std::lock_guard<std::mutex> lock(stab::mutex);
+    return stab::incidents;
+}
+std::wstring biosText() {
+    auto read = [](const wchar_t* name) {
+        wchar_t value[256]{}; DWORD bytes = sizeof(value);
+        return RegGetValueW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\BIOS", name, RRF_RT_REG_SZ, nullptr, value, &bytes) == ERROR_SUCCESS ? std::wstring(value) : std::wstring();
+    };
+    std::wstring t = read(L"SystemProductName");
+    const std::wstring bios = read(L"BIOSVersion");
+    if (!bios.empty()) t += L" · BIOS " + bios;
+    return t;
+}
+// The text that goes to the clipboard and summary.txt: everything needed to tell what happened.
+std::wstring stabilitySummary() {
+    using namespace bs::stability;
+    const auto list = stabilityIncidents();
+    const uint64_t now = nowUtc(), since = now - 30ull * 86400 * Second;
+    OSVERSIONINFOW os{}; os.dwOSVersionInfoSize = sizeof(os);
+    using RtlGetVersion = LONG (WINAPI*)(OSVERSIONINFOW*);
+    FARPROC symbol = GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion");
+    RtlGetVersion getVersion = nullptr; std::memcpy(&getVersion, &symbol, sizeof(getVersion));
+    if (getVersion) getVersion(&os);
+    std::wstring t = L"BatteryScope " BS_VERSION_STRING + std::wstring(tr(L" 穩定性回報 · ")) + localTimeText(now) + L"\n";
+    t += L"Windows " + std::to_wstring(os.dwMajorVersion) + L"." + std::to_wstring(os.dwMinorVersion) + L"." + std::to_wstring(os.dwBuildNumber);
+    const std::wstring bios = biosText();
+    if (!bios.empty()) t += L" · " + bios;
+    t += tr(L"\n開機時間：") + localTimeText(bootUtc()) + L"\n";
+    int shown = 0;
+    t += tr(L"\n最近 30 天：\n");
+    for (const auto& i : list) {
+        if (i.time < since || shown >= 25) continue;
+        ++shown;
+        t += L"- " + localTimeText(i.time) + L"  " + incidentTitle(i) + L"\n";
+        std::wstring lines = incidentLines(i);
+        if (i.kind == Kind::blueScreen && !i.detail.empty()) lines += L"\n" + i.detail;
+        size_t start = 0;
+        while (start < lines.size()) {
+            const size_t end = lines.find(L'\n', start);
+            t += L"    " + lines.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start) + L"\n";
+            if (end == std::wstring::npos) break;
+            start = end + 1;
+        }
+    }
+    if (!shown) t += tr(L"（沒有記錄）\n");
+    // The settings BatteryScope controls right now.
+    t += tr(L"\n目前設定：");
+    t += tr(L"動態省電 ") + std::wstring(dynamicEnabled ? tr(L"開") : tr(L"關"));
+    t += tr(L" · 用電池 60 Hz ") + std::wstring(refreshAuto ? tr(L"開") : tr(L"關"));
+    if (asusAvailable) {
+        const auto r = bs::asus::remembered();
+        const auto tuning = bs::asus::tuning();
+        if (r.mode) t += tr(L" · 華碩模式 ") + std::wstring(*r.mode == bs::asus::Mode::silent ? tr(L"靜音") : *r.mode == bs::asus::Mode::turbo ? L"Turbo" : tr(L"平衡"));
+        t += tr(L" · 風扇 ") + std::wstring(tr(bs::asus::fanPresetKey(tuning.fans))) + tr(L" · 功耗 ") + powerPresetText(tuning.power);
+        t += tr(L" · 獨顯自動 ") + std::wstring(gpuAuto ? tr(L"開") : tr(L"關"));
+        if (r.chargeLimit) t += tr(L" · 充電上限 ") + std::to_wstring(*r.chargeLimit) + L"%";
+    }
+    t += L"\n";
+    {
+        std::lock_guard<std::mutex> lock(stab::mutex);
+        if (stab::lastScanUtc) t += tr(L"上次讀取 Windows 記錄：") + localTimeText(stab::lastScanUtc) + L"\n";
+    }
+    return t;
+}
+std::wstring stabilityStatusNote() {
+    std::wstring t = tr(L"監測方式：每 10 秒把電量、溫度、模式、獨顯與前景程式寫進黑盒子（直接寫到磁碟，藍屏也不會遺失）；BatteryScope 每次寫入硬體設定前也會先記下。螢幕開著時整台電腦停住 2.5 秒以上記為凍結。開機後讀取 Windows 的藍屏、意外關機、顯示驅動重置、硬體與磁碟錯誤記錄。");
+    if (!demo && !isolatedPreview) {
+        std::lock_guard<std::mutex> lock(stab::mutex);
+        if (stab::lastScanUtc) t += tr(L"\n上次讀取：") + bs::stability::localTimeText(stab::lastScanUtc);
+    }
+    return t;
+}
+void showStabilityPage() {
+    using namespace bs::stability;
+    const auto list = stabilityIncidents();
+    const uint64_t now = nowUtc(), since = now - 30ull * 86400 * Second;
+    std::vector<VBlock> v;
+    v.push_back(vHeading(tr(L"最近 30 天")));
+    {
+        int counts[int(Kind::count)]{};
+        for (const auto& i : list) if (i.time >= since) ++counts[int(i.kind)];
+        const int shutdowns = counts[int(Kind::powerLoss)] + counts[int(Kind::forcedOff)] + counts[int(Kind::batteryEmpty)];
+        std::vector<std::pair<std::wstring, COLORREF>> chips;
+        auto chip = [&](const std::wstring& label, int n, bool bad) { chips.push_back({label + L" " + std::to_wstring(n), n && bad ? theme.warn : n ? COLORREF(0) : Green}); };
+        chip(tr(L"藍屏"), counts[int(Kind::blueScreen)], true);
+        chip(tr(L"意外關機"), shutdowns, true);
+        chip(tr(L"凍結"), counts[int(Kind::freeze)], true);
+        chip(tr(L"顯示重置"), counts[int(Kind::graphicsReset)], true);
+        if (counts[int(Kind::hardwareError)]) chip(tr(L"硬體錯誤"), counts[int(Kind::hardwareError)], true);
+        if (counts[int(Kind::diskError)]) chip(tr(L"磁碟錯誤"), counts[int(Kind::diskError)], false);
+        if (counts[int(Kind::appCrash)] + counts[int(Kind::appHang)]) chip(L"BatteryScope", counts[int(Kind::appCrash)] + counts[int(Kind::appHang)], true);
+        v.push_back(vChips(std::move(chips)));
+        if (!counts[int(Kind::blueScreen)] && !shutdowns && !counts[int(Kind::freeze)] && !counts[int(Kind::graphicsReset)])
+            v.push_back(vNote(tr(L"最近 30 天沒有藍屏、意外關機或凍結。")));
+    }
+    std::set<bs::stability::Area> areas;
+    int listed = 0;
+    for (const auto& i : list) {
+        if (i.time < since || listed >= 8) continue;
+        if (!listed) v.push_back(vHeading(tr(L"最近的問題")));
+        ++listed;
+        const bool bad = serious(i.kind);
+        v.push_back(vChips({{shortTime(i.time), 0}, {incidentTitle(i), bad ? theme.warn : COLORREF(0)}}));
+        const std::wstring lines = incidentLines(i);
+        if (!lines.empty()) v.push_back(vNote(lines));
+        if (bad || i.kind == Kind::diskError) areas.insert(incidentArea(i));
+    }
+    if (!areas.empty()) {
+        v.push_back(vHeading(tr(L"可能的方向")));
+        for (auto a : areas) v.push_back(vNote(areaHint(a)));
+    }
+    v.push_back(vHeading(tr(L"回報給開發者")));
+    v.push_back(vAction(tr(L"建立回報包"), stab::reportBusy ? tr(L"建立中…") : tr(L"存到桌面並複製摘要"), ReportId, Green));
+    v.push_back(vAction(tr(L"含藍屏傾印檔的回報"), tr(L"需要管理員權限"), ReportFullId));
+    v.push_back(vAction(tr(L"記錄剛剛發生的問題"), tr(L"卡頓、閃退或異常時按"), MarkProblemId));
+    v.push_back(vAction(tr(L"開啟記錄資料夾"), L"", StabilityFolderId));
+    v.push_back(vNote(stabilityStatusNote()));
+    showChartPage(InlinePage::stability, tr(L"穩定性"), stabilitySummary(), std::move(v));
+}
+// The performance page's line about stability: a warning when something happened this week.
+std::optional<VBlock> stabilityRow(bool warningsOnly) {
+    using namespace bs::stability;
+    const auto list = stabilityIncidents();
+    const uint64_t since = nowUtc() - 7ull * 86400 * Second;
+    int count = 0; const Incident* latest = nullptr;
+    for (const auto& i : list) if (i.time >= since && serious(i.kind) && i.kind != Kind::appHang) { ++count; if (!latest) latest = &i; }
+    if (count) return vAction(tr(L"穩定性 · 7 天 ") + std::to_wstring(count) + tr(L" 次"), incidentTitle(*latest), StabilityPageId, theme.warn);
+    if (warningsOnly) return std::nullopt;
+    return vAction(tr(L"穩定性與問題回報"), tr(L"正常"), StabilityPageId);
+}
+
+// ---- The monitor thread.
+void addIncidents(const std::vector<bs::stability::Incident>& found, uint64_t notifyAfter) {
+    std::vector<bs::stability::Incident> added;
+    {
+        std::lock_guard<std::mutex> lock(stab::mutex);
+        stab::incidents = bs::stability::merge(stab::incidents, found, &added);
+        bs::stability::saveIncidents(stab::incidents);
+        for (const auto& i : added) if (i.time >= notifyAfter) stab::news.push_back(i);
+    }
+    if (!added.empty() && mainWindow) PostMessageW(mainWindow, StabilityMessage, 0, 0);
+}
+void scanEvents(bool first) {
+    using namespace bs::stability;
+    const uint64_t now = nowUtc();
+    const uint64_t last = stab::lastScanUtc.load();
+    const uint64_t since = last ? last - 15 * 60 * Second : now - 30ull * 86400 * Second;
+    auto found = incidentsFromEvents(readEvents(since, false));
+    const auto records = blackBox().records();
+    const uint64_t boot = bootUtc();
+    for (auto& i : found) {
+        const bool atThisBoot = (i.kind == Kind::blueScreen || i.kind == Kind::powerLoss || i.kind == Kind::forcedOff) && i.time + 60 * Second >= boot && i.time <= boot + 15 * 60 * Second;
+        if (atThisBoot) {
+            if (stab::previous.ending == Ending::batteryEmpty && i.kind == Kind::powerLoss) i.kind = Kind::batteryEmpty;
+            if (stab::previous.ending == Ending::systemDownAsleep) i.sleeping = true;
+        }
+        attachContext(i, records);
+    }
+    if (first) {
+        // BatteryScope itself: a crash note from the previous session, or a hang it never recovered from.
+        const auto& p = stab::previous;
+        if (p.ending == Ending::appEnded || p.ending == Ending::appHung) {
+            const auto crashes = ownCrashes(p.lastTime > 120 * Second ? p.lastTime - 120 * Second : 0);
+            Incident i; i.time = p.lastTime;
+            if (!crashes.empty()) { i.kind = Kind::appCrash; i.detail = crashes.back().second; }
+            else if (p.ending == Ending::appHung) i.kind = Kind::appHang;
+            if (!crashes.empty() || p.ending == Ending::appHung) { attachContext(i, stab::previousRecords); found.push_back(i); }
+        }
+    }
+    // Notify what is new: since the last scan, or the last day on the very first one.
+    addIncidents(found, last ? last - 15 * 60 * Second : now - 86400 * Second);
+    stab::lastScanUtc = now;
+    writeQwordSetting(L"StabilityScan", now);
+}
+void stabilityLoop() {
+    using namespace bs::stability;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    // Keep this thread at full speed even when the process gets EcoQoS.
+    struct { ULONG version, controlMask, stateMask; } throttling{1, 0x1 /* execution speed */, 0 /* off */};
+    SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &throttling, sizeof(throttling));
+    uint64_t nextScan = GetTickCount64() + 15000;
+    bool firstScan = true, hung = false, hangDumped = false;
+    uint64_t hangStart = 0, lastStallTick = 0, lastPing = 0;
+    ULONGLONG lastUnbiased = 0; QueryUnbiasedInterruptTime(&lastUnbiased);
+    StallMeter meter;
+    while (stab::running) {
+        {
+            std::unique_lock<std::mutex> lock(stab::waitMutex);
+            stab::waitCv.wait_for(lock, std::chrono::milliseconds(1000), [] { return !stab::running.load() || stab::rescan.load(); });
+        }
+        if (!stab::running) break;
+        ULONGLONG unbiased = 0; QueryUnbiasedInterruptTime(&unbiased);
+        const uint64_t gapMs = (unbiased - lastUnbiased) / 10000; lastUnbiased = unbiased;
+        const uint64_t tick = GetTickCount64();
+        // The whole system stopped: this thread runs at high priority and did not get to run.
+        if (const auto stall = meter.feed(gapMs, 1000, stab::screenOn, tick - stab::powerChangeMs)) {
+            lastStallTick = tick;
+            wchar_t text[48]; swprintf(text, 48, L"freeze %.1fs", *stall);
+            note(text);
+            Incident i; i.kind = Kind::freeze; i.seconds = *stall; i.time = nowUtc() - uint64_t(*stall * Second);
+            attachContext(i, blackBox().records());
+            addIncidents({i}, 0);
+            nextScan = std::min(nextScan, tick + 30000); // a display driver reset is logged a little later
+        }
+        // The panel's thread: pinged every 2 seconds; 30 seconds without an answer is a hang.
+        if (tick - lastPing >= 2000 && mainWindow) { PostMessageW(mainWindow, StabilityPingMessage, 0, 0); lastPing = tick; }
+        const uint64_t silent = tick - stab::uiBeatMs;
+        if (!hung && silent > 30000 && stab::screenOn && tick - stab::powerChangeMs > 60000 && tick - lastStallTick > 60000) {
+            hung = true; hangStart = tick - silent;
+            note(L"hang ui " + std::to_wstring(silent / 1000) + L"s");
+            if (!hangDumped) {
+                hangDumped = true;
+                const DWORD uiThread = mainWindow ? GetWindowThreadProcessId(mainWindow, nullptr) : 0;
+                SYSTEMTIME t{}; GetLocalTime(&t);
+                wchar_t name[64]; swprintf(name, 64, L"\\hang-%04u%02u%02u-%02u%02u%02u.dmp", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+                writeOwnDump(folder() + name, uiThread);
+            }
+        } else if (hung && silent < 5000) {
+            hung = false;
+            const double seconds = double(tick - hangStart) / 1000;
+            note(L"responsive after " + std::to_wstring(int(seconds)) + L"s");
+            Incident i; i.kind = Kind::appHang; i.seconds = seconds; i.time = nowUtc() - uint64_t(seconds * Second);
+            attachContext(i, blackBox().records());
+            addIncidents({i}, 0);
+        }
+        if (tick >= nextScan || stab::rescan.exchange(false)) {
+            scanEvents(firstScan);
+            firstScan = false;
+            nextScan = tick + 15 * 60 * 1000;
+        }
+    }
+}
+void startStability() {
+    using namespace bs::stability;
+    installCrashHandler();
+    const std::wstring dir = folder();
+    if (dir.empty()) return;
+    const std::wstring path = dir + L"\\blackbox.bin";
+    stab::previousRecords = BlackBox::readFile(path);
+    stab::previous = classify(stab::previousRecords, bootUtc());
+    if (!blackBox().open(path)) return;
+    blackBox().write(L"start v=" BS_VERSION_STRING);
+    { std::lock_guard<std::mutex> lock(stab::mutex); stab::incidents = loadIncidents(); }
+    stab::lastScanUtc = readQwordSetting(L"StabilityScan");
+    stab::uiBeatMs = stab::powerChangeMs = GetTickCount64();
+    stab::powerChangeMs = GetTickCount64() - 60000; // a fresh start is not a power change
+    stab::started = stab::running = true;
+    stab::thread = std::thread(stabilityLoop);
+}
+void stopStability(const wchar_t* why) {
+    if (!stab::started) return;
+    bs::stability::blackBox().write(std::wstring(L"exit ") + why);
+    stab::running = false;
+    stab::waitCv.notify_all();
+}
+void markProblem() {
+    using namespace bs::stability;
+    if (demo || isolatedPreview || !stab::started) { setNotice(tr(L"示範模式不會記錄。")); return; }
+    writeHeartbeat();
+    note(L"mark");
+    Incident i; i.kind = Kind::manual; i.time = nowUtc();
+    attachContext(i, blackBox().records());
+    addIncidents({i}, UINT64_MAX);
+    stab::rescan = true; stab::waitCv.notify_all();
+    setNotice(tr(L"已記錄這個時間點與前面的狀態；建立回報包時會一起附上。"));
+    showStabilityPage();
+}
+
+// ---- The report.
+std::wstring zipFolderToDesktop(const std::wstring& folder, const std::wstring& stem) {
+    PWSTR desktop = nullptr;
+    constexpr GUID DesktopFolder = {0xB4BFCC3A, 0xDB2C, 0x424C, {0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41}};
+    std::wstring target;
+    if (SUCCEEDED(SHGetKnownFolderPath(DesktopFolder, 0, nullptr, &desktop)) && desktop) target = desktop;
+    CoTaskMemFree(desktop);
+    if (target.empty()) return {};
+    SYSTEMTIME t{}; GetLocalTime(&t);
+    wchar_t name[96]; swprintf(name, 96, L"\\%ls-%04u%02u%02u-%02u%02u.zip", stem.c_str(), t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute);
+    target += name;
+    // tar.exe ships with Windows 10 1803 and later.
+    wchar_t system[MAX_PATH]{}; GetSystemDirectoryW(system, MAX_PATH);
+    std::wstring command = L"\"" + std::wstring(system) + L"\\tar.exe\" -a -c -f \"" + target + L"\" -C \"" + folder + L"\" .";
+    STARTUPINFOW startup{}; startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    DWORD code = 1;
+    if (CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process)) {
+        if (WaitForSingleObject(process.hProcess, 60000) == WAIT_OBJECT_0) GetExitCodeProcess(process.hProcess, &code);
+        CloseHandle(process.hThread); CloseHandle(process.hProcess);
+    }
+    return code == 0 && GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES ? target : std::wstring();
+}
+void writeUtf8File(const std::filesystem::path& path, const std::wstring& text) {
+    std::wstring crlf;
+    for (size_t i = 0; i < text.size(); ++i) { if (text[i] == L'\n' && (i == 0 || text[i - 1] != L'\r')) crlf += L'\r'; crlf += text[i]; }
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out << "\xEF\xBB\xBF" << utf8(crlf);
+}
+void copyToClipboard(const std::wstring& text) {
+    if (!OpenClipboard(mainWindow)) return;
+    EmptyClipboard();
+    std::wstring crlf;
+    for (size_t i = 0; i < text.size(); ++i) { if (text[i] == L'\n' && (i == 0 || text[i - 1] != L'\r')) crlf += L'\r'; crlf += text[i]; }
+    const size_t size = (crlf.size() + 1) * sizeof(wchar_t);
+    if (HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, size)) {
+        if (void* data = GlobalLock(memory)) { std::memcpy(data, crlf.c_str(), size); GlobalUnlock(memory); }
+        if (!SetClipboardData(CF_UNICODETEXT, memory)) GlobalFree(memory);
+    }
+    CloseClipboard();
+}
+void buildReport(bool withDumps) {
+    if (demo || isolatedPreview) { setNotice(tr(L"示範模式不會建立回報。")); return; }
+    if (stab::reportBusy.exchange(true)) return;
+    writeHeartbeat();
+    const std::wstring summary = stabilitySummary();
+    const std::wstring asusText = asusAvailable ? bs::asus::dump(bs::asus::read()) : std::wstring();
+    { std::lock_guard<std::mutex> lock(stab::mutex); stab::reportSummary = summary; stab::reportPath.clear(); }
+    setNotice(withDumps ? tr(L"正在建立回報包，請在管理員視窗按「是」…（約 1 分鐘）") : tr(L"正在建立回報包…（約 1 分鐘）"));
+    if (inlinePage == InlinePage::stability) showStabilityPage();
+    const HWND target = mainWindow;
+    const std::wstring exe = executablePath();
+    std::thread([target, withDumps, summary, asusText, exe] {
+        using namespace bs::stability;
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        SYSTEMTIME t{}; GetLocalTime(&t);
+        wchar_t name[48]; swprintf(name, 48, L"report-%04u%02u%02u-%02u%02u%02u", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+        const std::filesystem::path dir = std::filesystem::path(folder()) / name;
+        std::error_code error;
+        std::filesystem::create_directories(dir, error);
+        writeUtf8File(dir / L"summary.txt", summary);
+        if (!asusText.empty()) writeUtf8File(dir / L"asus.txt", asusText);
+        // The black box, as it is now.
+        {
+            std::wstring box;
+            for (const auto& r : blackBox().records()) box += localTimeText(r.time, true) + L"  " + r.text + L"\n";
+            writeUtf8File(dir / L"blackbox.txt", box);
+        }
+        std::filesystem::copy_file(std::filesystem::path(folder()) / L"incidents.tsv", dir / L"incidents.tsv", std::filesystem::copy_options::overwrite_existing, error);
+        // Windows' own records of the last 30 days, with their text.
+        {
+            std::wstring text;
+            for (const auto& e : readEvents(nowUtc() - 30ull * 86400 * Second, true, 1500)) {
+                text += localTimeText(e.time, true) + L"  " + e.channel + L"  " + e.provider + L"  " + std::to_wstring(e.id) + L"  level " + std::to_wstring(e.level) + L"\n";
+                for (const auto& [k, value] : e.data) if (!value.empty() && value.size() < 400) text += L"    " + (k.empty() ? std::wstring(L"-") : k) + L" = " + value + L"\n";
+                if (!e.message.empty()) {
+                    std::wstring m = e.message;
+                    if (m.size() > 1500) m.resize(1500);
+                    text += L"    " + m + L"\n";
+                }
+            }
+            writeUtf8File(dir / L"events.txt", text.empty() ? std::wstring(L"(none)\n") : text);
+        }
+        // BatteryScope's own crash notes and dumps (the latest few).
+        {
+            std::vector<std::filesystem::path> own;
+            for (const auto& entry : std::filesystem::directory_iterator(folder(), error)) {
+                const auto n = entry.path().filename().wstring();
+                if (n.rfind(L"crash-", 0) == 0 || n.rfind(L"hang-", 0) == 0) own.push_back(entry.path());
+            }
+            std::sort(own.begin(), own.end());
+            if (own.size() > 6) own.erase(own.begin(), own.end() - 6);
+            for (const auto& p : own) std::filesystem::copy_file(p, dir / p.filename(), std::filesystem::copy_options::overwrite_existing, error);
+        }
+        // Blue screen dumps: listed always, copied through an elevated copy when asked.
+        {
+            bool denied = false; int count = 0;
+            std::wstring listing = listSystemDumps(denied, count);
+            if (denied) listing += L"(Minidump folder needs administrator rights)\n";
+            if (withDumps) {
+                const std::wstring dumps = (dir / L"dumps").wstring();
+                const std::wstring parameters = L"--copy-dumps \"" + dumps + L"\"";
+                SHELLEXECUTEINFOW info{}; info.cbSize = sizeof(info);
+                info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+                info.hwnd = target; info.lpVerb = L"runas"; info.lpFile = exe.c_str(); info.lpParameters = parameters.c_str(); info.nShow = SW_HIDE;
+                if (ShellExecuteExW(&info) && info.hProcess) { WaitForSingleObject(info.hProcess, 180000); CloseHandle(info.hProcess); }
+                else listing += L"(administrator copy was cancelled)\n";
+            }
+            writeUtf8File(dir / L"dumps-list.txt", listing.empty() ? std::wstring(L"(no dumps found)\n") : listing);
+        }
+        // Drivers, disks, Windows' reliability history and recent errors.
+        {
+            std::wstring quoted; for (wchar_t c : dir.wstring()) { quoted += c; if (c == L'\'') quoted += L'\''; }
+            const std::wstring script = L"$ErrorActionPreference='SilentlyContinue'; $d='" + quoted + L"';"
+                L"Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.DeviceClass -in 'DISPLAY','SCSIADAPTER','HDC','SYSTEM','NET','MEDIA','USB','BLUETOOTH','HIDCLASS' -or $_.Manufacturer -match 'AMD|Advanced Micro|NVIDIA|ASUS|Realtek|MediaTek|Intel|Acer|Biwin|Phison' } | Sort-Object DeviceClass,DeviceName | Format-Table DeviceClass,DeviceName,DriverVersion,DriverDate,Manufacturer -AutoSize | Out-String -Width 400 | Out-File -Encoding utf8 \"$d\\drivers.txt\";"
+                L"Get-PhysicalDisk | Format-List FriendlyName,MediaType,BusType,FirmwareVersion,HealthStatus,OperationalStatus,Size | Out-File -Encoding utf8 \"$d\\disks.txt\";"
+                L"Get-CimInstance Win32_DiskDrive | Format-List Model,FirmwareRevision,InterfaceType,Status,Size | Out-File -Encoding utf8 -Append \"$d\\disks.txt\";"
+                L"Get-PhysicalDisk | Get-StorageReliabilityCounter | Format-List DeviceId,Temperature,TemperatureMax,Wear,ReadErrorsTotal,ReadErrorsUncorrected,WriteErrorsTotal,WriteErrorsUncorrected,PowerOnHours | Out-File -Encoding utf8 -Append \"$d\\disks.txt\";"
+                L"Get-CimInstance Win32_ReliabilityRecords | Where-Object { $_.TimeGenerated -gt (Get-Date).AddDays(-30) } | Sort-Object TimeGenerated -Descending | Select-Object -First 300 TimeGenerated,SourceName,EventIdentifier,ProductName,Message | Format-List | Out-String -Width 400 | Out-File -Encoding utf8 \"$d\\reliability.txt\";"
+                L"Get-WinEvent -FilterHashtable @{LogName='System'; Level=1,2; StartTime=(Get-Date).AddDays(-3)} -MaxEvents 400 | Format-List TimeCreated,ProviderName,Id,LevelDisplayName,Message | Out-String -Width 400 | Out-File -Encoding utf8 \"$d\\system-errors.txt\";"
+                L"Get-CimInstance Win32_QuickFixEngineering | Sort-Object InstalledOn -Descending | Select-Object -First 20 HotFixID,Description,InstalledOn | Format-Table -AutoSize | Out-File -Encoding utf8 \"$d\\windows-updates.txt\";"
+                L"Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\CrashControl' | Format-List | Out-File -Encoding utf8 \"$d\\crash-settings.txt\"";
+            std::string out;
+            bs::lab::runPowerShell(script, out, 150000);
+        }
+        bs::lab::writeSystemSnapshot(dir.wstring());
+        const std::wstring zip = zipFolderToDesktop(dir.wstring(), L"BatteryScope-report");
+        if (!zip.empty()) {
+            std::filesystem::remove_all(dir, error);
+            const std::wstring select = L"/select,\"" + zip + L"\"";
+            ShellExecuteW(nullptr, L"open", L"explorer.exe", select.c_str(), nullptr, SW_SHOWNORMAL);
+        } else ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        { std::lock_guard<std::mutex> lock(stab::mutex); stab::reportPath = zip.empty() ? dir.wstring() : zip; }
+        PostMessageW(target, StabilityMessage, 2, zip.empty() ? 0 : 1);
+        CoUninitialize();
+    }).detach();
+}
+void finishReport(bool zipped) {
+    stab::reportBusy = false;
+    std::wstring summary;
+    { std::lock_guard<std::mutex> lock(stab::mutex); summary = stab::reportSummary; }
+    copyToClipboard(summary);
+    setNotice(zipped ? tr(L"回報包已存到桌面，摘要也已複製，可以直接貼上給開發者。") : tr(L"無法壓縮，已開啟資料夾；摘要已複製。"));
+    if (inlinePage == InlinePage::stability) showStabilityPage();
+}
+void notifyStability() {
+    using namespace bs::stability;
+    std::vector<Incident> fresh;
+    { std::lock_guard<std::mutex> lock(stab::mutex); fresh.swap(stab::news); }
+    fresh.erase(std::remove_if(fresh.begin(), fresh.end(), [](const Incident& i) { return !serious(i.kind); }), fresh.end());
+    if (!fresh.empty() && !demo && !isolatedPreview) {
+        std::sort(fresh.begin(), fresh.end(), [](const Incident& a, const Incident& b) { return a.time > b.time; });
+        const auto& top = fresh.front();
+        const uint64_t tick = GetTickCount64();
+        const bool onlyFreezes = std::all_of(fresh.begin(), fresh.end(), [](const Incident& i) { return i.kind == Kind::freeze || i.kind == Kind::graphicsReset; });
+        if (!onlyFreezes || !stab::lastFreezeNotice || tick - stab::lastFreezeNotice > 30 * 60 * 1000) {
+            if (onlyFreezes) stab::lastFreezeNotice = tick;
+            const std::wstring title = fresh.size() == 1 ? tr(L"偵測到：") + incidentTitle(top) : tr(L"偵測到 ") + std::to_wstring(fresh.size()) + tr(L" 個穩定性問題");
+            std::wstring body = shortTime(top.time) + L" · " + (fresh.size() == 1 && top.kind == Kind::blueScreen && bugcheckName(top.code) ? std::wstring(bugcheckName(top.code)) : incidentTitle(top));
+            body += tr(L"。點此查看並建立回報。");
+            showBalloon(title, body, BalloonTarget::stability);
+        }
+    }
+    if (inlinePage == InlinePage::stability) showStabilityPage();
+    else if (inlinePage == InlinePage::performance && !hidden) showPerformancePage();
 }
 // The ⋯ menu (also the tray icon's right-click menu).
 // The ⋯ menu (also the tray icon's right-click menu): quick switches and tools. The
@@ -5735,6 +6375,8 @@ std::vector<MenuItem> mainMenuItems() {
     tools.push_back(menuItem(ShareCardId, tr(L"分享今日卡片"), false, preview));
     tools.push_back(menuItem(MiniToggleId, tr(L"迷你浮動視窗"), miniEnabled));
     items.push_back(submenu(tr(L"工具"), tools));
+    items.push_back(menuItem(StabilityPageId, tr(L"穩定性與問題回報")));
+    items.push_back(menuItem(MarkProblemId, tr(L"記錄剛剛發生的問題"), false, preview));
     items.push_back(menuSeparator());
     if (hidden) items.push_back(menuItem(TrayShow, tr(L"顯示面板"))); // from the tray icon
     items.push_back(menuItem(TrayExit, tr(L"結束 BatteryScope"), false, pendingAction));
@@ -5911,6 +6553,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (wp == UpdateTimer) { SetTimer(window, UpdateTimer, 6 * 3600 * 1000, nullptr); maybeCheckForUpdate(); return 0; }
         if (wp == GovernorTimer) { governorTick(); return 0; }
         if (wp == KeyboardTimer) { keyboardTick(); return 0; }
+        if (wp == StabilityTimer) { writeHeartbeat(); return 0; }
         if (wp == AsusTimer) { KillTimer(window, AsusTimer); reapplyAsus(); asusKeys.stop(); asusKeys.start(window, AsusKeyMessage); return 0; }
         break;
     case WM_SYSCOLORCHANGE:
@@ -6163,6 +6806,10 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (id == GoalPageId) { showMain(); showGoalPage(); return 0; }
         if (id == HardwarePageId) { showMain(); showHardwarePage(); return 0; }
         if (id == PerfPageId) { showMain(); showPerformancePage(); return 0; }
+        if (id == StabilityPageId) { showMain(); showStabilityPage(); return 0; }
+        if (id == ReportId || id == ReportFullId) { buildReport(id == ReportFullId); return 0; }
+        if (id == MarkProblemId) { showMain(); markProblem(); return 0; }
+        if (id == StabilityFolderId) { const auto dir = bs::stability::folder(); if (!dir.empty()) ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL); return 0; }
         if (id == FanMenuId || id == PowerLimitMenuId) {
             if (!asusAvailable) return 0;
             if (const int chosen = showMenu(id == FanMenuId ? fanMenuItems() : powerLimitMenuItems(), menuAnchor(), mainWindow)) SendMessageW(window, WM_COMMAND, chosen, 0);
@@ -6490,6 +7137,13 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         break;
     case GpuUsersMessage: finishGpuEco(reinterpret_cast<std::vector<std::wstring>*>(lp)); return 0;
     case AsusKeyMessage: handleAsusKey(unsigned(wp), lp != 0); return 0;
+    case StabilityPingMessage: stab::uiBeatMs = GetTickCount64(); return 0;
+    case StabilityMessage:
+        if (wp == 2) finishReport(lp != 0); else notifyStability();
+        return 0;
+    case WM_ENDSESSION:
+        if (wp) stopStability(L"shutdown"); // a restart or shutdown, not a crash
+        return 0;
     case TuningDoneMessage:
         setNotice(wp == ERROR_SUCCESS ? std::wstring(tr(L"風扇與功耗設定已套用。")) : wp == ERROR_NOT_SUPPORTED ? std::wstring(tr(L"這台電腦不支援這個設定。"))
             : tr(L"韌體沒有接受這個設定，已回到原廠。"));
@@ -6501,6 +7155,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (BalloonTarget(wp) == BalloonTarget::candidates) showReviewCandidates();
         else if (BalloonTarget(wp) == BalloonTarget::powerDetails) showPowerDetails();
         else if (BalloonTarget(wp) == BalloonTarget::update) installUpdate();
+        else if (BalloonTarget(wp) == BalloonTarget::stability) showStabilityPage();
         return 0;
     case OsdMessage: {
         const int level = int(lp);
@@ -6525,6 +7180,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         else if (inlinePage == InlinePage::history) showHistoryPage();
         else if (inlinePage == InlinePage::hardware) showHardwarePage();
         else if (inlinePage == InlinePage::performance) showPerformancePage();
+        else if (inlinePage == InlinePage::stability) showStabilityPage();
         else if (inlinePage == InlinePage::lab) showLabPage();
         else if (inlinePage == InlinePage::settings && settingsList) InvalidateRect(settingsList, nullptr, FALSE);
         InvalidateRect(window, nullptr, FALSE); // the tabs
@@ -6534,10 +7190,18 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             const auto* setting = reinterpret_cast<const POWERBROADCAST_SETTING*>(lp);
             constexpr GUID ConsoleDisplayState = {0x6FE69556, 0x704A, 0x47A0, {0x8F, 0x24, 0xC2, 0x8D, 0x93, 0x6F, 0xDA, 0x47}};
             if (IsEqualGUID(setting->PowerSetting, ConsoleDisplayState) && setting->DataLength >= sizeof(DWORD)) {
+                const bool wasOff = displayOff;
                 displayOff = *reinterpret_cast<const DWORD*>(setting->Data) == 0;
+                stab::screenOn = !displayOff;
+                if (wasOff != displayOff) { stab::powerChangeMs = GetTickCount64(); bs::stability::note(displayOff ? L"display off" : L"display on"); }
                 PostMessageW(window, GovernorNowMessage, 0, 0);
             }
             return TRUE;
+        }
+        if (wp == PBT_APMSUSPEND) { stab::screenOn = false; stab::powerChangeMs = GetTickCount64(); bs::stability::note(L"suspend"); }
+        if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND) {
+            stab::powerChangeMs = GetTickCount64(); stab::screenOn = !displayOff;
+            if (wp == PBT_APMRESUMEAUTOMATIC) bs::stability::note(L"resume");
         }
         if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND || wp == PBT_APMPOWERSTATUSCHANGE) { resetSamples = true; wake.notify_one(); }
         // After sleep the firmware and the keyboard may have forgotten: set things again once they are awake.
@@ -6555,7 +7219,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             RECT client{}; GetClientRect(window, &client);
             if (const int tab = tabAt(point, client); tab >= 0) {
                 const Tab target = visibleTabs()[size_t(tab)];
-                if (target != activeTab() || (target == Tab::ranking && inlinePage != InlinePage::none)) SendMessageW(window, WM_COMMAND, tabCommand(target), 0);
+                if (target != activeTab() || (target == Tab::ranking && inlinePage != InlinePage::none) || (target == Tab::performance && inlinePage == InlinePage::stability)) SendMessageW(window, WM_COMMAND, tabCommand(target), 0);
                 return 0;
             }
         }
@@ -6586,6 +7250,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             if (balloonTarget == BalloonTarget::candidates) showReviewCandidates();
             else if (balloonTarget == BalloonTarget::powerDetails) showPowerDetails();
             else if (balloonTarget == BalloonTarget::update) installUpdate();
+            else if (balloonTarget == BalloonTarget::stability) showStabilityPage();
             return 0;
         }
         if ((trayVersion4 && (LOWORD(lp) == NIN_SELECT || LOWORD(lp) == NIN_KEYSELECT)) ||
@@ -6600,7 +7265,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_CLOSE: hideMain(); return 0;
     case WM_DESTROY: {
         KillTimer(window, MotionTimer); motionTimerRunning = false;
-        KillTimer(window, NoticeTimer); KillTimer(window, UpdateTimer); KillTimer(window, GovernorTimer);
+        KillTimer(window, NoticeTimer); KillTimer(window, UpdateTimer); KillTimer(window, GovernorTimer); KillTimer(window, StabilityTimer);
+        stopStability(L"quit");
         if (dynamicEnabled && !demo && !isolatedPreview) stopGovernor();
         dynamicEnabled = false; autoTestActive = false; updateSensing();
         asusKeys.stop(); keyWork.stop(); KillTimer(window, KeyboardTimer); KillTimer(window, AsusTimer);
@@ -6952,6 +7618,22 @@ bool panelSelfTest(const std::wstring& path) {
     check("performance_page_is_its_own_tab", inlinePage == InlinePage::performance && activeTab() == Tab::performance && visibleTabs().front() == Tab::performance
         && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::segments && b.commands.size() >= 3; })
         && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::action && int(b.amount) == FanMenuId; }));
+    // The demo has a blue screen this week: the home page warns and links to the stability page.
+    check("performance_page_warns_of_recent_crashes", std::any_of(visualBlocks.begin(), visualBlocks.end(),
+        [](const VBlock& b) { return b.kind == VBlock::Kind::action && int(b.amount) == StabilityPageId; }));
+    SendMessageW(mainWindow, WM_COMMAND, StabilityPageId, 0);
+    auto stabilityAction = [](int id) { return std::any_of(visualBlocks.begin(), visualBlocks.end(), [id](const VBlock& b) { return b.kind == VBlock::Kind::action && int(b.amount) == id; }); };
+    check("stability_page_lists_problems_and_offers_a_report", inlinePage == InlinePage::stability && activeTab() == Tab::performance
+        && stabilityAction(ReportId) && stabilityAction(ReportFullId) && stabilityAction(MarkProblemId)
+        && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::note && b.text.find(L"UNEXPECTED_STORE_EXCEPTION") != std::wstring::npos; }));
+    {
+        RECT client{}; GetClientRect(mainWindow, &client);
+        const auto tabs = visibleTabs();
+        const RECT home = tabRect(0, tabs.size(), client);
+        SendMessageW(mainWindow, WM_LBUTTONDOWN, 0, MAKELPARAM((home.left + home.right) / 2, (home.top + home.bottom) / 2));
+        SendMessageW(mainWindow, WM_LBUTTONUP, 0, MAKELPARAM((home.left + home.right) / 2, (home.top + home.bottom) / 2));
+        check("the_home_tab_leaves_the_stability_page", inlinePage == InlinePage::performance);
+    }
     SendMessageW(mainWindow, WM_COMMAND, HistoryId, 0);
     check("battery_history_belongs_to_the_battery_tab", activeTab() == Tab::ranking);
     SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
@@ -7245,6 +7927,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         // Run elevated by BatteryScope itself (see runAsusServices).
         return int(args[1] == L"stop" ? bs::asus::stopServices(true) : args[1] == L"defaults" ? bs::asus::restoreServiceDefaults() : bs::asus::startServices());
     }
+    if (args.size() == 2 && args[0] == L"--copy-dumps") {
+        // Run elevated by a report (see buildReport): copies the latest blue screen dumps.
+        std::wstring listing;
+        const int copied = bs::stability::copySystemDumps(args[1], listing);
+        std::ofstream out(std::filesystem::path(args[1]) / L"dumps-copied.txt", std::ios::binary | std::ios::trunc);
+        out << utf8(listing);
+        return copied >= 0 ? 0 : 1;
+    }
     if (args.size() == 1 && args[0] == L"--asus-dump") {
         // Every ASUS firmware value BatteryScope reads, for checking a new model.
         printf("%s", utf8(bs::asus::dump(bs::asus::read())).c_str());
@@ -7376,6 +8066,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
             labEngine = std::make_unique<bs::lab::WorkloadEngine>();
             if (readSetting(L"LabRecording", 0) == 1) labController->setRecording(true);
         }
+        if (!isolatedPreview) { startStability(); SetTimer(window, StabilityTimer, 10000, nullptr); }
         worker = std::thread(sampleLoop);
         if (option(L"--autotest") && labController) PostMessageW(window, WM_COMMAND, LabAutoStartId, 0);
         if (option(L"--quicktest") && labController) PostMessageW(window, WM_COMMAND, LabQuickStartId, 0);
@@ -7398,6 +8089,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (screenshot && option(L"--goal")) showGoalPage();
     if (screenshot && option(L"--hardware")) showHardwarePage();
     if (screenshot && option(L"--performance")) showPerformancePage();
+    if (screenshot && option(L"--stability")) showStabilityPage();
     if (screenshot && option(L"--lab")) showLabPage();
     if (demo) for (size_t i = 0; i + 1 < args.size(); ++i) if (args[i] == L"--popups-bmp") {
         const bool saved = capturePopups(args[i + 1]);
@@ -7438,6 +8130,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     }
     if (worker.joinable()) worker.join();
     if (actionWorker.joinable()) actionWorker.join();
+    if (stab::thread.joinable()) stab::thread.join();
     for (auto f : {normalFont, smallFont, strongFont, titleFont, valueFont, metricFont}) if (f) DeleteObject(f);
     for (auto f : fallbackOwned) DeleteObject(f);
     ui::unloadPixelFont();

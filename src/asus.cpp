@@ -1,4 +1,5 @@
 #include "asus.h"
+#include "stability.h"
 #include <wbemcli.h>
 #include <oleauto.h>
 #include <setupapi.h>
@@ -115,8 +116,16 @@ std::optional<Reading> Acpi::get(uint32_t device) const {
     if (!result) return std::nullopt;
     return decode(*result);
 }
-std::optional<uint32_t> Acpi::set(uint32_t device, uint32_t value) const { return call(Devs, args(device, value)); }
+std::optional<uint32_t> Acpi::set(uint32_t device, uint32_t value) const {
+    wchar_t text[48]; swprintf(text, 48, L"acpi 0x%08X=%u", device, value);
+    stability::note(text); // before the write, so a crash right after it is on record
+    return call(Devs, args(device, value));
+}
 std::optional<uint32_t> Acpi::set(uint32_t device, const std::vector<uint8_t>& values) const {
+    std::wstring text = L"acpi 0x";
+    { wchar_t id[16]; swprintf(id, 16, L"%08X=", device); text += id; }
+    for (uint8_t b : values) { wchar_t hex[4]; swprintf(hex, 4, L"%02X", b); text += hex; }
+    stability::note(text);
     std::vector<uint8_t> a(4 + values.size());
     std::memcpy(a.data(), &device, 4);
     if (!values.empty()) std::memcpy(a.data() + 4, values.data(), values.size());
