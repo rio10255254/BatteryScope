@@ -1260,6 +1260,8 @@ int wrappedHeight(const std::wstring& text, HFONT face, int width) {
     SelectObject(dc, old); ReleaseDC(nullptr, dc);
     return r.bottom;
 }
+// A notice card's height for its text at this card width: up to three lines.
+int noticeHeight(const std::wstring& text, int width) { return std::max(sp(40), std::min(wrappedHeight(text, smallFont, width - sp(46)), sp(54)) + sp(20)); }
 RECT popupClose(RECT client) { return {client.right - sp(30), client.top + sp(8), client.right - sp(10), client.top + sp(28)}; }
 void paintPopup(HDC dc, RECT r, const Popup& p) {
     fill(dc, r, Background);
@@ -1289,7 +1291,7 @@ void paintPopup(HDC dc, RECT r, const Popup& p) {
         const int mid = (r.top + r.bottom) / 2;
         rounded(dc, {r.left + sp(14), mid - sp(4), r.left + sp(22), mid + sp(4)}, accent, 4);
         const int width = r.right - r.left - sp(46);
-        const int height = std::min(wrappedHeight(p.body, smallFont, width), sp(34));
+        const int height = std::min(wrappedHeight(p.body, smallFont, width), sp(54));
         drawText(dc, p.body, {r.left + sp(32), mid - height / 2, r.right - sp(14), mid - height / 2 + height}, Ink, smallFont, DT_LEFT | DT_WORDBREAK | DT_END_ELLIPSIS);
         break;
     }
@@ -1418,7 +1420,7 @@ void showNoticeCard(const std::wstring& text) {
     if (!mainWindow || hidden || !IsWindowVisible(mainWindow) || text.empty()) return;
     RECT panel{}; GetWindowRect(mainWindow, &panel);
     const int width = panel.right - panel.left - sp(36);
-    const int height = std::max(sp(40), std::min(wrappedHeight(text, smallFont, width - sp(46)), sp(34)) + sp(20));
+    const int height = noticeHeight(text, width);
     const int x = panel.left + sp(18), y = panel.bottom - tabBarHeight() - height - sp(10);
     noticePopup.body = text; noticePopup.color = 0;
     showPopup(noticePopup, {x, y, x + width, y + height}, std::clamp<uint64_t>(2600 + text.size() * 45, 3200, 9000));
@@ -1446,7 +1448,7 @@ bool capturePopups(const std::wstring& path) {
     alert.title = tr(L"背景程式持續耗電"); alert.color = theme.warn; alert.hover = true;
     alert.body = L"OneDrive.exe" + std::wstring(tr(L" 已在背景持續使用約 ")) + L"1.2 W" + tr(L" CPU 電力（") + L"12" + tr(L" 分鐘）。點此查看。");
     const int width = sp(340), gap = sp(12);
-    const RECT r1{0, 0, sp(250), sp(60)}, r2{0, 0, width, sp(46)}, r3{0, 0, width, sp(66) + std::min(wrappedHeight(alert.body, smallFont, width - sp(42)), sp(64))};
+    const RECT r1{0, 0, sp(250), sp(60)}, r2{0, 0, width, noticeHeight(note.body, width)}, r3{0, 0, width, sp(66) + std::min(wrappedHeight(alert.body, smallFont, width - sp(42)), sp(64))};
     const int height = gap * 4 + r1.bottom + r2.bottom + r3.bottom;
     HDC screen = GetDC(nullptr); HDC dc = CreateCompatibleDC(screen);
     BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(info.bmiHeader); info.bmiHeader.biWidth = width + gap * 2; info.bmiHeader.biHeight = height;
@@ -1814,6 +1816,7 @@ void hideMain() {
     if (!panelTargetShown && hidden) return;
     if (!trayAdded && !isolatedPreview) trayAdded = updateTray(true);
     if (!trayAdded && !isolatedPreview) { setNotice(tr(L"系統匣無法使用，面板會保持開啟。")); return; }
+    hidePopup(noticePopup); // a notice belongs to the panel
     closeInlinePage(true);
     stopScroll();
     hoveredRow = -1; pointerDown = false;
@@ -6611,7 +6614,7 @@ bool panelSelfTest(const std::wstring& path) {
     RECT noticeRect{}, panelRect{}; if (noticePopup.window) GetWindowRect(noticePopup.window, &noticeRect); GetWindowRect(mainWindow, &panelRect);
     check("notice_card_rests_above_the_tabs", noticePopup.window && IsWindowVisible(noticePopup.window) && noticeRect.left > panelRect.left
         && noticeRect.right < panelRect.right && noticeRect.bottom <= panelRect.bottom - tabBarHeight());
-    for (Popup* p : {&osdPopup, &noticePopup}) if (p->window) ShowWindow(p->window, SW_HIDE);
+    closePopups();
     {
         RECT client{}; GetClientRect(mainWindow, &client);
         HDC screen = GetDC(mainWindow), dc = CreateCompatibleDC(screen);
