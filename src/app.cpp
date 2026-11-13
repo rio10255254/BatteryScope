@@ -70,7 +70,7 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     SlashBright1Id = 238 /* ..240 */, SlashIntervalId = 241 /* ..246 */, SlashModeId = 250 /* ..265 */,
     RefreshAutoId = 266, DarkModeId = 267, AutoSaverCycleId = 268, PerfPageId = 269, FanMenuId = 270, PowerLimitMenuId = 271,
     FanPreset0Id = 272 /* ..275 */, PowerPreset0Id = 276 /* ..279 */, CpuBoostToggleId = 280, WinModeMenuId = 281,
-    StabilityPageId = 282, ReportId = 283, ReportFullId = 284, MarkProblemId = 285, StabilityFolderId = 286,
+    StabilityPageId = 282, ReportId = 283, ReportFullId = 284, MarkProblemId = 285, StabilityFolderId = 286, ProtectToggleId = 287,
     SettingsListId = 300,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1, FnKeyHotkey = 10 /* ..20: F1-F11 under the software Fn lock */;
@@ -184,6 +184,14 @@ void showSettingsPage();
 void showDynamicPage();
 void showPerformancePage();
 void showStabilityPage();
+// Protection: nothing is written by itself while protection mode is on (after a crash, or
+// chosen by the user), while a power transition is under way, or before the start has settled.
+int protectState = 0;          // 0 off, 1 chosen by the user, 2 switched on after a crash
+bool startupSettled = false;   // the deferred start (restores, then the remembered ASUS settings) has run
+std::atomic<bool> labRestoreNow{false}; // the worker restores a setting an interrupted experiment left changed
+bool autoWritesPaused() {
+    return protectState != 0 || !startupSettled || bs::stability::writeGuard().automaticBlocked(GetTickCount64());
+}
 struct VBlock;
 std::optional<VBlock> stabilityRow(bool warningsOnly); // the performance page's stability line
 int pluggedRefresh();
@@ -230,7 +238,7 @@ std::optional<ProcessRow> pendingForceRow;
 std::wstring notice = tr(L"正在讀取電池與程序資料…");
 uint64_t noticeUntil = 0;
 std::deque<uint64_t> actionMarks;
-constexpr UINT_PTR MotionTimer = 92, NoticeTimer = 93, UpdateTimer = 94, GovernorTimer = 95, KeyboardTimer = 96, AsusTimer = 97, StabilityTimer = 98;
+constexpr UINT_PTR MotionTimer = 92, NoticeTimer = 93, UpdateTimer = 94, GovernorTimer = 95, KeyboardTimer = 96, AsusTimer = 97, StabilityTimer = 98, StartupTimer = 99;
 constexpr int PanelWidth = 360, PanelHeight = 640, RowHeight = 51;
 bool motionEnabled = true, suppressMotion = false, panelTargetShown = false, motionTimerRunning = false;
 double motionNow() {
@@ -614,7 +622,7 @@ struct VBar {
     std::vector<VSegment> segments;     // stacked parts instead of one fill
 };
 struct VBlock {
-    enum class Kind { heading, note, meter, bars, series, chips, legend, action, segments } kind = Kind::note;
+    enum class Kind { heading, note, meter, bars, series, chips, legend, action, segments, banner, timeline, card, check } kind = Kind::note;
     std::wstring title, text, value;
     double amount = 0, goal = 0, scale = 0;
     std::vector<VBar> bars;
@@ -649,6 +657,25 @@ VBlock vSegments(std::vector<std::wstring> labels, std::vector<int> commands, in
 // line under the title (what it does, or what it saves).
 VBlock vToggle(const std::wstring& title, const std::wstring& detail, bool on, int command) {
     VBlock b; b.kind = VBlock::Kind::action; b.title = title; b.text = detail; b.amount = command; b.toggle = on ? 1 : 0; return b;
+}
+
+// A status banner: a tinted card with a glyph (0 fine, 1 attention, 2 paused), a title, a
+// sentence or two, and optionally a button that runs `command`.
+VBlock vBanner(int glyph, COLORREF tone, const std::wstring& title, const std::wstring& text, const std::wstring& button = {}, int command = 0) {
+    VBlock b; b.kind = VBlock::Kind::banner; b.toggle = glyph; b.goal = tone; b.title = title; b.text = text; b.value = button; b.amount = command; return b;
+}
+// One cell per day, oldest first: `marks` holds severity * 16 + count (severity 3 a crash,
+// 2 a freeze or reset, 1 a note). The two labels sit under the ends.
+VBlock vTimeline(const std::wstring& title, const std::wstring& value, std::vector<double> marks, const std::wstring& first, const std::wstring& last) {
+    VBlock b; b.kind = VBlock::Kind::timeline; b.title = title; b.value = value; b.series = std::move(marks); b.items = {{first, 0}, {last, 0}}; return b;
+}
+// One incident: a title, when it happened, and what it means in plain words.
+VBlock vCard(const std::wstring& title, const std::wstring& when, const std::wstring& text, COLORREF tone) {
+    VBlock b; b.kind = VBlock::Kind::card; b.title = title; b.value = when; b.text = text; b.goal = tone; return b;
+}
+// A step: 1 done, 0 still to do, -1 a tip that cannot be checked. `badge` is progress such as "2/3".
+VBlock vCheck(int state, const std::wstring& title, const std::wstring& detail = {}, const std::wstring& badge = {}) {
+    VBlock b; b.kind = VBlock::Kind::check; b.toggle = state; b.title = title; b.text = detail; b.value = badge; return b;
 }
 
 HWND visualView = nullptr;
@@ -689,6 +716,10 @@ int blockHeight(HDC dc, const VBlock& b, int width, bool first) {
     case VBlock::Kind::legend: return sp(24);
     case VBlock::Kind::action: return b.text.empty() ? sp(44) : sp(56);
     case VBlock::Kind::segments: return sp(46);
+    case VBlock::Kind::banner: return sp(40) + noteHeight(dc, b.text, width - sp(58)) + (b.value.empty() ? 0 : sp(36)) + sp(10);
+    case VBlock::Kind::timeline: return sp(88);
+    case VBlock::Kind::card: return sp(40) + (b.text.empty() ? 0 : noteHeight(dc, b.text, width - sp(24))) + sp(4);
+    case VBlock::Kind::check: return sp(30) + (b.text.empty() ? 0 : noteHeight(dc, b.text, width - sp(28)));
     }
     return 0;
 }
@@ -751,6 +782,13 @@ void drawSwitch(HDC dc, RECT r, double on) {
     }
 }
 COLORREF barColor(COLORREF color) { return color ? faded(color) : Green; }
+// A check mark from five small cells, so it reads the same in the pixel and the smooth style.
+void drawCheckGlyph(HDC dc, RECT r, COLORREF color) {
+    const int u = std::max(1, int(r.right - r.left) / 7);
+    const int ox = r.left + (int(r.right - r.left) - u * 5) / 2, oy = r.top + (int(r.bottom - r.top) - u * 4) / 2 - u / 2;
+    const POINT cells[] = {{0, 2}, {1, 3}, {2, 2}, {3, 1}, {4, 0}};
+    for (const auto& c : cells) fill(dc, {ox + c.x * u, oy + c.y * u, ox + (c.x + 1) * u, oy + (c.y + 1) * u + u}, color);
+}
 void paintVisual(HDC dc, RECT client) {
     fill(dc, client, Surface);
     const int width = client.right - sp(10); // room for the scroll indicator
@@ -768,6 +806,7 @@ void paintVisual(HDC dc, RECT client) {
         const int rise = int(std::lround((1 - appear) * sp(14)));
         if (y + h < 0 || y > client.bottom) {
             if (b.kind == VBlock::Kind::action) visualHits.push_back({{0, y + sp(3), width, y + h - sp(3)}, int(b.amount), i});
+            if (b.kind == VBlock::Kind::banner && b.amount) visualHits.push_back({{0, y + sp(2), width, y + h - sp(8)}, int(b.amount), i});
             if (b.kind == VBlock::Kind::segments)
                 for (size_t k = 0; k < b.commands.size(); ++k) visualHits.push_back({{0, y + sp(4), width, y + h - sp(4)}, b.commands[k], i});
             y += h; continue;
@@ -954,6 +993,100 @@ void paintVisual(HDC dc, RECT client) {
                 drawText(dc, b.items[size_t(k)].first, face, on ? (theme.highContrast ? theme.selectedInk : Green) : Ink, on ? strongFont : normalFont,
                     DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
             }
+            break;
+        }
+        case VBlock::Kind::banner: {
+            const COLORREF tone = b.goal ? faded(COLORREF(b.goal)) : Green;
+            const RECT box{0, top + sp(2), width, top + h - sp(8)};
+            double hot = 0, press = 0;
+            int index = -1;
+            if (b.amount) {
+                index = int(visualHits.size());
+                visualHits.push_back({{0, y + sp(2), width, y + h - sp(8)}, int(b.amount), i});
+                hot = std::max(fadeValue(visualHoverFade, i, now), index == visualFocus ? 1.0 : 0.0);
+                press = fadeValue(visualPress, i, now);
+            }
+            rounded(dc, box, blend(tone, Surface, theme.highContrast ? .9 : .84 - hot * .05), 10);
+            rounded(dc, {box.left, box.top, box.left + sp(4), box.bottom}, tone, 2);
+            if (index >= 0 && index == visualFocus && GetFocus() == visualView) outline(dc, box, tone, 10);
+            // The glyph: fine (a check), attention (!), paused (two bars).
+            const RECT mark{sp(14), box.top + sp(10), sp(14) + sp(22), box.top + sp(10) + sp(22)};
+            rounded(dc, mark, tone, 6);
+            const COLORREF onTone = theme.dark ? Background : Surface;
+            const int cx = (mark.left + mark.right) / 2, u = std::max(1, sp(2));
+            if (b.toggle == 1) {
+                fill(dc, {cx - u, mark.top + sp(4), cx + u, mark.bottom - sp(9)}, onTone);
+                fill(dc, {cx - u, mark.bottom - sp(7), cx + u, mark.bottom - sp(4)}, onTone);
+            } else if (b.toggle == 2) {
+                fill(dc, {cx - sp(5), mark.top + sp(6), cx - sp(1), mark.bottom - sp(6)}, onTone);
+                fill(dc, {cx + sp(1), mark.top + sp(6), cx + sp(5), mark.bottom - sp(6)}, onTone);
+            } else drawCheckGlyph(dc, mark, onTone);
+            drawText(dc, b.title, {sp(46), box.top + sp(8), width - sp(10), box.top + sp(32)}, Ink, strongFont);
+            const int textHeight = noteHeight(dc, b.text, width - sp(58));
+            drawText(dc, b.text, {sp(46), box.top + sp(36), width - sp(12), box.top + sp(36) + textHeight}, blend(Muted, Ink, .45), smallFont, DT_LEFT | DT_WORDBREAK);
+            if (!b.value.empty()) {
+                const int w = textWidth(dc, b.value, smallFont) + sp(26);
+                RECT pill{sp(46), box.bottom - sp(38), sp(46) + w, box.bottom - sp(10)};
+                if (press > 0) InflateRect(&pill, -int(std::lround(press * sp(2))), -int(std::lround(press * sp(1))));
+                rounded(dc, pill, blend(tone, Ink, hot * .12), 8);
+                drawText(dc, b.value, pill, onTone, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            }
+            break;
+        }
+        case VBlock::Kind::timeline: {
+            drawText(dc, b.title, {0, top, width / 2, top + sp(20)}, Ink, normalFont);
+            drawText(dc, b.value, {width / 3, top, width, top + sp(20)}, Muted, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+            const int n = int(b.series.size());
+            const RECT strip{0, top + sp(26), width, top + sp(26) + sp(34)};
+            if (n > 0) {
+                const double step = double(width) / n;
+                const int gap = std::max(1, sp(2)), height = strip.bottom - strip.top;
+                for (int k = 0; k < n; ++k) {
+                    const int x0 = int(k * step), x1 = std::max(x0 + 1, int((k + 1) * step) - gap);
+                    const int mark = int(b.series[size_t(k)]), level = mark / 16, count = std::clamp(mark % 16, 1, 4);
+                    rounded(dc, {x0, strip.top, x1, strip.bottom}, track, 3);
+                    if (level) {
+                        // A day with something on it: taller with more incidents, red for a crash.
+                        const double sweep = std::clamp(appear * 1.6 - double(k) / n * .6, 0.0, 1.0);
+                        const int fillHeight = std::max(sp(6), int(height * (.4 + .2 * count) * easeOut(sweep)));
+                        const COLORREF color = faded(level >= 3 ? theme.danger : level == 2 ? warnBase : blend(mutedBase, Surface, .25));
+                        rounded(dc, {x0, strip.bottom - std::min(height, fillHeight), x1, strip.bottom}, color, 3);
+                    }
+                    if (k == n - 1) fill(dc, {x0, strip.bottom + sp(3), x1, strip.bottom + sp(5)}, Ink); // today
+                }
+            }
+            if (b.items.size() >= 2) {
+                drawText(dc, b.items[0].first, {0, strip.bottom + sp(7), width / 2, strip.bottom + sp(25)}, Muted, smallFont);
+                drawText(dc, b.items[1].first, {width / 2, strip.bottom + sp(7), width, strip.bottom + sp(25)}, Muted, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+            }
+            break;
+        }
+        case VBlock::Kind::card: {
+            const COLORREF tone = b.goal ? faded(COLORREF(b.goal)) : blend(Muted, Surface, .4);
+            const RECT box{0, top + sp(3), width, top + h - sp(5)};
+            rounded(dc, box, blend(Surface, Background, .55), 8);
+            rounded(dc, {box.left, box.top, box.left + sp(4), box.bottom}, tone, 2);
+            const int whenWidth = textWidth(dc, b.value, smallFont) + sp(6);
+            drawText(dc, b.title, {sp(14), box.top + sp(6), width - whenWidth - sp(14), box.top + sp(30)}, Ink, strongFont);
+            drawText(dc, b.value, {width - whenWidth - sp(10), box.top + sp(6), width - sp(10), box.top + sp(30)}, Muted, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+            if (!b.text.empty()) drawText(dc, b.text, {sp(14), box.top + sp(32), width - sp(10), box.bottom - sp(2)}, Muted, smallFont, DT_LEFT | DT_WORDBREAK);
+            break;
+        }
+        case VBlock::Kind::check: {
+            const RECT box{0, top + sp(6), sp(18), top + sp(24)};
+            if (b.toggle == 1) { rounded(dc, box, Green, 4); drawCheckGlyph(dc, box, theme.dark ? Background : Surface); }
+            else if (b.toggle == 0) outline(dc, box, Muted, 4, 1.5f);
+            else rounded(dc, {sp(6), top + sp(12), sp(12), top + sp(18)}, Muted, 3);
+            int right = width;
+            if (!b.value.empty()) {
+                const int pillWidth = std::min(width / 2, textWidth(dc, b.value, smallFont) + sp(16));
+                const RECT pill{right - pillWidth, top + sp(5), right, top + sp(25)};
+                rounded(dc, pill, b.toggle == 1 ? blend(Green, Surface, .72) : blend(Surface, Border, .6), 6);
+                drawText(dc, b.value, pill, b.toggle == 1 ? (theme.dark ? Ink : blend(Green, Ink, .5)) : Muted, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                right = pill.left - sp(8);
+            }
+            drawText(dc, b.title, {sp(28), top + sp(3), right, top + sp(27)}, b.toggle == 1 ? Muted : Ink, normalFont);
+            if (!b.text.empty()) drawText(dc, b.text, {sp(28), top + sp(28), width, top + h}, Muted, smallFont, DT_LEFT | DT_WORDBREAK);
             break;
         }
         case VBlock::Kind::legend: {
@@ -2673,7 +2806,7 @@ void loadAutoOverrides() {
 // set both modes to Performance; low battery sets the on-battery mode to
 // Efficiency. Each change is undone only if the user has not changed it since.
 void applyAutoPowerRules() {
-    if (demo || isolatedPreview || current.history.empty()) return;
+    if (demo || isolatedPreview || current.history.empty() || autoWritesPaused()) return;
     // One owner at a time: with dynamic saving on, it covers the performance list (as app rules)
     // and low battery (as extra saving); while the lab measures, the lab owns the settings.
     if (dynamicEnabled || (labController && labController->status().running)) {
@@ -3782,7 +3915,7 @@ void sampleLoop() {
     uint64_t nextProcess = 0, nextPower = 0, nextGpu = 0;
     bool previousHidden = false, qosInitialized = false;
     // Power lab: undo a setting left changed by a crash, then sample every two seconds while it is on.
-    if (labController) bs::lab::restoreInterrupted();
+    // (An interrupted experiment's setting is restored once the start has settled: labRestoreNow.)
     std::unique_ptr<bs::lab::Probe> labProbe;
     uint64_t labLast = 0;
     CpuClock cpuClock;
@@ -3794,6 +3927,7 @@ void sampleLoop() {
             state.samplerEcoQoS = setSamplerEcoQoS(background) && background;
             qosInitialized = true; policy.reset(); nextProcess = nextPower = 0; previousHidden = background;
         }
+        if (labRestoreNow.exchange(false) && labController) bs::lab::restoreInterrupted();
         bool changed = false;
         if (now >= nextPower) {
             const PowerSample sample = readPower();
@@ -4154,7 +4288,8 @@ void applyDecision(const bs::gov::Decision& d) {
     for (size_t i = 0; i < d.apply.size(); ++i) if (d.apply[i]) { bs::lab::applyKnob(bs::gov::knobFor(bs::gov::Setting(i)), *d.apply[i]); changed = true; }
     for (const auto& [pid, created] : d.ecoOn) bs::lab::setProcessEco(pid, created, true);
     for (const auto& [pid, created] : d.ecoOff) bs::lab::setProcessEco(pid, created, false);
-    if (d.restore) forgetGovernorOriginals();
+    // A restore refused by the write guard (going to sleep or shutting down) is done at the next start.
+    if (d.restore) { if (!bs::stability::writeGuard().held()) forgetGovernorOriginals(); }
     else if (changed) saveGovernorOriginals();
 }
 void stopGovernor() {
@@ -4172,7 +4307,7 @@ uint64_t lastActiveInputMs = 0, lastPointerMs = 0, lastRawInputMs = 0, lastImmed
 bs::gov::InputKind lastActiveKind = bs::gov::InputKind::none;
 bool sensing = false, rawInputOn = false, displayOff = false;
 HWINEVENTHOOK foregroundHook = nullptr;
-HPOWERNOTIFY displayNotify = nullptr;
+HPOWERNOTIFY displayNotify = nullptr, lidNotify = nullptr; // registered for the whole run: the write guard needs them
 std::map<std::wstring, bs::gov::AppRule> appRules;   // the user's own rules, lower-case exe -> rule
 struct Learned { DWORD up = 0, down = 0; };
 std::map<std::wstring, Learned> appLearned;           // user overrides seen per program
@@ -4283,8 +4418,6 @@ void updateSensing() {
         RAWINPUTDEVICE devices[2] = {{0x01, 0x06, RIDEV_INPUTSINK, mainWindow}, {0x01, 0x02, RIDEV_INPUTSINK, mainWindow}};
         rawInputOn = RegisterRawInputDevices(devices, 2, sizeof(RAWINPUTDEVICE)) != FALSE;
         foregroundHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, foregroundChanged, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-        constexpr GUID ConsoleDisplayState = {0x6FE69556, 0x704A, 0x47A0, {0x8F, 0x24, 0xC2, 0x8D, 0x93, 0x6F, 0xDA, 0x47}};
-        displayNotify = RegisterPowerSettingNotification(mainWindow, &ConsoleDisplayState, DEVICE_NOTIFY_WINDOW_HANDLE);
         SetTimer(mainWindow, GovernorTimer, 1000, nullptr);
         wake.notify_one();
     } else {
@@ -4294,7 +4427,6 @@ void updateSensing() {
         }
         rawInputOn = false;
         if (foregroundHook) { UnhookWinEvent(foregroundHook); foregroundHook = nullptr; }
-        if (displayNotify) { UnregisterPowerSettingNotification(displayNotify); displayNotify = nullptr; }
         KillTimer(mainWindow, GovernorTimer);
     }
 }
@@ -4332,6 +4464,7 @@ void flushDetectionLog() {
 }
 void governorTick() {
     if (demo || isolatedPreview) return;
+    if (autoWritesPaused()) return; // protection mode, or going to sleep, waking or starting: hands off
     const bool testing = planRunning();
     if (!dynamicEnabled && !testing) { updateSensing(); return; }
     if (!signalReader) signalReader = std::make_unique<bs::lab::SignalReader>();
@@ -4462,7 +4595,8 @@ void setDynamic(bool on) {
     dynamicEnabled = on;
     if (!writeSetting(L"Dynamic", on ? 1 : 0)) setNotice(tr(L"無法儲存設定。"));
     updateSensing();
-    if (on) { applyAutoPowerRules(); governorTick(); setNotice(tr(L"動態省電已開啟：用電池時依你正在做的事自動調整。")); }
+    if (on && protectState) setNotice(tr(L"動態省電已開啟，但保護模式開著：關閉保護模式後才會開始調整。"));
+    else if (on) { applyAutoPowerRules(); governorTick(); setNotice(tr(L"動態省電已開啟：用電池時依你正在做的事自動調整。")); }
     else { stopGovernor(); governor.releaseAll(); applyAutoPowerRules(); setNotice(tr(L"動態省電已關閉，設定已還原。")); }
 }
 bool powerModeHeld() { return dynamicEnabled && governor.held(bs::gov::Setting::powerMode); }
@@ -5084,7 +5218,7 @@ int batteryRefresh() {
 }
 int pluggedRefresh() { const auto rates = bs::lab::availableRefreshRates(); return rates.empty() ? 0 : rates.back(); }
 void applyRefreshAuto() {
-    if (!refreshAuto || demo || isolatedPreview || current.history.empty()) return;
+    if (!refreshAuto || demo || isolatedPreview || current.history.empty() || autoWritesPaused()) return;
     if (labController && labController->status().running) return;
     const auto& p = current.history.back();
     if (!p.acKnown || !p.present) return; // desktops: nothing to save
@@ -5100,7 +5234,7 @@ void applyRefreshAuto() {
     bs::lab::applyKnob(bs::lab::Knob::refreshRate, DWORD(target));
 }
 void applyGpuAuto() {
-    if (!gpuAuto || !asusAvailable || demo || isolatedPreview || current.history.empty() || gpuCheckBusy) return;
+    if (!gpuAuto || !asusAvailable || demo || isolatedPreview || current.history.empty() || gpuCheckBusy || autoWritesPaused()) return;
     if (labController && labController->status().running) return; // never during a measurement
     const auto& p = current.history.back();
     if (!p.acKnown) return;
@@ -5116,7 +5250,9 @@ void applyGpuAuto() {
 // mode back: what BatteryScope set (mode, charge limit, keyboard, Fn lock, Slash) is put back
 // at start and after sleep. A running test owns the mode until it ends.
 void reapplyAsus() {
-    if (!asusAvailable || demo || isolatedPreview) return;
+    if (!asusAvailable || demo || isolatedPreview || protectState) return;
+    // Not while the PC is going down, waking or starting: try again shortly.
+    if (autoWritesPaused()) { if (startupSettled) SetTimer(mainWindow, AsusTimer, 5000, nullptr); return; }
     const bool labOwnsMode = labController && labController->status().running;
     bs::asus::reapply(!labOwnsMode, true);
     if (const auto slash = bs::asus::slashSettings(); slash.remembered && bs::asus::slashPresent()) bs::asus::setSlash(slash);
@@ -5391,7 +5527,7 @@ void handleFnKey(int index) {
 }
 // Keyboard backlight off after 30 s without input on battery, back on at the next input.
 void keyboardTick() {
-    if (!keyboardAutoOff || !asusAvailable || demo || isolatedPreview || current.history.empty()) return;
+    if (!keyboardAutoOff || !asusAvailable || demo || isolatedPreview || current.history.empty() || autoWritesPaused()) return;
     LASTINPUTINFO input{}; input.cbSize = sizeof(input);
     const double idle = GetLastInputInfo(&input) ? (GetTickCount() - input.dwTime) / 1000.0 : 0;
     const auto& p = current.history.back();
@@ -5593,7 +5729,7 @@ void showPerformancePage() {
         if (!plugged) if (auto left = remainingText(current.power); !left.empty()) chips.push_back({left, 0});
         v.push_back(vChips(std::move(chips)));
     }
-    if (auto warning = stabilityRow(true)) v.push_back(std::move(*warning));
+    if (auto banner = stabilityRow(true)) v.push_back(std::move(*banner));
     // The performance mode: ASUS's firmware modes, else Windows' power mode for the current source.
     v.push_back(vHeading(tr(L"效能模式")));
     if (asusAvailable && h.modeDevice) {
@@ -5703,8 +5839,10 @@ PreviousSession previous;
 std::thread thread;
 std::mutex waitMutex;
 std::condition_variable waitCv;
-std::atomic<bool> running{false}, rescan{false}, reportBusy{false}, screenOn{true};
+std::atomic<bool> running{false}, rescan{false}, reportBusy{false}, screenOn{true}, firstScanDone{false};
 std::atomic<uint64_t> powerChangeMs{0}, uiBeatMs{0}, lastScanUtc{0};
+uint64_t screenOffAt = 0, lastWakeCounted = 0, startedAtMs = 0; // UI thread
+bool lidOpen = true;
 std::wstring reportSummary, reportPath; // guarded by mutex
 uint64_t lastFreezeNotice = 0;
 bool started = false;
@@ -5719,6 +5857,61 @@ void writeQwordSetting(const wchar_t* name, uint64_t value) {
     RegSetValueExW(key, name, 0, REG_QWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value));
     RegCloseKey(key);
 }
+// ---- The stable streak: how long since the last crash, and how many sleeps and restarts went well since.
+struct Streak { uint64_t since = 0; DWORD wakes = 0, restarts = 0; };
+Streak stableStreak() {
+    if (demo || isolatedPreview) return {bs::stability::nowUtc() - 3 * 3600 * bs::stability::Second, 2, 1};
+    return {readQwordSetting(L"CrashSeen"), readSetting(L"WakesOk", 0), readSetting(L"RestartsOk", 0)};
+}
+// The screen came back after five minutes or more, or the PC resumed: one sleep and wake that went well.
+void countWake() {
+    const uint64_t tick = GetTickCount64();
+    if (!stab::started || (stab::lastWakeCounted && tick - stab::lastWakeCounted < 60000)) return;
+    stab::lastWakeCounted = tick;
+    writeSetting(L"WakesOk", readSetting(L"WakesOk", 0) + 1);
+    bs::stability::note(L"wake ok");
+}
+// G-Helper beside BatteryScope, looked up at most twice a minute.
+struct GHelperNow { bs::stability::GHelperSettings settings; bool running = false; uint64_t at = 0; };
+const GHelperNow& ghelperNow() {
+    static GHelperNow state;
+    if (demo || isolatedPreview) { state.settings.found = true; state.settings.autoUndervolt = true; state.settings.cpuUndervolt = -2; return state; }
+    const uint64_t tick = GetTickCount64();
+    if (!state.at || tick - state.at >= 30000) {
+        state.settings = bs::stability::readGHelperConfig();
+        state.running = bs::asus::os::processRunning(L"ghelper.exe");
+        state.at = tick;
+    }
+    return state;
+}
+std::wstring durationText(uint64_t seconds) {
+    const uint64_t days = seconds / 86400, hours = seconds % 86400 / 3600, minutes = seconds % 3600 / 60;
+    if (days) return std::to_wstring(days) + tr(L" 天") + (hours ? L" " + std::to_wstring(hours) + tr(L" 小時") : std::wstring());
+    if (hours) return std::to_wstring(hours) + tr(L" 小時") + (minutes ? L" " + std::to_wstring(minutes) + tr(L" 分") : std::wstring());
+    return std::to_wstring(std::max<uint64_t>(1, minutes)) + tr(L" 分鐘");
+}
+// "20 分鐘前", "今天 17:08", "昨天 02:17", "3 天前 17:08", then the date.
+std::wstring relativeTime(uint64_t utc) {
+    using namespace bs::stability;
+    const uint64_t now = nowUtc();
+    const std::wstring local = localTimeText(utc); // 2026-11-12 16:09
+    const std::wstring clock = local.size() >= 16 ? local.substr(11, 5) : local;
+    if (utc > now) return clock;
+    const uint64_t seconds = (now - utc) / Second;
+    if (seconds < 90) return tr(L"剛剛");
+    if (seconds < 3600) return std::to_wstring(seconds / 60) + tr(L" 分鐘前");
+    const std::wstring today = localTimeText(now);
+    if (today.substr(0, 10) == local.substr(0, 10)) return tr(L"今天 ") + clock;
+    // Whole local days between the two dates.
+    TIME_ZONE_INFORMATION zone{}; const DWORD mode = GetTimeZoneInformation(&zone);
+    const int64_t offset = -int64_t(zone.Bias + (mode == TIME_ZONE_ID_DAYLIGHT ? zone.DaylightBias : zone.StandardBias)) * 60;
+    const int64_t days = (int64_t(now / Second) + offset) / 86400 - (int64_t(utc / Second) + offset) / 86400;
+    if (days == 1) return tr(L"昨天 ") + clock;
+    if (days < 7) return std::to_wstring(days) + tr(L" 天前 ") + clock;
+    return local.size() >= 16 ? local.substr(5, 11) : local;
+}
+void setProtect(int state);
+std::wstring incidentTitle(const bs::stability::Incident& i);
 std::wstring foregroundExe() {
     HWND foreground = GetForegroundWindow();
     DWORD pid = 0; if (foreground) GetWindowThreadProcessId(foreground, &pid);
@@ -5780,6 +5973,7 @@ std::wstring heartbeatText() {
         add(L"lab", std::wstring(bs::lab::knobKey(s.knob)) + L"/" + std::to_wstring(s.arm));
     add(L"fg", foregroundExe());
     if (displayOff) add(L"disp", L"off");
+    if (protectState) add(L"prot", std::to_wstring(protectState));
     return t;
 }
 void writeHeartbeat() { if (stab::started) bs::stability::blackBox().write(heartbeatText()); }
@@ -5949,6 +6143,18 @@ std::wstring stabilitySummary() {
         }
     }
     if (!shown) t += tr(L"（沒有記錄）\n");
+    {
+        const auto streak = stableStreak();
+        if (streak.since && now > streak.since)
+            t += tr(L"\n距上次當機 ") + durationText((now - streak.since) / Second) + tr(L" · 順利喚醒 ") + std::to_wstring(streak.wakes) + tr(L" 次") + tr(L" · 順利重開 ") + std::to_wstring(streak.restarts) + tr(L" 次") + L"\n";
+        t += std::wstring(L"Protection mode: ") + (protectState == 2 ? L"on (after a crash)" : protectState ? L"on" : L"off") +
+            L" · writes refused by the guard this run: " + std::to_wstring(writeGuard().blockedWrites()) + L"\n";
+        const auto& g = ghelperNow();
+        if (g.settings.found || g.running)
+            t += std::wstring(L"G-Helper: ") + (g.running ? L"running" : L"not running") + L" · CPU undervolt " + std::to_wstring(g.settings.cpuUndervolt) +
+                (g.settings.autoUndervolt ? L" (auto)" : L"") + L" · iGPU undervolt " + std::to_wstring(g.settings.igpuUndervolt) +
+                L" · GPU +" + std::to_wstring(g.settings.gpuCore) + L"/+" + std::to_wstring(g.settings.gpuMemory) + L" MHz\n";
+    }
     if (const auto drivers = knownTroubleDrivers(); !drivers.empty()) {
         t += tr(L"\n已安裝、已知會造成藍屏的驅動：\n");
         for (const auto& [name, why] : drivers) t += L"- " + name + L": " + why + L"\n";
@@ -5980,71 +6186,186 @@ std::wstring stabilityStatusNote() {
     }
     return t;
 }
+// What a stop code or a kind of incident means, in one plain sentence.
+std::wstring plainReason(const bs::stability::Incident& i) {
+    using K = bs::stability::Kind;
+    if (i.kind == K::blueScreen || (i.kind == K::forcedOff && i.code)) {
+        switch (bs::stability::normalizeBugcheck(i.code)) {
+        case 0x154: return tr(L"Windows 讀不回系統磁碟上的資料。");
+        case 0xEF: return tr(L"重要的系統程序突然停止，常見於讀不到系統磁碟或系統檔損毀。");
+        case 0x7A: case 0xF4: return tr(L"從系統磁碟載入資料失敗。");
+        case 0x9F: case 0xA0: case 0x14F: case 0x15F: return tr(L"有裝置在睡眠、喚醒或關機時卡住。");
+        case 0x113: case 0x116: case 0x117: case 0x119: case 0x141: case 0x193: return tr(L"顯示卡驅動停止回應。");
+        case 0x124: case 0x9C: case 0x101: return tr(L"處理器或主機板回報硬體錯誤。");
+        case 0x1A: case 0x50: case 0x19: case 0x109: case 0x12B: return tr(L"記憶體裡的資料不正確。");
+        case 0x1C8: case 0xE2: return tr(L"長按電源鍵強制關機，通常是整台卡住之後。");
+        default: return tr(L"某個驅動程式或系統元件出錯。");
+        }
+    }
+    switch (i.kind) {
+    case K::powerLoss: return tr(L"突然斷電或重新啟動，Windows 沒有留下停止代碼。");
+    case K::forcedOff: return tr(L"長按電源鍵強制關機，通常是整台卡住之後。");
+    case K::batteryEmpty: return tr(L"電池用完而關機，不算當機。");
+    case K::freeze: return i.seconds > 0 ? tr(L"整台電腦停住幾秒後恢復。") : tr(L"某個系統元件逾時，Windows 自己恢復了。");
+    case K::graphicsReset: return tr(L"顯示驅動停止回應，Windows 把它重新啟動（畫面會黑一下）。");
+    case K::hardwareError: return tr(L"處理器或主機板回報了硬體錯誤。");
+    case K::diskError: return tr(L"磁碟或檔案系統回報錯誤。");
+    case K::appCrash: return tr(L"BatteryScope 自己當掉，已留下記錄。");
+    case K::appHang: return tr(L"BatteryScope 的面板一度沒有回應。");
+    default: return tr(L"你標記的時間點。");
+    }
+}
+// The card's text: the plain sentence first, then the technical lines.
+std::wstring incidentCardText(const bs::stability::Incident& i) {
+    std::wstring t = plainReason(i);
+    auto line = [&](const std::wstring& text) { if (!text.empty()) t += L"\n" + text; };
+    if (i.kind == bs::stability::Kind::blueScreen) {
+        const wchar_t* name = bs::stability::bugcheckName(i.code);
+        if (name) line(name);
+    }
+    if (i.dumpFailed) line(tr(L"當下系統磁碟寫不進去（Windows 沒能存下傾印檔）。"));
+    if (i.sleeping) line(tr(L"發生在睡眠或喚醒時"));
+    if (!i.context.empty()) line(tr(L"當時：") + contextText(i.context));
+    if (!i.recentWrites.empty()) line(tr(L"之前 BatteryScope 寫入：") + i.recentWrites);
+    if (!i.detail.empty() && i.kind != bs::stability::Kind::blueScreen && !bs::stability::tookSystemDown(i.kind)) line(i.detail);
+    return t;
+}
+COLORREF incidentTone(const bs::stability::Incident& i) {
+    const int level = bs::stability::severity(i.kind);
+    return level >= 3 ? theme.danger : level == 2 ? theme.warn : COLORREF(0);
+}
+// The state of things in one banner. On the home page it appears only when there is something to say.
+std::optional<VBlock> stabilityBanner(bool home) {
+    using namespace bs::stability;
+    const auto list = stabilityIncidents();
+    const uint64_t now = nowUtc();
+    if (protectState) {
+        const std::wstring text = protectState == 2
+            ? tr(L"偵測到當機後自動開啟。動態省電、自動更新率、實驗與華碩設定都先暫停；你手動選的仍然有效。確認穩定後再恢復。")
+            : tr(L"BatteryScope 現在不會自動改任何設定；你手動選的仍然有效。");
+        return vBanner(2, theme.warn, tr(L"保護模式：只監測，不調整"), text, tr(L"恢復自動調整"), ProtectToggleId);
+    }
+    int week = 0, month = 0; const Incident* latest = nullptr;
+    for (const auto& i : list) {
+        if (!serious(i.kind) || i.kind == Kind::appHang || i.kind == Kind::appCrash) continue;
+        if (i.when() + 30ull * 86400 * Second >= now) { ++month; if (!latest) latest = &i; }
+        if (i.when() + 7ull * 86400 * Second >= now) ++week;
+    }
+    if (week && latest) {
+        const std::wstring title = tr(L"7 天內 ") + std::to_wstring(week) + tr(L" 次當機或凍結");
+        const std::wstring text = tr(L"最近一次：") + relativeTime(latest->when()) + L" · " + plainReason(*latest);
+        return home ? vBanner(1, theme.warn, title, text, tr(L"查看與回報"), StabilityPageId) : vBanner(1, theme.warn, title, text);
+    }
+    if (home) return std::nullopt;
+    if (month && latest) return vBanner(0, 0, tr(L"觀察中：已 ") + durationText((now - latest->when()) / Second) + tr(L" 沒有再發生"),
+        tr(L"最近一次：") + relativeTime(latest->when()) + L" · " + plainReason(*latest));
+    return vBanner(0, 0, tr(L"一切正常"), tr(L"最近 30 天沒有藍屏、意外關機或凍結。"));
+}
+// What to do next, most useful first: things BatteryScope can see for itself are ticked off as they are done.
+std::vector<VBlock> stabilitySteps(const std::vector<bs::stability::Incident>& list) {
+    using namespace bs::stability;
+    const uint64_t now = nowUtc(), since = now - 30ull * 86400 * Second;
+    std::vector<VBlock> steps;
+    bool crashed = false; int dumpFailures = 0; std::set<Area> areas;
+    for (const auto& i : list) {
+        if (i.when() < since) continue;
+        if (tookSystemDown(i.kind)) crashed = true;
+        if (i.dumpFailed) ++dumpFailures;
+        if (serious(i.kind) || i.kind == Kind::diskError) areas.insert(incidentArea(i));
+    }
+    const bool preview = demo || isolatedPreview;
+    const auto drivers = preview ? std::vector<std::pair<std::wstring, std::wstring>>{{L"nipcibrd.sys", L""}} : knownTroubleDrivers();
+    if (!drivers.empty()) {
+        std::wstring names;
+        for (const auto& d : drivers) names += (names.empty() ? L"" : L"、") + d.first;
+        steps.push_back(vCheck(0, tr(L"移除 NI 的 PCI 橋接驅動"), names + tr(L"：National Instruments（LabVIEW／PXI）的驅動，掛在所有 PCI 橋接器上（包括 SSD 那一個），已知會在睡眠與喚醒時造成藍屏。用 NI Package Manager 移除「PXI Platform Services」；不要直接停用，可能無法開機。")));
+    }
+    const auto& ghelper = ghelperNow();
+    if (ghelper.settings.cpuUndervolt < 0 || ghelper.settings.igpuUndervolt < 0) {
+        const int value = std::min(ghelper.settings.cpuUndervolt, ghelper.settings.igpuUndervolt);
+        steps.push_back(vCheck(0, tr(L"把 G-Helper 的降壓歸零"), tr(L"目前設定 ") + std::to_wstring(value) +
+            (ghelper.settings.autoUndervolt ? tr(L"，而且開機自動套用") : std::wstring()) + tr(L"。降壓幅度再小也可能造成偶發當機。")));
+    }
+    if (ghelper.running) steps.push_back(vCheck(0, tr(L"觀察期間只開一個：先關閉 G-Helper"), tr(L"G-Helper 正在執行。它和 BatteryScope 控制同一個韌體介面，同時開著會互相覆蓋。")));
+    if (ghelper.settings.gpuCore > 0 || ghelper.settings.gpuMemory > 0)
+        steps.push_back(vCheck(-1, tr(L"暫時不要用顯示卡超頻"), tr(L"G-Helper 設定了核心 +") + std::to_wstring(ghelper.settings.gpuCore) + tr(L"、記憶體 +") + std::to_wstring(ghelper.settings.gpuMemory) + L" MHz" + tr(L"。")));
+    if (crashed) {
+        const auto streak = stableStreak();
+        const uint64_t quiet = streak.since && now > streak.since ? (now - streak.since) / Second : 0;
+        steps.push_back(vCheck(streak.wakes >= 3 ? 1 : 0, tr(L"睡眠測試：闔蓋 10 分鐘再喚醒，3 次"),
+            streak.wakes >= 3 ? std::wstring() : tr(L"當機常發生在睡眠與喚醒前後。每次順利喚醒會自動計數。"), std::to_wstring(std::min<DWORD>(streak.wakes, 3)) + L"/3"));
+        steps.push_back(vCheck(streak.restarts >= 1 ? 1 : 0, tr(L"正常重新啟動 1 次"), std::wstring(), std::to_wstring(std::min<DWORD>(streak.restarts, 1)) + L"/1"));
+        steps.push_back(vCheck(quiet >= 3 * 86400 ? 1 : 0, tr(L"連續 3 天沒有當機"), std::wstring(), quiet ? durationText(quiet) : std::wstring()));
+    }
+    if (dumpFailures) steps.push_back(vCheck(-1, tr(L"查 SSD 韌體有沒有新版"), std::to_wstring(dumpFailures) + tr(L" 次當機時 Windows 寫不進系統磁碟。到 SSD 廠商網站確認韌體，並備份重要資料。")));
+    for (auto a : areas) {
+        if (a == Area::storage && dumpFailures) continue; // said above
+        if (a == Area::unknown || a == Area::freeze) continue;
+        std::wstring hint = areaHint(a);
+        const size_t colon = hint.find(english ? L": " : L"：");
+        if (colon != std::wstring::npos) hint = hint.substr(colon + (english ? 2 : 1));
+        steps.push_back(vCheck(-1, areaName(a), hint));
+    }
+    return steps;
+}
 void showStabilityPage() {
     using namespace bs::stability;
     const auto list = stabilityIncidents();
     const uint64_t now = nowUtc(), since = now - 30ull * 86400 * Second;
     std::vector<VBlock> v;
-    v.push_back(vHeading(tr(L"最近 30 天")));
+    if (auto banner = stabilityBanner(false)) v.push_back(std::move(*banner));
+    // Thirty days at a glance.
     {
-        int counts[int(Kind::count)]{};
-        for (const auto& i : list) if (i.when() >= since) ++counts[int(i.kind)];
-        const int shutdowns = counts[int(Kind::powerLoss)] + counts[int(Kind::forcedOff)] + counts[int(Kind::batteryEmpty)];
-        std::vector<std::pair<std::wstring, COLORREF>> chips;
-        auto chip = [&](const std::wstring& label, int n, bool bad) { chips.push_back({label + L" " + std::to_wstring(n), n && bad ? theme.warn : n ? COLORREF(0) : Green}); };
-        chip(tr(L"藍屏"), counts[int(Kind::blueScreen)], true);
-        chip(tr(L"意外關機"), shutdowns, true);
-        chip(tr(L"凍結"), counts[int(Kind::freeze)], true);
-        chip(tr(L"顯示重置"), counts[int(Kind::graphicsReset)], true);
-        if (counts[int(Kind::hardwareError)]) chip(tr(L"硬體錯誤"), counts[int(Kind::hardwareError)], true);
-        if (counts[int(Kind::diskError)]) chip(tr(L"磁碟錯誤"), counts[int(Kind::diskError)], false);
-        if (counts[int(Kind::appCrash)] + counts[int(Kind::appHang)]) chip(L"BatteryScope", counts[int(Kind::appCrash)] + counts[int(Kind::appHang)], true);
-        v.push_back(vChips(std::move(chips)));
-        if (!counts[int(Kind::blueScreen)] && !shutdowns && !counts[int(Kind::freeze)] && !counts[int(Kind::graphicsReset)])
-            v.push_back(vNote(tr(L"最近 30 天沒有藍屏、意外關機或凍結。")));
+        TIME_ZONE_INFORMATION zone{}; const DWORD mode = GetTimeZoneInformation(&zone);
+        const int64_t offset = -int64_t(zone.Bias + (mode == TIME_ZONE_ID_DAYLIGHT ? zone.DaylightBias : zone.StandardBias)) * 60;
+        const auto marks = timeline(list, now, 30, offset);
+        std::vector<double> cells;
+        for (const auto& m : marks) cells.push_back(m.severity * 16 + std::min(m.count, 15));
+        int crashes = 0, others = 0;
+        for (const auto& i : list) if (i.when() >= since) { if (tookSystemDown(i.kind)) ++crashes; else if (bs::stability::severity(i.kind) == 2) ++others; }
+        const std::wstring total = crashes || others ? std::to_wstring(crashes) + tr(L" 次當機") + (others ? L" · " + std::to_wstring(others) + tr(L" 次凍結或重置") : std::wstring()) : std::wstring(tr(L"沒有事件"));
+        const std::wstring first = localTimeText(now - 29ull * 86400 * Second).substr(5, 5);
+        v.push_back(vTimeline(tr(L"最近 30 天"), total, std::move(cells), first, tr(L"今天")));
+        v.push_back(vLegend({{tr(L"當機"), theme.danger}, {tr(L"凍結或顯示重置"), theme.warn}, {tr(L"其他記錄"), blend(Muted, Surface, .25)}}));
+        const auto streak = stableStreak();
+        if (crashes && streak.since && now > streak.since)
+            v.push_back(vChips({{tr(L"距上次當機 ") + durationText((now - streak.since) / Second), 0}, {tr(L"順利喚醒 ") + std::to_wstring(streak.wakes) + tr(L" 次"), streak.wakes ? Green : COLORREF(0)},
+                {tr(L"順利重開 ") + std::to_wstring(streak.restarts) + tr(L" 次"), streak.restarts ? Green : COLORREF(0)}}));
     }
-    std::set<bs::stability::Area> areas;
+    if (auto steps = stabilitySteps(list); !steps.empty()) {
+        v.push_back(vHeading(tr(L"下一步")));
+        for (auto& step : steps) v.push_back(std::move(step));
+    }
     int listed = 0;
     for (const auto& i : list) {
-        if (i.when() < since || listed >= 8) continue;
+        if (i.when() < since || listed >= 6) continue;
         if (!listed) v.push_back(vHeading(tr(L"最近的問題")));
         ++listed;
-        const bool bad = serious(i.kind);
-        v.push_back(vChips({{shortTime(i.when()), 0}, {incidentTitle(i), bad ? theme.warn : COLORREF(0)}}));
-        const std::wstring lines = incidentLines(i);
-        if (!lines.empty()) v.push_back(vNote(lines));
-        if (bad || i.kind == Kind::diskError) areas.insert(incidentArea(i));
-        if (i.dumpFailed) areas.insert(bs::stability::Area::storage);
+        v.push_back(vCard(incidentTitle(i), relativeTime(i.when()), incidentCardText(i), incidentTone(i)));
     }
-    const auto drivers = (demo || isolatedPreview) ? std::vector<std::pair<std::wstring, std::wstring>>{{L"nipcibrd.sys", L"National Instruments PCI bridge driver"}}
-        : knownTroubleDrivers();
-    if (!drivers.empty()) {
-        v.push_back(vHeading(tr(L"可能有關的驅動")));
-        std::wstring names;
-        for (const auto& d : drivers) names += (names.empty() ? L"" : L"、") + d.first;
-        v.push_back(vNote(names + tr(L"：National Instruments（LabVIEW／PXI）的 PCI 橋接驅動，掛在所有 PCI 橋接器上（包括 SSD 所在的那一個），已知會在睡眠與喚醒時造成 0x9F 藍屏。用不到 NI 的硬體時，請用 NI Package Manager 移除「PXI Platform Services」或 NI 的 PCI 橋接驅動；不要直接停用，可能導致無法開機。")));
-    }
-    if (!areas.empty()) {
-        v.push_back(vHeading(tr(L"可能的方向")));
-        for (auto a : areas) v.push_back(vNote(areaHint(a)));
+    v.push_back(vHeading(tr(L"防護")));
+    v.push_back(vToggle(tr(L"保護模式"), tr(L"只監測；不自動改任何設定"), protectState != 0, ProtectToggleId));
+    {
+        const uint64_t blocked = writeGuard().blockedWrites();
+        v.push_back(vNote(tr(L"睡眠、喚醒、闔蓋、關機與剛開機的那幾秒，一律不寫入任何設定。偵測到當機時會自動進入保護模式。") +
+            (blocked ? tr(L"這次執行已擋下 ") + std::to_wstring(blocked) + tr(L" 次寫入。") : std::wstring())));
     }
     v.push_back(vHeading(tr(L"回報給開發者")));
     v.push_back(vAction(tr(L"建立回報包"), stab::reportBusy ? tr(L"建立中…") : tr(L"存到桌面並複製摘要"), ReportId, Green));
     v.push_back(vAction(tr(L"含藍屏傾印檔的回報"), tr(L"需要管理員權限"), ReportFullId));
-    v.push_back(vAction(tr(L"記錄剛剛發生的問題"), tr(L"卡頓、閃退或異常時按"), MarkProblemId));
+    v.push_back(vAction(tr(L"記錄剛剛發生的問題"), tr(L"卡頓或異常時按"), MarkProblemId));
     v.push_back(vAction(tr(L"開啟記錄資料夾"), L"", StabilityFolderId));
     v.push_back(vNote(stabilityStatusNote()));
     showChartPage(InlinePage::stability, tr(L"穩定性"), stabilitySummary(), std::move(v));
 }
-// The performance page's line about stability: a warning when something happened this week.
+// The home page's stability line when all is well (a banner takes its place otherwise).
 std::optional<VBlock> stabilityRow(bool warningsOnly) {
+    if (warningsOnly) return stabilityBanner(true);
     using namespace bs::stability;
-    const auto list = stabilityIncidents();
-    const uint64_t since = nowUtc() - 7ull * 86400 * Second;
-    int count = 0; const Incident* latest = nullptr;
-    for (const auto& i : list) if (i.when() >= since && serious(i.kind) && i.kind != Kind::appHang) { ++count; if (!latest) latest = &i; }
-    if (count) return vAction(tr(L"穩定性 · 7 天 ") + std::to_wstring(count) + tr(L" 次"), incidentTitle(*latest), StabilityPageId, theme.warn);
-    if (warningsOnly) return std::nullopt;
+    const auto streak = stableStreak();
+    const uint64_t now = nowUtc();
+    if (streak.since && now > streak.since && now - streak.since < 30ull * 86400 * Second)
+        return vAction(tr(L"穩定性與問題回報"), tr(L"已 ") + durationText((now - streak.since) / Second) + tr(L" 沒有當機"), StabilityPageId);
     return vAction(tr(L"穩定性與問題回報"), tr(L"正常"), StabilityPageId);
 }
 
@@ -6057,13 +6378,21 @@ void addIncidents(const std::vector<bs::stability::Incident>& found, uint64_t no
         bs::stability::saveIncidents(stab::incidents);
         for (const auto& i : added) if (i.time >= notifyAfter) stab::news.push_back(i);
     }
+    // A crash newer than any seen before: the stable streak starts over, and when it is fresh
+    // (within a day) protection mode comes on.
+    uint64_t newest = 0;
+    for (const auto& i : added) if (bs::stability::tookSystemDown(i.kind)) newest = std::max(newest, i.when());
+    if (newest > readQwordSetting(L"CrashSeen")) {
+        writeQwordSetting(L"CrashSeen", newest); writeSetting(L"WakesOk", 0); writeSetting(L"RestartsOk", 0);
+        if (bs::stability::nowUtc() - newest < 86400 * bs::stability::Second && mainWindow) PostMessageW(mainWindow, StabilityMessage, 3, 0);
+    }
     if (!added.empty() && mainWindow) PostMessageW(mainWindow, StabilityMessage, 0, 0);
 }
 void scanEvents(bool first) {
     using namespace bs::stability;
     const uint64_t now = nowUtc();
     const uint64_t last = stab::lastScanUtc.load();
-    const uint64_t since = last ? last - 15 * 60 * Second : now - 30ull * 86400 * Second;
+    const uint64_t since = last ? last - 15 * 60 * Second : now - 60ull * 86400 * Second;
     auto found = incidentsFromEvents(readEvents(since, false));
     const auto records = blackBox().records();
     const uint64_t boot = bootUtc();
@@ -6097,7 +6426,7 @@ void stabilityLoop() {
     // Keep this thread at full speed even when the process gets EcoQoS.
     struct { ULONG version, controlMask, stateMask; } throttling{1, 0x1 /* execution speed */, 0 /* off */};
     SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &throttling, sizeof(throttling));
-    uint64_t nextScan = GetTickCount64() + 15000;
+    uint64_t nextScan = GetTickCount64() + 1500; // early: a crash found here turns protection mode on before anything is written
     bool firstScan = true, hung = false, hangDumped = false;
     uint64_t hangStart = 0, lastStallTick = 0, lastPing = 0;
     ULONGLONG lastUnbiased = 0; QueryUnbiasedInterruptTime(&lastUnbiased);
@@ -6123,7 +6452,9 @@ void stabilityLoop() {
         }
         // The panel's thread: pinged every 2 seconds; 30 seconds without an answer is a hang.
         if (tick - lastPing >= 2000 && mainWindow) { PostMessageW(mainWindow, StabilityPingMessage, 0, 0); lastPing = tick; }
-        const uint64_t silent = tick - stab::uiBeatMs;
+        // The panel may answer the ping before this line runs: its beat can be newer than `tick`.
+        const uint64_t beat = stab::uiBeatMs;
+        const uint64_t silent = tick > beat ? tick - beat : 0;
         if (!hung && silent > 30000 && stab::screenOn && tick - stab::powerChangeMs > 60000 && tick - lastStallTick > 60000) {
             hung = true; hangStart = tick - silent;
             note(L"hang ui " + std::to_wstring(silent / 1000) + L"s");
@@ -6133,6 +6464,7 @@ void stabilityLoop() {
                 SYSTEMTIME t{}; GetLocalTime(&t);
                 wchar_t name[64]; swprintf(name, 64, L"\\hang-%04u%02u%02u-%02u%02u%02u.dmp", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
                 writeOwnDump(folder() + name, uiThread);
+                QueryUnbiasedInterruptTime(&lastUnbiased); // this thread's own work is not a system stall
             }
         } else if (hung && silent < 5000) {
             hung = false;
@@ -6144,7 +6476,8 @@ void stabilityLoop() {
         }
         if (tick >= nextScan || stab::rescan.exchange(false)) {
             scanEvents(firstScan);
-            firstScan = false;
+            firstScan = false; stab::firstScanDone = true;
+            QueryUnbiasedInterruptTime(&lastUnbiased); // reading the records took time of its own: not a system stall
             nextScan = tick + 15 * 60 * 1000;
         }
     }
@@ -6170,6 +6503,11 @@ void startStability() {
         stab::lastScanUtc = 0;
         writeSetting(L"StabilityFormat", 2);
     }
+    protectState = int(std::min<DWORD>(2, readSetting(L"Protect", 0)));
+    // A restart or shutdown that went well counts toward the stable streak.
+    if (stab::previous.ending == Ending::clean && !stab::previousRecords.empty() && stab::previousRecords.back().text == L"exit shutdown"
+        && bootUtc() > stab::previousRecords.back().time) writeSetting(L"RestartsOk", readSetting(L"RestartsOk", 0) + 1);
+    stab::startedAtMs = GetTickCount64();
     stab::uiBeatMs = stab::powerChangeMs = GetTickCount64();
     stab::powerChangeMs = GetTickCount64() - 60000; // a fresh start is not a power change
     stab::started = stab::running = true;
@@ -6180,6 +6518,40 @@ void stopStability(const wchar_t* why) {
     bs::stability::blackBox().write(std::wstring(L"exit ") + why);
     stab::running = false;
     stab::waitCv.notify_all();
+}
+// Protection mode: BatteryScope only watches. Dynamic saving, the automatic refresh rate and
+// GPU mode, the low-battery switch, keyboard dimming, experiments and the remembered ASUS
+// settings all stay off until it is switched off again. What you choose by hand still works.
+void setProtect(int state) {
+    if (state == protectState) return;
+    const bool was = protectState != 0;
+    protectState = state;
+    writeSetting(L"Protect", DWORD(state));
+    bs::stability::note(state ? (state == 2 ? L"protect on (crash)" : L"protect on") : L"protect off");
+    if (state && !was) {
+        // Hand back what was changed automatically.
+        if (labController && labController->status().running) labController->stop();
+        if (dynamicEnabled) { stopGovernor(); governor.releaseAll(); }
+        if (autoApplied != AutoMode::none) { undoAutoOverrides(); autoApplied = AutoMode::none; saveAutoOverrides(); }
+        if (keyboardDimmed) { bs::asus::setKeyboardBacklight(keyboardBefore); keyboardDimmed = false; }
+        if (state == 2) {
+            // Switched on by a crash: say so, with the crash it follows.
+            std::wstring what;
+            {
+                std::lock_guard<std::mutex> lock(stab::mutex);
+                for (const auto& i : stab::incidents) if (bs::stability::tookSystemDown(i.kind)) { what = relativeTime(i.when()) + L" · " + incidentTitle(i) + tr(L"。"); break; }
+            }
+            showBalloon(tr(L"偵測到當機，已開啟保護模式"), what + tr(L"BatteryScope 暫時只監測、不自動調整任何設定。點此查看。"), BalloonTarget::stability);
+        } else setNotice(tr(L"保護模式已開啟：只監測，不自動調整任何設定。"));
+    } else if (!state) {
+        setNotice(tr(L"保護模式已關閉：自動調整恢復。"));
+        reapplyAsus();
+        if (dynamicEnabled) governorTick();
+    }
+    refreshPowerButton();
+    if (inlinePage == InlinePage::stability) showStabilityPage();
+    else if (inlinePage == InlinePage::performance) showPerformancePage();
+    else if (inlinePage == InlinePage::goal) showGoalPage();
 }
 void markProblem() {
     using namespace bs::stability;
@@ -6429,6 +6801,7 @@ std::vector<MenuItem> mainMenuItems() {
     tools.push_back(menuItem(MiniToggleId, tr(L"迷你浮動視窗"), miniEnabled));
     items.push_back(submenu(tr(L"工具"), tools));
     items.push_back(menuItem(StabilityPageId, tr(L"穩定性與問題回報")));
+    items.push_back(menuItem(ProtectToggleId, tr(L"保護模式（只監測）"), protectState != 0, preview));
     items.push_back(menuItem(MarkProblemId, tr(L"記錄剛剛發生的問題"), false, preview));
     items.push_back(menuSeparator());
     if (hidden) items.push_back(menuItem(TrayShow, tr(L"顯示面板"))); // from the tray icon
@@ -6569,10 +6942,21 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             if (asusAvailable) {
                 // 0.18 kept the charge limit in the main settings; it now lives with the other ASUS settings.
                 if (const DWORD old = readSetting(L"ChargeLimit", 0)) { if (!bs::asus::remembered().chargeLimit) bs::asus::setChargeLimit(old); writeSetting(L"ChargeLimit", 0); }
-                reapplyAsus(); asusKeys.start(window, AsusKeyMessage); updateKeyboardTimer(); updateFnKeys();
+                asusKeys.start(window, AsusKeyMessage); updateKeyboardTimer(); updateFnKeys();
             }
-            restoreGovernorAfterCrash(); loadAppRules(); refreshDetectorRules(); updateSensing();
+            loadAppRules(); refreshDetectorRules(); updateSensing();
+            // The screen and the lid, for the write guard and the black box.
+            constexpr GUID ConsoleDisplayState = {0x6FE69556, 0x704A, 0x47A0, {0x8F, 0x24, 0xC2, 0x8D, 0x93, 0x6F, 0xDA, 0x47}};
+            constexpr GUID LidSwitchState = {0xBA3E0F4D, 0xB817, 0x4094, {0xA2, 0xD1, 0xD5, 0x63, 0x79, 0xE6, 0xA0, 0xF3}};
+            displayNotify = RegisterPowerSettingNotification(window, &ConsoleDisplayState, DEVICE_NOTIFY_WINDOW_HANDLE);
+            lidNotify = RegisterPowerSettingNotification(window, &LidSwitchState, DEVICE_NOTIFY_WINDOW_HANDLE);
+            // Restores and the remembered ASUS settings wait until the start has settled: 8 seconds,
+            // or 25 when Windows itself has only just started (launch at sign-in).
+            const uint64_t settle = GetTickCount64() < 180000 ? 25000 : 8000;
+            bs::stability::writeGuard().settle(GetTickCount64(), settle);
+            SetTimer(window, StartupTimer, UINT(settle), nullptr);
         }
+        else startupSettled = true; // previews write nothing anyway
         if (demo || isolatedPreview) asusAvailable = true; // the preview shows the hardware menu
         return 0;
     }
@@ -6607,7 +6991,25 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (wp == GovernorTimer) { governorTick(); return 0; }
         if (wp == KeyboardTimer) { keyboardTick(); return 0; }
         if (wp == StabilityTimer) { writeHeartbeat(); return 0; }
-        if (wp == AsusTimer) { KillTimer(window, AsusTimer); reapplyAsus(); asusKeys.stop(); asusKeys.start(window, AsusKeyMessage); return 0; }
+        if (wp == AsusTimer) {
+            KillTimer(window, AsusTimer);
+            if (autoWritesPaused() && !protectState) { SetTimer(window, AsusTimer, 5000, nullptr); return 0; }
+            reapplyAsus(); asusKeys.stop(); asusKeys.start(window, AsusKeyMessage); return 0;
+        }
+        if (wp == StartupTimer) {
+            KillTimer(window, StartupTimer);
+            // Wait for the guard, and for the first look at Windows' crash records (at most 30 seconds):
+            // after a crash, protection mode must be on before anything is written.
+            if (bs::stability::writeGuard().automaticBlocked(GetTickCount64()) ||
+                (stab::started && !stab::firstScanDone && GetTickCount64() - stab::startedAtMs < 30000)) { SetTimer(window, StartupTimer, 2000, nullptr); return 0; }
+            // What a crash left changed goes back first; then the automatic work may begin.
+            restoreGovernorAfterCrash();
+            labRestoreNow = true; wake.notify_one();
+            startupSettled = true;
+            bs::stability::note(L"start settled");
+            reapplyAsus();
+            return 0;
+        }
         break;
     case WM_SYSCOLORCHANGE:
     case WM_THEMECHANGED:
@@ -6860,6 +7262,11 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (id == HardwarePageId) { showMain(); showHardwarePage(); return 0; }
         if (id == PerfPageId) { showMain(); showPerformancePage(); return 0; }
         if (id == StabilityPageId) { showMain(); showStabilityPage(); return 0; }
+        if (id == ProtectToggleId) { if (!demo && !isolatedPreview) setProtect(protectState ? 0 : 1); else setNotice(tr(L"示範模式不會變更設定。")); return 0; }
+        if (protectState && ((id >= LabExperimentId && id < LabExperimentId + bs::lab::ManualKnobs) || id == LabAutoId || id == LabAutoStartId || id == LabQuickId || id == LabQuickStartId)) {
+            setNotice(tr(L"保護模式開著：不會執行實驗。先到「穩定性」關閉保護模式。"));
+            return 0;
+        }
         if (id == ReportId || id == ReportFullId) { buildReport(id == ReportFullId); return 0; }
         if (id == MarkProblemId) { showMain(); markProblem(); return 0; }
         if (id == StabilityFolderId) { const auto dir = bs::stability::folder(); if (!dir.empty()) ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL); return 0; }
@@ -7192,10 +7599,18 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case AsusKeyMessage: handleAsusKey(unsigned(wp), lp != 0); return 0;
     case StabilityPingMessage: stab::uiBeatMs = GetTickCount64(); return 0;
     case StabilityMessage:
-        if (wp == 2) finishReport(lp != 0); else notifyStability();
+        if (wp == 2) finishReport(lp != 0);
+        else if (wp == 3) { if (!protectState) setProtect(2); }
+        else notifyStability();
         return 0;
+    case WM_QUERYENDSESSION:
+        // Signing out, restarting or shutting down: from here on nothing is written.
+        bs::stability::writeGuard().hold(bs::stability::WriteGuard::shuttingDown);
+        bs::stability::note(L"shutdown asked");
+        return TRUE;
     case WM_ENDSESSION:
         if (wp) stopStability(L"shutdown"); // a restart or shutdown, not a crash
+        else { bs::stability::writeGuard().release(bs::stability::WriteGuard::shuttingDown, GetTickCount64(), 3000); bs::stability::note(L"shutdown cancelled"); }
         return 0;
     case TuningDoneMessage:
         setNotice(wp == ERROR_SUCCESS ? std::wstring(tr(L"風扇與功耗設定已套用。")) : wp == ERROR_NOT_SUPPORTED ? std::wstring(tr(L"這台電腦不支援這個設定。"))
@@ -7246,19 +7661,46 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
                 const bool wasOff = displayOff;
                 displayOff = *reinterpret_cast<const DWORD*>(setting->Data) == 0;
                 stab::screenOn = !displayOff;
-                if (wasOff != displayOff) { stab::powerChangeMs = GetTickCount64(); bs::stability::note(displayOff ? L"display off" : L"display on"); }
+                if (wasOff != displayOff) {
+                    const uint64_t tick = GetTickCount64();
+                    stab::powerChangeMs = tick;
+                    auto& guard = bs::stability::writeGuard();
+                    // Screen off is how Modern Standby begins: hands off until it is back, and a moment more.
+                    if (displayOff) { guard.hold(bs::stability::WriteGuard::screenOff); stab::screenOffAt = tick; }
+                    else {
+                        guard.release(bs::stability::WriteGuard::screenOff, tick, 5000);
+                        if (stab::screenOffAt && tick - stab::screenOffAt >= 5 * 60000) countWake(); // a sleep and wake that went well
+                    }
+                    bs::stability::note(displayOff ? L"display off" : L"display on");
+                }
                 PostMessageW(window, GovernorNowMessage, 0, 0);
+            }
+            constexpr GUID LidSwitchState = {0xBA3E0F4D, 0xB817, 0x4094, {0xA2, 0xD1, 0xD5, 0x63, 0x79, 0xE6, 0xA0, 0xF3}};
+            if (IsEqualGUID(setting->PowerSetting, LidSwitchState) && setting->DataLength >= sizeof(DWORD)) {
+                const bool open = *reinterpret_cast<const DWORD*>(setting->Data) != 0;
+                if (open != stab::lidOpen) {
+                    stab::lidOpen = open;
+                    bs::stability::note(open ? L"lid open" : L"lid closed");
+                    // Closing the lid usually leads to sleep within seconds: pause automatic writes
+                    // at once (with an external screen the PC stays up, so this is not a hold).
+                    bs::stability::writeGuard().settle(GetTickCount64(), open ? 5000 : 20000);
+                }
             }
             return TRUE;
         }
-        if (wp == PBT_APMSUSPEND) { stab::screenOn = false; stab::powerChangeMs = GetTickCount64(); bs::stability::note(L"suspend"); }
+        if (wp == PBT_APMSUSPEND) {
+            stab::screenOn = false; stab::powerChangeMs = GetTickCount64();
+            bs::stability::writeGuard().hold(bs::stability::WriteGuard::suspending);
+            bs::stability::note(L"suspend");
+        }
         if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND) {
             stab::powerChangeMs = GetTickCount64(); stab::screenOn = !displayOff;
-            if (wp == PBT_APMRESUMEAUTOMATIC) bs::stability::note(L"resume");
+            bs::stability::writeGuard().release(bs::stability::WriteGuard::suspending, GetTickCount64(), 10000);
+            if (wp == PBT_APMRESUMEAUTOMATIC) { bs::stability::note(L"resume"); countWake(); }
         }
         if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND || wp == PBT_APMPOWERSTATUSCHANGE) { resetSamples = true; wake.notify_one(); }
         // After sleep the firmware and the keyboard may have forgotten: set things again once they are awake.
-        if (wp == PBT_APMRESUMEAUTOMATIC && asusAvailable && !demo && !isolatedPreview) { asusReadAt = 0; SetTimer(window, AsusTimer, 3000, nullptr); }
+        if (wp == PBT_APMRESUMEAUTOMATIC && asusAvailable && !demo && !isolatedPreview) { asusReadAt = 0; SetTimer(window, AsusTimer, 10000, nullptr); }
         return TRUE;
     case PowerModeMessage:
         effectiveMode = EffectiveMode(wp);
@@ -7318,7 +7760,9 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_CLOSE: hideMain(); return 0;
     case WM_DESTROY: {
         KillTimer(window, MotionTimer); motionTimerRunning = false;
-        KillTimer(window, NoticeTimer); KillTimer(window, UpdateTimer); KillTimer(window, GovernorTimer); KillTimer(window, StabilityTimer);
+        KillTimer(window, NoticeTimer); KillTimer(window, UpdateTimer); KillTimer(window, GovernorTimer); KillTimer(window, StabilityTimer); KillTimer(window, StartupTimer);
+        if (displayNotify) { UnregisterPowerSettingNotification(displayNotify); displayNotify = nullptr; }
+        if (lidNotify) { UnregisterPowerSettingNotification(lidNotify); lidNotify = nullptr; }
         stopStability(L"quit");
         if (dynamicEnabled && !demo && !isolatedPreview) stopGovernor();
         dynamicEnabled = false; autoTestActive = false; updateSensing();
@@ -7671,14 +8115,39 @@ bool panelSelfTest(const std::wstring& path) {
     check("performance_page_is_its_own_tab", inlinePage == InlinePage::performance && activeTab() == Tab::performance && visibleTabs().front() == Tab::performance
         && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::segments && b.commands.size() >= 3; })
         && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::action && int(b.amount) == FanMenuId; }));
-    // The demo has a blue screen this week: the home page warns and links to the stability page.
+    // The demo has a blue screen this week: the home page shows a banner that leads to the stability page.
     check("performance_page_warns_of_recent_crashes", std::any_of(visualBlocks.begin(), visualBlocks.end(),
-        [](const VBlock& b) { return b.kind == VBlock::Kind::action && int(b.amount) == StabilityPageId; }));
+        [](const VBlock& b) { return b.kind == VBlock::Kind::banner && int(b.amount) == StabilityPageId; }));
     SendMessageW(mainWindow, WM_COMMAND, StabilityPageId, 0);
     auto stabilityAction = [](int id) { return std::any_of(visualBlocks.begin(), visualBlocks.end(), [id](const VBlock& b) { return b.kind == VBlock::Kind::action && int(b.amount) == id; }); };
+    auto countKind = [](VBlock::Kind kind) { return std::count_if(visualBlocks.begin(), visualBlocks.end(), [kind](const VBlock& b) { return b.kind == kind; }); };
     check("stability_page_lists_problems_and_offers_a_report", inlinePage == InlinePage::stability && activeTab() == Tab::performance
         && stabilityAction(ReportId) && stabilityAction(ReportFullId) && stabilityAction(MarkProblemId)
-        && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::note && b.text.find(L"UNEXPECTED_STORE_EXCEPTION") != std::wstring::npos; }));
+        && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::card && b.text.find(L"UNEXPECTED_STORE_EXCEPTION") != std::wstring::npos; }));
+    check("stability_page_has_timeline_steps_and_protection", countKind(VBlock::Kind::banner) == 1 && countKind(VBlock::Kind::timeline) == 1
+        && countKind(VBlock::Kind::check) >= 4 && countKind(VBlock::Kind::card) >= 3 && stabilityAction(ProtectToggleId)
+        && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::timeline && b.series.size() == 30 && int(b.series.back()) / 16 == 3; })
+        && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::check && b.toggle == 1; })
+        && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::check && b.toggle == 0; }));
+    {
+        // Every new block fits the view's width: nothing is drawn wider than the page.
+        RECT view{}; GetClientRect(visualView, &view);
+        HDC dc = GetDC(visualView);
+        bool sized = true;
+        for (size_t i = 0; i < visualBlocks.size(); ++i) sized = sized && blockHeight(dc, visualBlocks[i], view.right - sp(10), i == 0) > 0;
+        ReleaseDC(visualView, dc);
+        check("stability_blocks_have_heights", sized);
+    }
+    // Protection mode shows as a banner with the way out, on the stability page and at home.
+    protectState = 2;
+    showStabilityPage();
+    const bool protectOnPage = std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::banner && int(b.amount) == ProtectToggleId && b.toggle == 2; })
+        && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::action && int(b.amount) == ProtectToggleId && b.toggle == 1; });
+    showPerformancePage();
+    const bool protectAtHome = std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::banner && int(b.amount) == ProtectToggleId; });
+    check("protection_mode_shows_a_banner_with_the_way_out", protectOnPage && protectAtHome && autoWritesPaused());
+    protectState = 0;
+    showStabilityPage();
     {
         RECT client{}; GetClientRect(mainWindow, &client);
         const auto tabs = visibleTabs();
@@ -8141,9 +8610,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (screenshot && option(L"--dynamic")) showDynamicPage();
     if (screenshot && option(L"--goal")) showGoalPage();
     if (screenshot && option(L"--hardware")) showHardwarePage();
+    if ((screenshot || uiTest) && option(L"--protect")) protectState = 2;
     if (screenshot && option(L"--performance")) showPerformancePage();
     if (screenshot && option(L"--stability")) showStabilityPage();
     if (screenshot && option(L"--lab")) showLabPage();
+    // --page-scroll <n>: a chart page scrolled down by n (unscaled) pixels, to capture its lower part.
+    if (screenshot) for (size_t i = 0; i + 1 < args.size(); ++i) if (args[i] == L"--page-scroll") { visualScroll = sp(_wtoi(args[i + 1].c_str())); if (visualView) InvalidateRect(visualView, nullptr, FALSE); }
     if (demo) for (size_t i = 0; i + 1 < args.size(); ++i) if (args[i] == L"--popups-bmp") {
         const bool saved = capturePopups(args[i + 1]);
         DestroyWindow(window);

@@ -347,6 +347,9 @@ DWORD readKnob(Knob knob, DWORD& value) {
 std::vector<int> availableRefreshRates() { return refreshRates(); }
 DWORD applyKnob(Knob knob, DWORD value) {
     // Noted before the write: if the write takes the system down, the black box shows it.
+    // Nothing is written while the PC is going to sleep, the screen is off or it is shutting
+    // down. Turning the display back on is the one exception.
+    if (knob != Knob::display && stability::refuseWrite(std::wstring(L"knob ") + knobKey(knob) + L"=" + std::to_wstring(value))) return ERROR_NOT_READY;
     stability::note(std::wstring(L"knob ") + knobKey(knob) + L"=" + std::to_wstring(value));
     switch (knob) {
     case Knob::cpuBoost: return writeProcessor(BoostMode, value);
