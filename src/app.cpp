@@ -6312,7 +6312,8 @@ std::wstring controlDetail(const bs::verify::Result& r) {
         break;
     case Control::loadBaseline:
         if (r.before) t = tr(L"什麼都還沒改之前，全核心負載的 CPU 功耗是 ") + n(r.before, 1) + tr(L" W。這是後面比較的基準。");
-        if (r.after) t += *r.after > 0 ? tr(L"插電時 CPU Boost：開。") : tr(L"插電時 CPU Boost：關（電源計畫把它關掉了，時脈不會超過基準）。");
+        if (r.after && *r.after == 0) t = tr(L"你的電源計畫把 CPU Boost 關掉了（時脈不超過基準、比較涼也比較安靜）。檢查時暫時打開來量，量完已關回去。打開後的全核心負載：") + n(r.before, 1) + L" W";
+        else if (r.after) t += tr(L"CPU Boost：開。");
         break;
     case Control::powerRestore:
         if (r.verdict == Verdict::works) t = tr(L"還原後同樣的負載回到 ") + n(r.after, 1) + tr(L" W（原本 ") + n(r.before, 1) + tr(L" W）。");
