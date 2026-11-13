@@ -447,6 +447,34 @@ int wmain(int argc, wchar_t** argv) {
             void remember(lab::Knob, DWORD) override { remembered = true; }
             void forget() override { remembered = false; }
         };
+        {
+            // A setting that cannot be set (the G14's panel ignored the brightness call, and the quick
+            // test retried every 2 seconds for three hours): the step is given up and the plan goes on.
+            struct StuckActuator : FakeActuator {
+                int failures = 0; bool refuse = true;
+                DWORD apply(lab::Knob k, DWORD v) override {
+                    if (refuse && k == lab::Knob::brightness && v != 2) { ++failures; return ERROR_NOT_SUPPORTED; }
+                    return FakeActuator::apply(k, v);
+                }
+            };
+            auto stuck = std::make_shared<StuckActuator>();
+            lab::Controller plan(L"", stuck);
+            lab::Step bad; bad.knob = lab::Knob::brightness; bad.pairs = 1; bad.blockSeconds = 20; bad.warmupSeconds = 2; bad.minimumSeconds = 4;
+            lab::Step good = bad; good.knob = lab::Knob::cpuBoost;
+            check(plan.startPlan({bad, good}) == ERROR_SUCCESS, "a plan with an unsettable step starts");
+            uint64_t t = 1000;
+            for (int i = 0; i < 60 && plan.status().running; ++i) { lab::Sample s = labSample(t, 8, 3, 1, lab::Context::interactive); s.onBattery = true; plan.onSample(s, 2); t += 2000; }
+            const auto st = plan.status();
+            check(stuck->failures == 1 && st.skipped == 1 && st.step >= 1 && (st.running ? st.knob == lab::Knob::cpuBoost : st.finished),
+                "a setting that cannot be set is given up at once and restored; the plan moves on");
+            // One that is set but never holds is given up after five tries.
+            struct Slippery : FakeActuator { DWORD read(lab::Knob, DWORD& v) override { v = 99; return ERROR_SUCCESS; } };
+            auto slippery = std::make_shared<Slippery>();
+            lab::Controller single(L"", slippery);
+            single.start(lab::Knob::cpuBoost);
+            for (int i = 0; i < 20; ++i) { lab::Sample s = labSample(t, 8, 3, 1, lab::Context::interactive); s.onBattery = true; single.onSample(s, 2); t += 2000; }
+            check(!single.status().running && slippery->applied <= 8 && slippery->value == 2, "a setting that never holds ends the experiment after five tries, restored");
+        }
         auto fake = std::make_shared<FakeActuator>();
         lab::Controller controller(L"", fake);
         check(controller.start(lab::Knob::cpuBoost) == ERROR_SUCCESS && fake->remembered && controller.active(),
