@@ -5917,6 +5917,7 @@ std::wstring relativeTime(uint64_t utc) {
 }
 void setProtect(int state);
 bool controlKnownDead(bs::lab::Knob knob);
+bool powerPresetsBlocked();
 void startControlCheck();
 void finishControlCheck(std::vector<bs::verify::Result>* results);
 void loadControlResults();
@@ -6208,9 +6209,9 @@ uint64_t controlCheckedUtc = 0;
 std::vector<bs::verify::Result> demoControlResults() {
     using namespace bs::verify;
     auto r = [](Control c, Verdict v, std::optional<double> a = {}, std::optional<double> b = {}, int note = 0) { Result x; x.control = c; x.verdict = v; x.before = a; x.after = b; x.note = note; return x; };
-    return {r(Control::refreshRate, Verdict::works, 60, 120), r(Control::powerMode, Verdict::works, 0, 1), r(Control::cpuBoost, Verdict::works, 2, 0, onBatteryOnly),
+    return {r(Control::loadBaseline, Verdict::skipped, 58.4), r(Control::refreshRate, Verdict::works, 60, 120), r(Control::powerMode, Verdict::works, 0, 1), r(Control::cpuBoost, Verdict::works, 2, 0, onBatteryOnly),
         r(Control::energyPreference, Verdict::works, 60, 80), r(Control::brightness, Verdict::noEffect, 48, 48), r(Control::asusMode, Verdict::works, 31.5, 62.0),
-        r(Control::powerLimit, Verdict::works, 62.0, 24.8), r(Control::fanCurve, Verdict::writeOnly, {}, {}, needsTime), r(Control::gpuEco, Verdict::skipped, 1, {}, notToggled),
+        r(Control::powerLimit, Verdict::works, 62.0, 24.8), r(Control::powerRestore, Verdict::works, 62.0, 60.9), r(Control::fanCurve, Verdict::writeOnly, {}, {}, needsTime), r(Control::gpuEco, Verdict::skipped, 1, {}, notToggled),
         r(Control::chargeLimit, Verdict::skipped, {}, {}, needsTime), r(Control::keyboard, Verdict::writeOnly, {}, {}, lookAtIt)};
 }
 const std::vector<bs::verify::Result>& controlResultsNow() {
@@ -6229,6 +6230,11 @@ void loadControlResults() {
     controlCheckedUtc = readQwordSetting(L"ControlsAt");
 }
 // A setting found without effect here: tests leave it out.
+// The power limit was seen to stay in force after "factory" on this PC: the presets are not offered.
+bool powerPresetsBlocked() {
+    for (const auto& r : controlResults) if (r.control == bs::verify::Control::powerRestore) return r.verdict == bs::verify::Verdict::noEffect;
+    return false;
+}
 bool controlKnownDead(bs::lab::Knob knob) {
     using namespace bs::verify;
     const Control control = knob == bs::lab::Knob::brightness ? Control::brightness : knob == bs::lab::Knob::refreshRate ? Control::refreshRate :
@@ -6250,6 +6256,8 @@ const wchar_t* controlName(bs::verify::Control c) {
     case C::fanCurve: return tr(L"風扇曲線");
     case C::gpuEco: return tr(L"獨顯 Eco 開關");
     case C::chargeLimit: return tr(L"充電上限");
+    case C::loadBaseline: return tr(L"全核心負載（檢查前）");
+    case C::powerRestore: return tr(L"功耗上限還原");
     default: return tr(L"鍵盤背光");
     }
 }
@@ -6302,6 +6310,14 @@ std::wstring controlDetail(const bs::verify::Result& r) {
         else if (r.verdict == Verdict::noEffect) t = tr(L"電量已超過上限卻還在充電（上限 ") + n(r.before) + tr(L"%，目前 ") + n(r.after) + L"%）";
         else if (r.verdict != Verdict::unsupported) t = tr(L"韌體不回報上限，只能從充電行為判斷：設定上限後插電充到上限，再檢查一次。");
         break;
+    case Control::loadBaseline:
+        if (r.before) t = tr(L"什麼都還沒改之前，全核心負載的 CPU 功耗是 ") + n(r.before, 1) + tr(L" W。這是後面比較的基準。");
+        break;
+    case Control::powerRestore:
+        if (r.verdict == Verdict::works) t = tr(L"還原後同樣的負載回到 ") + n(r.after, 1) + tr(L" W（原本 ") + n(r.before, 1) + tr(L" W）。");
+        else if (r.verdict == Verdict::noEffect) t = tr(L"還原後只有 ") + n(r.after, 1) + tr(L" W（原本 ") + n(r.before, 1) + tr(L" W）：上限還留著。請重新開機清除；功耗上限選項已停用。");
+        else if (r.note == loadHeldBack) t = tr(L"功耗上限沒有量到效果，所以也無從確認還原。");
+        break;
     default: if (r.note == lookAtIt) t = tr(L"鍵盤不回報亮度；請直接看鍵盤背光有沒有跟著變。"); break;
     }
     if (r.verdict == Verdict::refused) t += std::wstring(t.empty() ? L"" : L" ") + tr(L"錯誤：") + errorText(r.status);
@@ -6325,6 +6341,7 @@ std::vector<VBlock> controlCheckBlocks() {
     for (const auto& r : results) {
         if (r.verdict == Verdict::unsupported) continue;
         const int box = r.verdict == Verdict::works ? 1 : r.verdict == Verdict::noEffect || r.verdict == Verdict::refused ? 0 : -1;
+        if (r.control == Control::loadBaseline) { v.push_back(vCheck(-1, controlName(r.control), controlDetail(r), r.before ? number(*r.before, 1) + L" W" : std::wstring())); continue; }
         v.push_back(vCheck(box, controlName(r.control), controlDetail(r), verdictName(r.verdict)));
     }
     v.push_back(vNote(tr(L"「有作用」是讀回或量測確認過的；「只能寫入」表示韌體接受了，但沒有辦法由程式確認效果。")));
@@ -6376,6 +6393,8 @@ void finishControlCheck(std::vector<bs::verify::Result>* results) {
         if (r.verdict != bs::verify::Verdict::unsupported) report += std::wstring(controlName(r.control)) + L": " + verdictName(r.verdict) + L" · " + controlDetail(r) + L"\n";
     }
     copyToClipboard(report + L"\n" + text);
+    if (powerPresetsBlocked())
+        showBalloon(tr(L"功耗上限沒有還原"), tr(L"檢查設下的 CPU 功耗上限還留著，電腦會變慢。請重新開機清除；這個選項已停用。"), BalloonTarget::stability);
     setNotice(tr(L"檢查完成：") + std::to_wstring(works) + tr(L" 項確認有作用") + (dead ? tr(L"，") + std::to_wstring(dead) + tr(L" 項沒有作用") : std::wstring()) + tr(L"。結果已複製，可以直接貼上。"));
     asusReadAt = 0;
     if (inlinePage == InlinePage::stability) showStabilityPage();
@@ -7476,6 +7495,10 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (id == FanMenuId || id == PowerLimitMenuId) {
             if (!asusAvailable) return 0;
             if (const int chosen = showMenu(id == FanMenuId ? fanMenuItems() : powerLimitMenuItems(), menuAnchor(), mainWindow)) SendMessageW(window, WM_COMMAND, chosen, 0);
+            return 0;
+        }
+        if (id > PowerPreset0Id && id <= PowerPreset0Id + 3 && powerPresetsBlocked()) {
+            setNotice(tr(L"這台電腦上功耗上限設了之後還原不回來，已停用這個選項。重新開機可以清除目前的上限。"));
             return 0;
         }
         if ((id >= FanPreset0Id && id <= FanPreset0Id + 3) || (id >= PowerPreset0Id && id <= PowerPreset0Id + 3)) {
