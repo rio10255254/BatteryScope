@@ -6380,8 +6380,13 @@ void addIncidents(const std::vector<bs::stability::Incident>& found, uint64_t no
     }
     // A crash newer than any seen before: the stable streak starts over, and when it is fresh
     // (within a day) protection mode comes on.
+    // (Looked up among all incidents, not only the new ones: a crash an earlier version already
+    // listed has not been seen by this logic yet.)
     uint64_t newest = 0;
-    for (const auto& i : added) if (bs::stability::tookSystemDown(i.kind)) newest = std::max(newest, i.when());
+    {
+        std::lock_guard<std::mutex> lock(stab::mutex);
+        for (const auto& i : stab::incidents) if (bs::stability::tookSystemDown(i.kind)) newest = std::max(newest, i.when());
+    }
     if (newest > readQwordSetting(L"CrashSeen")) {
         writeQwordSetting(L"CrashSeen", newest); writeSetting(L"WakesOk", 0); writeSetting(L"RestartsOk", 0);
         if (bs::stability::nowUtc() - newest < 86400 * bs::stability::Second && mainWindow) PostMessageW(mainWindow, StabilityMessage, 3, 0);

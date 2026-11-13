@@ -934,7 +934,7 @@ bool Controller::beginStep() {
             FILETIME now{}; GetSystemTimeAsFileTime(&now);
             run_ = ((uint64_t(now.dwHighDateTime) << 32) | now.dwLowDateTime) / 10000000ull + stepIndex_;
             schedule_ = Schedule(run_ * 2654435761ull);
-            block_ = 0; pairs_.clear(); prepareStart_ = 0; prepared_ = false;
+            block_ = 0; pairs_.clear(); prepareStart_ = 0; prepared_ = false; stepRepeats_ = 0;
             log(L"step " + std::to_wstring(stepIndex_ + 1) + L"/" + std::to_wstring(steps_.size()) + L" " + experimentKey(step.knob, step.workload) +
                 L": original " + std::to_wstring(plan.original) + L", arms " + std::to_wstring(plan.values[0]) + L" / " + std::to_wstring(plan.values[1]));
             return true;
@@ -979,6 +979,13 @@ void Controller::finishStep() {
     applied_ = false;
     log(L"step " + std::to_wstring(stepIndex_ + 1) + L" done, setting restored to " + std::to_wstring(plan_.original));
 }
+void Controller::abandonStep(const std::wstring& why) {
+    log(L"step " + std::to_wstring(stepIndex_ + 1) + L" " + experimentKey(knob_, steps_[stepIndex_].workload) + L" abandoned: " + why);
+    ++skipped_; stepRepeats_ = 0;
+    finishStep();
+    ++stepIndex_;
+    if (!beginStep()) finishRun(planMode_ && stepIndex_ >= steps_.size());
+}
 void Controller::finishRun(bool completed) {
     if (!running_) return;
     finishStep();
@@ -1017,19 +1024,37 @@ void Controller::onSample(Sample& s, double seconds) {
             prepared_ = true;
             const int arm = schedule_.armFor(block_);
             const DWORD expected = plan_.values[size_t(arm)];
+            bool abandoned = false;
             if (!applied_) {
                 lastError_ = actuator_->apply(knob_, expected);
                 if (paused_) log(L"on battery: resumed");
-                applied_ = true; paused_ = false;
-                recorder_.begin(block_ / 2, arm, s.ms, step.warmupSeconds, step.minimumSeconds);
+                if (lastError_ != ERROR_SUCCESS) {
+                    // The setting cannot be set here (a panel that ignores the brightness call, say):
+                    // there is nothing to compare. Trying again every sample would never end.
+                    abandonStep(L"cannot be set: error " + std::to_wstring(lastError_));
+                    abandoned = true;
+                } else {
+                    applied_ = true; paused_ = false;
+                    recorder_.begin(block_ / 2, arm, s.ms, step.warmupSeconds, step.minimumSeconds);
+                }
             } else {
                 DWORD actual = 0;
                 if (actuator_->read(knob_, actual) == ERROR_SUCCESS && actual != expected) {
                     // Another program (for example G-Helper) changed it: this block no longer measures the arm.
-                    ++externalChanges_; recorder_.invalidate(); actuator_->apply(knob_, expected);
+                    ++externalChanges_; recorder_.invalidate();
+                    const DWORD again = actuator_->apply(knob_, expected);
                     log(L"setting changed from outside to " + std::to_wstring(actual) + L"; block " + std::to_wstring(block_) + L" will be repeated");
-                }
+                    // It will not hold: give the step up after five tries in a row, or when it cannot be set again.
+                    if (again != ERROR_SUCCESS || ++stepRepeats_ >= 5) {
+                        lastError_ = again != ERROR_SUCCESS ? again : ERROR_RETRY;
+                        abandonStep(again != ERROR_SUCCESS ? L"cannot be set again: error " + std::to_wstring(again) : std::wstring(L"the setting does not hold"));
+                        abandoned = true;
+                    }
+                } else stepRepeats_ = 0;
             }
+            if (abandoned) {
+                if (!running_) return;
+            } else {
             s.arm = arm;
             s.counted = recorder_.add(s, seconds);
             if (s.ms >= recorder_.startMs() && (s.ms - recorder_.startMs()) / 1000.0 >= step.blockSeconds) {
@@ -1051,6 +1076,7 @@ void Controller::onSample(Sample& s, double seconds) {
                     ++stepIndex_;
                     if (!beginStep()) finishRun(true);
                 }
+            }
             }
         }
     }

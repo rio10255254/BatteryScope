@@ -316,6 +316,8 @@ private:
     Schedule schedule_{1};
     uint64_t run_ = 0;
     int block_ = 0, externalChanges_ = 0;
+    int stepRepeats_ = 0;         // times in a row this step's setting did not hold
+    void abandonStep(const std::wstring& why); // a setting that cannot be set: restore, move on
     std::map<int, std::array<bool, 2>> pairs_;
     BlockRecorder recorder_;
     DWORD lastError_ = ERROR_SUCCESS;
