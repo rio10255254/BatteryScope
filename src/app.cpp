@@ -72,7 +72,7 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     RefreshAutoId = 266, DarkModeId = 267, AutoSaverCycleId = 268, PerfPageId = 269, FanMenuId = 270, PowerLimitMenuId = 271,
     FanPreset0Id = 272 /* ..275 */, PowerPreset0Id = 276 /* ..279 */, CpuBoostToggleId = 280, WinModeMenuId = 281,
     StabilityPageId = 282, ReportId = 283, ReportFullId = 284, MarkProblemId = 285, StabilityFolderId = 286, ProtectToggleId = 287, VerifyControlsId = 288,
-    SettingsListId = 300,
+    SettingRowId = 300 /* ..329, one per settings row */,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1, FnKeyHotkey = 10 /* ..20: F1-F11 under the software Fn lock */;
 const wchar_t* ClassName = L"BatteryScope.Main.v1";
@@ -146,7 +146,6 @@ bool dynamicEnabled = false, dynamicRefresh = false, dynamicEco = true;
 unsigned dynamicTarget = 0;
 // Battery power goals in watts while in use and while still (0 = no goal).
 unsigned goalUse = 10, goalStill = 7;
-HWND settingsList = nullptr;
 BalloonTarget balloonTarget = BalloonTarget::none;  // what clicking the last notification opens
 bool sleepAlerts = true;          // notify after a sleep with unusual battery drain
 unsigned seenSleeps = 0;
@@ -408,6 +407,21 @@ RECT menuRow(const MenuState& state, int index, int width) {
     for (int i = 0; i < index; ++i) y += menuRowHeight(state.items()[size_t(i)]);
     return {menuPadding(), y, width - menuPadding(), y + menuRowHeight(state.items()[size_t(index)])};
 }
+// A chevron pointing down, for an opened fold.
+void drawDownArrow(HDC dc, int x, int y, int size, COLORREF color) {
+    if (pixelStyle) {
+        const int u = std::max(2, size / 4);
+        for (int i = 0; i < 3; ++i) {
+            fill(dc, {x + i * u, y + i * u, x + i * u + u, y + i * u + u}, color);
+            fill(dc, {x + (4 - i) * u, y + i * u, x + (4 - i) * u + u, y + i * u + u}, color);
+        }
+        return;
+    }
+    HPEN pen = CreatePen(PS_SOLID, std::max(1, sp(2)), color); HGDIOBJ old = SelectObject(dc, pen);
+    const int h = size / 2;
+    MoveToEx(dc, x, y, nullptr); LineTo(dc, x + h, y + h); LineTo(dc, x + size + 1, y - 1);
+    SelectObject(dc, old); DeleteObject(pen);
+}
 void drawMenuArrow(HDC dc, int x, int y, int size, COLORREF color, bool left) {
     // A small chevron; pixel style draws it from square cells.
     if (pixelStyle) {
@@ -625,7 +639,7 @@ struct VBar {
     std::vector<VSegment> segments;     // stacked parts instead of one fill
 };
 struct VBlock {
-    enum class Kind { heading, note, meter, bars, series, chips, legend, action, segments, banner, timeline, card, check } kind = Kind::note;
+    enum class Kind { heading, note, meter, bars, series, chips, legend, action, segments, banner, timeline, card, check, fold } kind = Kind::note;
     std::wstring title, text, value;
     double amount = 0, goal = 0, scale = 0;
     std::vector<VBar> bars;
@@ -681,7 +695,13 @@ VBlock vCheck(int state, const std::wstring& title, const std::wstring& detail =
     VBlock b; b.kind = VBlock::Kind::check; b.toggle = state; b.title = title; b.text = detail; b.value = badge; return b;
 }
 
+// Explanations kept out of the way: a row that opens to show its text, and closes again.
+VBlock vFold(const std::wstring& title, const std::wstring& text) {
+    VBlock b; b.kind = VBlock::Kind::fold; b.title = title; b.text = text; return b;
+}
+
 HWND visualView = nullptr;
+constexpr int FoldCommand = -7001; // a hit that opens or closes its fold instead of sending a command
 std::vector<VBlock> visualBlocks;
 int visualScroll = 0, visualContent = 0, visualDragOffset = -1;
 // Action rows as last painted (view coordinates) and the one under the mouse or keyboard focus.
@@ -708,8 +728,13 @@ int noteHeight(HDC dc, const std::wstring& text, int width) {
     DrawTextW(dc, text.c_str(), -1, &r, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
     return r.bottom + sp(8);
 }
+// Folds: which are open (by title, for the session), and how far each has opened.
+std::set<std::wstring> visualFoldsOpen;
+std::map<std::wstring, Transition> visualFolds;
+double foldAmount(const VBlock& b, double now);
 int blockHeight(HDC dc, const VBlock& b, int width, bool first) {
     switch (b.kind) {
+    case VBlock::Kind::fold: return sp(40) + int(std::lround(foldAmount(b, motionNow()) * (noteHeight(dc, b.text, width - sp(24)) + sp(8))));
     case VBlock::Kind::heading: return first ? sp(26) : sp(36);
     case VBlock::Kind::note: return noteHeight(dc, b.text, width);
     case VBlock::Kind::meter: return sp(48);
@@ -736,6 +761,10 @@ std::map<std::wstring, Transition> visualValues;          // bar and meter fract
 std::map<int, Transition> visualKnobs;                    // switches, by command
 std::map<size_t, Transition> visualHoverFade, visualPress; // rows, by block index
 bool visualAnimating = false, visualTimerOn = false;
+int visualEnterDir = 0;                                    // the page slides in from the right (1) or the left (-1); 0 rises
+std::map<std::wstring, std::pair<std::wstring, Transition>> visualPulse; // action rows: the value last shown, and a glow when it changes
+POINT visualMouse{-1, -1};                                 // the pointer over the view, for chart readouts
+std::vector<RECT> visualPlots;                             // charts as last painted
 double paintFade = 1;                                      // the block being painted, 0 (hidden) to 1
 COLORREF faded(COLORREF c) { return paintFade >= 1 ? c : blend(Surface, c, paintFade); }
 double easeOut(double t) { t = std::clamp(t, 0.0, 1.0); return 1 - (1 - t) * (1 - t) * (1 - t); }
@@ -755,6 +784,15 @@ double glide(const std::wstring& key, double target, double now) {
     auto& m = it->second;
     if (fresh) { m.from = m.to = target; m.duration = 0; }
     else if (std::abs(m.to - target) > .0005) m.move(target, now, canAnimate() ? 420 : 0);
+    if (m.active(now)) visualAnimating = true;
+    return m.value(now);
+}
+double foldAmount(const VBlock& b, double now) {
+    const double target = visualFoldsOpen.count(b.title) ? 1 : 0;
+    auto [it, fresh] = visualFolds.try_emplace(b.title);
+    auto& m = it->second;
+    if (fresh) { m.from = m.to = target; m.duration = 0; }
+    else if (std::abs(m.to - target) > .01) m.move(target, now, canAnimate() ? 240 : 0);
     if (m.active(now)) visualAnimating = true;
     return m.value(now);
 }
@@ -799,15 +837,18 @@ void paintVisual(HDC dc, RECT client) {
     visualAnimating = false;
     if (visualEnterAt >= 0 && now - visualEnterAt > 32.0 * 12 + 300) visualEnterAt = -1;
     int y = -visualScroll;
-    visualHits.clear();
+    visualHits.clear(); visualPlots.clear();
     // Each block draws with the shared colours faded by how far it has come in.
     const COLORREF inkBase = Ink, mutedBase = Muted, greenBase = Green, borderBase = Border, selectedBase = Selected, warnBase = theme.warn;
     for (size_t i = 0; i < visualBlocks.size(); ++i) {
         const auto& b = visualBlocks[i];
         const int h = blockHeight(dc, b, width, i == 0);
         const double appear = blockAppear(i, now);
-        const int rise = int(std::lround((1 - appear) * sp(14)));
+        // A page from another tab slides in from that side; anything else rises into place.
+        const int rise = visualEnterDir ? 0 : int(std::lround((1 - appear) * sp(14)));
+        const int slide = visualEnterDir * int(std::lround((1 - appear) * sp(26)));
         if (y + h < 0 || y > client.bottom) {
+            if (b.kind == VBlock::Kind::fold) visualHits.push_back({{0, y + sp(3), width, y + sp(37)}, FoldCommand, i});
             if (b.kind == VBlock::Kind::action) visualHits.push_back({{0, y + sp(3), width, y + h - sp(3)}, int(b.amount), i});
             if (b.kind == VBlock::Kind::banner && b.amount) visualHits.push_back({{0, y + sp(2), width, y + h - sp(8)}, int(b.amount), i});
             if (b.kind == VBlock::Kind::segments)
@@ -818,7 +859,34 @@ void paintVisual(HDC dc, RECT client) {
         Ink = faded(inkBase); Muted = faded(mutedBase); Green = faded(greenBase); Border = faded(borderBase); Selected = faded(selectedBase); theme.warn = faded(warnBase);
         const int top = y + rise;
         const COLORREF track = blend(Surface, Border, .75);
+        if (slide) SetViewportOrgEx(dc, slide, 0, nullptr);
         switch (b.kind) {
+        case VBlock::Kind::fold: {
+            // "About this page  v": a quiet row; its text unrolls beneath it.
+            const RECT row{0, top + sp(3), width, top + sp(37)};
+            const int index = int(visualHits.size());
+            visualHits.push_back({{0, y + sp(3), width, y + sp(37)}, FoldCommand, i});
+            const double open = foldAmount(b, now);
+            const double hot = std::max(fadeValue(visualHoverFade, i, now), index == visualFocus ? 1.0 : 0.0);
+            const double press = fadeValue(visualPress, i, now);
+            RECT face = row;
+            if (press > 0) InflateRect(&face, -int(std::lround(press * sp(2))), -int(std::lround(press * sp(1))));
+            if (hot > 0 || open > 0) rounded(dc, face, blend(Surface, Selected, (theme.highContrast ? 1.0 : .45) * std::max(hot, open * .35)), 8);
+            if (index == visualFocus && GetFocus() == visualView) outline(dc, face, Green, 8);
+            const COLORREF ink = blend(Muted, Ink, std::max(hot, open) * .6);
+            if (open > .5) drawDownArrow(dc, row.left + sp(10), (row.top + row.bottom) / 2 - sp(3), sp(10), ink);
+            else drawMenuArrow(dc, row.left + sp(12), (row.top + row.bottom) / 2 - sp(5), sp(10), ink, false);
+            drawText(dc, b.title, {row.left + sp(30), row.top, row.right - sp(8), row.bottom}, ink, normalFont);
+            if (open > 0) {
+                const int saved = SaveDC(dc);
+                IntersectClipRect(dc, 0, top + sp(40), width, top + h);
+                const int textHeight = noteHeight(dc, b.text, width - sp(24));
+                const COLORREF textInk = blend(Surface, Muted, open);
+                drawText(dc, b.text, {sp(12), top + sp(42), width - sp(12), top + sp(42) + textHeight}, textInk, smallFont, DT_LEFT | DT_WORDBREAK);
+                RestoreDC(dc, saved);
+            }
+            break;
+        }
         case VBlock::Kind::heading: {
             // A short accent mark leads each section.
             const int mid = top + h - sp(14);
@@ -903,11 +971,23 @@ void paintVisual(HDC dc, RECT client) {
                 // Columns, one per sample, coloured by whether they are over the goal; on opening they
                 // rise from left to right.
                 const double step = double(right - left) / double(b.series.size());
+                // Under the pointer a column lights up and the corner shows its value.
+                visualPlots.push_back({plot.left, y + sp(26), plot.right, y + sp(104)});
+                int pointed = -1;
+                if (visualMouse.x >= left && visualMouse.x < right && visualMouse.y >= y + sp(26) && visualMouse.y < y + sp(104) && appear >= 1)
+                    pointed = std::clamp(int((visualMouse.x - left) / step), 0, int(b.series.size()) - 1);
+                if (pointed >= 0) {
+                    const RECT label{width / 2, top, width, top + sp(20)};
+                    fill(dc, label, Surface);
+                    drawText(dc, number(b.series[size_t(pointed)], 1) + (b.text.empty() ? std::wstring(L" W") : b.text), label, Ink, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+                }
                 for (size_t k = 0; k < b.series.size(); ++k) {
                     const double sweep = std::clamp(appear * 1.6 - double(k) / double(b.series.size()) * .6, 0.0, 1.0);
                     const int x0 = left + int(k * step), x1 = std::max(x0 + 1, left + int((k + 1) * step) - (step > sp(3) ? 1 : 0));
                     const int hgt = int(std::clamp(b.series[k] / peak, 0.0, 1.0) * height * easeOut(sweep));
-                    fill(dc, {x0, bottom - hgt, x1, bottom}, b.goal > 0 && b.series[k] > b.goal ? blend(theme.warn, Surface, .15) : blend(Green, Surface, .15));
+                    const COLORREF column = b.goal > 0 && b.series[k] > b.goal ? blend(theme.warn, Surface, .15) : blend(Green, Surface, .15);
+                    if (int(k) == pointed) fill(dc, {x0, plot.top + sp(6), x1, bottom}, blend(Surface, Ink, .12));
+                    fill(dc, {x0, bottom - hgt, x1, bottom}, int(k) == pointed ? blend(column, Ink, .45) : pointed >= 0 ? blend(column, Surface, .35) : column);
                 }
                 if (b.goal > 0) {
                     const int gy = bottom - int(std::clamp(b.goal / peak, 0.0, 1.0) * height);
@@ -958,8 +1038,19 @@ void paintVisual(HDC dc, RECT client) {
                     const int pillWidth = std::min(width / 2, textWidth(dc, b.value, smallFont) + sp(16));
                     const RECT pill{right - pillWidth, row.top + sp(8), right, row.bottom - sp(8)};
                     const COLORREF tone = faded(COLORREF(b.goal));
-                    rounded(dc, pill, b.goal ? blend(tone, Surface, .72) : blend(Surface, Border, .6), 6);
-                    drawText(dc, b.value, pill, b.goal ? (theme.dark ? Ink : blend(tone, Ink, .5)) : Muted, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+                    // A value that just changed glows for a moment: the click was taken.
+                    auto [seen, fresh] = visualPulse.try_emplace(b.title);
+                    if (fresh) seen->second.first = b.value;
+                    else if (seen->second.first != b.value) {
+                        seen->second.first = b.value;
+                        auto& glow = seen->second.second;
+                        glow.from = 1; glow.to = 0; glow.started = now; glow.duration = canAnimate() ? 900 : 0; glow.tangent = 0;
+                    }
+                    const double glow = seen->second.second.value(now);
+                    if (seen->second.second.active(now)) visualAnimating = true;
+                    const COLORREF base = b.goal ? blend(tone, Surface, .72) : blend(Surface, Border, .6);
+                    rounded(dc, pill, blend(base, Green, glow * .55), 6);
+                    drawText(dc, b.value, pill, blend(b.goal ? (theme.dark ? Ink : blend(tone, Ink, .5)) : Muted, theme.dark ? Ink : Surface, glow * .6), smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
                     right = pill.left - sp(8);
                 }
             }
@@ -1103,11 +1194,25 @@ void paintVisual(HDC dc, RECT client) {
             break;
         }
         }
+        if (slide) SetViewportOrgEx(dc, 0, 0, nullptr);
         Ink = inkBase; Muted = mutedBase; Green = greenBase; Border = borderBase; Selected = selectedBase; theme.warn = warnBase;
         paintFade = 1;
         y += h;
     }
     visualContent = y + visualScroll;
+    // Content continuing past an edge fades into it, so a longer page shows there is more.
+    {
+        const int bands = 6, band = std::max(1, sp(3));
+        auto fadeEdge = [&](bool atTop) {
+            for (int k = 0; k < bands; ++k) {
+                const int offset = k * band;
+                const RECT strip = atTop ? RECT{0, offset, width, offset + band} : RECT{0, client.bottom - offset - band, width, client.bottom - offset};
+                ui::fillRound(dc, strip, Surface, 0, BYTE(230 - k * 36));
+            }
+        };
+        if (visualScroll > 0) fadeEdge(true);
+        if (visualContent - visualScroll > client.bottom + sp(2)) fadeEdge(false);
+    }
     // A thin scroll indicator on the right when the page is taller than the view.
     if (visualContent > client.bottom) {
         const int trackHeight = int(client.bottom), thumb = std::max(sp(24), trackHeight * trackHeight / visualContent);
@@ -1134,6 +1239,21 @@ void scrollVisualSmooth(int to) {
     armVisualTimer();
 }
 int visualScrollTarget() { return visualScrollMotion.active(motionNow()) ? int(std::lround(visualScrollMotion.to)) : visualScroll; }
+// Runs what a row stands for: a fold opens or closes in place, anything else is the panel's command.
+void activateVisualHit(HWND window, size_t index) {
+    const auto& hit = visualHits[index];
+    if (hit.command == FoldCommand) {
+        if (hit.block < visualBlocks.size()) {
+            const auto& title = visualBlocks[hit.block].title;
+            if (!visualFoldsOpen.erase(title)) visualFoldsOpen.insert(title);
+        }
+        armVisualTimer(); InvalidateRect(window, nullptr, FALSE);
+        return;
+    }
+    POINT anchor{hit.rect.left, hit.rect.bottom}; ClientToScreen(window, &anchor);
+    actionAnchor = anchor; actionAnchored = true;
+    PostMessageW(GetParent(window), WM_COMMAND, hit.command, 0);
+}
 LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     switch (message) {
     case WM_ERASEBKGND: return 1;
@@ -1179,6 +1299,12 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             return 0;
         }
         const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        {
+            bool onPlot = false, wasOnPlot = false;
+            for (const auto& plot : visualPlots) { onPlot |= PtInRect(&plot, pt) != 0; wasOnPlot |= PtInRect(&plot, visualMouse) != 0; }
+            visualMouse = pt;
+            if (onPlot || wasOnPlot) InvalidateRect(window, nullptr, FALSE);
+        }
         int hover = -1;
         for (size_t i = 0; i < visualHits.size(); ++i) if (PtInRect(&visualHits[i].rect, pt)) hover = int(i);
         if (hover != visualHover) {
@@ -1193,6 +1319,7 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (LOWORD(lp) == HTCLIENT && visualHover >= 0) { SetCursor(LoadCursorW(nullptr, IDC_HAND)); return TRUE; }
         break;
     case WM_MOUSELEAVE:
+        if (visualMouse.x >= 0) { visualMouse = {-1, -1}; InvalidateRect(window, nullptr, FALSE); }
         if (visualHover >= 0) {
             if (visualHover < int(visualHits.size())) setFade(visualHoverFade, visualHits[size_t(visualHover)].block, 0, 180);
             visualHover = -1; InvalidateRect(window, nullptr, FALSE);
@@ -1204,13 +1331,7 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (message == WM_LBUTTONUP && visualDragOffset < 0) {
             const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             for (size_t i = 0; i < visualHits.size(); ++i)
-                if (PtInRect(&visualHits[i].rect, pt)) {
-                    visualFocus = int(i);
-                    POINT anchor{visualHits[i].rect.left, visualHits[i].rect.bottom}; ClientToScreen(window, &anchor);
-                    actionAnchor = anchor; actionAnchored = true;
-                    PostMessageW(GetParent(window), WM_COMMAND, visualHits[i].command, 0);
-                    break;
-                }
+                if (PtInRect(&visualHits[i].rect, pt)) { visualFocus = int(i); activateVisualHit(window, i); break; }
         }
         visualDragOffset = -1; if (message == WM_LBUTTONUP) ReleaseCapture(); return 0;
     case WM_SETFOCUS: case WM_KILLFOCUS: InvalidateRect(window, nullptr, FALSE); return 0;
@@ -1225,11 +1346,7 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             else if (row.bottom > r.bottom) scrollVisual(visualScroll + row.bottom - r.bottom + sp(8));
             InvalidateRect(window, nullptr, FALSE);
         };
-        if ((wp == VK_RETURN || wp == VK_SPACE) && visualFocus >= 0 && visualFocus < int(visualHits.size())) {
-            POINT anchor{visualHits[size_t(visualFocus)].rect.left, visualHits[size_t(visualFocus)].rect.bottom}; ClientToScreen(window, &anchor);
-            actionAnchor = anchor; actionAnchored = true;
-            PostMessageW(GetParent(window), WM_COMMAND, visualHits[size_t(visualFocus)].command, 0);
-        }
+        if ((wp == VK_RETURN || wp == VK_SPACE) && visualFocus >= 0 && visualFocus < int(visualHits.size())) activateVisualHit(window, size_t(visualFocus));
         else if (wp == VK_ESCAPE) PostMessageW(GetParent(window), WM_COMMAND, IDCANCEL, 0);
         else if (wp == VK_DOWN && !visualHits.empty() && visualFocus + 1 < int(visualHits.size())) focusRow(visualFocus + 1);
         else if (wp == VK_UP && !visualHits.empty() && visualFocus > 0) focusRow(visualFocus - 1);
@@ -1252,7 +1369,8 @@ void showVisual(std::vector<VBlock> blocks, bool keepScroll) {
     if (!keepScroll) {
         visualScroll = 0; visualFocus = -1; visualHover = -1; visualScrollMotion.duration = 0;
         // A new page comes in: its blocks rise into place, bars grow, switches start where they are.
-        visualValues.clear(); visualKnobs.clear(); visualHoverFade.clear(); visualPress.clear();
+        visualValues.clear(); visualKnobs.clear(); visualHoverFade.clear(); visualPress.clear(); visualPulse.clear(); visualFolds.clear();
+        visualMouse = {-1, -1};
         visualEnterAt = canAnimate() ? motionNow() : -1;
         if (visualEnterAt >= 0) armVisualTimer();
     }
@@ -1724,7 +1842,7 @@ void applyTheme() {
     Surface = theme.surface; Border = theme.border; Selected = theme.selected; Danger = theme.danger;
     if (!mainWindow) return;
     const wchar_t* controls = theme.highContrast ? nullptr : theme.dark ? L"DarkMode_Explorer" : L"Explorer";
-    for (HWND control : {viewport, list, inlineText, settingsList}) if (control) SetWindowTheme(control, controls, nullptr);
+    for (HWND control : {viewport, list, inlineText}) if (control) SetWindowTheme(control, controls, nullptr);
     if (list) { ListView_SetBkColor(list, Background); ListView_SetTextBkColor(list, Background); ListView_SetTextColor(list, Ink); }
     if (tooltip) { SendMessageW(tooltip, TTM_SETTIPBKCOLOR, Surface, 0); SendMessageW(tooltip, TTM_SETTIPTEXTCOLOR, Ink, 0); }
     BOOL dark = theme.dark; DwmSetWindowAttribute(mainWindow, 20, &dark, sizeof(dark));
@@ -2270,7 +2388,6 @@ void layout() {
     const int textBottom = inlinePage == InlinePage::process ? h - sp(140) : section ? h - sp(24) : h - sp(94);
     MoveWindow(inlineText, margin + sp(12), textTop, inner - sp(24), std::max(sp(55), textBottom - textTop), TRUE);
     if (visualView) MoveWindow(visualView, margin + sp(12), textTop, inner - sp(24), std::max(sp(55), textBottom - textTop), TRUE);
-    if (settingsList) MoveWindow(settingsList, margin + sp(8), textTop - sp(4), inner - sp(16), std::max(sp(55), textBottom - textTop + sp(4)), TRUE);
     {
         const int pageLeft = margin + sp(12), pageWidth = inner - sp(24), pageHalf = (pageWidth - sp(8)) / 2;
         MoveWindow(ecoButton, pageLeft, h - sp(103), pageHalf, sp(32), TRUE);
@@ -2314,14 +2431,13 @@ void showInlinePage(InlinePage page, const std::wstring& title, const std::wstri
     ShowWindow(inlineText, page == InlinePage::settings ? SW_HIDE : SW_SHOW);
     ShowWindow(inlineBack, sectionPage(page) ? SW_HIDE : SW_SHOW); // sections are left through the tabs (or Esc)
     if (visualView) ShowWindow(visualView, SW_HIDE); // a chart page shows it again with showVisual
-    if (settingsList) ShowWindow(settingsList, page == InlinePage::settings ? SW_SHOW : SW_HIDE);
     ShowWindow(inlineConfirm, page == InlinePage::confirm ? SW_SHOW : SW_HIDE);
     for (HWND control : modeButtons) ShowWindow(control, page == InlinePage::powerMode ? SW_SHOW : SW_HIDE);
     for (HWND control : {ecoButton, perfAppButton}) ShowWindow(control, page == InlinePage::process ? SW_SHOW : SW_HIDE);
     for (HWND control : {restoreModesButton, energySettingsButton}) ShowWindow(control, page == InlinePage::powerMode ? SW_SHOW : SW_HIDE);
     SetWindowTextW(inlineBack, page == InlinePage::confirm ? tr(L"取消") : tr(L"返回排行"));
     layout();
-    HWND focus = page == InlinePage::confirm ? inlineBack : page == InlinePage::settings ? settingsList : inlineText;
+    HWND focus = page == InlinePage::confirm ? inlineBack : inlineText;
     if (page == InlinePage::powerMode) {
         focus = inlineBack;
         for (HWND control : modeButtons) if (IsWindowEnabled(control)) { focus = control; break; }
@@ -2333,7 +2449,6 @@ void finishInlineClose() {
     inlineClosing = false;
     ShowWindow(inlineText, SW_HIDE); ShowWindow(inlineBack, SW_HIDE); ShowWindow(inlineConfirm, SW_HIDE);
     if (visualView) ShowWindow(visualView, SW_HIDE);
-    if (settingsList) ShowWindow(settingsList, SW_HIDE);
     for (HWND control : modeButtons) ShowWindow(control, SW_HIDE);
     ShowWindow(restoreModesButton, SW_HIDE); ShowWindow(energySettingsButton, SW_HIDE);
     ShowWindow(ecoButton, SW_HIDE); ShowWindow(perfAppButton, SW_HIDE);
@@ -3263,13 +3378,13 @@ void showHistoryPage() {
             bars.push_back({label, value, wh, 0, i == 0 ? Green : blend(Green, Surface, .4), {}});
         }
         v.push_back(vBars(std::move(bars)));
-        v.push_back(vNote(tr(L"每天用電池時的放電量，右邊是平均耗電。紀錄只存在這台電腦，保留 60 天。")));
+        v.push_back(vNote(tr(L"每天用電池時的放電量，右邊是平均耗電。")));
     }
     for (auto& block : ledgerBlocks()) v.push_back(std::move(block)); // which programs used it
+    v.push_back(vHeading(tr(L"匯出")));
     v.push_back(vAction(tr(L"匯出 CSV"), tr(L"程序排行與 30 分鐘電量"), ExportCsvId));
     v.push_back(vAction(tr(L"分享今日卡片"), tr(L"圖片"), ShareCardId));
-    v.push_back(vHeading(tr(L"詳細")));
-    v.push_back(vNote(powerDetailsText()));
+    v.push_back(vFold(tr(L"詳細數據"), powerDetailsText()));
     showChartPage(InlinePage::history, tr(L"電池"), historyText() + L"\n\n" + ledgerText() + L"\n\n" + candidatesText() + L"\n\n" + powerDetailsText(), std::move(v));
     releaseInteraction();
 }
@@ -3453,22 +3568,19 @@ bs::lab::Controller::Status demoLabStatus() {
 }
 std::vector<VBlock> labBlocks(const bs::lab::Controller::Status& st) {
     std::vector<VBlock> v;
-    // Tests first: one row starts (or stops) each, then the results.
-    if (st.running && st.plan) v.push_back(vAction(tr(L"停止自動測試"), std::to_wstring(st.step + 1) + L" / " + std::to_wstring(st.steps), LabAutoId, theme.warn));
-    else {
-        v.push_back(vAction(tr(L"快速測試"), tr(L"約 30 分鐘"), LabQuickId, Green));
-        v.push_back(vAction(tr(L"完整測試"), tr(L"約 1.5 小時"), LabAutoId));
-    }
-    v.push_back(vAction(tr(L"匯出結果"), tr(L"壓縮檔＋摘要"), LabExportId));
-    v.push_back(vAction(tr(L"記錄詳細資料"), st.recording ? tr(L"開") : tr(L"關"), LabRecordId, st.recording ? Green : COLORREF(0)));
-    v.push_back(vAction(tr(L"單項實驗"), st.running && !st.plan ? tr(L"進行中") : std::wstring(), LabSingleMenuId));
-    v.push_back(vAction(tr(L"開啟資料夾"), L"", LabFolderId));
+    // Tests first (a running one shows its progress), then the results, then the data.
     if (st.running && st.plan) {
         v.push_back(vHeading(tr(L"自動測試進行中")));
+        v.push_back(vAction(tr(L"停止自動測試"), std::to_wstring(st.step + 1) + L" / " + std::to_wstring(st.steps), LabAutoId, theme.warn));
         v.push_back(vMeter(labKnobTitle(bs::lab::knobKey(st.knob)) + std::wstring(L" · ") + tr(bs::lab::workloadName(st.workload)),
             std::to_wstring(st.step + 1) + L" / " + std::to_wstring(st.steps) + tr(L" 項 · 剩約 ") + std::to_wstring(int(std::ceil(st.remainingSeconds / 60))) + tr(L" 分"),
             double(st.step + 1), 0, double(std::max(1, st.steps))));
         if (st.paused) v.push_back(vNote(tr(L"插電中，已暫停並還原；拔掉電源後繼續。")));
+    } else {
+        v.push_back(vHeading(tr(L"開始測試")));
+        v.push_back(vAction(tr(L"快速測試"), tr(L"約 30 分鐘"), LabQuickId, Green));
+        v.push_back(vAction(tr(L"完整測試"), tr(L"約 1.5 小時"), LabAutoId));
+        v.push_back(vAction(tr(L"單項實驗"), st.running ? tr(L"進行中") : std::wstring(), LabSingleMenuId));
     }
     // What each setting saves, per activity: the bar is the saving, the whisker its 95% range.
     std::vector<VBar> savings;
@@ -3489,7 +3601,7 @@ std::vector<VBlock> labBlocks(const bs::lab::Controller::Status& st) {
     else {
         v.push_back(vBars(std::move(savings)));
         v.push_back(vLegend({{tr(L"差異明確"), Green}, {tr(L"差異不明確"), blend(Muted, Surface, .35)}}));
-        v.push_back(vNote(tr(L"每條是兩種設定輪流量測的平均差，細線是 95% 範圍；「明確」才會被動態省電採用。")));
+        v.push_back(vFold(tr(L"怎麼看這張圖"), tr(L"每條是兩種設定輪流量測的平均差，細線是 95% 範圍；「明確」才會被動態省電採用。")));
     }
     // Where battery power goes per activity: CPU cores, the rest of the processor, and everything else.
     std::vector<VBar> split;
@@ -3517,7 +3629,11 @@ std::vector<VBlock> labBlocks(const bs::lab::Controller::Status& st) {
             }
         v.push_back(vBars(std::move(bars), 100));
     }
-    v.push_back(vNote(tr(L"資料只存在本機：") + bs::lab::labFolder()));
+    v.push_back(vHeading(tr(L"資料")));
+    v.push_back(vAction(tr(L"匯出結果"), tr(L"壓縮檔＋摘要"), LabExportId));
+    v.push_back(vToggle(tr(L"記錄詳細資料"), tr(L"每秒記錄讀數，供匯出分析"), st.recording, LabRecordId));
+    v.push_back(vAction(tr(L"開啟資料夾"), L"", LabFolderId));
+    v.push_back(vFold(tr(L"資料存在哪裡"), tr(L"資料只存在本機：") + bs::lab::labFolder()));
     return v;
 }
 void showLabPage() {
@@ -3553,12 +3669,7 @@ std::wstring candidatesText() {
 std::vector<const ProcessRow*> busyPrograms(size_t count);
 std::vector<VBlock> ledgerBlocks() {
     std::vector<VBlock> v;
-    if (const auto busy = busyPrograms(8); !busy.empty()) {
-        v.push_back(vHeading(tr(L"現在（CPU 耗電）")));
-        std::vector<VBar> bars;
-        for (const auto* row : busy) bars.push_back({row->name, number(*row->averageCpuWatts, 2) + L" W", *row->averageCpuWatts, 0, theme.warn, {}});
-        v.push_back(vBars(std::move(bars)));
-    }
+    // What is using power right now is the ranking itself; here is what has added up.
     v.push_back(vHeading(tr(L"從 BatteryScope 開啟到現在")));
     if (current.ledger.empty()) v.push_back(vNote(tr(L"尚無資料：需要可用的 CPU 能源計數器與一段觀測時間。")));
     else {
@@ -3587,7 +3698,7 @@ std::vector<VBlock> ledgerBlocks() {
         v.push_back(vBars(std::move(bars)));
         v.push_back(vNote(tr(L"它們在背景持續用 CPU。可能是同步、下載或更新；在排行中選它，可看詳情、改效率模式或關閉。")));
     }
-    v.push_back(vNote(tr(L"這是 CPU 能源分攤估計，不含螢幕、顯示卡與儲存；關閉程式不保證省下相同能量。")));
+    v.push_back(vFold(tr(L"這些數字怎麼算"), tr(L"這是 CPU 能源分攤估計，不含螢幕、顯示卡與儲存；關閉程式不保證省下相同能量。")));
     return v;
 }
 // Programs using power are part of the battery tab.
@@ -4843,37 +4954,34 @@ std::vector<VBlock> goalBlocks() {
     }
     {
         std::vector<std::pair<std::wstring, COLORREF>> chips;
-        chips.push_back({tr(L"動態省電 ") + std::wstring(dynamicEnabled ? tr(L"開") : tr(L"關")), dynamicEnabled ? Green : 0});
+        // What is in force right now; the switches themselves are the rows below.
         if (dynamicEnabled && governor.stretchLevel())
             chips.push_back({governor.stretchLevel() == 2 ? tr(L"最大省電") : tr(L"加強省電"), theme.warn});
-        const auto modes = queryPowerModes();
-        if (modes.dcKnown) chips.push_back({tr(L"用電池：") + std::wstring(modeName(modes.dc)), modes.dc == PowerMode::efficiency ? Green : theme.warn});
         DWORD value = 0;
         if (bs::lab::readKnob(bs::lab::Knob::refreshRate, value) == ERROR_SUCCESS) chips.push_back({std::to_wstring(value) + L" Hz", value <= 60 ? Green : COLORREF(0)});
         if (bs::lab::readKnob(bs::lab::Knob::cpuBoost, value) == ERROR_SUCCESS) chips.push_back({value ? tr(L"Boost 開") : tr(L"Boost 關"), value ? theme.warn : Green});
-        if (bs::lab::readKnob(bs::lab::Knob::darkMode, value) == ERROR_SUCCESS) chips.push_back({value ? tr(L"深色模式") : tr(L"淺色模式"), value ? Green : COLORREF(0)});
-        if (asusAvailable) {
-            const auto& h = asusNow();
-            if (h.mode) chips.push_back({tr(L"華碩 ") + std::wstring(tr(bs::asus::modeKey(*h.mode))), *h.mode == bs::asus::Mode::silent ? Green : *h.mode == bs::asus::Mode::turbo ? theme.warn : COLORREF(0)});
-            if (h.gpuEco) chips.push_back({(*h.gpuEco ? tr(L"獨顯 Eco") : tr(L"獨顯 標準")) + std::wstring(gpuAuto ? tr(L"（自動）") : L""), *h.gpuEco ? Green : COLORREF(0)});
-        }
         // Settings the user chose by hand this battery session.
         const wchar_t* heldNames[] = {L"電源模式", L"處理器能源偏好", L"CPU Boost", L"螢幕更新率", L"華碩效能模式"};
         if (dynamicEnabled)
             for (size_t i = 0; i < size_t(bs::gov::Setting::count); ++i)
                 if (governor.held(bs::gov::Setting(i))) chips.push_back({tr(L"手動：") + std::wstring(tr(heldNames[i])), theme.warn});
-        v.push_back(vChips(std::move(chips)));
+        if (!chips.empty()) v.push_back(vChips(std::move(chips)));
     }
-    // Every saving switch, here where the saving is shown, each turned on or off with one click.
-    v.push_back(vHeading(tr(L"省電開關")));
+    // Every saving switch lives here and nowhere else, grouped by what it acts on.
+    v.push_back(vHeading(tr(L"自動省電")));
     v.push_back(vToggle(tr(L"動態省電"), tr(L"依你正在做的事自動調整電源設定"), dynamicEnabled, DynamicToggleId));
+    if (dynamicEnabled) {
+        v.push_back(vToggle(tr(L"背景程式效率模式"), tr(L"用電池時讓背景程式以省電方式執行"), dynamicEco, DynamicEcoId));
+        v.push_back(vToggle(tr(L"動態切換螢幕更新率"), tr(L"靜止與閱讀時 60 Hz，捲動與影片時回到最高"), dynamicRefresh, DynamicRefreshId));
+        if (heldCount()) v.push_back(vAction(tr(L"把手動設定交回動態省電"), std::to_wstring(heldCount()) + tr(L" 項"), ReleaseHoldsId, theme.warn));
+    }
+    v.push_back(vAction(tr(L"低電量自動省電"), autoSaverThreshold ? std::to_wstring(autoSaverThreshold) + tr(L"% 以下") : std::wstring(tr(L"關")), AutoSaverCycleId,
+        autoSaverThreshold ? Green : COLORREF(0)));
+    v.push_back(vHeading(tr(L"螢幕與裝置")));
     {
         const int top = pluggedRefresh();
         v.push_back(vToggle(tr(L"用電池時 60 Hz"), top > 60 ? tr(L"插電自動回到 ") + std::to_wstring(top) + tr(L" Hz · 實測省 0.7–1.5 W") : std::wstring(tr(L"插電自動回到最高更新率")),
             refreshAuto, RefreshAutoId));
-    }
-    v.push_back(vToggle(tr(L"背景程式效率模式"), dynamicEnabled ? tr(L"用電池時讓背景程式以省電方式執行") : tr(L"隨動態省電一起運作"), dynamicEco, DynamicEcoId));
-    {
         DWORD dark = 0;
         if (bs::lab::readKnob(bs::lab::Knob::darkMode, dark) == ERROR_SUCCESS)
             v.push_back(vToggle(tr(L"深色模式"), tr(L"OLED 螢幕上深色畫面較省電"), dark != 0, DarkModeId));
@@ -4883,25 +4991,15 @@ std::vector<VBlock> goalBlocks() {
         if (h.gpuEco) v.push_back(vToggle(tr(L"獨顯自動 Eco"), tr(L"用電池時關閉獨顯，插電恢復"), gpuAuto, GpuAutoId));
         if (h.keyboardDevice) v.push_back(vToggle(tr(L"鍵盤背光閒置自動關"), tr(L"用電池時 30 秒沒操作就關，一碰就亮"), keyboardAutoOff, KeyboardAutoOffId));
         if (h.slash) v.push_back(vToggle(tr(L"Slash 燈效用電池時關閉"), tr(L"由韌體在拔掉電源時關閉燈效"), bs::asus::slashSettings().offOnBattery, SlashBatteryId));
-        if (h.modeDevice) {
-            const bool autoMode = dynamicEnabled && !governor.held(bs::gov::Setting::firmwareMode);
-            v.push_back(vAction(tr(L"華碩效能模式"), (autoMode ? tr(L"自動") + std::wstring(L" · ") : std::wstring()) + (h.mode ? tr(bs::asus::modeKey(*h.mode)) : tr(L"未設定")),
-                HwModeMenuId, h.mode == bs::asus::Mode::silent ? Green : COLORREF(0)));
-        }
     }
-    v.push_back(vAction(tr(L"低電量自動省電"), autoSaverThreshold ? std::to_wstring(autoSaverThreshold) + tr(L"% 以下") : std::wstring(tr(L"關")), AutoSaverCycleId,
-        autoSaverThreshold ? Green : COLORREF(0)));
-    if (dynamicEnabled && heldCount())
-        v.push_back(vAction(tr(L"把手動設定交回動態省電"), std::to_wstring(heldCount()) + tr(L" 項"), ReleaseHoldsId, theme.warn));
-    {
-        const auto modes = queryPowerModes();
-        v.push_back(vAction(tr(L"電源模式"), modes.dcKnown ? tr(L"用電池：") + std::wstring(modeName(modes.dc)) : std::wstring(), PowerModeId,
-            modes.dcKnown && modes.dc == PowerMode::efficiency ? Green : COLORREF(0)));
-    }
-    v.push_back(vAction(tr(L"省電目標"), goalUse ? std::to_wstring(goalUse) + L" W／" + std::to_wstring(goalStill) + L" W" : std::wstring(tr(L"關")), GoalCycleId));
+    v.push_back(vHeading(tr(L"目標與規則")));
+    v.push_back(vAction(tr(L"省電目標"), goalUse ? std::to_wstring(goalUse) + (english ? L" W / " : L" W／") + std::to_wstring(goalStill) + L" W" : std::wstring(tr(L"關")), GoalCycleId));
     {
         size_t rules = appRules.size(); for (const auto& exe : performanceApps) rules += !appRules.count(exe);
         v.push_back(vAction(tr(L"程式規則"), std::to_wstring(rules) + tr(L" 個"), AppRulesMenuId));
+        const auto modes = queryPowerModes();
+        v.push_back(vAction(tr(L"Windows 電源模式"), modes.dcKnown ? tr(L"用電池：") + std::wstring(modeName(modes.dc)) : std::wstring(), PowerModeId,
+            modes.dcKnown && modes.dc == PowerMode::efficiency ? Green : COLORREF(0)));
     }
     const auto tips = savingTips();
     if (!tips.empty()) {
@@ -4914,17 +5012,12 @@ std::vector<VBlock> goalBlocks() {
         std::wstring how;
         for (const auto& t : tips) how += (how.empty() ? L"" : L"\n") + t.label + (english ? L": " : L"：") + t.detail;
         if (dynamicEnabled) how += tr(L"\n動態省電已自動處理：") + handledByDynamic() + (heldCount() ? tr(L"（手動設定的項目除外，可從「⋯」交回）") : L"");
-        v.push_back(vNote(how));
+        v.push_back(vFold(tr(L"怎麼做"), how));
     }
-    if (const auto busy = busyPrograms(6); !busy.empty()) {
-        v.push_back(vHeading(tr(L"正在耗電的程式（CPU）")));
-        std::vector<VBar> bars;
-        for (const auto* row : busy) bars.push_back({row->name, number(*row->averageCpuWatts, 2) + L" W", *row->averageCpuWatts, 0, theme.warn, {}});
-        v.push_back(vBars(std::move(bars)));
-    }
-    v.push_back(vHeading(tr(L"動態省電")));
-    if (!dynamicEnabled) v.push_back(vNote(tr(L"關閉中。開啟後，用電池時會依你正在做的事自動切換：閒置與閱讀省電，一操作就恢復反應，高負載給效能。")));
-    else {
+    if (const auto busy = busyPrograms(1); !busy.empty())
+        v.push_back(vAction(tr(L"正在耗電的程式"), busy.front()->name + L" " + number(*busy.front()->averageCpuWatts, 1) + L" W", InlineBackId, theme.warn));
+    if (dynamicEnabled) {
+        v.push_back(vHeading(tr(L"動態省電現在的判斷")));
         const auto& a = lastAssessment;
         std::vector<std::pair<std::wstring, COLORREF>> chips{{tr(bs::gov::activityKey(governor.activity())), Green}};
         if (signalReader && !signalReader->lastForeground().empty())
@@ -4940,9 +5033,10 @@ std::vector<VBlock> goalBlocks() {
         std::wstring recent;
         int shown = 0;
         for (auto it = governor.log.rbegin(); it != governor.log.rend() && shown < 4; ++it, ++shown) recent += (recent.empty() ? L"" : L"\n") + *it;
-        if (!recent.empty()) v.push_back(vNote(tr(L"最近的調整：\n") + recent));
+        if (!recent.empty()) v.push_back(vFold(tr(L"最近的調整"), recent));
     }
-    v.push_back(vNote(tr(L"只讀取時間、程式名稱和裝置使用狀態，不截圖、不讀畫面或文字內容，也不記錄按了哪些鍵。")));
+    v.push_back(vFold(tr(L"動態省電怎麼運作"), tr(L"開啟後，用電池時會依你正在做的事自動切換：閒置與閱讀省電，一操作就恢復反應，高負載給效能。") + std::wstring(L"\n") +
+        tr(L"只讀取時間、程式名稱和裝置使用狀態，不截圖、不讀畫面或文字內容，也不記錄按了哪些鍵。")));
     return v;
 }
 // Shows a chart page; a refresh of the page already open only updates the charts.
@@ -4954,7 +5048,13 @@ void showChartPage(InlinePage page, const std::wstring& title, const std::wstrin
         showVisual(std::move(blocks), true);
         return;
     }
+    // Which way the new page lies: along the tab bar, or deeper into (and back out of) a tab.
+    const auto position = [](Tab tab) { const auto tabs = visibleTabs(); return int(std::find(tabs.begin(), tabs.end(), tab) - tabs.begin()); };
+    const int before = position(activeTab());
+    const bool wasDeep = inlinePage == InlinePage::stability;
     showInlinePage(page, title, text);
+    const int after = position(activeTab());
+    visualEnterDir = after > before ? 1 : after < before ? -1 : page == InlinePage::stability ? 1 : wasDeep ? -1 : 0;
     showVisual(std::move(blocks), false);
     if (visualView) SetFocus(visualView);
 }
@@ -4964,37 +5064,29 @@ void showGoalPage() {
 }
 
 // ----- Settings page -----
-// Every option in one scrolling list, grouped into sections. A row shows its
-// value; clicking it switches or cycles the value through the same commands
-// the menus used.
-enum class Row { section, dynamic, refreshAuto, dynamicRefresh, dynamicEco, target, goal, appRules, autoSaver, perfApps, lowBattery, chargeReminder, drainAlert,
+// What is left once every saving switch lives on the Saving tab: reminders, looks and the
+// program itself. The same rows as every other page: a switch turns on or off, a value row
+// steps to its next choice.
+enum class Row { section, target, perfApps, lowBattery, chargeReminder, drainAlert,
     sleepAlert, theme, style, mascot, trayPercent, mini, language, startup, hotkey, history, clearHistory, updates };
-struct SettingRow { Row row; const wchar_t* label; };
+struct SettingRow { Row row; const wchar_t* label; const wchar_t* detail; };
 const SettingRow settingRows[] = {
-    {Row::section, L"省電"}, {Row::dynamic, L"動態省電（實驗功能）"}, {Row::refreshAuto, L"用電池時 60 Hz"}, {Row::dynamicRefresh, L"動態切換螢幕更新率"}, {Row::dynamicEco, L"背景程式自動效率模式"},
-    {Row::goal, L"省電目標"}, {Row::appRules, L"程式規則"}, {Row::autoSaver, L"低電量時自動省電"},
-    {Row::section, L"提醒"}, {Row::lowBattery, L"低電量提醒"}, {Row::chargeReminder, L"充電提醒"}, {Row::drainAlert, L"背景耗電提醒"}, {Row::sleepAlert, L"睡眠耗電提醒"},
-    {Row::section, L"外觀"}, {Row::theme, L"主題"}, {Row::style, L"風格"}, {Row::mascot, L"電池小精靈"}, {Row::trayPercent, L"系統匣顯示電量"},
-    {Row::mini, L"迷你浮動視窗"}, {Row::language, L"語言 / Language"},
-    {Row::section, L"一般"}, {Row::startup, L"登入時啟動"}, {Row::hotkey, L"快速鍵 Ctrl+Alt+B"}, {Row::history, L"記錄每日歷史"},
-    {Row::clearHistory, L"清除歷史紀錄"}, {Row::updates, L"更新"}};
+    {Row::section, L"提醒", nullptr}, {Row::lowBattery, L"低電量提醒", nullptr}, {Row::chargeReminder, L"充電提醒", nullptr},
+    {Row::drainAlert, L"背景耗電提醒", L"有程式在背景持續耗電時通知"}, {Row::sleepAlert, L"睡眠耗電提醒", L"睡眠時掉電太快時通知"},
+    {Row::section, L"外觀", nullptr}, {Row::theme, L"主題", nullptr}, {Row::style, L"風格", nullptr}, {Row::language, L"語言 / Language", nullptr},
+    {Row::mascot, L"電池小精靈", nullptr}, {Row::trayPercent, L"系統匣顯示電量", nullptr}, {Row::mini, L"迷你浮動視窗", nullptr},
+    {Row::section, L"一般", nullptr}, {Row::startup, L"登入時啟動", nullptr}, {Row::hotkey, L"快速鍵 Ctrl+Alt+B", L"隨時叫出或收起面板"},
+    {Row::history, L"記錄每日歷史", L"只存在這台電腦，保留 60 天"}, {Row::clearHistory, L"清除歷史紀錄", nullptr}, {Row::updates, L"更新", nullptr}};
+bool rowIsSwitch(Row row) {
+    return row == Row::drainAlert || row == Row::sleepAlert || row == Row::mascot || row == Row::trayPercent || row == Row::mini ||
+        row == Row::startup || row == Row::hotkey || row == Row::history;
+}
 std::wstring rowValue(Row row) {
     auto onOff = [](bool on) { return std::wstring(on ? tr(L"開") : tr(L"關")); };
     auto percentOrOff = [](unsigned value) { return value ? std::to_wstring(value) + L"%" : std::wstring(tr(L"關")); };
     switch (row) {
-    case Row::dynamic: return onOff(dynamicEnabled);
-    case Row::dynamicRefresh: return onOff(dynamicRefresh);
-    case Row::refreshAuto: return onOff(refreshAuto);
-    case Row::dynamicEco: return onOff(dynamicEco);
     case Row::target: return dynamicTarget ? std::to_wstring(dynamicTarget) + tr(L" 小時") : std::wstring(tr(L"無"));
-    case Row::goal: return goalUse ? std::to_wstring(goalUse) + L" W／" + std::to_wstring(goalStill) + L" W" : std::wstring(tr(L"關"));
-    case Row::autoSaver: return percentOrOff(autoSaverThreshold);
     case Row::perfApps: return std::to_wstring(performanceApps.size()) + tr(L" 個");
-    case Row::appRules: {
-        size_t learned = 0; for (const auto& [exe, l] : appLearned) learned += learnedRule(l) != bs::gov::AppRule::automatic && !appRules.count(exe);
-        size_t listed = 0; for (const auto& exe : performanceApps) listed += !appRules.count(exe);
-        return std::to_wstring(appRules.size() + listed + learned) + tr(L" 個");
-    }
     case Row::lowBattery: return percentOrOff(lowBatteryThreshold);
     case Row::chargeReminder: return percentOrOff(chargeReminderTarget);
     case Row::drainAlert: return onOff(drainAlerts);
@@ -5018,12 +5110,7 @@ std::wstring rowValue(Row row) {
 }
 bool rowOn(Row row) {
     switch (row) {
-    case Row::dynamic: return dynamicEnabled;
-    case Row::dynamicRefresh: return dynamicRefresh;
-    case Row::refreshAuto: return refreshAuto;
-    case Row::dynamicEco: return dynamicEco;
     case Row::target: return dynamicTarget != 0;
-    case Row::autoSaver: return autoSaverThreshold != 0;
     case Row::lowBattery: return lowBatteryThreshold != 0;
     case Row::chargeReminder: return chargeReminderTarget != 0;
     case Row::drainAlert: return drainAlerts;
@@ -5045,13 +5132,7 @@ int rowCommand(Row row) {
         return it == values.end() || std::next(it) == values.end() ? *values.begin() : *std::next(it);
     };
     switch (row) {
-    case Row::dynamic: return DynamicToggleId;
-    case Row::dynamicRefresh: return DynamicRefreshId;
-    case Row::refreshAuto: return RefreshAutoId;
-    case Row::dynamicEco: return DynamicEcoId;
     case Row::target: return DynamicTargetId;
-    case Row::goal: return GoalCycleId;
-    case Row::autoSaver: { const unsigned v = next(autoSaverThreshold, {0, 20, 30}); return v == 0 ? AutoSaverOffId : v == 20 ? AutoSaver20Id : AutoSaver30Id; }
     case Row::perfApps: return PerfAppsPageId;
     case Row::lowBattery: return LowBatteryOffId + int(next(lowBatteryThreshold, {0, 10, 20, 30}) / 10);
     case Row::chargeReminder: {
@@ -5074,30 +5155,19 @@ int rowCommand(Row row) {
     default: return 0;
     }
 }
-void showSettingsPage() {
-    if (SendMessageW(settingsList, LB_GETCOUNT, 0, 0) == 0)
-        for (size_t i = 0; i < std::size(settingRows); ++i) SendMessageW(settingsList, LB_ADDSTRING, 0, LPARAM(i));
-    showInlinePage(InlinePage::settings, tr(L"設定"), L"");
-    InvalidateRect(settingsList, nullptr, FALSE);
-}
-void drawSettingRow(const DRAWITEMSTRUCT& item) {
-    if (item.itemID == UINT(-1) || item.itemID >= std::size(settingRows)) return;
-    const auto& entry = settingRows[item.itemID];
-    HDC dc = item.hDC; RECT r = item.rcItem;
-    fill(dc, r, Surface);
-    if (entry.row == Row::section) {
-        drawText(dc, tr(entry.label), {r.left + sp(6), r.top + sp(10), r.right - sp(6), r.bottom}, Green, strongFont);
-        return;
+std::vector<VBlock> settingsBlocks() {
+    std::vector<VBlock> v;
+    for (const auto& entry : settingRows) {
+        const int command = SettingRowId + int(entry.row);
+        if (entry.row == Row::section) v.push_back(vHeading(tr(entry.label)));
+        else if (rowIsSwitch(entry.row)) v.push_back(vToggle(tr(entry.label), entry.detail ? tr(entry.detail) : std::wstring(), rowOn(entry.row), command));
+        else v.push_back(vAction(tr(entry.label), rowValue(entry.row), command, rowOn(entry.row) ? Green : COLORREF(0)));
     }
-    RECT box{r.left + sp(2), r.top + sp(3), r.right - sp(2), r.bottom - sp(3)};
-    rounded(dc, box, blend(Surface, Border, .45), 8);
-    drawText(dc, tr(entry.label), {box.left + sp(12), box.top, box.right - sp(110), box.bottom}, Ink, normalFont);
-    const std::wstring value = rowValue(entry.row);
-    const bool on = rowOn(entry.row);
-    const int width = std::max(sp(44), textWidth(dc, value, smallFont) + sp(18));
-    RECT pill{box.right - sp(10) - width, box.top + sp(8), box.right - sp(10), box.bottom - sp(8)};
-    rounded(dc, pill, on ? blend(Green, Surface, theme.highContrast ? 0 : .25) : blend(Surface, Border, .9), 8);
-    drawText(dc, value, pill, on ? theme.accentInk : Muted, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    v.push_back(vFold(tr(L"省電的開關在哪裡？"), tr(L"動態省電、60 Hz、省電目標、程式規則與低電量自動省電都在「省電」分頁，每個開關只有一個地方。效能模式、風扇與功耗上限在「效能」；充電上限、鍵盤與燈效在「硬體」。")));
+    return v;
+}
+void showSettingsPage() {
+    showChartPage(InlinePage::settings, tr(L"設定"), L"BatteryScope " BS_VERSION_STRING, settingsBlocks());
 }
 // Per-program rules in one menu: the program last in front first, then every
 // rule, each with the five choices; learned rules can be kept, changed or forgotten.
@@ -5155,17 +5225,14 @@ std::vector<MenuItem> updateMenuItems() {
     items.push_back(menuItem(UpdateOffId, tr(L"不要自動檢查"), !updateChecks));
     return items;
 }
-void activateSettingRow(int index) {
-    if (index < 0 || size_t(index) >= std::size(settingRows) || demo || isolatedPreview) return;
-    if (settingRows[index].row == Row::updates) {
-        POINT point{}; GetCursorPos(&point);
+// A settings row was chosen: the update row opens its menu, the others run their command.
+void activateSetting(Row row) {
+    if (demo || isolatedPreview) return;
+    if (row == Row::updates) {
+        const POINT point = menuAnchor();
         if (const int chosen = showMenu(updateMenuItems(), point, mainWindow)) SendMessageW(mainWindow, WM_COMMAND, chosen, 0);
-        if (inlinePage == InlinePage::settings) InvalidateRect(settingsList, nullptr, FALSE);
-        return;
-    }
-    if (settingRows[index].row == Row::appRules) { showAppRulesMenu(); if (inlinePage == InlinePage::settings) InvalidateRect(settingsList, nullptr, FALSE); return; }
-    if (const int command = rowCommand(settingRows[index].row)) SendMessageW(mainWindow, WM_COMMAND, command, 0);
-    if (inlinePage == InlinePage::settings) InvalidateRect(settingsList, nullptr, FALSE);
+    } else if (const int command = rowCommand(row)) SendMessageW(mainWindow, WM_COMMAND, command, 0);
+    if (inlinePage == InlinePage::settings) showSettingsPage();
 }
 
 // ----- ASUS hardware -----
@@ -5599,21 +5666,16 @@ void showHardwarePage() {
         showChartPage(InlinePage::hardware, tr(L"華碩硬體"), hardwareText(h), std::move(v));
         return;
     }
-    const auto modeColor = [&](std::optional<bs::asus::Mode> mode) { return mode == bs::asus::Mode::silent ? Green : mode == bs::asus::Mode::turbo ? theme.warn : COLORREF(0); };
-    if (h.mode) chips.push_back({tr(L"效能模式 ") + std::wstring(tr(bs::asus::modeKey(*h.mode))), modeColor(h.mode)});
-    if (h.gpuEco) chips.push_back({*h.gpuEco ? tr(L"獨顯 Eco") : tr(L"獨顯 標準"), *h.gpuEco ? Green : theme.warn});
     if (h.gpuMux && !*h.gpuMux) chips.push_back({tr(L"獨顯直連"), theme.warn});
-    if (h.chargeLimit) chips.push_back({tr(L"充電上限 ") + std::to_wstring(*h.chargeLimit) + L"%", *h.chargeLimit <= 80 ? Green : COLORREF(0)});
     v.push_back(vChips(std::move(chips)));
     // Controls, each opening its choices in place.
     {
-        const bool autoMode = dynamicEnabled && !governor.held(bs::gov::Setting::firmwareMode);
         const std::wstring unset = tr(L"未設定");
-        if (h.modeDevice) v.push_back(vAction(tr(L"效能模式"), (autoMode ? tr(L"自動") + std::wstring(L" · ") : std::wstring()) + (h.mode ? tr(bs::asus::modeKey(*h.mode)) : unset),
-            HwModeMenuId, modeColor(h.mode)));
-        if (h.gpuEco) v.push_back(vAction(tr(L"獨顯"), (gpuAuto ? tr(L"自動") + std::wstring(L" · ") : std::wstring()) + (*h.gpuEco ? L"Eco" : tr(L"標準")), HwGpuMenuId, *h.gpuEco ? Green : COLORREF(0)));
+        v.push_back(vHeading(tr(L"電池與顯示")));
         if (h.chargeDevice) v.push_back(vAction(tr(L"充電上限"), h.chargeLimit ? std::to_wstring(*h.chargeLimit) + L"%" : unset, HwChargeMenuId,
             h.chargeLimit && *h.chargeLimit <= 80 ? Green : COLORREF(0)));
+        if (h.overdrive) v.push_back(vAction(tr(L"螢幕 Overdrive"), *h.overdrive ? tr(L"開") : tr(L"關"), OverdriveId));
+        v.push_back(vHeading(tr(L"鍵盤與燈效")));
         if (h.keyboardDevice) v.push_back(vAction(tr(L"鍵盤背光"), (h.keyboard || keyboardDimmed ? std::wstring(keyboardLevelName(keyboardDimmed ? 0 : *h.keyboard)) : unset)
             + (keyboardAutoOff ? tr(L" · 閒置自動關") : L""), HwKeyboardMenuId));
         v.push_back(vAction(tr(L"Fn 鎖定"), h.fnLock.value_or(false) ? tr(L"開（F1–F11 免按 Fn）") : tr(L"關"), FnLockId, h.fnLock.value_or(false) ? Green : COLORREF(0)));
@@ -5622,7 +5684,7 @@ void showHardwarePage() {
             v.push_back(vAction(tr(L"Slash 燈效"), s.on ? std::wstring(bs::asus::slashModeName(s.mode)) + (s.offOnBattery ? tr(L" · 用電池關") : L"") : std::wstring(tr(L"關")), HwSlashMenuId,
                 s.on ? Green : COLORREF(0)));
         }
-        if (h.overdrive) v.push_back(vAction(tr(L"螢幕 Overdrive"), *h.overdrive ? tr(L"開") : tr(L"關"), OverdriveId));
+        v.push_back(vHeading(tr(L"華碩軟體")));
         const bool listening = preview || SUCCEEDED(asusKeys.status()) || asusKeys.keyboard();
         v.push_back(vAction(tr(L"華碩按鍵"), !asusKeysHandled ? std::wstring(tr(L"交給華碩軟體")) : !listening ? std::wstring(tr(L"收不到按鍵")) : tr(L"BatteryScope 接手"),
             HwKeysMenuId, !asusKeysHandled ? COLORREF(0) : !listening ? theme.warn : Green));
@@ -5631,25 +5693,6 @@ void showHardwarePage() {
         else { running = 0; total = 9; }
         v.push_back(vAction(tr(L"華碩服務"), total ? std::to_wstring(running) + L" / " + std::to_wstring(total) + tr(L" 執行中") + (disabled ? L" · " + std::to_wstring(disabled) + tr(L" 個停用") : L"")
             : std::wstring(tr(L"沒有")), HwServicesMenuId, running ? theme.warn : Green));
-    }
-    if (h.cpuTemp || h.gpuTemp) {
-        v.push_back(vHeading(tr(L"溫度")));
-        if (h.cpuTemp) v.push_back(vMeter(L"CPU", std::to_wstring(*h.cpuTemp) + L" °C", *h.cpuTemp, 85, 100));
-        if (h.gpuTemp) v.push_back(vMeter(tr(L"獨顯"), std::to_wstring(*h.gpuTemp) + L" °C", *h.gpuTemp, 80, 100));
-    }
-    if (h.cpuFan || h.gpuFan || h.midFan) {
-        v.push_back(vHeading(tr(L"風扇")));
-        std::vector<VBar> bars;
-        if (h.cpuFan) bars.push_back({L"CPU", *h.cpuFan ? std::to_wstring(*h.cpuFan * 100) + L" RPM" : std::wstring(tr(L"停止")), double(*h.cpuFan), 0, 0, {}});
-        if (h.gpuFan) bars.push_back({tr(L"獨顯"), *h.gpuFan ? std::to_wstring(*h.gpuFan * 100) + L" RPM" : std::wstring(tr(L"停止")), double(*h.gpuFan), 0, 0, {}});
-        if (h.midFan) bars.push_back({tr(L"中間"), *h.midFan ? std::to_wstring(*h.midFan * 100) + L" RPM" : std::wstring(tr(L"停止")), double(*h.midFan), 0, 0, {}});
-        v.push_back(vBars(std::move(bars), 70));
-    }
-    if (!h.limits.empty()) {
-        v.push_back(vHeading(tr(L"功耗上限")));
-        std::vector<VBar> bars;
-        for (const auto& [label, watts] : h.limits) bars.push_back({tr(label), std::to_wstring(watts) + L" W", double(watts), 0, blend(Green, Surface, .3), {}});
-        v.push_back(vBars(std::move(bars)));
     }
     if (!preview && asusKeysHandled && FAILED(asusKeys.status()) && !asusKeys.keyboard()) {
         wchar_t code[16]; swprintf(code, 16, L"0x%08lX", static_cast<unsigned long>(asusKeys.status()));
@@ -5664,7 +5707,7 @@ void showHardwarePage() {
         }
         v.push_back(vNote(tr(L"最近按下的華碩按鍵：") + keys));
     }
-    v.push_back(vNote(tr(L"這台的韌體不會回報效能模式與充電上限：顯示的是 BatteryScope 最後設定的值，開機與睡眠喚醒後會自動重設。效能模式選「自動」時由動態省電管理；手動選的模式在這次用電池期間保留。華碩軟體停止後，亮度、鍵盤背光、觸控板、麥克風、睡眠、Fn 鎖定（Fn+C、Fn+Esc）、效能模式與 ROG 鍵都由 BatteryScope 接手。Fn 鎖定開啟時，F1–F11 不按 Fn 就是快捷功能。")));
+    v.push_back(vFold(tr(L"關於這些設定"), tr(L"這台的韌體不會回報效能模式與充電上限：顯示的是 BatteryScope 最後設定的值，開機與睡眠喚醒後會自動重設。效能模式選「自動」時由動態省電管理；手動選的模式在這次用電池期間保留。華碩軟體停止後，亮度、鍵盤背光、觸控板、麥克風、睡眠、Fn 鎖定（Fn+C、Fn+Esc）、效能模式與 ROG 鍵都由 BatteryScope 接手。Fn 鎖定開啟時，F1–F11 不按 Fn 就是快捷功能。") + std::wstring(L"\n") + tr(L"效能模式、風扇、溫度與功耗上限在「效能」分頁。")));
     showChartPage(InlinePage::hardware, tr(L"華碩硬體"), hardwareText(h), std::move(v));
 }
 // ----- The performance dashboard (home) -----
@@ -5764,7 +5807,6 @@ void showPerformancePage() {
         double busy = 0; for (const auto& core : current.energy.cores) busy += core.busyLogicalCores;
         if (current.energy.ready) chips.push_back({tr(L"負載 ") + number(busy * 100 / std::max<DWORD>(1, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)), 0) + L"%", 0});
         DWORD boost = 0;
-        if (bs::lab::readKnob(bs::lab::Knob::cpuBoost, boost) == ERROR_SUCCESS) chips.push_back({boost ? tr(L"Boost 開") : tr(L"Boost 關"), boost ? theme.warn : Green});
         v.push_back(vChips(std::move(chips)));
         const Value watts = current.energy.packageWatts ? current.energy.packageWatts : current.energy.coreWatts;
         const auto limits = bs::asus::powerLimits(bs::asus::tuning().power);
@@ -5776,6 +5818,8 @@ void showPerformancePage() {
         if (series.empty() && (demo || isolatedPreview))
             for (int i = 0; i < 100; ++i) series.push_back(5.0 + 3.0 * std::sin(i / 6.0) + (i % 17 == 0 ? 9.0 : 0.0) + (i > 70 && i < 80 ? 12.0 : 0.0));
         v.push_back(vSeries(tr(L"近 5 分鐘"), std::move(series), limits.spl, watts ? tr(L"現在 ") + valueText(watts, L" W") : std::wstring()));
+        if (bs::lab::readKnob(bs::lab::Knob::cpuBoost, boost) == ERROR_SUCCESS)
+            v.push_back(vToggle(tr(L"CPU Boost（用電池時）"), tr(L"關閉可省 2–5 W，短暫運算稍慢"), boost != 0, CpuBoostToggleId));
     }
     // GPU.
     v.push_back(vHeading(L"GPU"));
@@ -5802,6 +5846,7 @@ void showPerformancePage() {
     // Fans and power limits (ASUS).
     if (asusAvailable && h.driver) {
         v.push_back(vHeading(tr(L"風扇與功耗")));
+        if (h.gpuTemp) v.push_back(vMeter(tr(L"獨顯溫度"), std::to_wstring(*h.gpuTemp) + L" °C", *h.gpuTemp, 80, 100));
         if (h.cpuFan || h.gpuFan || h.midFan) {
             std::vector<VBar> bars;
             if (h.cpuFan) bars.push_back({L"CPU", *h.cpuFan ? std::to_wstring(*h.cpuFan * 100) + L" RPM" : std::wstring(tr(L"停止")), double(*h.cpuFan), 0, 0, {}});
@@ -5815,19 +5860,8 @@ void showPerformancePage() {
         if (fanCurves) v.push_back(vAction(tr(L"風扇模式"), tr(bs::asus::fanPresetKey(t.fans)), FanMenuId, t.fans == bs::asus::FanPreset::quiet ? Green : COLORREF(0)));
         v.push_back(vAction(tr(L"CPU 功耗上限"), powerPresetText(t.power), PowerLimitMenuId, t.power == bs::asus::PowerPreset::saver ? Green : COLORREF(0)));
     }
-    // Quick switches.
-    v.push_back(vHeading(tr(L"快速開關")));
-    {
-        const int top = pluggedRefresh();
-        v.push_back(vToggle(tr(L"用電池時 60 Hz"), top > 60 ? tr(L"插電自動回到 ") + std::to_wstring(top) + L" Hz" : std::wstring(tr(L"插電自動回到最高更新率")), refreshAuto, RefreshAutoId));
-        DWORD boost = 0;
-        if (bs::lab::readKnob(bs::lab::Knob::cpuBoost, boost) == ERROR_SUCCESS)
-            v.push_back(vToggle(tr(L"CPU Boost（用電池時）"), tr(L"關閉可省 2–5 W，短暫運算稍慢"), boost != 0, CpuBoostToggleId));
-        v.push_back(vToggle(tr(L"動態省電"), tr(L"依你正在做的事自動調整"), dynamicEnabled, DynamicToggleId));
-        if (asusAvailable && h.keyboardDevice) v.push_back(vAction(tr(L"鍵盤背光"), h.keyboard ? std::wstring(keyboardLevelName(*h.keyboard)) : std::wstring(tr(L"未設定")), HwKeyboardMenuId));
-    }
     if (!stabilityRow(true)) if (auto row = stabilityRow(false)) v.push_back(std::move(*row));
-    v.push_back(vNote(tr(L"風扇與功耗只提供原廠範圍內的預設：風扇曲線取自韌體各模式自己的曲線，功耗上限不超過平衡模式。每次切換效能模式後會自動重新套用，選「原廠」即還原。獨顯只有在已經醒著時才讀取溫度與時脈，不會為了顯示把它叫醒。")));
+    v.push_back(vFold(tr(L"關於風扇與功耗"), tr(L"風扇與功耗只提供原廠範圍內的預設：風扇曲線取自韌體各模式自己的曲線，功耗上限不超過平衡模式。每次切換效能模式後會自動重新套用，選「原廠」即還原。獨顯只有在已經醒著時才讀取溫度與時脈，不會為了顯示把它叫醒。")));
     showChartPage(InlinePage::performance, tr(L"效能"), perfPageText(), std::move(v));
 }
 // ----- Stability: crashes, freezes and problem reports -----
@@ -6563,7 +6597,7 @@ void showStabilityPage() {
     v.push_back(vToggle(tr(L"保護模式"), tr(L"只監測；不自動改任何設定"), protectState != 0, ProtectToggleId));
     {
         const uint64_t blocked = writeGuard().blockedWrites();
-        v.push_back(vNote(tr(L"睡眠、喚醒、闔蓋、關機與剛開機的那幾秒，一律不寫入任何設定。偵測到當機時會自動進入保護模式。") +
+        v.push_back(vFold(tr(L"防護怎麼運作"), tr(L"睡眠、喚醒、闔蓋、關機與剛開機的那幾秒，一律不寫入任何設定。偵測到當機時會自動進入保護模式。") +
             (blocked ? tr(L"這次執行已擋下 ") + std::to_wstring(blocked) + tr(L" 次寫入。") : std::wstring())));
     }
     for (auto& block : controlCheckBlocks()) v.push_back(std::move(block));
@@ -7128,8 +7162,6 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             visualView = CreateWindowExW(0, vc.lpszClassName, L"", WS_CHILD | WS_TABSTOP, 0, 0, 0, 0, window, nullptr, nullptr, nullptr);
         }
         SendMessageW(inlineText, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(sp(4), sp(4)));
-        settingsList = CreateWindowExW(0, L"LISTBOX", L"", WS_CHILD | WS_VSCROLL | LBS_OWNERDRAWVARIABLE | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
-            0, 0, 0, 0, window, reinterpret_cast<HMENU>(INT_PTR(SettingsListId)), nullptr, nullptr);
         inlineBack = button(tr(L"返回排行"), InlineBackId);
         inlineConfirm = button(tr(L"確定強制結束"), InlineConfirmId);
         ShowWindow(inlineBack, SW_HIDE);
@@ -7185,16 +7217,10 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     }
     case WM_MEASUREITEM:
         if (wp == ListId) { reinterpret_cast<MEASUREITEMSTRUCT*>(lp)->itemHeight = px(RowHeight); return TRUE; }
-        if (wp == SettingsListId) {
-            auto measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lp);
-            measure->itemHeight = measure->itemID < std::size(settingRows) && settingRows[measure->itemID].row == Row::section ? sp(34) : sp(46);
-            return TRUE;
-        }
         break;
     case WM_DRAWITEM: {
         auto item = reinterpret_cast<DRAWITEMSTRUCT*>(lp);
         if (item->CtlID == ListId) drawProcess(*item);
-        else if (item->CtlID == SettingsListId) drawSettingRow(*item);
         else if (item->CtlType == ODT_BUTTON) drawButton(*item);
         return TRUE;
     }
@@ -7258,7 +7284,6 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         SelectObject(dc, old); DeleteObject(bitmap); DeleteDC(dc); EndPaint(window, &ps); return 0;
     }
     case WM_CTLCOLORLISTBOX:
-        if (reinterpret_cast<HWND>(lp) == settingsList) { SetDCBrushColor(reinterpret_cast<HDC>(wp), Surface); return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH)); }
         break;
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLOREDIT:
@@ -7641,14 +7666,10 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             if (id == DynamicRefreshId) { dynamicRefresh = !dynamicRefresh; writeSetting(L"DynamicRefresh", dynamicRefresh); }
             if (id == DynamicEcoId) { dynamicEco = !dynamicEco; writeSetting(L"DynamicEco", dynamicEco); }
             if (id == DynamicTargetId) { dynamicTarget = dynamicTarget == 0 ? 3 : dynamicTarget == 3 ? 5 : dynamicTarget == 5 ? 8 : 0; writeSetting(L"DynamicTarget", dynamicTarget); }
+            if (inlinePage == InlinePage::goal) showGoalPage();
             return 0;
         }
-        if (id == SettingsListId && HIWORD(wp) == LBN_SELCHANGE) {
-            const int index = int(SendMessageW(settingsList, LB_GETCURSEL, 0, 0));
-            SendMessageW(settingsList, LB_SETCURSEL, WPARAM(-1), 0);
-            activateSettingRow(index);
-            return 0;
-        }
+        if (id >= SettingRowId && id < SettingRowId + 30) { activateSetting(Row(id - SettingRowId)); return 0; }
         if (id == LabRecordId && labController) {
             const bool on = !labController->status().recording;
             labController->setRecording(on);
@@ -7709,7 +7730,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             if (!saved) setNotice(tr(L"無法儲存設定。"));
             else setNotice(id == UpdateAutoId ? tr(L"有新版本時會自動安裝（測試進行中會等測試結束）。") : id == UpdateNotifyId ? tr(L"有新版本時會通知你。") : tr(L"不再自動檢查更新。"));
             if (updateChecks) maybeCheckForUpdate();
-            if (inlinePage == InlinePage::settings) InvalidateRect(settingsList, nullptr, FALSE);
+            if (inlinePage == InlinePage::settings) showSettingsPage();
             return 0;
         }
         if (id == UpdatePageId) { openReleasePage(); return 0; }
@@ -7883,7 +7904,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         else if (inlinePage == InlinePage::performance) showPerformancePage();
         else if (inlinePage == InlinePage::stability) showStabilityPage();
         else if (inlinePage == InlinePage::lab) showLabPage();
-        else if (inlinePage == InlinePage::settings && settingsList) InvalidateRect(settingsList, nullptr, FALSE);
+        else if (inlinePage == InlinePage::settings) showSettingsPage();
         InvalidateRect(window, nullptr, FALSE); // the tabs
         return 0;
     case WM_POWERBROADCAST:
@@ -8087,7 +8108,7 @@ bool captureWindow(const std::wstring& path) {
     // window uses, so captures do not depend on WM_PRINT support for them.
     for (auto child : {viewport, closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck,
         powerButton, hideButton, menuButton, inlineText, inlineBack, inlineConfirm, restoreModesButton, energySettingsButton, ecoButton, perfAppButton,
-        modeButtons[0], modeButtons[1], modeButtons[2], modeButtons[3], modeButtons[4], modeButtons[5], settingsList, visualView}) {
+        modeButtons[0], modeButtons[1], modeButtons[2], modeButtons[3], modeButtons[4], modeButtons[5], visualView}) {
         if (!child || !(GetWindowLongPtrW(child, GWL_STYLE) & WS_VISIBLE)) continue;
         RECT childRect; GetWindowRect(child, &childRect); MapWindowPoints(nullptr, mainWindow, reinterpret_cast<POINT*>(&childRect), 2);
         const int cw = childRect.right - childRect.left, ch = childRect.bottom - childRect.top;
@@ -8095,16 +8116,6 @@ bool captureWindow(const std::wstring& path) {
         IntersectClipRect(dc, 0, 0, cw, ch);
         if (child == visualView) {
             paintVisual(dc, {0, 0, cw, ch});
-        } else if (child == settingsList) {
-            fill(dc, {0, 0, cw, ch}, Surface);
-            const int count = int(SendMessageW(settingsList, LB_GETCOUNT, 0, 0));
-            for (int index = 0; index < count; ++index) {
-                RECT item{};
-                if (SendMessageW(settingsList, LB_GETITEMRECT, WPARAM(index), reinterpret_cast<LPARAM>(&item)) == LB_ERR || item.top >= ch) continue;
-                DRAWITEMSTRUCT draw{}; draw.CtlType = ODT_LISTBOX; draw.CtlID = SettingsListId; draw.itemID = UINT(index);
-                draw.hwndItem = settingsList; draw.hDC = dc; draw.rcItem = item;
-                drawSettingRow(draw);
-            }
         } else if (child == viewport) {
             fill(dc, {0, 0, cw, ch}, Background);
             for (int index = 0; index < int(displayed.size()); ++index) {
@@ -8322,12 +8333,39 @@ bool panelSelfTest(const std::wstring& path) {
     // Settings page: every option in one list, grouped; clicking in demo changes nothing.
     SendMessageW(mainWindow, WM_COMMAND, SettingsPageId, 0);
     const bool styleBefore = pixelStyle;
-    check("settings_page_lists_every_option", inlinePage == InlinePage::settings && IsWindowVisible(settingsList) && !IsWindowVisible(inlineText) &&
-        SendMessageW(settingsList, LB_GETCOUNT, 0, 0) == LRESULT(std::size(settingRows)));
-    activateSettingRow(int(std::find_if(std::begin(settingRows), std::end(settingRows), [](const SettingRow& r) { return r.row == Row::style; }) - std::begin(settingRows)));
+    check("settings_page_lists_every_option", inlinePage == InlinePage::settings && IsWindowVisible(visualView) && !IsWindowVisible(inlineText) &&
+        visualBlocks.size() == std::size(settingRows) + 1);
+    check("settings_switches_are_switches", std::count_if(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::action && b.toggle >= 0; }) == 8 &&
+        std::none_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.amount == DynamicToggleId || b.amount == RefreshAutoId; }));
+    SendMessageW(mainWindow, WM_COMMAND, SettingRowId + int(Row::style), 0);
     check("settings_rows_do_not_change_demo_settings", pixelStyle == styleBefore);
+    {
+        // An explanation stays folded until asked for: the row opens it in place and the page grows.
+        RECT view{}; GetClientRect(visualView, &view);
+        HDC dc = GetDC(visualView);
+        paintVisual(dc, view);
+        const auto fold = std::find_if(visualHits.begin(), visualHits.end(), [](const VHit& hit) { return hit.command == FoldCommand; });
+        const bool found = fold != visualHits.end() && fold->block < visualBlocks.size();
+        const VBlock closedBlock = found ? visualBlocks[fold->block] : VBlock{};
+        const int closed = found ? blockHeight(dc, closedBlock, view.right - sp(10), false) : 0;
+        if (found) activateVisualHit(visualView, size_t(fold - visualHits.begin()));
+        visualFolds.clear();
+        const int open = found ? blockHeight(dc, closedBlock, view.right - sp(10), false) : 0;
+        check("fold_opens_in_place", found && visualFoldsOpen.count(closedBlock.title) && open > closed + sp(20) && inlinePage == InlinePage::settings);
+        paintVisual(dc, view);
+        const auto again = std::find_if(visualHits.begin(), visualHits.end(), [](const VHit& hit) { return hit.command == FoldCommand; });
+        if (again != visualHits.end()) activateVisualHit(visualView, size_t(again - visualHits.begin()));
+        visualFolds.clear();
+        check("fold_closes_again", found && !visualFoldsOpen.count(closedBlock.title) && blockHeight(dc, closedBlock, view.right - sp(10), false) == closed);
+        ReleaseDC(visualView, dc);
+    }
+    // Pages slide in from the side their tab is on.
+    SendMessageW(mainWindow, WM_COMMAND, PerfPageId, 0);
+    const int cameFromRight = visualEnterDir;
+    SendMessageW(mainWindow, WM_COMMAND, SettingsPageId, 0);
+    check("pages_slide_in_from_their_tab_side", cameFromRight == -1 && visualEnterDir == 1);
     SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
-    check("settings_list_hides_on_return", inlinePage == InlinePage::none || inlineClosing || !IsWindowVisible(settingsList));
+    check("settings_page_closes_on_return", inlinePage == InlinePage::none || inlineClosing);
     SendMessageW(mainWindow, WM_COMMAND, DynamicPageId, 0);
     std::wstring dynamicBody(size_t(GetWindowTextLengthW(inlineText)) + 1, L'\0');
     GetWindowTextW(inlineText, dynamicBody.data(), int(dynamicBody.size()));
@@ -8406,7 +8444,7 @@ bool panelSelfTest(const std::wstring& path) {
     auto hasAction = [](const std::wstring& title) {
         return std::any_of(visualBlocks.begin(), visualBlocks.end(), [&](const VBlock& b) { return b.kind == VBlock::Kind::action && b.title == title; });
     };
-    check("hardware_page_offers_every_control", inlinePage == InlinePage::hardware && hasAction(tr(L"效能模式")) && hasAction(tr(L"充電上限"))
+    check("hardware_page_offers_every_control", inlinePage == InlinePage::hardware && !hasAction(tr(L"效能模式")) && hasAction(tr(L"充電上限"))
         && hasAction(tr(L"鍵盤背光")) && hasAction(tr(L"Fn 鎖定")) && hasAction(tr(L"Slash 燈效")) && hasAction(tr(L"華碩按鍵")) && hasAction(tr(L"華碩服務")));
     SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
     showOsd(L"Test", 50);
@@ -8863,6 +8901,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (screenshot && option(L"--stability")) showStabilityPage();
     if (screenshot && option(L"--lab")) showLabPage();
     // --page-scroll <n>: a chart page scrolled down by n (unscaled) pixels, to capture its lower part.
+    if (screenshot && option(L"--open-folds")) { for (const auto& b : visualBlocks) if (b.kind == VBlock::Kind::fold) visualFoldsOpen.insert(b.title); visualFolds.clear(); }
     if (screenshot) for (size_t i = 0; i + 1 < args.size(); ++i) if (args[i] == L"--page-scroll") { visualScroll = sp(_wtoi(args[i + 1].c_str())); if (visualView) InvalidateRect(visualView, nullptr, FALSE); }
     if (demo) for (size_t i = 0; i + 1 < args.size(); ++i) if (args[i] == L"--popups-bmp") {
         const bool saved = capturePopups(args[i + 1]);
