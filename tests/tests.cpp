@@ -5,6 +5,7 @@
 #include "../src/governor.h"
 #include "../src/asus.h"
 #include "../src/stability.h"
+#include "../src/verify.h"
 #include "../src/motion.h"
 #include "../src/i18n.h"
 #include <shellapi.h>
@@ -791,6 +792,29 @@ int wmain(int argc, wchar_t** argv) {
                     "the 30-day timeline puts each incident on its local day, worst kind first");
                 check(tookSystemDown(Kind::blueScreen) && tookSystemDown(Kind::forcedOff) && !tookSystemDown(Kind::freeze) && !tookSystemDown(Kind::batteryEmpty) &&
                     severity(Kind::manual) == 0, "only blue screens, power loss and forced shutdowns count as crashes");
+            }
+            {
+                // Control check: what counts as working.
+                using namespace bs::verify;
+                check(judgeReadback(ERROR_SUCCESS, 120.0, 120) == Verdict::works && judgeReadback(ERROR_SUCCESS, 60.0, 120) == Verdict::noEffect &&
+                    judgeReadback(ERROR_SUCCESS, 48.0, 63, 3) == Verdict::noEffect && judgeReadback(ERROR_SUCCESS, 61.0, 63, 3) == Verdict::works &&
+                    judgeReadback(ERROR_ACCESS_DENIED, 60.0, 120) == Verdict::refused && judgeReadback(ERROR_SUCCESS, std::nullopt, 1) == Verdict::writeOnly &&
+                    judgeReadback(ERROR_NOT_SUPPORTED, std::nullopt, 1) == Verdict::unsupported && judgeReadback(ERROR_GEN_FAILURE, std::nullopt, 1) == Verdict::refused,
+                    "a control works only when the value read back is the one written");
+                check(judgeMeasured(31.5, 62.0, 1.15, false) == Verdict::works && judgeMeasured(40.0, 41.0, 1.15, false) == Verdict::noEffect &&
+                    judgeMeasured(40.0, 44.0, 1.15, false) == Verdict::inconclusive && judgeMeasured(62.0, 24.8, .8, true) == Verdict::works &&
+                    judgeMeasured(62.0, 60.0, .8, true) == Verdict::noEffect && judgeMeasured(std::nullopt, 60.0, .8, true) == Verdict::inconclusive,
+                    "a measured effect must be clear: a small difference is not called either way");
+                check(judgeChargeLimit(80, 80, true, false) == Verdict::works && judgeChargeLimit(80, 92, true, true) == Verdict::noEffect &&
+                    judgeChargeLimit(80, 55, true, true) == Verdict::inconclusive && judgeChargeLimit(80, 70, false, false) == Verdict::inconclusive &&
+                    judgeChargeLimit(100, 100, true, false) == Verdict::skipped, "the charge limit is judged from what the battery does");
+                Result a; a.control = Control::asusMode; a.verdict = Verdict::works; a.before = 31.5; a.after = 62.0;
+                Result b; b.control = Control::brightness; b.verdict = Verdict::noEffect; b.before = 48; b.after = 48; b.status = ERROR_NOT_SUPPORTED;
+                Result c; c.control = Control::fanCurve; c.verdict = Verdict::writeOnly; c.note = needsTime;
+                const auto loaded = loadText(saveText({a, b, c}));
+                check(loaded.size() == 3 && loaded[0].control == Control::asusMode && loaded[0].verdict == Verdict::works && loaded[0].after && std::abs(*loaded[0].after - 62.0) < .001 &&
+                    loaded[1].verdict == Verdict::noEffect && loaded[1].status == ERROR_NOT_SUPPORTED && loaded[2].note == needsTime && !loaded[2].before,
+                    "control check results save and load");
             }
             const auto query = eventQueryXml(expected, Channel::system);
             const auto appQuery = eventQueryXml(expected, Channel::application);
