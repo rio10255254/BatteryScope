@@ -29,8 +29,9 @@ struct Result {
     DWORD status = ERROR_SUCCESS;         // of the write
     std::optional<double> before, after;  // read-backs or measurements (unit depends on the control)
     int note = 0;                         // a reason code, see Note
+    std::optional<double> mhz;            // the clock under the last load, where a load was run
 };
-enum Note { none = 0, onBatteryOnly, pluggedInOnly, customPreset, notToggled, needsTime, lookAtIt, noSecondValue, noPowerReading, guardHeld };
+enum Note { none = 0, onBatteryOnly, pluggedInOnly, customPreset, notToggled, needsTime, lookAtIt, noSecondValue, noPowerReading, guardHeld, loadHeldBack };
 const wchar_t* controlKey(Control control); // stable id for files: refresh, power-mode, ...
 const wchar_t* verdictKey(Verdict verdict);
 
@@ -43,7 +44,10 @@ Verdict judgeMeasured(std::optional<double> baseline, std::optional<double> chan
 Verdict judgeChargeLimit(unsigned limit, double percent, bool pluggedIn, bool charging);
 
 // ---- Measurement: every logical processor busy for a while.
-struct LoadReading { std::optional<double> packageWatts, mhz; };
+struct LoadReading { std::optional<double> packageWatts, mhz, baseMhz; };
+// A load whose clock stays well under the base clock was held back by something else
+// (efficiency throttling, a power plan): it cannot show a power limit.
+bool heldBack(const LoadReading& reading);
 LoadReading measureLoad(int milliseconds);
 
 struct Options {

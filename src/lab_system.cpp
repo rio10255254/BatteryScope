@@ -185,17 +185,16 @@ bool powershell(const std::wstring& script, std::string& output, DWORD timeoutMs
     return runCapture(L"\"" + std::wstring(system) + L"\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " +
         base64(utf16), output, timeoutMs);
 }
+// The panel's level through WMI directly (the active panel's instance). The PowerShell
+// route this replaced read 0 whenever PowerShell wrote a progress record first, and asked the
+// first instance, active or not.
 int readBrightness() {
-    std::string out;
-    if (!powershell(L"(Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightness -ErrorAction Stop | Select-Object -First 1).CurrentBrightness", out, 15000)) return -1;
-    const int value = atoi(out.c_str());
-    return out.find_first_of("0123456789") != std::string::npos && value >= 0 && value <= 100 ? value : -1;
+    const auto level = asus::os::screenBrightness();
+    return level && *level >= 0 && *level <= 100 ? *level : -1;
 }
 DWORD setBrightness(DWORD value) {
-    std::string out;
-    return powershell(L"try { Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightnessMethods -ErrorAction Stop | "
-        L"Invoke-CimMethod -MethodName WmiSetBrightness -Arguments @{Timeout=[uint32]0; Brightness=[byte]" + std::to_wstring(value) + L"} -ErrorAction Stop | Out-Null; exit 0 } catch { exit 1 }",
-        out, 15000) ? ERROR_SUCCESS : ERROR_NOT_SUPPORTED;
+    const DWORD status = asus::os::setScreenBrightness(int(value));
+    return status == ERROR_SUCCESS ? ERROR_SUCCESS : ERROR_NOT_SUPPORTED;
 }
 // The screen on or off, as the display timeout does; input or "on" wakes it.
 DWORD setDisplay(bool on) {
@@ -363,7 +362,7 @@ DWORD applyKnob(Knob knob, DWORD value) {
         // The level can take a moment to arrive: look up to three times.
         if (!status) {
             int now = -1;
-            for (int attempt = 0; attempt < 3; ++attempt) { if (attempt) Sleep(400); now = readBrightness(); if (now < 0 || std::abs(now - int(value)) <= 2) break; }
+            for (int attempt = 0; attempt < 4; ++attempt) { Sleep(attempt ? 400 : 150); now = readBrightness(); if (now < 0 || std::abs(now - int(value)) <= 2) break; }
             if (now >= 0 && std::abs(now - int(value)) > 2) status = ERROR_NOT_SUPPORTED;
         }
         if (!status) brightnessValue = value;

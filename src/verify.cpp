@@ -106,7 +106,14 @@ LoadReading measureLoad(int milliseconds) {
     std::atomic<bool> stop{false};
     std::vector<std::thread> workers;
     const DWORD processors = std::max<DWORD>(1, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
-    for (DWORD i = 0; i < processors; ++i) workers.emplace_back([&stop] {
+    // The whole process, and each worker, at full speed: Windows' efficiency throttling
+    // (EcoQoS) would hold the clock down and hide every power limit.
+    struct { ULONG version, controlMask, stateMask; } full{1, 0x1 /* execution speed */, 0 /* off */};
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &full, sizeof(full));
+    for (DWORD i = 0; i < processors; ++i) workers.emplace_back([&stop, full] {
+        auto state = full;
+        SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &state, sizeof(state));
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
         volatile double x = 1.0001;
         while (!stop.load(std::memory_order_relaxed)) for (int k = 0; k < 20000; ++k) x = x * 1.0000001 + 0.0000001;
     });
@@ -125,9 +132,15 @@ LoadReading measureLoad(int milliseconds) {
     stop = true;
     for (auto& worker : workers) worker.join();
     if (query) PdhCloseQuery(query);
+    // Back to the system's own choice for this process.
+    struct { ULONG version, controlMask, stateMask; } automatic{1, 0, 0};
+    SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &automatic, sizeof(automatic));
+    if (base > 0) reading.baseMhz = base;
     if (report.ready && !report.timingMismatch) reading.packageWatts = report.packageWatts ? report.packageWatts : report.coreWatts;
     return reading;
 }
+
+bool heldBack(const LoadReading& r) { return r.mhz && r.baseMhz && *r.mhz < *r.baseMhz * .7; }
 
 std::vector<Result> run(const Options& o) {
     std::vector<Result> results;
@@ -207,12 +220,13 @@ std::vector<Result> run(const Options& o) {
             const DWORD turboStatus = asus::setMode(asus::Mode::turbo); pause(1500, o);
             const auto turbo = measureLoad(3600);
             if (r.status == ERROR_SUCCESS) r.status = turboStatus;
-            r.before = silent.packageWatts; r.after = turbo.packageWatts;
+            r.before = silent.packageWatts; r.after = turbo.packageWatts; r.mhz = turbo.mhz;
             if (r.status != ERROR_SUCCESS) r.verdict = r.status == ERROR_NOT_SUPPORTED ? Verdict::unsupported : Verdict::refused;
             else if (!silent.packageWatts || !turbo.packageWatts) { r.verdict = Verdict::writeOnly; r.note = noPowerReading; }
             else {
                 r.verdict = judgeMeasured(silent.packageWatts, turbo.packageWatts, 1.15, false);
                 if (r.verdict != Verdict::works && o.onBattery) { r.verdict = Verdict::inconclusive; r.note = pluggedInOnly; } // limits are close together on battery
+                else if (r.verdict != Verdict::works && (heldBack(silent) || heldBack(turbo))) { r.verdict = Verdict::inconclusive; r.note = loadHeldBack; }
             }
             results.push_back(r);
 
@@ -224,10 +238,12 @@ std::vector<Result> run(const Options& o) {
                 Result p; p.control = Control::powerLimit; p.before = turbo.packageWatts;
                 p.status = asus::setTuning({asus::FanPreset::factory, asus::PowerPreset::saver}); pause(1200, o);
                 const auto limited = measureLoad(4200);
-                p.after = limited.packageWatts;
+                p.after = limited.packageWatts; p.mhz = limited.mhz;
                 if (p.status != ERROR_SUCCESS) p.verdict = p.status == ERROR_NOT_SUPPORTED ? Verdict::unsupported : Verdict::refused;
                 else if (!p.before || !p.after) { p.verdict = Verdict::writeOnly; p.note = noPowerReading; }
                 else p.verdict = *p.after <= 30 && *p.after < *p.before * .9 ? Verdict::works : judgeMeasured(p.before, p.after, .8, true);
+                // A load that never got near a limit says nothing about the limit.
+                if (p.verdict != Verdict::works && (heldBack(turbo) || *p.before < 28)) { p.verdict = Verdict::inconclusive; p.note = loadHeldBack; }
                 asus::setTuning({}); // back to factory (switches mode away and back)
                 results.push_back(p);
             }
@@ -274,8 +290,8 @@ std::wstring saveText(const std::vector<Result>& results) {
     std::wstring text;
     for (const auto& r : results) {
         wchar_t line[200];
-        swprintf(line, 200, L"%ls\t%ls\t%lu\t%ls\t%ls\t%d\n", controlKey(r.control), verdictKey(r.verdict), static_cast<unsigned long>(r.status),
-            r.before ? std::to_wstring(*r.before).c_str() : L"-", r.after ? std::to_wstring(*r.after).c_str() : L"-", r.note);
+        swprintf(line, 200, L"%ls\t%ls\t%lu\t%ls\t%ls\t%d\t%ls\n", controlKey(r.control), verdictKey(r.verdict), static_cast<unsigned long>(r.status),
+            r.before ? std::to_wstring(*r.before).c_str() : L"-", r.after ? std::to_wstring(*r.after).c_str() : L"-", r.note, r.mhz ? std::to_wstring(*r.mhz).c_str() : L"-");
         text += line;
     }
     return text;
@@ -296,6 +312,7 @@ std::vector<Result> loadText(const std::wstring& text) {
         if (parts[3] != L"-") r.before = std::wcstod(parts[3].c_str(), nullptr);
         if (parts[4] != L"-") r.after = std::wcstod(parts[4].c_str(), nullptr);
         r.note = _wtoi(parts[5].c_str());
+        if (parts.size() > 6 && parts[6] != L"-") r.mhz = std::wcstod(parts[6].c_str(), nullptr);
         results.push_back(r);
     }
     return results;

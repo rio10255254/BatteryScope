@@ -367,6 +367,18 @@ std::wstring dump(const Snapshot& s) {
     if (memory.chargeLimit) out += L"\nremembered charge=" + std::to_wstring(*memory.chargeLimit);
     if (memory.keyboard) out += L"\nremembered keyboard=" + std::to_wstring(*memory.keyboard);
     if (memory.fnLock) out += L"\nremembered fnlock=" + std::to_wstring(int(*memory.fnLock));
+    // The firmware's fan curves as it hands them out (8 temperatures, then 8 duties), per fan and mode.
+    {
+        Acpi acpi;
+        const std::pair<uint32_t, const wchar_t*> fans[] = {{0x00110024u, L"cpu"}, {0x00110025u, L"gpu"}};
+        for (const auto& [device, name] : fans)
+            for (uint32_t fanMode = 0; fanMode < 3; ++fanMode) {
+                const auto raw = acpi.available() ? acpi.getBuffer(device, fanMode) : std::nullopt;
+                out += std::wstring(L"\nfan curve ") + name + L" mode " + std::to_wstring(fanMode) + L" =";
+                if (!raw) { out += L" (no answer)"; continue; }
+                for (uint8_t b : *raw) { wchar_t hex[8]; swprintf(hex, 8, L" %02X", b); out += hex; }
+            }
+    }
     auto ids = [](const std::vector<uint8_t>& list) {
         std::wstring text;
         for (uint8_t id : list) { wchar_t hex[8]; swprintf(hex, 8, L"%02X", id); text += (text.empty() ? L"" : L",") + std::wstring(hex); }
@@ -700,7 +712,10 @@ std::optional<int> screenBrightness() {
 DWORD stepScreenBrightness(int percent) {
     const auto now = screenBrightness();
     if (!now) return ERROR_NOT_SUPPORTED;
-    const int target = std::clamp(*now + percent, 0, 100);
+    return setScreenBrightness(*now + percent);
+}
+DWORD setScreenBrightness(int level) {
+    const int target = std::clamp(level, 0, 100);
     Com com;
     if (!com.ready()) return ERROR_NOT_SUPPORTED;
     Ref<IWbemServices> wmi; Ref<IWbemClassObject> row;

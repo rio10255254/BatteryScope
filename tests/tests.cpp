@@ -808,12 +808,16 @@ int wmain(int argc, wchar_t** argv) {
                 check(judgeChargeLimit(80, 80, true, false) == Verdict::works && judgeChargeLimit(80, 92, true, true) == Verdict::noEffect &&
                     judgeChargeLimit(80, 55, true, true) == Verdict::inconclusive && judgeChargeLimit(80, 70, false, false) == Verdict::inconclusive &&
                     judgeChargeLimit(100, 100, true, false) == Verdict::skipped, "the charge limit is judged from what the battery does");
-                Result a; a.control = Control::asusMode; a.verdict = Verdict::works; a.before = 31.5; a.after = 62.0;
+                LoadReading slow; slow.mhz = 1900; slow.baseMhz = 4000;
+                LoadReading fast; fast.mhz = 4600; fast.baseMhz = 4000;
+                check(heldBack(slow) && !heldBack(fast) && !heldBack(LoadReading{}), "a load far under the base clock is held back and proves nothing");
+                Result a; a.control = Control::asusMode; a.verdict = Verdict::works; a.before = 31.5; a.after = 62.0; a.mhz = 4420;
                 Result b; b.control = Control::brightness; b.verdict = Verdict::noEffect; b.before = 48; b.after = 48; b.status = ERROR_NOT_SUPPORTED;
                 Result c; c.control = Control::fanCurve; c.verdict = Verdict::writeOnly; c.note = needsTime;
                 const auto loaded = loadText(saveText({a, b, c}));
                 check(loaded.size() == 3 && loaded[0].control == Control::asusMode && loaded[0].verdict == Verdict::works && loaded[0].after && std::abs(*loaded[0].after - 62.0) < .001 &&
-                    loaded[1].verdict == Verdict::noEffect && loaded[1].status == ERROR_NOT_SUPPORTED && loaded[2].note == needsTime && !loaded[2].before,
+                    loaded[1].verdict == Verdict::noEffect && loaded[1].status == ERROR_NOT_SUPPORTED && loaded[2].note == needsTime && !loaded[2].before &&
+                    loaded[0].mhz && std::abs(*loaded[0].mhz - 4420) < .01 && !loaded[1].mhz,
                     "control check results save and load");
             }
             const auto query = eventQueryXml(expected, Channel::system);

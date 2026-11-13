@@ -1278,6 +1278,9 @@ inline const std::map<std::wstring_view, const wchar_t*> translations = {
     {L" 項確認有作用", L" confirmed working"},
     {L" 項沒有作用", L" without effect"},
     {L"。結果已複製，可以直接貼上。", L". Results copied, ready to paste."},
+    {L"。負載沒有跑到全速（時脈 ", L". The load did not reach full speed (clock "},
+    {L" MHz），量不出上限的差異；請插電、把 Windows 電源模式設成平衡或效能後再檢查。", L" MHz), so the limits cannot be told apart; plug in, set the Windows power mode to balanced or performance, and check again."},
+    {L"。負載的功耗本來就低於上限，量不出差異；請插電、把 Windows 電源模式設成平衡或效能後再檢查。", L". The load already drew less than the limit, so no difference can be measured; plug in, set the Windows power mode to balanced or performance, and check again."},
 };
 inline const wchar_t* tr(const wchar_t* text) {
     if (!english) return text;
