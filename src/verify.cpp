@@ -117,15 +117,14 @@ LoadReading measureLoad(int milliseconds) {
         auto state = full;
         SetThreadInformation(GetCurrentThread(), ThreadPowerThrottling, &state, sizeof(state));
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
-        // Eight independent chains of packed multiply, add and square root: every execution
-        // port busy, so the processor draws what its limits allow (a light loop sat at 20 W on
-        // the G14 whatever the mode, far under any limit).
+        // Eight independent chains of packed multiply and add keep the arithmetic ports busy.
+        // (With square roots in the chain the G14 drew less, not more: 13 W against 20 W.)
         __m128d a[8];
         for (int k = 0; k < 8; ++k) a[k] = _mm_set_pd(1.0001 + k, 2.0003 + k);
         const __m128d scale = _mm_set1_pd(1.0000001), shift = _mm_set1_pd(0.5);
         while (!stop.load(std::memory_order_relaxed))
             for (int k = 0; k < 4000; ++k)
-                for (int c = 0; c < 8; ++c) a[c] = _mm_sqrt_pd(_mm_add_pd(_mm_mul_pd(a[c], scale), shift));
+                for (int c = 0; c < 8; ++c) a[c] = _mm_add_pd(_mm_mul_pd(a[c], scale), shift);
         volatile double sink = _mm_cvtsd_f64(a[0]); (void)sink;
     });
     // Let the limits settle for a third of the time, then measure the rest.
@@ -167,6 +166,28 @@ std::optional<double> pluggedInBoost() {
     const DWORD status = readAc(nullptr, scheme, &Processor, &Boost, &value);
     LocalFree(scheme);
     return status == ERROR_SUCCESS ? std::optional<double>(double(value)) : std::nullopt;
+}
+// Sets the plan's CPU Boost mode while plugged in and applies it. For the load tests only.
+DWORD setPluggedInBoost(DWORD value) {
+    HMODULE module = LoadLibraryExW(L"powrprof.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!module) return ERROR_PROC_NOT_FOUND;
+    DWORD (WINAPI* active)(HKEY, GUID**) = nullptr;
+    DWORD (WINAPI* writeAc)(HKEY, const GUID*, const GUID*, const GUID*, DWORD) = nullptr;
+    DWORD (WINAPI* apply)(HKEY, const GUID*) = nullptr;
+    FARPROC a = GetProcAddress(module, "PowerGetActiveScheme"), b = GetProcAddress(module, "PowerWriteACValueIndex"), c = GetProcAddress(module, "PowerSetActiveScheme");
+    std::memcpy(&active, &a, sizeof(active)); std::memcpy(&writeAc, &b, sizeof(writeAc)); std::memcpy(&apply, &c, sizeof(apply));
+    if (!active || !writeAc || !apply) return ERROR_PROC_NOT_FOUND;
+    if (stability::refuseWrite(L"knob cpu-boost-ac=" + std::to_wstring(value))) return ERROR_NOT_READY;
+    stability::note(L"knob cpu-boost-ac=" + std::to_wstring(value));
+    constexpr GUID Processor = {0x54533251, 0x82be, 0x4824, {0x96, 0xc1, 0x47, 0xb6, 0x0b, 0x74, 0x0d, 0x00}};
+    constexpr GUID Boost = {0xbe337238, 0x0d82, 0x4146, {0xa9, 0x60, 0x4f, 0x37, 0x49, 0xd4, 0x70, 0xc7}};
+    GUID* scheme = nullptr;
+    DWORD status = active(nullptr, &scheme);
+    if (status != ERROR_SUCCESS || !scheme) return status ? status : ERROR_GEN_FAILURE;
+    status = writeAc(nullptr, scheme, &Processor, &Boost, value);
+    if (status == ERROR_SUCCESS) status = apply(nullptr, scheme);
+    LocalFree(scheme);
+    return status;
 }
 bool heldBack(const LoadReading& r) { return r.mhz && r.baseMhz && *r.mhz < *r.baseMhz * .7; }
 
@@ -241,12 +262,21 @@ std::vector<Result> run(const Options& o) {
         if (!snapshot.modeDevice) skip(Control::asusMode, Verdict::unsupported, none);
         else if (cancelled()) skip(Control::asusMode, Verdict::skipped, guardHeld);
         else {
+            // With CPU Boost off the clock stops at the base clock and the load never reaches a
+            // mode's limit (the G14, plugged in with boost off, drew 13-20 W in every mode). Boost
+            // is switched on for the load tests and put back afterwards.
+            const std::optional<double> boostBefore = o.onBattery ? knob(lab::Knob::cpuBoost) : pluggedInBoost();
+            const bool boostRaised = boostBefore && *boostBefore == 0 &&
+                (o.onBattery ? lab::applyKnob(lab::Knob::cpuBoost, 2) : setPluggedInBoost(2)) == ERROR_SUCCESS;
+            auto restoreBoost = [&] { if (boostRaised) { if (o.onBattery) lab::applyKnob(lab::Knob::cpuBoost, 0); else setPluggedInBoost(0); } };
+            if (boostRaised) pause(800, o);
             // First, the load as things stand, before anything is written.
             {
                 begin(Control::loadBaseline);
                 const auto base = measureLoad(3600);
                 Result b; b.control = Control::loadBaseline; b.before = base.packageWatts; b.mhz = base.mhz;
-                b.after = pluggedInBoost(); // the plan's CPU Boost while plugged in: 0 means off
+                b.after = boostBefore;      // CPU Boost for the current power source before the check: 0 means off
+                if (boostRaised) b.note = onBatteryOnly + 100; // 101: boost was off, switched on for the load tests
                 b.verdict = base.packageWatts ? Verdict::skipped : Verdict::unsupported;
                 results.push_back(b);
             }
@@ -313,7 +343,8 @@ std::vector<Result> run(const Options& o) {
                 asus::setTuning({});
                 results.push_back(f);
             }
-            // Put the mode and the presets back as they were.
+            // Put boost, the mode and the presets back as they were.
+            restoreBoost();
             asus::setMode(mode);
             if (tuning.fans != asus::FanPreset::factory || tuning.power != asus::PowerPreset::factory) { pause(1300, o); asus::setTuning(tuning); }
         }

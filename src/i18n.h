@@ -1297,6 +1297,8 @@ inline const std::map<std::wstring_view, const wchar_t*> translations = {
     {L"檢查設下的 CPU 功耗上限還留著，電腦會變慢。請重新開機清除；這個選項已停用。", L"The CPU power limit set by the check is still in force and the PC will be slow. Restart to clear it; the option is switched off."},
     {L"插電時 CPU Boost：開。", L" CPU Boost while plugged in: on."},
     {L"插電時 CPU Boost：關（電源計畫把它關掉了，時脈不會超過基準）。", L" CPU Boost while plugged in: off (the power plan turns it off, so the clock stays at the base clock)."},
+    {L"你的電源計畫把 CPU Boost 關掉了（時脈不超過基準、比較涼也比較安靜）。檢查時暫時打開來量，量完已關回去。打開後的全核心負載：", L"Your power plan has CPU Boost switched off (the clock stays at the base clock: cooler and quieter). The check switched it on to measure and off again afterwards. All-core load with boost on: "},
+    {L"CPU Boost：開。", L" CPU Boost: on."},
 };
 inline const wchar_t* tr(const wchar_t* text) {
     if (!english) return text;
