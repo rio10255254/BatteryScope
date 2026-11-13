@@ -1295,6 +1295,8 @@ inline const std::map<std::wstring_view, const wchar_t*> translations = {
     {L"這台電腦上功耗上限設了之後還原不回來，已停用這個選項。重新開機可以清除目前的上限。", L"On this PC a power limit stays in force after it is set back, so the option is switched off. Restart the PC to clear the current limit."},
     {L"功耗上限沒有還原", L"The power limit was not restored"},
     {L"檢查設下的 CPU 功耗上限還留著，電腦會變慢。請重新開機清除；這個選項已停用。", L"The CPU power limit set by the check is still in force and the PC will be slow. Restart to clear it; the option is switched off."},
+    {L"插電時 CPU Boost：開。", L" CPU Boost while plugged in: on."},
+    {L"插電時 CPU Boost：關（電源計畫把它關掉了，時脈不會超過基準）。", L" CPU Boost while plugged in: off (the power plan turns it off, so the clock stays at the base clock)."},
 };
 inline const wchar_t* tr(const wchar_t* text) {
     if (!english) return text;
