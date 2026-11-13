@@ -13,7 +13,10 @@
 
 namespace bs::verify {
 
-enum class Control { refreshRate, powerMode, cpuBoost, energyPreference, brightness, asusMode, powerLimit, fanCurve, gpuEco, chargeLimit, keyboard, count };
+enum class Control { refreshRate, powerMode, cpuBoost, energyPreference, brightness, asusMode, powerLimit, fanCurve, gpuEco, chargeLimit, keyboard,
+    loadBaseline,  // all-core power before anything is changed: what the limits are compared with
+    powerRestore,  // after the power-limit test: does the load come back to where it was?
+    count };
 enum class Verdict {
     works,        // written, and the read-back or the measured effect confirms it
     noEffect,     // written without error, but nothing changed

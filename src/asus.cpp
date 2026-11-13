@@ -106,7 +106,10 @@ std::optional<uint32_t> Acpi::call(uint32_t method, const std::vector<uint8_t>& 
     std::memcpy(in.data(), &method, 4); std::memcpy(in.data() + 4, &length, 4);
     if (!a.empty()) std::memcpy(in.data() + 8, a.data(), a.size());
     uint8_t out[16]{}; DWORD returned = 0;
-    if (!DeviceIoControl(handle_, ControlCode, in.data(), DWORD(in.size()), out, sizeof(out), &returned, nullptr)) return std::nullopt;
+    // A buffer answer (a fan curve) can be longer than the 16 bytes asked for: the driver then
+    // reports "more data" with the first 16 bytes in place. G-Helper reads them the same way.
+    if (!DeviceIoControl(handle_, ControlCode, in.data(), DWORD(in.size()), out, sizeof(out), &returned, nullptr)
+        && !(raw && (GetLastError() == ERROR_MORE_DATA || GetLastError() == ERROR_INSUFFICIENT_BUFFER))) return std::nullopt;
     uint32_t result = 0; std::memcpy(&result, out, 4);
     if (raw) raw->assign(out, out + sizeof(out));
     return result;

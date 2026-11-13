@@ -28,6 +28,8 @@ const wchar_t* controlKey(Control c) {
     case Control::gpuEco: return L"gpu-eco";
     case Control::chargeLimit: return L"charge-limit";
     case Control::keyboard: return L"keyboard";
+    case Control::loadBaseline: return L"load-baseline";
+    case Control::powerRestore: return L"power-restore";
     default: return L"";
     }
 }
@@ -203,7 +205,7 @@ std::vector<Result> run(const Options& o) {
     // ASUS firmware controls.
     const asus::Snapshot snapshot = o.asus ? asus::read() : asus::Snapshot{};
     if (!o.asus || !snapshot.driver) {
-        for (Control c : {Control::asusMode, Control::powerLimit, Control::fanCurve, Control::gpuEco, Control::chargeLimit, Control::keyboard}) skip(c, Verdict::unsupported, none);
+        for (Control c : {Control::asusMode, Control::powerLimit, Control::powerRestore, Control::fanCurve, Control::gpuEco, Control::chargeLimit, Control::keyboard}) skip(c, Verdict::unsupported, none);
     } else {
         const asus::Tuning tuning = asus::tuning();
         const asus::Mode mode = asus::remembered().mode.value_or(asus::Mode::balanced);
@@ -213,6 +215,14 @@ std::vector<Result> run(const Options& o) {
         if (!snapshot.modeDevice) skip(Control::asusMode, Verdict::unsupported, none);
         else if (cancelled()) skip(Control::asusMode, Verdict::skipped, guardHeld);
         else {
+            // First, the load as things stand, before anything is written.
+            {
+                begin(Control::loadBaseline);
+                const auto base = measureLoad(3600);
+                Result b; b.control = Control::loadBaseline; b.before = base.packageWatts; b.mhz = base.mhz;
+                b.verdict = base.packageWatts ? Verdict::skipped : Verdict::unsupported;
+                results.push_back(b);
+            }
             Result r; r.control = Control::asusMode;
             if (tuning.fans != asus::FanPreset::factory || tuning.power != asus::PowerPreset::factory) asus::setTuning({});
             r.status = asus::setMode(asus::Mode::silent); pause(1500, o);
@@ -234,6 +244,13 @@ std::vector<Result> run(const Options& o) {
             begin(Control::powerLimit);
             if (!asus::powerLimitsSupported()) skip(Control::powerLimit, Verdict::unsupported, none);
             else if (cancelled()) skip(Control::powerLimit, Verdict::skipped, guardHeld);
+            else if (!turbo.packageWatts || *turbo.packageWatts < 28) {
+                // The load already draws less than the limit would allow: writing the limit could show
+                // nothing, so it is not written at all.
+                Result p; p.control = Control::powerLimit; p.verdict = Verdict::inconclusive; p.note = turbo.packageWatts ? loadHeldBack : noPowerReading;
+                p.before = turbo.packageWatts; p.mhz = turbo.mhz;
+                results.push_back(p);
+            }
             else {
                 Result p; p.control = Control::powerLimit; p.before = turbo.packageWatts;
                 p.status = asus::setTuning({asus::FanPreset::factory, asus::PowerPreset::saver}); pause(1200, o);
@@ -246,6 +263,16 @@ std::vector<Result> run(const Options& o) {
                 if (p.verdict != Verdict::works && (heldBack(turbo) || *p.before < 28)) { p.verdict = Verdict::inconclusive; p.note = loadHeldBack; }
                 asus::setTuning({}); // back to factory (switches mode away and back)
                 results.push_back(p);
+                // Did the limit really go away? The same load again, in turbo, must come back to
+                // where it was. If it does not, the limit is still in force until a restart.
+                begin(Control::powerRestore);
+                pause(1500, o);
+                const auto restored = measureLoad(4200);
+                Result back; back.control = Control::powerRestore; back.before = turbo.packageWatts; back.after = restored.packageWatts; back.mhz = restored.mhz;
+                if (!back.before || !back.after) { back.verdict = Verdict::inconclusive; back.note = noPowerReading; }
+                else if (p.verdict != Verdict::works) { back.verdict = Verdict::skipped; back.note = loadHeldBack; } // the limit showed no effect: nothing to see return
+                else back.verdict = *back.after >= *back.before * .88 ? Verdict::works : Verdict::noEffect;
+                results.push_back(back);
             }
             // Fan curve: the firmware's answer is all there is; the speed only shows as it warms up.
             begin(Control::fanCurve);

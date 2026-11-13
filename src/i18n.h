@@ -1281,6 +1281,20 @@ inline const std::map<std::wstring_view, const wchar_t*> translations = {
     {L"。負載沒有跑到全速（時脈 ", L". The load did not reach full speed (clock "},
     {L" MHz），量不出上限的差異；請插電、把 Windows 電源模式設成平衡或效能後再檢查。", L" MHz), so the limits cannot be told apart; plug in, set the Windows power mode to balanced or performance, and check again."},
     {L"。負載的功耗本來就低於上限，量不出差異；請插電、把 Windows 電源模式設成平衡或效能後再檢查。", L". The load already drew less than the limit, so no difference can be measured; plug in, set the Windows power mode to balanced or performance, and check again."},
+    // 0.24.2
+    {L"全核心負載（檢查前）", L"All-core load (before the check)"},
+    {L"功耗上限還原", L"Power limit restored"},
+    {L"什麼都還沒改之前，全核心負載的 CPU 功耗是 ", L"Before anything was changed, an all-core load drew "},
+    {L" W。這是後面比較的基準。", L" W of CPU power. The rest is compared with this."},
+    {L"還原後同樣的負載回到 ", L"After restoring, the same load is back at "},
+    {L" W（原本 ", L" W (it was "},
+    {L" W）。", L" W)."},
+    {L"還原後只有 ", L"After restoring, only "},
+    {L" W）：上限還留著。請重新開機清除；功耗上限選項已停用。", L" W): the limit is still in force. Restart the PC to clear it; the power limit option is switched off."},
+    {L"功耗上限沒有量到效果，所以也無從確認還原。", L"The power limit showed no measurable effect, so restoring it cannot be confirmed either."},
+    {L"這台電腦上功耗上限設了之後還原不回來，已停用這個選項。重新開機可以清除目前的上限。", L"On this PC a power limit stays in force after it is set back, so the option is switched off. Restart the PC to clear the current limit."},
+    {L"功耗上限沒有還原", L"The power limit was not restored"},
+    {L"檢查設下的 CPU 功耗上限還留著，電腦會變慢。請重新開機清除；這個選項已停用。", L"The CPU power limit set by the check is still in force and the PC will be slow. Restart to clear it; the option is switched off."},
 };
 inline const wchar_t* tr(const wchar_t* text) {
     if (!english) return text;
