@@ -9,6 +9,7 @@
 #include <array>
 #include <iterator>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
@@ -1029,6 +1030,95 @@ int copySystemDumps(const std::wstring& target, std::wstring& listing) {
     }
     if (denied) listing += L"(some folders could not be read)\r\n";
     return copied;
+}
+
+// ---- Write guard.
+void WriteGuard::hold(Hold reason) { holds_ |= unsigned(reason); }
+void WriteGuard::release(Hold reason, uint64_t nowMs, uint64_t settleMs) {
+    holds_ &= ~unsigned(reason);
+    settle(nowMs, settleMs);
+}
+void WriteGuard::settle(uint64_t nowMs, uint64_t ms) {
+    uint64_t until = nowMs + ms, current = settleUntil_.load();
+    while (until > current && !settleUntil_.compare_exchange_weak(current, until)) {}
+}
+bool WriteGuard::held() const { return holds_.load() != 0; }
+bool WriteGuard::automaticBlocked(uint64_t nowMs) const { return held() || nowMs < settleUntil_.load(); }
+unsigned WriteGuard::holds() const { return holds_.load(); }
+uint64_t WriteGuard::blockedWrites() const { return blocked_.load(); }
+void WriteGuard::countBlocked() { ++blocked_; }
+WriteGuard& writeGuard() { static WriteGuard guard; return guard; }
+bool refuseWrite(const std::wstring& what) {
+    if (!writeGuard().held()) return false;
+    writeGuard().countBlocked();
+    note(L"blocked " + what);
+    return true;
+}
+
+// ---- G-Helper.
+GHelperSettings parseGHelperConfig(const std::string& json) {
+    GHelperSettings g;
+    // A flat object of "key": number pairs; anything else is skipped.
+    size_t at = 0;
+    while ((at = json.find('"', at)) != std::string::npos) {
+        const size_t end = json.find('"', at + 1);
+        if (end == std::string::npos) break;
+        const std::string key = json.substr(at + 1, end - at - 1);
+        size_t colon = end + 1;
+        while (colon < json.size() && (json[colon] == ' ' || json[colon] == '\t' || json[colon] == '\r' || json[colon] == '\n')) ++colon;
+        if (colon >= json.size() || json[colon] != ':') { at = end + 1; continue; }
+        ++colon;
+        while (colon < json.size() && (json[colon] == ' ' || json[colon] == '\t')) ++colon;
+        char* stop = nullptr;
+        const long value = std::strtol(json.c_str() + colon, &stop, 10);
+        const bool number = stop != json.c_str() + colon;
+        at = number ? size_t(stop - json.c_str()) : colon;
+        if (!number) { if (colon < json.size() && json[colon] == '"') { const size_t close = json.find('"', colon + 1); if (close == std::string::npos) break; at = close + 1; } continue; }
+        g.found = true;
+        if (key == "auto_uv") g.autoUndervolt = value != 0;
+        else if (key.rfind("cpu_uv", 0) == 0) g.cpuUndervolt = std::min(g.cpuUndervolt, int(value));
+        else if (key.rfind("igpu_uv", 0) == 0) g.igpuUndervolt = std::min(g.igpuUndervolt, int(value));
+        else if (key.rfind("gpu_core", 0) == 0) g.gpuCore = std::max(g.gpuCore, int(value));
+        else if (key.rfind("gpu_memory", 0) == 0) g.gpuMemory = std::max(g.gpuMemory, int(value));
+    }
+    return g;
+}
+GHelperSettings readGHelperConfig() {
+    PWSTR roaming = nullptr;
+    constexpr GUID RoamingAppData = {0x3EB685DB, 0x65F9, 0x4CF6, {0xA0, 0x3A, 0xE3, 0xEF, 0x65, 0x72, 0x9F, 0x3D}};
+    std::filesystem::path path;
+    if (SUCCEEDED(SHGetKnownFolderPath(RoamingAppData, 0, nullptr, &roaming)) && roaming) path = std::filesystem::path(roaming) / L"GHelper" / L"config.json";
+    CoTaskMemFree(roaming);
+    if (path.empty()) return {};
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return {};
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (text.size() > (1u << 20)) return {};
+    return parseGHelperConfig(text);
+}
+
+// ---- Timeline.
+bool tookSystemDown(Kind kind) { return kind == Kind::blueScreen || kind == Kind::powerLoss || kind == Kind::forcedOff; }
+int severity(Kind kind) {
+    if (tookSystemDown(kind)) return 3;
+    if (kind == Kind::freeze || kind == Kind::graphicsReset || kind == Kind::hardwareError) return 2;
+    if (kind == Kind::manual || kind == Kind::count) return 0;
+    return 1;
+}
+std::vector<DayMark> timeline(const std::vector<Incident>& incidents, uint64_t now, int days, int64_t utcOffsetSeconds) {
+    std::vector<DayMark> out(size_t(std::max(days, 1)));
+    auto day = [&](uint64_t utc) { return (int64_t(utc / Second) + utcOffsetSeconds) / 86400; };
+    const int64_t today = day(now);
+    for (const auto& i : incidents) {
+        const int64_t age = today - day(i.when());
+        if (age < 0 || age >= int64_t(out.size())) continue;
+        auto& mark = out[out.size() - 1 - size_t(age)];
+        const int s = severity(i.kind);
+        if (!s) continue;
+        mark.severity = std::max(mark.severity, s);
+        if (s >= 2) ++mark.count; else if (!mark.count) mark.count = 1;
+    }
+    return out;
 }
 
 } // namespace bs::stability

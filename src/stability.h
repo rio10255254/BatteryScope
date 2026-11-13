@@ -13,6 +13,7 @@
 // - Live freezes: a high-priority thread notices when the whole system stops
 //   scheduling it for seconds while the screen is on.
 #include <windows.h>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -173,5 +174,50 @@ std::vector<std::pair<uint64_t, std::wstring>> ownCrashes(uint64_t sinceUtc);
 int copySystemDumps(const std::wstring& target, std::wstring& listing);
 // Lists the dumps without copying (names, sizes, times), or why it could not.
 std::wstring listSystemDumps(bool& accessDenied, int& count);
+
+// ---- Write guard: no hardware or power-setting writes around power transitions.
+// The crashes this monitor was built for cluster at sleep, wake and restart, so nothing is
+// written while the PC is going down or the screen is off, nor in the seconds after it comes
+// back. Hard holds (suspending, screen off, shutting down) also stop the low-level writers;
+// the settle time after a hold applies to automatic writes only, so a key press still works.
+class WriteGuard {
+public:
+    enum Hold : unsigned { suspending = 1, screenOff = 2, shuttingDown = 4 };
+    void hold(Hold reason);
+    void release(Hold reason, uint64_t nowMs, uint64_t settleMs); // automatic writes wait settleMs more
+    void settle(uint64_t nowMs, uint64_t ms);                      // e.g. after the program starts
+    bool held() const;                                             // a transition is in progress
+    bool automaticBlocked(uint64_t nowMs) const;                   // held, or still settling
+    unsigned holds() const;
+    uint64_t blockedWrites() const;                                // low-level writes refused so far
+    void countBlocked();
+private:
+    std::atomic<unsigned> holds_{0};
+    std::atomic<uint64_t> settleUntil_{0}, blocked_{0};
+};
+WriteGuard& writeGuard();
+// For the low-level writers: true (and noted in the black box) when a write must not happen now.
+bool refuseWrite(const std::wstring& what);
+
+// ---- G-Helper beside BatteryScope: both drive the same firmware interface, and its
+// undervolt or overclock settings matter when the PC is unstable.
+struct GHelperSettings {
+    bool found = false;        // a config file was read
+    bool autoUndervolt = false; // applies the undervolt by itself at start
+    int cpuUndervolt = 0;      // the most negative CPU value over all modes (0: none)
+    int igpuUndervolt = 0;
+    int gpuCore = 0, gpuMemory = 0; // the largest GPU overclock over all modes (MHz)
+    bool risky() const { return cpuUndervolt < 0 || igpuUndervolt < 0 || gpuCore > 0 || gpuMemory > 0; }
+};
+GHelperSettings parseGHelperConfig(const std::string& json);
+GHelperSettings readGHelperConfig(); // %APPDATA%\GHelper\config.json
+
+// ---- The 30-day timeline: per local day, the worst incident and how many. Index 0 is the
+// oldest day, the last is today.
+struct DayMark { int severity = 0, count = 0; }; // 0 none, 1 note, 2 freeze or reset, 3 crash
+int severity(Kind kind);
+std::vector<DayMark> timeline(const std::vector<Incident>& incidents, uint64_t nowUtc, int days, int64_t utcOffsetSeconds);
+// Crashes that took the system down, newest first: what protection mode and the streak follow.
+bool tookSystemDown(Kind kind);
 
 } // namespace bs::stability

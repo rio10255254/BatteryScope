@@ -716,6 +716,54 @@ int wmain(int argc, wchar_t** argv) {
                 check(text.find(L"0x9F DRIVER_POWER_STATE_FAILURE (0x3,") == 0 && text.find(L"pci ACPI nipbcfk nipcibrd") != std::wstring::npos,
                     "a kernel minidump gives its stop code and the drivers in its crash data");
             }
+            // The write guard: hard holds stop everything; the settle time after them only automatic writes.
+            {
+                WriteGuard guard;
+                check(!guard.held() && !guard.automaticBlocked(1000), "the write guard starts open");
+                guard.hold(WriteGuard::screenOff);
+                guard.hold(WriteGuard::suspending);
+                check(guard.held() && guard.automaticBlocked(1000), "screen off and suspend hold all writes");
+                guard.release(WriteGuard::suspending, 5000, 10000);
+                check(guard.held() && guard.holds() == WriteGuard::screenOff, "one hold released leaves the other");
+                guard.release(WriteGuard::screenOff, 6000, 5000);
+                check(!guard.held() && guard.automaticBlocked(14999) && !guard.automaticBlocked(15000),
+                    "after the holds, automatic writes wait out the longest settle time; direct ones may go");
+                guard.settle(20000, 8000); guard.settle(21000, 1000);
+                check(guard.automaticBlocked(27999) && !guard.automaticBlocked(28000), "a shorter settle never cuts a longer one");
+                guard.hold(WriteGuard::shuttingDown);
+                check(guard.held(), "shutting down holds all writes");
+                // The process-wide guard refuses low-level writes while held, and counts them.
+                const uint64_t before = writeGuard().blockedWrites();
+                check(!refuseWrite(L"test"), "low-level writes pass while nothing is held");
+                writeGuard().hold(WriteGuard::screenOff);
+                const bool refused = refuseWrite(L"test");
+                const DWORD knob = bs::lab::applyKnob(bs::lab::Knob::cpuBoost, 0);
+                writeGuard().release(WriteGuard::screenOff, GetTickCount64(), 0);
+                check(refused && knob == ERROR_NOT_READY && writeGuard().blockedWrites() == before + 2, "with the screen off, power settings are not written");
+            }
+            {
+                const auto g = parseGHelperConfig("{\n  \"auto_uv\": 1,\n  \"cpu_uv_0\": -2,\n  \"cpu_uv_2\": -5,\n  \"igpu_uv_1\": 0,\n  \"gpu_core_1\": 155,\n  \"gpu_memory_1\": 230,\n"
+                    "  \"name\": \"cpu_uv_9: -40\",\n  \"performance_mode\": 2\n}");
+                const auto none = parseGHelperConfig("{\"performance_mode\": 0, \"cpu_uv_0\": 0}");
+                check(g.found && g.autoUndervolt && g.cpuUndervolt == -5 && g.igpuUndervolt == 0 && g.gpuCore == 155 && g.gpuMemory == 230 && g.risky() &&
+                    none.found && !none.risky() && !none.autoUndervolt && !parseGHelperConfig("").found, "G-Helper's undervolt and overclock settings are read from its config");
+            }
+            {
+                const uint64_t noon = 20000ull * 86400 * Second + 12 * 3600 * Second; // a day's noon, UTC
+                Incident crashToday; crashToday.kind = Kind::blueScreen; crashToday.time = noon - 3600 * Second;
+                Incident crashAgain = crashToday; crashAgain.time = noon - 2 * 3600 * Second;
+                Incident freezeYesterday; freezeYesterday.kind = Kind::freeze; freezeYesterday.time = noon - 86400 * Second;
+                Incident diskOld; diskOld.kind = Kind::diskError; diskOld.time = noon - 29 * 86400 * Second;
+                Incident tooOld = crashToday; tooOld.time = noon - 31 * 86400 * Second;
+                Incident lateEvening = crashToday; lateEvening.time = noon + 5 * 3600 * Second - 86400 * Second; // 17:00 UTC the day before
+                const auto marks = timeline({crashToday, crashAgain, freezeYesterday, diskOld, tooOld}, noon, 30, 0);
+                const auto shifted = timeline({lateEvening}, noon, 30, 8 * 3600); // UTC+8: 01:00 today
+                check(marks.size() == 30 && marks[29].severity == 3 && marks[29].count == 2 && marks[28].severity == 2 && marks[28].count == 1 &&
+                    marks[0].severity == 1 && marks[1].severity == 0 && shifted[29].severity == 3 && shifted[28].severity == 0,
+                    "the 30-day timeline puts each incident on its local day, worst kind first");
+                check(tookSystemDown(Kind::blueScreen) && tookSystemDown(Kind::forcedOff) && !tookSystemDown(Kind::freeze) && !tookSystemDown(Kind::batteryEmpty) &&
+                    severity(Kind::manual) == 0, "only blue screens, power loss and forced shutdowns count as crashes");
+            }
             const auto query = eventQueryXml(expected, Channel::system);
             const auto appQuery = eventQueryXml(expected, Channel::application);
             check(query.find(L"<Select Path='System'>") != std::wstring::npos && appQuery.find(L"<Select Path='Application'>") != std::wstring::npos &&

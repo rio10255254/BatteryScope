@@ -15,8 +15,8 @@
 
 From the **[Releases page](https://github.com/rio10255254/BatteryScope/releases/latest)**:
 
-- **Installer (recommended):** `BatteryScope-0.23.1-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
-- **Portable:** `BatteryScope-0.23.1-win64.zip`; extract it and run `BatteryScope.exe`.
+- **Installer (recommended):** `BatteryScope-0.23.2-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
+- **Portable:** `BatteryScope-0.23.2-win64.zip`; extract it and run `BatteryScope.exe`.
 
 Requires Windows 10 version 1703 or later (Windows 11 recommended), 64-bit. The program is not code-signed; if SmartScreen appears the first time, choose **More info → Run anyway**. It lives in the notification area, where the icon shows the battery percentage; click it to show or hide the panel.
 
@@ -53,7 +53,7 @@ Details follow.
 
 ## Using it
 
-1. Download `BatteryScope-0.23.1-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
+1. Download `BatteryScope-0.23.2-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
 2. Click its battery icon in the notification area to show or hide the panel. Esc hides it; monitoring continues at a lower frequency.
 3. Open **⋯ → Language / 語言 → English** to switch immediately. The setting persists for your Windows account. Selection and scroll position are retained.
 4. Use Background and Show filters, the mouse wheel, arrow keys, Home/End, or Page Up/Down. Enter or double-click opens details.
@@ -184,6 +184,26 @@ When the PC shows a blue screen, restarts on its own, freezes or the screen flas
   - **Mark a problem that just happened:** after a stutter, a crash or anything odd, marks that moment and the state before it. It is also in the ⋯ menu.
 - Everything stays on this PC. Nothing is uploaded; you decide whether and to whom to give a report.
 
+**Protection (0.23.2).** BatteryScope cannot repair a hardware or driver fault, but it makes sure it never acts at a risky moment:
+
+- **No writes during power transitions.**
+  - While the PC goes to sleep, while the screen is off (how Modern Standby begins), and while it signs out, shuts down or restarts, every hardware and power-setting write is refused. That includes the low-level ASUS ACPI and power-setting writers.
+  - Automatic adjustments also pause for 20 seconds after the lid closes, 10 seconds after a resume, 5 seconds after the screen comes back, and 8 seconds after BatteryScope starts (25 when Windows itself has just started).
+  - Keys you press and choices you make are not held back by the wait after a wake.
+- **Protection mode.** When BatteryScope finds a crash from the last 24 hours, it switches to protection mode by itself: it only watches.
+  - Paused: dynamic saving, the automatic refresh rate and GPU mode, the low-battery switch, keyboard dimming, experiments, and re-applying the ASUS settings after a start or wake.
+  - It stays on until you choose "Resume automatic adjustments".
+  - You can also turn it on yourself (Stability page or the ⋯ menu), which suits a period of watching for a fault.
+- **Start order.** It reads Windows' crash records first (to decide on protection mode), then restores what a crash left changed, and only then applies the remembered ASUS settings. Nothing is written at the moment it starts.
+- **G-Helper alongside.** "Next steps" warns when G-Helper is running, or when its settings undervolt the CPU or overclock the GPU. Both programs drive the same firmware interface and overwrite each other.
+- **The Stability page reads at a glance:**
+  - one line on the state of things (all is well, watching, how many in 7 days, protection mode);
+  - a 30-day timeline, one cell per day, red for a crash;
+  - "Next steps", where what BatteryScope can see for itself is ticked off: three clean sleep-and-wake cycles, one clean restart, three days without a crash;
+  - each incident in plain words with the state at the time.
+
+  The home page shows the same banner when there is a problem or protection mode is on.
+
 ## ASUS hardware (0.18, ASUS laptops)
 
 The **ASUS** tab reads and writes settings through the ASUS ATKACPI driver (ASUS System Control Interface, which Armoury Crate and G-Helper also use) and the keyboard's and lighting's HID interfaces. Neither G-Helper nor Armoury Crate is needed:
@@ -256,7 +276,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-To avoid replacing a running executable, use `-OutputDirectory dist/v0.23.1`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
+To avoid replacing a running executable, use `-OutputDirectory dist/v0.23.2`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
 
 ```powershell
 .\dist\BatteryScope.exe --demo
