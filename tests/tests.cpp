@@ -808,6 +808,10 @@ int wmain(int argc, wchar_t** argv) {
                 check(judgeChargeLimit(80, 80, true, false) == Verdict::works && judgeChargeLimit(80, 92, true, true) == Verdict::noEffect &&
                     judgeChargeLimit(80, 55, true, true) == Verdict::inconclusive && judgeChargeLimit(80, 70, false, false) == Verdict::inconclusive &&
                     judgeChargeLimit(100, 100, true, false) == Verdict::skipped, "the charge limit is judged from what the battery does");
+                const uint64_t loadStart = GetTickCount64();
+                (void)measureLoad(900);
+                const uint64_t loadTook = GetTickCount64() - loadStart;
+                check(loadTook >= 850 && loadTook < 6000, "the test load runs for the time asked and stops");
                 LoadReading slow; slow.mhz = 1900; slow.baseMhz = 4000;
                 LoadReading fast; fast.mhz = 4600; fast.baseMhz = 4000;
                 check(heldBack(slow) && !heldBack(fast) && !heldBack(LoadReading{}), "a load far under the base clock is held back and proves nothing");
