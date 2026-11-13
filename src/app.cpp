@@ -8,6 +8,7 @@
 #include "governor.h"
 #include "asus.h"
 #include "stability.h"
+#include "verify.h"
 #include "ui.h"
 #include <commctrl.h>
 #include <pdh.h>
@@ -70,7 +71,7 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     SlashBright1Id = 238 /* ..240 */, SlashIntervalId = 241 /* ..246 */, SlashModeId = 250 /* ..265 */,
     RefreshAutoId = 266, DarkModeId = 267, AutoSaverCycleId = 268, PerfPageId = 269, FanMenuId = 270, PowerLimitMenuId = 271,
     FanPreset0Id = 272 /* ..275 */, PowerPreset0Id = 276 /* ..279 */, CpuBoostToggleId = 280, WinModeMenuId = 281,
-    StabilityPageId = 282, ReportId = 283, ReportFullId = 284, MarkProblemId = 285, StabilityFolderId = 286, ProtectToggleId = 287,
+    StabilityPageId = 282, ReportId = 283, ReportFullId = 284, MarkProblemId = 285, StabilityFolderId = 286, ProtectToggleId = 287, VerifyControlsId = 288,
     SettingsListId = 300,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1, FnKeyHotkey = 10 /* ..20: F1-F11 under the software Fn lock */;
@@ -189,8 +190,10 @@ void showStabilityPage();
 int protectState = 0;          // 0 off, 1 chosen by the user, 2 switched on after a crash
 bool startupSettled = false;   // the deferred start (restores, then the remembered ASUS settings) has run
 std::atomic<bool> labRestoreNow{false}; // the worker restores a setting an interrupted experiment left changed
+std::atomic<bool> controlCheckBusy{false}; // the control check owns the settings while it runs
+std::atomic<int> controlCheckAt{-1};       // the control it is on (verify::Control), for the page
 bool autoWritesPaused() {
-    return protectState != 0 || !startupSettled || bs::stability::writeGuard().automaticBlocked(GetTickCount64());
+    return protectState != 0 || !startupSettled || controlCheckBusy || bs::stability::writeGuard().automaticBlocked(GetTickCount64());
 }
 struct VBlock;
 std::optional<VBlock> stabilityRow(bool warningsOnly); // the performance page's stability line
@@ -5911,6 +5914,13 @@ std::wstring relativeTime(uint64_t utc) {
     return local.size() >= 16 ? local.substr(5, 11) : local;
 }
 void setProtect(int state);
+bool controlKnownDead(bs::lab::Knob knob);
+void startControlCheck();
+void finishControlCheck(std::vector<bs::verify::Result>* results);
+void loadControlResults();
+void copyToClipboard(const std::wstring& text);
+extern std::vector<bs::verify::Result> controlResults;
+extern uint64_t controlCheckedUtc;
 std::wstring incidentTitle(const bs::stability::Incident& i);
 std::wstring foregroundExe() {
     HWND foreground = GetForegroundWindow();
@@ -6155,6 +6165,10 @@ std::wstring stabilitySummary() {
                 (g.settings.autoUndervolt ? L" (auto)" : L"") + L" · iGPU undervolt " + std::to_wstring(g.settings.igpuUndervolt) +
                 L" · GPU +" + std::to_wstring(g.settings.gpuCore) + L"/+" + std::to_wstring(g.settings.gpuMemory) + L" MHz\n";
     }
+    if (!controlResults.empty()) {
+        t += L"\nControl check (" + localTimeText(controlCheckedUtc) + L"): control, verdict, write status, before, after, note\n";
+        t += bs::verify::saveText(controlResults);
+    }
     if (const auto drivers = knownTroubleDrivers(); !drivers.empty()) {
         t += tr(L"\n已安裝、已知會造成藍屏的驅動：\n");
         for (const auto& [name, why] : drivers) t += L"- " + name + L": " + why + L"\n";
@@ -6185,6 +6199,183 @@ std::wstring stabilityStatusNote() {
         if (stab::lastScanUtc) t += tr(L"\n上次讀取：") + bs::stability::localTimeText(stab::lastScanUtc);
     }
     return t;
+}
+// ---- Control check: which controls really take effect on this PC (verify.h).
+std::vector<bs::verify::Result> controlResults; // the last check, UI thread
+uint64_t controlCheckedUtc = 0;
+std::vector<bs::verify::Result> demoControlResults() {
+    using namespace bs::verify;
+    auto r = [](Control c, Verdict v, std::optional<double> a = {}, std::optional<double> b = {}, int note = 0) { Result x; x.control = c; x.verdict = v; x.before = a; x.after = b; x.note = note; return x; };
+    return {r(Control::refreshRate, Verdict::works, 60, 120), r(Control::powerMode, Verdict::works, 0, 1), r(Control::cpuBoost, Verdict::works, 2, 0, onBatteryOnly),
+        r(Control::energyPreference, Verdict::works, 60, 80), r(Control::brightness, Verdict::noEffect, 48, 48), r(Control::asusMode, Verdict::works, 31.5, 62.0),
+        r(Control::powerLimit, Verdict::works, 62.0, 24.8), r(Control::fanCurve, Verdict::writeOnly, {}, {}, needsTime), r(Control::gpuEco, Verdict::skipped, 1, {}, notToggled),
+        r(Control::chargeLimit, Verdict::skipped, {}, {}, needsTime), r(Control::keyboard, Verdict::writeOnly, {}, {}, lookAtIt)};
+}
+const std::vector<bs::verify::Result>& controlResultsNow() {
+    static const auto demoResults = demoControlResults();
+    return demo || isolatedPreview ? demoResults : controlResults;
+}
+void loadControlResults() {
+    const std::wstring dir = bs::stability::folder();
+    if (dir.empty()) return;
+    std::ifstream in(std::filesystem::path(dir) / L"controls.tsv", std::ios::binary);
+    if (!in) return;
+    const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::wstring wide(size_t(MultiByteToWideChar(CP_UTF8, 0, text.data(), int(text.size()), nullptr, 0)), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.data(), int(text.size()), wide.data(), int(wide.size()));
+    controlResults = bs::verify::loadText(wide);
+    controlCheckedUtc = readQwordSetting(L"ControlsAt");
+}
+// A setting found without effect here: tests leave it out.
+bool controlKnownDead(bs::lab::Knob knob) {
+    using namespace bs::verify;
+    const Control control = knob == bs::lab::Knob::brightness ? Control::brightness : knob == bs::lab::Knob::refreshRate ? Control::refreshRate :
+        knob == bs::lab::Knob::cpuBoost ? Control::cpuBoost : knob == bs::lab::Knob::energyPreference ? Control::energyPreference :
+        knob == bs::lab::Knob::powerMode ? Control::powerMode : knob == bs::lab::Knob::asusMode ? Control::asusMode : Control::count;
+    for (const auto& r : controlResults) if (r.control == control) return r.verdict == Verdict::noEffect || r.verdict == Verdict::refused;
+    return false;
+}
+const wchar_t* controlName(bs::verify::Control c) {
+    using C = bs::verify::Control;
+    switch (c) {
+    case C::refreshRate: return tr(L"螢幕更新率");
+    case C::powerMode: return tr(L"Windows 電源模式");
+    case C::cpuBoost: return L"CPU Boost";
+    case C::energyPreference: return tr(L"處理器能源偏好");
+    case C::brightness: return tr(L"螢幕亮度");
+    case C::asusMode: return tr(L"華碩效能模式");
+    case C::powerLimit: return tr(L"CPU 功耗上限");
+    case C::fanCurve: return tr(L"風扇曲線");
+    case C::gpuEco: return tr(L"獨顯 Eco 開關");
+    case C::chargeLimit: return tr(L"充電上限");
+    default: return tr(L"鍵盤背光");
+    }
+}
+const wchar_t* verdictName(bs::verify::Verdict v) {
+    using V = bs::verify::Verdict;
+    switch (v) {
+    case V::works: return tr(L"有作用");
+    case V::noEffect: return tr(L"沒有作用");
+    case V::refused: return tr(L"寫入失敗");
+    case V::writeOnly: return tr(L"只能寫入");
+    case V::inconclusive: return tr(L"無法判斷");
+    case V::unsupported: return tr(L"不支援");
+    default: return tr(L"未測");
+    }
+}
+// What was seen, in a sentence.
+std::wstring controlDetail(const bs::verify::Result& r) {
+    using namespace bs::verify;
+    auto n = [](std::optional<double> v, int digits = 0) { return v ? number(*v, digits) : std::wstring(L"—"); };
+    std::wstring t;
+    switch (r.control) {
+    case Control::refreshRate: if (r.before && r.after) t = n(r.before) + L" → " + n(r.after) + L" Hz" + tr(L"，已讀回並還原"); break;
+    case Control::powerMode: case Control::energyPreference:
+        if (r.verdict == Verdict::works) t = tr(L"寫入後讀回一致，已還原");
+        break;
+    case Control::cpuBoost:
+        if (r.verdict == Verdict::works && r.note == onBatteryOnly) t = tr(L"寫入後讀回一致。這個設定只在用電池時生效，拔掉電源再檢查可以量到時脈差異。");
+        else if (r.before && r.after && *r.before > 100) t = tr(L"負載下時脈：Boost 關 ") + n(r.before) + tr(L" MHz，開 ") + n(r.after) + L" MHz";
+        else if (r.verdict == Verdict::works) t = tr(L"寫入後讀回一致，已還原");
+        break;
+    case Control::brightness:
+        if (r.before && r.after) t = tr(L"設定前 ") + n(r.before) + tr(L"%，設定後讀回 ") + n(r.after) + L"%" +
+            (r.verdict == Verdict::noEffect ? tr(L"。這個面板不接受 Windows 的亮度設定指令；請用鍵盤亮度鍵，測試也會略過這一項。") : std::wstring(tr(L"，已還原")));
+        break;
+    case Control::asusMode:
+        if (r.before && r.after) t = tr(L"全核心負載下的 CPU 功耗：靜音 ") + n(r.before, 1) + tr(L" W，Turbo ") + n(r.after, 1) + L" W";
+        if (r.note == pluggedInOnly) t += tr(L"。用電池時兩者的上限接近，請插電再檢查。");
+        if (r.note == noPowerReading) t = tr(L"韌體接受了寫入，但這台電腦讀不到 CPU 功耗，無法量效果。");
+        break;
+    case Control::powerLimit:
+        if (r.before && r.after) t = tr(L"全核心負載下的 CPU 功耗：原廠 ") + n(r.before, 1) + tr(L" W，設成 15 W 後 ") + n(r.after, 1) + L" W";
+        if (r.note == noPowerReading) t = tr(L"韌體接受了寫入，但這台電腦讀不到 CPU 功耗，無法量效果。");
+        break;
+    case Control::fanCurve: if (r.verdict == Verdict::writeOnly) t = tr(L"韌體接受了曲線，但沒有可以讀回的值；轉速差異要在升溫時才看得出來。"); break;
+    case Control::gpuEco: if (r.note == notToggled) t = tr(L"每次切換都會讀回確認；這裡不實際切換（會關掉正在用獨顯的程式）。目前：") + std::wstring(r.before && *r.before > 0 ? L"Eco" : tr(L"標準")); break;
+    case Control::chargeLimit:
+        if (r.verdict == Verdict::works) t = tr(L"插電中，電量停在上限附近（上限 ") + n(r.before) + tr(L"%，目前 ") + n(r.after) + L"%）";
+        else if (r.verdict == Verdict::noEffect) t = tr(L"電量已超過上限卻還在充電（上限 ") + n(r.before) + tr(L"%，目前 ") + n(r.after) + L"%）";
+        else if (r.verdict != Verdict::unsupported) t = tr(L"韌體不回報上限，只能從充電行為判斷：設定上限後插電充到上限，再檢查一次。");
+        break;
+    default: if (r.note == lookAtIt) t = tr(L"鍵盤不回報亮度；請直接看鍵盤背光有沒有跟著變。"); break;
+    }
+    if (r.verdict == Verdict::refused) t += std::wstring(t.empty() ? L"" : L" ") + tr(L"錯誤：") + errorText(r.status);
+    if (r.note == guardHeld) t = tr(L"檢查當下正在睡眠、關機或螢幕關閉，沒有執行。");
+    if (r.note == noSecondValue) t = tr(L"只有一種更新率，沒有可以切換的對象。");
+    return t;
+}
+std::vector<VBlock> controlCheckBlocks() {
+    using namespace bs::verify;
+    std::vector<VBlock> v;
+    v.push_back(vHeading(tr(L"控制檢查")));
+    const int at = controlCheckAt.load();
+    const std::wstring state = controlCheckBusy ? tr(L"檢查中：") + std::wstring(at >= 0 && at < int(Control::count) ? controlName(Control(at)) : L"…")
+        : controlCheckedUtc ? relativeTime(controlCheckedUtc) : std::wstring(tr(L"約 40 秒"));
+    v.push_back(vAction(tr(L"檢查每項控制是否真的有作用"), state, VerifyControlsId, controlCheckBusy ? theme.warn : COLORREF(0)));
+    const auto& results = controlResultsNow();
+    if (results.empty()) {
+        v.push_back(vNote(tr(L"逐項寫入、讀回，能量測的就實際量效果（切換效能模式與功耗上限後跑幾秒全核心負載看 CPU 功耗），最後還原。檢查時風扇會轉幾秒；請先存檔，並避免在檢查中闔蓋。")));
+        return v;
+    }
+    for (const auto& r : results) {
+        if (r.verdict == Verdict::unsupported) continue;
+        const int box = r.verdict == Verdict::works ? 1 : r.verdict == Verdict::noEffect || r.verdict == Verdict::refused ? 0 : -1;
+        v.push_back(vCheck(box, controlName(r.control), controlDetail(r), verdictName(r.verdict)));
+    }
+    v.push_back(vNote(tr(L"「有作用」是讀回或量測確認過的；「只能寫入」表示韌體接受了，但沒有辦法由程式確認效果。")));
+    return v;
+}
+void startControlCheck() {
+    if (demo || isolatedPreview) { setNotice(tr(L"示範模式不會變更設定。")); return; }
+    if (controlCheckBusy) return;
+    if (labController && labController->status().running) { setNotice(tr(L"實驗進行中，結束後再檢查。")); return; }
+    if (bs::stability::writeGuard().held() || !startupSettled) { setNotice(tr(L"剛啟動或正在切換電源狀態，稍後再試。")); return; }
+    controlCheckBusy = true; controlCheckAt = -1;
+    // Hand back what dynamic saving changed, so the check starts from the user's own settings.
+    if (dynamicEnabled && !protectState) { stopGovernor(); governor.releaseAll(); }
+    bs::verify::Options options;
+    options.asus = asusAvailable;
+    if (!current.history.empty()) {
+        const auto& p = current.history.back();
+        options.onBattery = p.present && p.acKnown && !p.onAc && !p.charging;
+        options.pluggedIn = p.acKnown && p.onAc; options.charging = p.charging; options.batteryPercent = p.percent;
+    }
+    const HWND target = mainWindow;
+    options.progress = [target](bs::verify::Control c) { controlCheckAt = int(c); PostMessageW(target, StabilityMessage, 5, 0); };
+    setNotice(tr(L"正在檢查控制，約 40 秒；風扇會轉幾秒。"));
+    if (inlinePage == InlinePage::stability) showStabilityPage();
+    std::thread([target, options] {
+        CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+        auto* results = new std::vector<bs::verify::Result>(bs::verify::run(options));
+        CoUninitialize();
+        PostMessageW(target, StabilityMessage, 4, LPARAM(results));
+    }).detach();
+}
+void finishControlCheck(std::vector<bs::verify::Result>* results) {
+    std::unique_ptr<std::vector<bs::verify::Result>> owned(results);
+    controlCheckBusy = false; controlCheckAt = -1;
+    if (!owned) return;
+    controlResults = std::move(*owned);
+    controlCheckedUtc = bs::stability::nowUtc();
+    writeQwordSetting(L"ControlsAt", controlCheckedUtc);
+    const std::wstring text = bs::verify::saveText(controlResults);
+    if (const std::wstring dir = bs::stability::folder(); !dir.empty()) {
+        std::ofstream out(std::filesystem::path(dir) / L"controls.tsv", std::ios::binary | std::ios::trunc);
+        out << utf8(text);
+    }
+    int works = 0, dead = 0;
+    std::wstring report = L"BatteryScope " BS_VERSION_STRING L" control check\n";
+    for (const auto& r : controlResults) {
+        if (r.verdict == bs::verify::Verdict::works) ++works;
+        if (r.verdict == bs::verify::Verdict::noEffect || r.verdict == bs::verify::Verdict::refused) ++dead;
+        if (r.verdict != bs::verify::Verdict::unsupported) report += std::wstring(controlName(r.control)) + L": " + verdictName(r.verdict) + L" · " + controlDetail(r) + L"\n";
+    }
+    copyToClipboard(report + L"\n" + text);
+    setNotice(tr(L"檢查完成：") + std::to_wstring(works) + tr(L" 項確認有作用") + (dead ? tr(L"，") + std::to_wstring(dead) + tr(L" 項沒有作用") : std::wstring()) + tr(L"。結果已複製，可以直接貼上。"));
+    asusReadAt = 0;
+    if (inlinePage == InlinePage::stability) showStabilityPage();
+    if (dynamicEnabled && !protectState) governorTick();
 }
 // What a stop code or a kind of incident means, in one plain sentence.
 std::wstring plainReason(const bs::stability::Incident& i) {
@@ -6350,6 +6541,7 @@ void showStabilityPage() {
         v.push_back(vNote(tr(L"睡眠、喚醒、闔蓋、關機與剛開機的那幾秒，一律不寫入任何設定。偵測到當機時會自動進入保護模式。") +
             (blocked ? tr(L"這次執行已擋下 ") + std::to_wstring(blocked) + tr(L" 次寫入。") : std::wstring())));
     }
+    for (auto& block : controlCheckBlocks()) v.push_back(std::move(block));
     v.push_back(vHeading(tr(L"回報給開發者")));
     v.push_back(vAction(tr(L"建立回報包"), stab::reportBusy ? tr(L"建立中…") : tr(L"存到桌面並複製摘要"), ReportId, Green));
     v.push_back(vAction(tr(L"含藍屏傾印檔的回報"), tr(L"需要管理員權限"), ReportFullId));
@@ -6509,6 +6701,7 @@ void startStability() {
         writeSetting(L"StabilityFormat", 2);
     }
     protectState = int(std::min<DWORD>(2, readSetting(L"Protect", 0)));
+    loadControlResults();
     // A restart or shutdown that went well counts toward the stable streak.
     if (stab::previous.ending == Ending::clean && !stab::previousRecords.empty() && stab::previousRecords.back().text == L"exit shutdown"
         && bootUtc() > stab::previousRecords.back().time) writeSetting(L"RestartsOk", readSetting(L"RestartsOk", 0) + 1);
@@ -7267,6 +7460,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (id == HardwarePageId) { showMain(); showHardwarePage(); return 0; }
         if (id == PerfPageId) { showMain(); showPerformancePage(); return 0; }
         if (id == StabilityPageId) { showMain(); showStabilityPage(); return 0; }
+        if (id == VerifyControlsId) { startControlCheck(); return 0; }
         if (id == ProtectToggleId) { if (!demo && !isolatedPreview) setProtect(protectState ? 0 : 1); else setNotice(tr(L"示範模式不會變更設定。")); return 0; }
         if (protectState && ((id >= LabExperimentId && id < LabExperimentId + bs::lab::ManualKnobs) || id == LabAutoId || id == LabAutoStartId || id == LabQuickId || id == LabQuickStartId)) {
             setNotice(tr(L"保護模式開著：不會執行實驗。先到「穩定性」關閉保護模式。"));
@@ -7453,7 +7647,10 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             }
             const bool browser = !bs::lab::WorkloadEngine::browserPath().empty();
             const bool quick = id == LabQuickId || id == LabQuickStartId;
-            const DWORD result = labController->startPlan(quick ? bs::lab::quickPlan(browser) : bs::lab::automaticPlan(browser));
+            auto steps = quick ? bs::lab::quickPlan(browser) : bs::lab::automaticPlan(browser);
+            // A setting the control check found without effect on this PC has nothing to measure.
+            steps.erase(std::remove_if(steps.begin(), steps.end(), [](const bs::lab::Step& step) { return controlKnownDead(step.knob); }), steps.end());
+            const DWORD result = labController->startPlan(steps);
             if (result) { setNotice(tr(L"無法開始自動測試：") + errorText(result)); showLabPage(); return 0; }
             autoTestActive = true;
             detectionTally = {}; detectionLog.clear(); lastTallyMs = 0;
@@ -7606,6 +7803,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case StabilityMessage:
         if (wp == 2) finishReport(lp != 0);
         else if (wp == 3) { if (!protectState) setProtect(2); }
+        else if (wp == 4) finishControlCheck(reinterpret_cast<std::vector<bs::verify::Result>*>(lp));
+        else if (wp == 5) { if (inlinePage == InlinePage::stability) showStabilityPage(); }
         else notifyStability();
         return 0;
     case WM_QUERYENDSESSION:
@@ -8143,6 +8342,11 @@ bool panelSelfTest(const std::wstring& path) {
         ReleaseDC(visualView, dc);
         check("stability_blocks_have_heights", sized);
     }
+    // The control check: one row per control with what was seen, the ones without effect marked.
+    check("control_check_lists_each_control_honestly", stabilityAction(VerifyControlsId)
+        && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::check && b.toggle == 1 && b.value == tr(L"有作用") && b.text.find(L"Turbo") != std::wstring::npos; })
+        && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::check && b.toggle == 0 && b.value == tr(L"沒有作用"); })
+        && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::check && b.toggle == -1 && b.value == tr(L"只能寫入"); }));
     // Protection mode shows as a banner with the way out, on the stability page and at home.
     protectState = 2;
     showStabilityPage();
@@ -8461,6 +8665,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         std::ofstream out(std::filesystem::path(args[1]) / L"dumps-copied.txt", std::ios::binary | std::ios::trunc);
         out << utf8(listing);
         return copied >= 0 ? 0 : 1;
+    }
+    if (args.size() == 1 && args[0] == L"--verify-controls") {
+        // The control check from a console, for diagnosis (close the running copy first, or its
+        // automatic adjustments get in the way). One line per control: verdict, status, before, after.
+        bs::verify::Options options; options.asus = bs::asus::Acpi().available();
+        const PowerSample power = readPower();
+        options.onBattery = power.present && power.acKnown && !power.onAc && !power.charging;
+        options.pluggedIn = power.acKnown && power.onAc; options.charging = power.charging; options.batteryPercent = power.percent;
+        printf("%s", utf8(bs::verify::saveText(bs::verify::run(options))).c_str());
+        return 0;
     }
     if (args.size() == 1 && args[0] == L"--asus-dump") {
         // Every ASUS firmware value BatteryScope reads, for checking a new model.

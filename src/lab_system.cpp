@@ -280,6 +280,7 @@ DWORD setDarkMode(bool dark) {
 }
 }
 void setProtectedJob(HANDLE job) { protectedJob = job; }
+int screenBrightness() { return readBrightness(); }
 bool runPowerShell(const std::wstring& script, std::string& output, DWORD timeoutMs) { return powershell(script, output, timeoutMs); }
 void writeSystemSnapshot(const std::wstring& folder) {
     SYSTEMTIME t{}; GetLocalTime(&t);
@@ -359,7 +360,12 @@ DWORD applyKnob(Knob knob, DWORD value) {
     case Knob::brightness: {
         DWORD status = setBrightness(value);
         // A panel that takes the call but keeps its level would make the comparison meaningless.
-        if (!status) { const int now = readBrightness(); if (now >= 0 && std::abs(now - int(value)) > 2) status = ERROR_NOT_SUPPORTED; }
+        // The level can take a moment to arrive: look up to three times.
+        if (!status) {
+            int now = -1;
+            for (int attempt = 0; attempt < 3; ++attempt) { if (attempt) Sleep(400); now = readBrightness(); if (now < 0 || std::abs(now - int(value)) <= 2) break; }
+            if (now >= 0 && std::abs(now - int(value)) > 2) status = ERROR_NOT_SUPPORTED;
+        }
         if (!status) brightnessValue = value;
         return status;
     }

@@ -230,6 +230,8 @@ void setProtectedJob(HANDLE job);
 // Power plans, battery report, hardware, display, processes, startup apps and
 // running tasks, written to <folder>\system-<time>. Takes up to a minute.
 void writeSystemSnapshot(const std::wstring& folder);
+// The panel's brightness as Windows reports it (0-100), or -1; slow (a PowerShell call).
+int screenBrightness();
 // Runs a PowerShell script (passed encoded, nothing to quote) and captures its output.
 bool runPowerShell(const std::wstring& script, std::string& output, DWORD timeoutMs);
 

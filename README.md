@@ -15,8 +15,8 @@
 
 到 **[Releases 頁面](https://github.com/rio10255254/BatteryScope/releases/latest)** 下載：
 
-- **安裝版（建議）**：`BatteryScope-0.23.3-setup.exe`。不需要管理員權限，安裝到 `%LOCALAPPDATA%\Programs\BatteryScope`，會建立開始功能表捷徑，可選擇桌面捷徑與登入時啟動，並可從「設定 → 應用程式」解除安裝。
-- **免安裝版**：`BatteryScope-0.23.3-win64.zip`，解壓後執行 `BatteryScope.exe`。
+- **安裝版（建議）**：`BatteryScope-0.24.0-setup.exe`。不需要管理員權限，安裝到 `%LOCALAPPDATA%\Programs\BatteryScope`，會建立開始功能表捷徑，可選擇桌面捷徑與登入時啟動，並可從「設定 → 應用程式」解除安裝。
+- **免安裝版**：`BatteryScope-0.24.0-win64.zip`，解壓後執行 `BatteryScope.exe`。
 
 需要 Windows 10 1703 以上（建議 Windows 11），64 位元。程式沒有數位簽章，第一次開啟若出現 SmartScreen，點「其他資訊 → 仍要執行」。開啟後在右下角系統匣，圖示會顯示電量百分比；點圖示開關面板。
 
@@ -55,7 +55,7 @@
 
 ## 使用方式
 
-1. 從 [GitHub Releases](https://github.com/rio10255254/BatteryScope/releases/latest) 下載 `BatteryScope-0.23.3-win64.zip`，解壓後執行 `BatteryScope.exe`。已編譯版本適用 Windows 10（1703 以上）與 Windows 11 的 x64 筆電與桌機。
+1. 從 [GitHub Releases](https://github.com/rio10255254/BatteryScope/releases/latest) 下載 `BatteryScope-0.24.0-win64.zip`，解壓後執行 `BatteryScope.exe`。已編譯版本適用 Windows 10（1703 以上）與 Windows 11 的 x64 筆電與桌機。
    升級時先從系統匣結束舊版，再執行新版；程式會避免同時啟動多個正式監測視窗。
 2. 目前耗電顯示電池回報的整機放電功率；資料累積後顯示平均功率、耗電速度與預估續航。
 3. 硬體能源資料可用時，下方依「估計 CPU W」由高到低列出前 10 個程序／服務。每張卡片第二行顯示類型、PID 與核心分攤模型範圍。點「僅背景」切換背景篩選，點「顯示」切換前 10 名／全部；滑鼠滾輪或鍵盤上下鍵瀏覽。若能源資料不可用，會明確退回 CPU / I/O 活動排行。
@@ -135,6 +135,16 @@
 - **啟動順序**：先讀 Windows 的當機記錄（決定要不要進保護模式），再還原上次當機遺留的設定，最後才套用記住的華碩設定；啟動當下不寫入任何東西。
 - **G-Helper 並存**：G-Helper 正在執行、或它的設定有 CPU 降壓／顯示卡超頻時，「下一步」會提醒（兩個程式控制同一個韌體介面會互相覆蓋）。
 - **穩定性頁**改成一眼看懂：最上面一句現況（一切正常／觀察中／7 天內幾次／保護模式）、30 天時間軸（每天一格，紅色是當機）、「下一步」清單（能自動確認的會打勾：睡眠喚醒 3 次、正常重開 1 次、連續 3 天沒當機）、每一次問題的白話說明與當時狀態。首頁有問題或保護模式時會顯示同樣的橫幅。
+
+**控制檢查（0.24 起）**：穩定性頁的「檢查每項控制是否真的有作用」會在你的電腦上逐項實測（約 40 秒），不是只看寫入有沒有報錯：
+
+- 螢幕更新率、Windows 電源模式、CPU Boost、處理器能源偏好、螢幕亮度：寫入另一個值、讀回、還原。用電池時 CPU Boost 另外量負載下的時脈差異。
+- 華碩效能模式（韌體不回報目前模式）：靜音與 Turbo 各跑幾秒全核心負載，比較 CPU 功耗，差 15% 以上才算有作用。
+- CPU 功耗上限：設成 15 W 後同樣的負載，功耗要明顯下降。
+- 風扇曲線、鍵盤背光：韌體或鍵盤只接受寫入、沒有可讀回的值，標示為「只能寫入」，不會說成有作用。
+- 獨顯 Eco：每次切換本來就會讀回確認，這裡不實際切換（會關掉正在用獨顯的程式）。充電上限：只能從充電行為判斷（插電時電量停在上限附近）。
+- 結果會留在頁面上、複製到剪貼簿、寫進回報包；被判定「沒有作用」的設定，自動測試會略過。
+- 診斷：先結束 BatteryScope，再執行 `BatteryScope.exe --verify-controls | more`，每項一行。
 
 ### 華碩硬體（0.18 起，華碩筆電）
 
@@ -268,7 +278,7 @@
 .\build.ps1 -Test
 ```
 
-舊版仍在執行時，可使用 `./build.ps1 -Test -OutputDirectory dist/v0.23.3` 編譯到獨立目錄，避免覆寫使用中的 EXE。
+舊版仍在執行時，可使用 `./build.ps1 -Test -OutputDirectory dist/v0.24.0` 編譯到獨立目錄，避免覆寫使用中的 EXE。
 
 預設尋找 PATH 上的 `g++.exe`，其次使用 `C:\mingw64\bin\g++.exe`，並使用同目錄的 `windres.exe`。產出 `dist\BatteryScope.exe`。
 
