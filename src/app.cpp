@@ -5810,7 +5810,9 @@ void showPerformancePage() {
             v.push_back(vBars(std::move(bars), 70));
         }
         const auto t = bs::asus::tuning();
-        v.push_back(vAction(tr(L"風扇模式"), tr(bs::asus::fanPresetKey(t.fans)), FanMenuId, t.fans == bs::asus::FanPreset::quiet ? Green : COLORREF(0)));
+        // Offered only where the firmware hands out its fan curves (asked once).
+        static const bool fanCurves = preview || bs::asus::fanCurvesSupported();
+        if (fanCurves) v.push_back(vAction(tr(L"風扇模式"), tr(bs::asus::fanPresetKey(t.fans)), FanMenuId, t.fans == bs::asus::FanPreset::quiet ? Green : COLORREF(0)));
         v.push_back(vAction(tr(L"CPU 功耗上限"), powerPresetText(t.power), PowerLimitMenuId, t.power == bs::asus::PowerPreset::saver ? Green : COLORREF(0)));
     }
     // Quick switches.
@@ -6285,11 +6287,13 @@ std::wstring controlDetail(const bs::verify::Result& r) {
     case Control::asusMode:
         if (r.before && r.after) t = tr(L"全核心負載下的 CPU 功耗：靜音 ") + n(r.before, 1) + tr(L" W，Turbo ") + n(r.after, 1) + L" W";
         if (r.note == pluggedInOnly) t += tr(L"。用電池時兩者的上限接近，請插電再檢查。");
+        if (r.note == loadHeldBack) t += tr(L"。負載沒有跑到全速（時脈 ") + n(r.mhz) + tr(L" MHz），量不出上限的差異；請插電、把 Windows 電源模式設成平衡或效能後再檢查。");
         if (r.note == noPowerReading) t = tr(L"韌體接受了寫入，但這台電腦讀不到 CPU 功耗，無法量效果。");
         break;
     case Control::powerLimit:
         if (r.before && r.after) t = tr(L"全核心負載下的 CPU 功耗：原廠 ") + n(r.before, 1) + tr(L" W，設成 15 W 後 ") + n(r.after, 1) + L" W";
         if (r.note == noPowerReading) t = tr(L"韌體接受了寫入，但這台電腦讀不到 CPU 功耗，無法量效果。");
+        if (r.note == loadHeldBack) t += tr(L"。負載的功耗本來就低於上限，量不出差異；請插電、把 Windows 電源模式設成平衡或效能後再檢查。");
         break;
     case Control::fanCurve: if (r.verdict == Verdict::writeOnly) t = tr(L"韌體接受了曲線，但沒有可以讀回的值；轉速差異要在升溫時才看得出來。"); break;
     case Control::gpuEco: if (r.note == notToggled) t = tr(L"每次切換都會讀回確認；這裡不實際切換（會關掉正在用獨顯的程式）。目前：") + std::wstring(r.before && *r.before > 0 ? L"Eco" : tr(L"標準")); break;

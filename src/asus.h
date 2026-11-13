@@ -178,6 +178,7 @@ DWORD setSlash(const Slash& settings);      // applies and remembers
 
 // What the Fn keys do once the ASUS software is gone, done the Windows way.
 namespace os {
+DWORD setScreenBrightness(int level);       // 0-100, on the active panel
 DWORD stepScreenBrightness(int percent);    // WMI WmiMonitorBrightnessMethods; call on a worker thread
 std::optional<int> screenBrightness();
 std::optional<bool> toggleMicrophone();     // mutes or unmutes every microphone; the new state
