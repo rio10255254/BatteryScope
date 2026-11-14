@@ -72,7 +72,7 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     RefreshAutoId = 266, DarkModeId = 267, AutoSaverCycleId = 268, PerfPageId = 269, FanMenuId = 270, PowerLimitMenuId = 271,
     FanPreset0Id = 272 /* ..275 */, PowerPreset0Id = 276 /* ..279 */, CpuBoostToggleId = 280, WinModeMenuId = 281,
     StabilityPageId = 282, ReportId = 283, ReportFullId = 284, MarkProblemId = 285, StabilityFolderId = 286, ProtectToggleId = 287, VerifyControlsId = 288,
-    ModeLinkMenuId = 289, ModeLinkToggleId = 290, ModeLinkWindowsId = 291, ModeLinkImportId = 292, ModeBoost0Id = 340 /* ..358: + mode * 8 + boost */,
+    ModeLinkMenuId = 289, ModeLinkToggleId = 290, ModeLinkWindowsId = 291, ModeLinkImportId = 292, PowerLimitResetId = 293, ModeBoost0Id = 340 /* ..358: + mode * 8 + boost */,
     SettingRowId = 300 /* ..329, one per settings row */,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1, FnKeyHotkey = 10 /* ..20: F1-F11 under the software Fn lock */;
@@ -186,6 +186,7 @@ bool powerPresetsBlocked();
 bool powerRestoreBroken();
 bool powerLimitStuck();
 bool lastCheckLeftLimit();
+void clearPowerLimitStuck(const wchar_t* why);
 DWORD biosKey();
 void showDynamicPage();
 void showPerformancePage();
@@ -5381,7 +5382,8 @@ void applyModeCompanions(bool now) {
     if (modeLinkWindows) {
         const PowerMode target = modeWindows[m] == 0 ? PowerMode::efficiency : modeWindows[m] == 2 ? PowerMode::performance : PowerMode::balanced;
         const auto modes = queryPowerModes();
-        if (modes.acKnown && modes.acSettable && modes.ac != target) setPowerMode(true, target);
+        if (modes.acKnown && modes.acSettable && modes.ac != target && setPowerMode(true, target) == ERROR_SUCCESS)
+            bs::stability::note(L"mode-link windows=" + std::to_wstring(modeWindows[m]));
     }
 }
 std::wstring modeLinkSummary() {
@@ -5875,8 +5877,9 @@ void showPerformancePage() {
     }
     if (auto banner = stabilityRow(true)) v.push_back(std::move(*banner));
     if (asusAvailable && powerLimitStuck())
-        v.push_back(vBanner(1, theme.warn, tr(L"CPU 功耗上限還卡在 15 W"),
-            tr(L"控制檢查設下的上限，這版 BIOS 切換效能模式也解除不了。持續高負載（例如遊戲）時 CPU 最多 15–20 W。請「重新啟動」電腦（不是關機）就會恢復原廠。")));
+        v.push_back(vBanner(1, theme.warn, tr(L"CPU 功耗上限可能還在 15 W"),
+            tr(L"控制檢查設下的上限，這版 BIOS 切換效能模式解除不了。按「重新套用」會再套用一次電源計畫與 Windows 電源模式（上次就是這樣在沒重開機的情況下解除的）；還不行就重新啟動。CPU 功耗一超過 25 W，這個提示會自動消失。"),
+            tr(L"重新套用"), PowerLimitResetId));
     // The performance mode: ASUS's firmware modes, else Windows' power mode for the current source.
     v.push_back(vHeading(tr(L"效能模式")));
     if (asusAvailable && h.modeDevice) {
@@ -6357,7 +6360,7 @@ std::vector<bs::verify::Result> demoControlResults() {
     using namespace bs::verify;
     auto r = [](Control c, Verdict v, std::optional<double> a = {}, std::optional<double> b = {}, int note = 0) { Result x; x.control = c; x.verdict = v; x.before = a; x.after = b; x.note = note; return x; };
     return {r(Control::loadBaseline, Verdict::skipped, 58.4), r(Control::refreshRate, Verdict::works, 60, 120), r(Control::powerMode, Verdict::works, 0, 1), r(Control::cpuBoost, Verdict::works, 2, 0, onBatteryOnly),
-        r(Control::energyPreference, Verdict::works, 60, 80), r(Control::brightness, Verdict::noEffect, 48, 48), r(Control::asusMode, Verdict::works, 31.5, 62.0),
+        r(Control::energyPreference, Verdict::works, 60, 80), r(Control::brightness, Verdict::noEffect, 48, 48), r(Control::asusMode, Verdict::works, 31.5, 62.0), r(Control::windowsModeLoad, Verdict::works, 28.4, 61.2),
         r(Control::powerLimit, Verdict::works, 62.0, 24.8), r(Control::powerRestore, Verdict::works, 62.0, 60.9), r(Control::fanCurve, Verdict::writeOnly, {}, {}, needsTime), r(Control::gpuEco, Verdict::skipped, 1, {}, notToggled),
         r(Control::chargeLimit, Verdict::skipped, {}, {}, needsTime), r(Control::keyboard, Verdict::writeOnly, {}, {}, lookAtIt)};
 }
@@ -6380,6 +6383,8 @@ void loadControlResults() {
         if (const DWORD key = biosKey()) writeSetting(L"PowerRestoreBios", key);
         if (controlCheckedUtc > bs::stability::bootUtc()) writeQwordSetting(L"PowerStuckBoot", bs::stability::bootUtc());
     }
+    for (const auto& r : controlResults)
+        if (r.control == bs::verify::Control::loadBaseline && r.before && *r.before > 28 && !lastCheckLeftLimit()) clearPowerLimitStuck(L"check baseline");
 }
 // A setting found without effect here: tests leave it out.
 // The power limit was seen to stay in force after "factory" on this PC: on the G14's BIOS 311 a
@@ -6404,6 +6409,14 @@ bool powerPresetsBlocked() { return powerRestoreBroken() || lastCheckLeftLimit()
 // The limit the check left is still in force: it was left during this boot.
 bool powerLimitStuck() {
     return !demo && !isolatedPreview && bs::stability::sameBoot(readQwordSetting(L"PowerStuckBoot"), bs::stability::bootUtc());
+}
+// The CPU drew more than the check's fast limit (25 W): whatever the check left is gone. On the
+// G14 it went away within the hour without a restart (the power plan or the Windows power mode
+// was set again in between), so the mark follows what is measured, not only the boot.
+void clearPowerLimitStuck(const wchar_t* why) {
+    if (!readQwordSetting(L"PowerStuckBoot")) return;
+    writeQwordSetting(L"PowerStuckBoot", 0);
+    bs::stability::note(std::wstring(L"power limit gone: ") + why);
 }
 void notePowerLimitLeft() {
     if (const DWORD key = biosKey()) writeSetting(L"PowerRestoreBios", key);
@@ -6433,6 +6446,7 @@ const wchar_t* controlName(bs::verify::Control c) {
     case C::chargeLimit: return tr(L"充電上限");
     case C::loadBaseline: return tr(L"全核心負載（檢查前）");
     case C::powerRestore: return tr(L"功耗上限還原");
+    case C::windowsModeLoad: return tr(L"Windows 電源模式（負載下）");
     default: return tr(L"鍵盤背光");
     }
 }
@@ -6470,6 +6484,7 @@ std::wstring controlDetail(const bs::verify::Result& r) {
     case Control::asusMode:
         if (r.before && r.after) t = tr(L"全核心負載下的 CPU 功耗：靜音 ") + n(r.before, 1) + tr(L" W，Turbo ") + n(r.after, 1) + L" W";
         if (r.note == pluggedInOnly) t += tr(L"。用電池時兩者的上限接近，請插電再檢查。");
+        if (r.note == cpuOnly) t += tr(L"。短時間的 CPU 負載下兩個模式差不到 7%；韌體模式還會改風扇曲線與獨顯功耗，這項檢查量不到。CPU 功耗主要看 CPU Boost 與 Windows 電源模式（見下一項），模式連動會把它們一起切換。");
         if (r.note == loadHeldBack) t += tr(L"。負載沒有跑到全速（時脈 ") + n(r.mhz) + tr(L" MHz），量不出上限的差異；請插電、把 Windows 電源模式設成平衡或效能後再檢查。");
         if (r.note == noPowerReading) t = tr(L"韌體接受了寫入，但這台電腦讀不到 CPU 功耗，無法量效果。");
         break;
@@ -6478,6 +6493,13 @@ std::wstring controlDetail(const bs::verify::Result& r) {
         if (r.before && r.after) t = tr(L"全核心負載下的 CPU 功耗：原廠 ") + n(r.before, 1) + tr(L" W，設成 15 W 後 ") + n(r.after, 1) + L" W";
         if (r.note == noPowerReading) t = tr(L"韌體接受了寫入，但這台電腦讀不到 CPU 功耗，無法量效果。");
         if (r.note == loadHeldBack) t += tr(L"。負載的功耗本來就低於上限，量不出差異；請插電、把 Windows 電源模式設成平衡或效能後再檢查。");
+        break;
+    case Control::windowsModeLoad:
+        if (r.before && r.after) t = tr(L"全核心負載下的 CPU 功耗：最佳能源效率 ") + n(r.before, 1) + tr(L" W，最佳效能 ") + n(r.after, 1) + L" W";
+        if (r.verdict == Verdict::works) t += tr(L"。這台的 CPU 功耗會跟著 Windows 電源模式走；模式連動切換效能模式時會一併切換它。");
+        else if (r.verdict == Verdict::noEffect) t += tr(L"。Windows 電源模式在全核心負載下不影響這台的 CPU 功耗。");
+        if (r.note == loadHeldBack) t += tr(L"。負載沒有跑到全速（時脈 ") + n(r.mhz) + tr(L" MHz），量不出差異。");
+        if (r.note == noPowerReading) t = tr(L"寫入成功，但這台電腦讀不到 CPU 功耗，無法量效果。");
         break;
     case Control::fanCurve: if (r.verdict == Verdict::writeOnly) t = tr(L"韌體接受了曲線，但沒有可以讀回的值；轉速差異要在升溫時才看得出來。"); break;
     case Control::gpuEco: if (r.note == notToggled) t = tr(L"每次切換都會讀回確認；這裡不實際切換（會關掉正在用獨顯的程式）。目前：") + std::wstring(r.before && *r.before > 0 ? L"Eco" : tr(L"標準")); break;
@@ -6573,6 +6595,8 @@ void finishControlCheck(std::vector<bs::verify::Result>* results) {
         if (r.verdict != bs::verify::Verdict::unsupported) report += std::wstring(controlName(r.control)) + L": " + verdictName(r.verdict) + L" · " + controlDetail(r) + L"\n";
     }
     copyToClipboard(report + L"\n" + text);
+    for (const auto& r : controlResults)
+        if (r.control == bs::verify::Control::loadBaseline && r.before && *r.before > 28) clearPowerLimitStuck(L"check baseline");
     if (lastCheckLeftLimit()) {
         notePowerLimitLeft();
         showBalloon(tr(L"功耗上限沒有還原"), tr(L"檢查設下的 CPU 功耗上限還留著，電腦會變慢。請「重新啟動」電腦清除；之後不會再測這一項。"), BalloonTarget::stability);
@@ -7665,6 +7689,23 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (id == ReportId || id == ReportFullId) { buildReport(id == ReportFullId); return 0; }
         if (id == MarkProblemId) { showMain(); markProblem(); return 0; }
         if (id == StabilityFolderId) { const auto dir = bs::stability::folder(); if (!dir.empty()) ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL); return 0; }
+        if (id == PowerLimitResetId) {
+            if (demo || isolatedPreview || !asusAvailable) return 0;
+            // What took the limit away on the G14 without a restart: the plan and the Windows power
+            // mode set again. The firmware mode is set again too.
+            bs::verify::reapplyPowerPlan();
+            const bool plugged = !current.history.empty() && current.history.back().onAc;
+            const auto modes = queryPowerModes();
+            const PowerMode now = plugged ? modes.ac : modes.dc;
+            if ((plugged ? modes.acSettable : modes.dcSettable) && now != PowerMode::other) {
+                setPowerMode(plugged, now == PowerMode::performance ? PowerMode::balanced : PowerMode::performance);
+                Sleep(500);
+                setPowerMode(plugged, now);
+            }
+            if (const auto mode = bs::asus::remembered().mode) bs::asus::setMode(*mode);
+            setNotice(tr(L"已重新套用。跑點重負載：CPU 功耗超過 25 W 就表示上限解除了，提示會自動消失。"));
+            return 0;
+        }
         if (id == ModeLinkMenuId) {
             if (!asusAvailable) return 0;
             if (const int chosen = showMenu(modeLinkMenuItems(), menuAnchor(), mainWindow)) SendMessageW(window, WM_COMMAND, chosen, 0);
@@ -7991,6 +8032,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         applyGpuAuto();
         applyRefreshAuto();
         applyModeCompanions(false);
+        if (const Value watts = current.energy.packageWatts; watts && *watts > 28 && powerLimitStuck()) clearPowerLimitStuck(L"cpu above 28 W");
         if (inlinePage == InlinePage::hardware && !hidden) showHardwarePage();
         if (inlinePage == InlinePage::performance && !hidden) showPerformancePage();
         if (inlinePage == InlinePage::goal && !hidden && GetTickCount64() - goalPageShownAt >= 10000) showGoalPage();

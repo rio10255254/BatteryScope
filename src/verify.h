@@ -16,6 +16,7 @@ namespace bs::verify {
 enum class Control { refreshRate, powerMode, cpuBoost, energyPreference, brightness, asusMode, powerLimit, fanCurve, gpuEco, chargeLimit, keyboard,
     loadBaseline,  // all-core power before anything is changed: what the limits are compared with
     powerRestore,  // after the power-limit test: does the load come back to where it was?
+    windowsModeLoad, // the Windows power mode under load: best efficiency against best performance
     count };
 enum class Verdict {
     works,        // written, and the read-back or the measured effect confirms it
@@ -35,7 +36,8 @@ struct Result {
     std::optional<double> mhz;            // the clock under the last load, where a load was run
 };
 enum Note { none = 0, onBatteryOnly, pluggedInOnly, customPreset, notToggled, needsTime, lookAtIt, noSecondValue, noPowerReading, guardHeld, loadHeldBack,
-    restartToClear }; // the power limit is not written: on this BIOS only a restart takes it away again
+    restartToClear, // the power limit is not written: on this BIOS a mode switch does not take it away again
+    cpuOnly };      // the firmware mode barely moved the CPU's power; it also sets fans and the GPU, which are not measured
 const wchar_t* controlKey(Control control); // stable id for files: refresh, power-mode, ...
 const wchar_t* verdictKey(Verdict verdict);
 
@@ -56,6 +58,8 @@ LoadReading measureLoad(int milliseconds);
 // The active plan's CPU Boost mode while plugged in (0 off, 1 on, 2 aggressive, ...), and setting it.
 std::optional<double> pluggedInBoost();
 DWORD setPluggedInBoost(DWORD value);
+// Applies the active power plan again, so the platform re-reads its settings (and its power limits).
+DWORD reapplyPowerPlan();
 
 struct Options {
     bool onBattery = false, asus = false;

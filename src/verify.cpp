@@ -3,6 +3,7 @@
 #include "energy.h"
 #include "lab.h"
 #include "stability.h"
+#include "platform.h"
 
 #include <pdh.h>
 #include <emmintrin.h>
@@ -31,6 +32,7 @@ const wchar_t* controlKey(Control c) {
     case Control::keyboard: return L"keyboard";
     case Control::loadBaseline: return L"load-baseline";
     case Control::powerRestore: return L"power-restore";
+    case Control::windowsModeLoad: return L"windows-mode-load";
     default: return L"";
     }
 }
@@ -189,6 +191,23 @@ DWORD setPluggedInBoost(DWORD value) {
     LocalFree(scheme);
     return status;
 }
+DWORD reapplyPowerPlan() {
+    HMODULE module = LoadLibraryExW(L"powrprof.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!module) return ERROR_PROC_NOT_FOUND;
+    DWORD (WINAPI* active)(HKEY, GUID**) = nullptr;
+    DWORD (WINAPI* apply)(HKEY, const GUID*) = nullptr;
+    FARPROC a = GetProcAddress(module, "PowerGetActiveScheme"), c = GetProcAddress(module, "PowerSetActiveScheme");
+    std::memcpy(&active, &a, sizeof(active)); std::memcpy(&apply, &c, sizeof(apply));
+    if (!active || !apply) return ERROR_PROC_NOT_FOUND;
+    if (stability::refuseWrite(L"power plan re-applied")) return ERROR_NOT_READY;
+    stability::note(L"power plan re-applied");
+    GUID* scheme = nullptr;
+    DWORD status = active(nullptr, &scheme);
+    if (status != ERROR_SUCCESS || !scheme) return status ? status : ERROR_GEN_FAILURE;
+    status = apply(nullptr, scheme);
+    LocalFree(scheme);
+    return status;
+}
 bool heldBack(const LoadReading& r) { return r.mhz && r.baseMhz && *r.mhz < *r.baseMhz * .7; }
 
 std::vector<Result> run(const Options& o) {
@@ -294,8 +313,42 @@ std::vector<Result> run(const Options& o) {
                 r.verdict = judgeMeasured(silent.packageWatts, turbo.packageWatts, 1.15, false);
                 if (r.verdict != Verdict::works && o.onBattery) { r.verdict = Verdict::inconclusive; r.note = pluggedInOnly; } // limits are close together on battery
                 else if (r.verdict != Verdict::works && (heldBack(silent) || heldBack(turbo))) { r.verdict = Verdict::inconclusive; r.note = loadHeldBack; }
+                // The firmware mode also sets the fan curves and the GPU's limits, which a CPU load
+                // does not show: a mode that barely moves the CPU is not a mode without effect.
+                else if (r.verdict == Verdict::noEffect) { r.verdict = Verdict::inconclusive; r.note = cpuOnly; }
             }
             results.push_back(r);
+
+            // The Windows power mode under the same load (in turbo): on some laptops the platform
+            // sets the CPU's limits from it, and mode link switches it with the firmware mode.
+            begin(Control::windowsModeLoad);
+            {
+                const PowerModes modes = queryPowerModes();
+                const bool plugged = !o.onBattery;
+                const bool known = plugged ? modes.acKnown && modes.acSettable : modes.dcKnown && modes.dcSettable;
+                if (!known) skip(Control::windowsModeLoad, Verdict::unsupported, none);
+                else if (cancelled()) skip(Control::windowsModeLoad, Verdict::skipped, guardHeld);
+                else {
+                    const PowerMode before = plugged ? modes.ac : modes.dc;
+                    Result w; w.control = Control::windowsModeLoad;
+                    stability::note(L"knob windows-mode=efficiency");
+                    w.status = setPowerMode(plugged, PowerMode::efficiency); pause(1500, o);
+                    const auto efficient = measureLoad(3600);
+                    stability::note(L"knob windows-mode=performance");
+                    const DWORD second = setPowerMode(plugged, PowerMode::performance); pause(1500, o);
+                    const auto fast = measureLoad(3600);
+                    if (w.status == ERROR_SUCCESS) w.status = second;
+                    if (before != PowerMode::other) setPowerMode(plugged, before);
+                    w.before = efficient.packageWatts; w.after = fast.packageWatts; w.mhz = fast.mhz;
+                    if (w.status != ERROR_SUCCESS) w.verdict = w.status == ERROR_NOT_SUPPORTED ? Verdict::unsupported : Verdict::refused;
+                    else if (!efficient.packageWatts || !fast.packageWatts) { w.verdict = Verdict::writeOnly; w.note = noPowerReading; }
+                    else {
+                        w.verdict = judgeMeasured(fast.packageWatts, efficient.packageWatts, .85, true);
+                        if (w.verdict != Verdict::works && heldBack(fast)) { w.verdict = Verdict::inconclusive; w.note = loadHeldBack; }
+                    }
+                    results.push_back(w);
+                }
+            }
 
             // CPU power limit: the 15 W preset against factory, in turbo, under the same load.
             begin(Control::powerLimit);
@@ -320,6 +373,7 @@ std::vector<Result> run(const Options& o) {
                 // A load that never got near a limit says nothing about the limit.
                 if (p.verdict != Verdict::works && (heldBack(turbo) || *p.before < 28)) { p.verdict = Verdict::inconclusive; p.note = loadHeldBack; }
                 asus::setTuning({}); // back to factory (switches mode away and back)
+                reapplyPowerPlan();  // and the plan, which made the platform drop the limit on the G14
                 results.push_back(p);
                 // Did the limit really go away? The same load again, in turbo, must come back to
                 // where it was. If it does not, the limit is still in force until a restart.
