@@ -300,6 +300,7 @@ std::vector<Result> run(const Options& o) {
             // CPU power limit: the 15 W preset against factory, in turbo, under the same load.
             begin(Control::powerLimit);
             if (!asus::powerLimitsSupported()) skip(Control::powerLimit, Verdict::unsupported, none);
+            else if (o.keepPowerLimit) skip(Control::powerLimit, Verdict::skipped, restartToClear);
             else if (cancelled()) skip(Control::powerLimit, Verdict::skipped, guardHeld);
             else if (!turbo.packageWatts || *turbo.packageWatts < 28) {
                 // The load already draws less than the limit would allow: writing the limit could show

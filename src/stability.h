@@ -219,5 +219,7 @@ int severity(Kind kind);
 std::vector<DayMark> timeline(const std::vector<Incident>& incidents, uint64_t nowUtc, int days, int64_t utcOffsetSeconds);
 // Crashes that took the system down, newest first: what protection mode and the streak follow.
 bool tookSystemDown(Kind kind);
+// Whether a boot time written down earlier is this boot (bootUtc() drifts by a few seconds).
+bool sameBoot(uint64_t recordedBoot, uint64_t currentBoot);
 
 } // namespace bs::stability

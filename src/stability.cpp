@@ -1099,6 +1099,11 @@ GHelperSettings readGHelperConfig() {
 
 // ---- Timeline.
 bool tookSystemDown(Kind kind) { return kind == Kind::blueScreen || kind == Kind::powerLoss || kind == Kind::forcedOff; }
+bool sameBoot(uint64_t recordedBoot, uint64_t currentBoot) {
+    if (!recordedBoot || !currentBoot) return false;
+    const uint64_t gap = recordedBoot > currentBoot ? recordedBoot - currentBoot : currentBoot - recordedBoot;
+    return gap < 5 * 60 * Second;
+}
 int severity(Kind kind) {
     if (tookSystemDown(kind)) return 3;
     if (kind == Kind::freeze || kind == Kind::graphicsReset || kind == Kind::hardwareError) return 2;

@@ -34,7 +34,8 @@ struct Result {
     int note = 0;                         // a reason code, see Note
     std::optional<double> mhz;            // the clock under the last load, where a load was run
 };
-enum Note { none = 0, onBatteryOnly, pluggedInOnly, customPreset, notToggled, needsTime, lookAtIt, noSecondValue, noPowerReading, guardHeld, loadHeldBack };
+enum Note { none = 0, onBatteryOnly, pluggedInOnly, customPreset, notToggled, needsTime, lookAtIt, noSecondValue, noPowerReading, guardHeld, loadHeldBack,
+    restartToClear }; // the power limit is not written: on this BIOS only a restart takes it away again
 const wchar_t* controlKey(Control control); // stable id for files: refresh, power-mode, ...
 const wchar_t* verdictKey(Verdict verdict);
 
@@ -56,6 +57,7 @@ LoadReading measureLoad(int milliseconds);
 struct Options {
     bool onBattery = false, asus = false;
     std::optional<double> batteryPercent; bool charging = false, pluggedIn = false;
+    bool keepPowerLimit = false;          // never write the power limit (it could not be restored here before)
     std::function<void(Control)> progress; // called before each control
     std::function<bool()> cancelled;
 };
