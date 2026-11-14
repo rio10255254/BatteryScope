@@ -72,7 +72,8 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     RefreshAutoId = 266, DarkModeId = 267, AutoSaverCycleId = 268, PerfPageId = 269, FanMenuId = 270, PowerLimitMenuId = 271,
     FanPreset0Id = 272 /* ..275 */, PowerPreset0Id = 276 /* ..279 */, CpuBoostToggleId = 280, WinModeMenuId = 281,
     StabilityPageId = 282, ReportId = 283, ReportFullId = 284, MarkProblemId = 285, StabilityFolderId = 286, ProtectToggleId = 287, VerifyControlsId = 288,
-    ModeLinkMenuId = 289, ModeLinkToggleId = 290, ModeLinkWindowsId = 291, ModeLinkImportId = 292, PowerLimitResetId = 293, ModeBoost0Id = 340 /* ..358: + mode * 8 + boost */,
+    ModeLinkMenuId = 289, ModeLinkToggleId = 290, ModeLinkWindowsId = 291, ModeLinkImportId = 292, PowerLimitResetId = 293, IdleDisplayToggleId = 294, IdleDisplayMenuId = 295,
+    DimAfter0Id = 370 /* ..375 */, DisplayOff0Id = 380 /* ..386 */, DimLevel0Id = 390 /* ..393 */, ModeBoost0Id = 340 /* ..358: + mode * 8 + boost */,
     SettingRowId = 300 /* ..329, one per settings row */,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1, FnKeyHotkey = 10 /* ..20: F1-F11 under the software Fn lock */;
@@ -203,7 +204,12 @@ bool modeLink = true, modeLinkWindows = true;
 DWORD modeBoost[3] = {0, 2, 0};   // the plan's CPU Boost while plugged in: 0 off, 1 on, 2 aggressive, ...
 int modeWindows[3] = {1, 2, 0};   // Windows power mode: 0 best efficiency, 1 balanced, 2 best performance
 int modeLinkDone = -1;            // the mode they were last set for while plugged in
+// Away from the PC on battery: Windows dims the display, then turns it off (see applyDisplayTimers).
+bool idleDisplay = true;
+DWORD dimAfter = 60, displayOffAfter = 300, dimLevel = 30; // seconds, seconds (0 never), percent
+bool displayTimersDone = false;
 void loadModeLink();
+std::wstring idleDisplaySummary();
 bool autoWritesPaused() {
     return protectState != 0 || !startupSettled || controlCheckBusy || bs::stability::writeGuard().automaticBlocked(GetTickCount64());
 }
@@ -3159,6 +3165,10 @@ void loadSettings() {
     updateAuto = readSetting(L"UpdateAuto", 1) != 0;
     gpuAuto = readSetting(L"GpuAuto", 0) != 0;
     if (!demo && !isolatedPreview) loadModeLink();
+    idleDisplay = readSetting(L"IdleDisplay", 1) != 0;
+    dimAfter = std::min<DWORD>(600, readSetting(L"DimAfter", 60));
+    displayOffAfter = std::min<DWORD>(3600, readSetting(L"DisplayOffAfter", 300));
+    dimLevel = std::clamp<DWORD>(readSetting(L"DimLevel", 30), 5, 100);
     keyboardAutoOff = readSetting(L"KeyboardAutoOff", 0) != 0;
     asusKeysHandled = readSetting(L"AsusKeysOff", 0) == 0;
     rogKeyAction = std::min<DWORD>(2, readSetting(L"RogKey", 0));
@@ -4905,7 +4915,11 @@ std::vector<Tip> savingTips() {
         tips.push_back({.8, tr(L"獨顯改用自動（用電池時 Eco）"), tr(L"⋯ → 華碩硬體 → 獨顯 → 自動；有程式喚醒獨顯時最多可省數瓦"), false});
     if (bs::lab::readKnob(bs::lab::Knob::darkMode, value) == ERROR_SUCCESS && value == 0)
         measuredTip(L"dark-mode", tr(L"改用深色模式（OLED）"), tr(L"Windows 設定 → 個人化 → 色彩"), .8);
-    measuredTip(L"brightness", tr(L"螢幕亮度降 40%"), tr(L"OLED 上白底畫面影響最大"), .6);
+    {
+        bool measured = false; const double watts = saving(L"brightness", .6, measured);
+        tips.push_back({watts, tr(L"螢幕亮度降 40%"), measured ? tr(L"這台實測：每 10% 亮度約 ") + number(watts / 4, 2) + tr(L" W；OLED 上白底畫面影響最大")
+            : std::wstring(tr(L"OLED 上白底畫面影響最大；跑一次快速測試就會換成這台的實測值")), measured});
+    }
     std::sort(tips.begin(), tips.end(), [](const Tip& a, const Tip& b) { return a.watts > b.watts; });
     return tips;
 }
@@ -4952,6 +4966,22 @@ std::vector<VBlock> goalBlocks() {
     v.push_back(vHeading(goalUse ? tr(L"最近 30 分鐘 vs 目標") : tr(L"最近 30 分鐘")));
     v.push_back(vMeter(tr(L"使用中"), meterValue(use, goalUse), use.minutes >= 1 ? use.watts : 0, goalUse, 0));
     v.push_back(vMeter(tr(L"靜態（1 分鐘沒操作）"), meterValue(still, goalStill), still.minutes >= 1 ? still.watts : 0, goalStill, 0));
+    // Where the battery's power goes right now: the CPU (what dynamic saving manages) and the
+    // rest (display, discrete GPU, storage, Wi-Fi), which the display timers and brightness act on.
+    {
+        const bool onBattery = !current.history.empty() && current.history.back().acKnown && !current.history.back().onAc;
+        Value battery = current.power.currentWatts, cpu = current.energy.packageWatts;
+        if (demo || isolatedPreview) { battery = 9.4; cpu = 2.6; }
+        if ((onBattery || demo || isolatedPreview) && battery && cpu && *battery > 0) {
+            const double package = std::min(*cpu, *battery), rest = std::max(0.0, *battery - package);
+            v.push_back(vHeading(tr(L"現在的電花在哪裡")));
+            VBar bar; bar.label = L"CPU " + number(package, 1) + tr(L" W · 螢幕與其他 ") + number(rest, 1) + L" W";
+            bar.value = number(*battery, 1) + L" W";
+            bar.segments = {{package, Green}, {rest, blend(theme.warn, Surface, .25)}};
+            v.push_back(vBars({bar}));
+            v.push_back(vLegend({{tr(L"CPU：動態省電調整"), Green}, {tr(L"螢幕、獨顯、儲存、網路"), blend(theme.warn, Surface, .25)}}));
+        }
+    }
     {
         // The live series: the last 30 minutes of battery power, at most 120 columns.
         std::vector<double> series;
@@ -4996,6 +5026,9 @@ std::vector<VBlock> goalBlocks() {
         const int top = pluggedRefresh();
         v.push_back(vToggle(tr(L"用電池時 60 Hz"), top > 60 ? tr(L"插電自動回到 ") + std::to_wstring(top) + tr(L" Hz · 實測省 0.7–1.5 W") : std::wstring(tr(L"插電自動回到最高更新率")),
             refreshAuto, RefreshAutoId));
+        // Away from the PC: dim, then off. A playing video keeps the display on.
+        v.push_back(vToggle(tr(L"離開時調暗、黑屏"), idleDisplay ? idleDisplaySummary() : std::wstring(tr(L"用電池時沒人操作，先調暗再黑屏；動一下立刻回來")), idleDisplay, IdleDisplayToggleId));
+        if (idleDisplay) v.push_back(vAction(tr(L"調暗與黑屏的時間"), std::to_wstring(dimLevel) + L"%", IdleDisplayMenuId));
         DWORD dark = 0;
         if (bs::lab::readKnob(bs::lab::Knob::darkMode, dark) == ERROR_SUCCESS)
             v.push_back(vToggle(tr(L"深色模式"), tr(L"OLED 螢幕上深色畫面較省電"), dark != 0, DarkModeId));
@@ -5414,6 +5447,162 @@ std::vector<MenuItem> modeLinkMenuItems() {
         }
     }
     return items;
+}
+// ----- Away from the PC: dim, then black -----
+// On battery the display is the largest part of the power that is not the CPU (the G14 idle on
+// battery: 6.8-9 W of 9-12 W), and this PC's plan had the display never turning off.
+// Dimming is Windows' own timer on the active plan, for battery only: Windows keeps the display
+// bright while a program asks it to (a video, a presentation, a call) and restores it at the
+// first touch. Windows' display-off timer is left as the user has it: on a Modern Standby laptop
+// like the G14 it also starts standby and drops the network. Instead BatteryScope covers the
+// screen with black, which on OLED turns the pixels off, and lifts it at the first input: the PC
+// stays awake and is back at once. The plan's originals are put back when switched off, and a
+// change made in Windows' own settings is followed.
+std::wstring secondsText(DWORD seconds) {
+    if (!seconds) return tr(L"永不");
+    if (seconds < 60) return std::to_wstring(seconds) + tr(L" 秒");
+    return std::to_wstring(seconds / 60) + tr(L" 分");
+}
+void applyDisplayTimers(bool now) {
+    if (demo || isolatedPreview) return;
+    if (!now && (displayTimersDone || autoWritesPaused())) return;
+    displayTimersDone = true;
+    bs::DisplayTimers plan{};
+    if (!readBatteryDisplayTimers(plan)) return;
+    const bool saved = readSetting(L"DisplayTimersSaved", 0) != 0;
+    if (!idleDisplay) {
+        // Off: the plan's own values back, once.
+        if (saved) {
+            writeBatteryDisplayTimers({readSetting(L"OriginalDim", 0), readSetting(L"OriginalOff", 0), readSetting(L"OriginalDimLevel", 50)});
+            writeSetting(L"DisplayTimersSaved", 0);
+            bs::stability::note(L"display timers restored");
+        }
+        return;
+    }
+    const DWORD planOff = saved ? readSetting(L"OriginalOff", plan.offSeconds) : plan.offSeconds;
+    if (!saved) {
+        writeSetting(L"OriginalDim", plan.dimSeconds); writeSetting(L"OriginalOff", plan.offSeconds); writeSetting(L"OriginalDimLevel", plan.dimPercent);
+        writeSetting(L"DisplayTimersSaved", 1);
+    } else if (!now && readSetting(L"WrittenDim", 0xFFFFFFFFu) != 0xFFFFFFFFu && plan.dimSeconds != readSetting(L"WrittenDim", 0)) {
+        // The dimming changed in Windows' settings since: that is the user's choice now.
+        dimAfter = plan.dimSeconds; dimLevel = std::clamp<DWORD>(plan.dimPercent, 5, 100);
+        writeSetting(L"DimAfter", dimAfter); writeSetting(L"DimLevel", dimLevel); writeSetting(L"WrittenDim", plan.dimSeconds);
+        return;
+    }
+    if (plan.offSeconds != planOff) writeSetting(L"OriginalOff", plan.offSeconds); // the user's own display-off, changed in Windows
+    const bs::DisplayTimers keep = bs::consistentTimers({dimAfter, plan.offSeconds, dimLevel});
+    if (plan.dimSeconds == keep.dimSeconds && plan.dimPercent == keep.dimPercent) { writeSetting(L"WrittenDim", keep.dimSeconds); return; }
+    if (writeBatteryDisplayTimers(keep) == ERROR_SUCCESS) {
+        writeSetting(L"WrittenDim", keep.dimSeconds);
+        bs::stability::note(L"display timers dim=" + std::to_wstring(keep.dimSeconds) + L" level=" + std::to_wstring(keep.dimPercent));
+    }
+}
+// The black cover: one top-most window over every display, no cursor. A key or click on it is
+// taken by it (so it does not reach the program below); any other input is seen through
+// GetLastInputInfo. Either lifts it at once and gives the focus back.
+HWND blankWindow = nullptr, blankPrevious = nullptr;
+DWORD blankInputAt = 0;      // the last input when it went black
+DWORD blankDoneInput = 0;    // the input it went black for, so it does not come back without new input
+constexpr UINT_PTR BlankTimer = 1;
+void hideBlank(const wchar_t* why) {
+    if (!blankWindow) return;
+    HWND window = blankWindow; blankWindow = nullptr;
+    KillTimer(window, BlankTimer);
+    DestroyWindow(window);
+    if (blankPrevious && IsWindow(blankPrevious)) SetForegroundWindow(blankPrevious);
+    blankPrevious = nullptr;
+    bs::stability::note(std::wstring(L"black screen off: ") + why);
+}
+LRESULT CALLBACK blankProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
+    switch (message) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: { PAINTSTRUCT ps{}; HDC dc = BeginPaint(window, &ps); FillRect(dc, &ps.rcPaint, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH))); EndPaint(window, &ps); return 0; }
+    case WM_SETCURSOR: SetCursor(nullptr); return TRUE;
+    case WM_KEYDOWN: case WM_SYSKEYDOWN: case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: case WM_MOUSEWHEEL: case WM_POINTERDOWN:
+        hideBlank(L"input"); return 0;
+    case WM_TIMER: {
+        LASTINPUTINFO input{}; input.cbSize = sizeof(input);
+        if (GetLastInputInfo(&input) && input.dwTime != blankInputAt) hideBlank(L"input");
+        return 0;
+    }
+    case WM_CLOSE: hideBlank(L"closed"); return 0;
+    }
+    return DefWindowProcW(window, message, wp, lp);
+}
+void showBlank(DWORD inputAt) {
+    if (blankWindow) return;
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{}; wc.cbSize = sizeof(wc); wc.lpfnWndProc = blankProc; wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"BatteryScope.Blank.v1"; wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+        registered = RegisterClassExW(&wc) != 0;
+    }
+    const int x = GetSystemMetrics(SM_XVIRTUALSCREEN), y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    const int w = GetSystemMetrics(SM_CXVIRTUALSCREEN), h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    blankPrevious = GetForegroundWindow();
+    blankInputAt = inputAt; blankDoneInput = inputAt;
+    blankWindow = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"BatteryScope.Blank.v1", L"", WS_POPUP, x, y, w, h, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!blankWindow) return;
+    ShowWindow(blankWindow, SW_SHOW);
+    SetForegroundWindow(blankWindow);
+    SetTimer(blankWindow, BlankTimer, 50, nullptr);
+    bs::stability::note(L"black screen on");
+}
+// A program asked Windows to keep the display on (a video, a presentation).
+bool displayRequested() {
+    using Query = LONG (WINAPI*)(int, PVOID, ULONG, PVOID, ULONG);
+    static Query query = [] {
+        Query q = nullptr;
+        if (HMODULE module = LoadLibraryExW(L"powrprof.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
+            FARPROC p = GetProcAddress(module, "CallNtPowerInformation"); std::memcpy(&q, &p, sizeof(q));
+        }
+        return q;
+    }();
+    ULONG state = 0;
+    return query && query(16 /* SystemExecutionState */, nullptr, 0, &state, sizeof(state)) == 0 && (state & ES_DISPLAY_REQUIRED);
+}
+// Once a second: black after the chosen time without input, on battery, when nothing is being
+// watched or heard. With dynamic saving on, its detector must say the PC is idle (it weighs
+// sound, video decoding, full screen and calls); without it, no sound, call or full screen.
+void checkBlank() {
+    if (blankWindow) {
+        const bool plugged = !current.history.empty() && current.history.back().acKnown && current.history.back().onAc;
+        if (plugged || !idleDisplay) hideBlank(plugged ? L"plugged in" : L"switched off");
+        return;
+    }
+    if (!idleDisplay || !displayOffAfter || demo || isolatedPreview || current.history.empty()) return;
+    const auto& p = current.history.back();
+    if (!p.acKnown || p.onAc || controlCheckBusy || bs::stability::writeGuard().held() || protectState) return;
+    if (labController && labController->status().running) return;
+    LASTINPUTINFO input{}; input.cbSize = sizeof(input);
+    if (!GetLastInputInfo(&input) || input.dwTime == blankDoneInput) return;
+    if (GetTickCount() - input.dwTime < displayOffAfter * 1000) return;
+    if (displayRequested()) return;
+    if (dynamicEnabled) { if (lastAssessment.activity != bs::gov::Activity::idle) return; }
+    else {
+        if (!signalReader) signalReader = std::make_unique<bs::lab::SignalReader>();
+        const auto s = signalReader->read(std::nullopt);
+        if (s.audio || s.call || s.fullscreenGame) return;
+    }
+    showBlank(input.dwTime);
+}
+std::wstring idleDisplaySummary() {
+    const auto t = bs::consistentTimers({dimAfter, 0, dimLevel});
+    std::wstring s = t.dimSeconds ? secondsText(t.dimSeconds) + tr(L"後調暗到 ") + std::to_wstring(t.dimPercent) + L"%" : std::wstring(tr(L"不調暗"));
+    s += L" · " + (displayOffAfter ? secondsText(displayOffAfter) + tr(L"後黑屏") : std::wstring(tr(L"不黑屏")));
+    return s;
+}
+std::vector<MenuItem> idleDisplayMenuItems() {
+    const bool preview = demo || isolatedPreview;
+    static const DWORD dims[] = {0, 30, 60, 120, 300}, offs[] = {0, 120, 300, 600, 900, 1800}, levels[] = {10, 20, 30, 50};
+    std::vector<MenuItem> a, b, c;
+    for (size_t i = 0; i < std::size(dims); ++i) a.push_back(menuItem(DimAfter0Id + int(i), dims[i] ? secondsText(dims[i]) : std::wstring(tr(L"不調暗")), dimAfter == dims[i], preview));
+    for (size_t i = 0; i < std::size(offs); ++i) b.push_back(menuItem(DisplayOff0Id + int(i), secondsText(offs[i]), displayOffAfter == offs[i], preview));
+    for (size_t i = 0; i < std::size(levels); ++i) c.push_back(menuItem(DimLevel0Id + int(i), std::to_wstring(levels[i]) + L"%", dimLevel == levels[i], preview));
+    auto dim = submenu(tr(L"多久沒操作就調暗"), a); dim.hint = dimAfter ? secondsText(dimAfter) : std::wstring(tr(L"不調暗"));
+    auto off = submenu(tr(L"多久沒操作就黑屏（動一下立刻回來）"), b); off.hint = secondsText(displayOffAfter);
+    auto level = submenu(tr(L"調暗後的亮度"), c); level.hint = std::to_wstring(dimLevel) + L"%";
+    return {dim, off, level};
 }
 // The firmware of many models forgets the charge limit at a restart and never reports the
 // mode back: what BatteryScope set (mode, charge limit, keyboard, Fn lock, Slash) is put back
@@ -7689,6 +7878,22 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (id == ReportId || id == ReportFullId) { buildReport(id == ReportFullId); return 0; }
         if (id == MarkProblemId) { showMain(); markProblem(); return 0; }
         if (id == StabilityFolderId) { const auto dir = bs::stability::folder(); if (!dir.empty()) ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL); return 0; }
+        if (id == IdleDisplayMenuId) {
+            if (const int chosen = showMenu(idleDisplayMenuItems(), menuAnchor(), mainWindow)) SendMessageW(window, WM_COMMAND, chosen, 0);
+            return 0;
+        }
+        if (id == IdleDisplayToggleId || (id >= DimAfter0Id && id <= DimAfter0Id + 4) || (id >= DisplayOff0Id && id <= DisplayOff0Id + 5) || (id >= DimLevel0Id && id <= DimLevel0Id + 3)) {
+            if (demo || isolatedPreview) return 0;
+            static const DWORD dims[] = {0, 30, 60, 120, 300}, offs[] = {0, 120, 300, 600, 900, 1800}, levels[] = {10, 20, 30, 50};
+            if (id == IdleDisplayToggleId) { idleDisplay = !idleDisplay; writeSetting(L"IdleDisplay", idleDisplay ? 1 : 0); }
+            else if (id < DisplayOff0Id) { dimAfter = dims[id - DimAfter0Id]; writeSetting(L"DimAfter", dimAfter); }
+            else if (id < DimLevel0Id) { displayOffAfter = offs[id - DisplayOff0Id]; writeSetting(L"DisplayOffAfter", displayOffAfter); }
+            else { dimLevel = levels[id - DimLevel0Id]; writeSetting(L"DimLevel", dimLevel); }
+            applyDisplayTimers(true);
+            setNotice(idleDisplay ? tr(L"用電池時：") + idleDisplaySummary() : std::wstring(tr(L"已還原 Windows 原本的螢幕設定。")));
+            if (inlinePage == InlinePage::goal) showGoalPage();
+            return 0;
+        }
         if (id == PowerLimitResetId) {
             if (demo || isolatedPreview || !asusAvailable) return 0;
             // What took the limit away on the G14 without a restart: the plan and the Windows power
@@ -8032,6 +8237,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         applyGpuAuto();
         applyRefreshAuto();
         applyModeCompanions(false);
+        applyDisplayTimers(false);
+        checkBlank();
         if (const Value watts = current.energy.packageWatts; watts && *watts > 28 && powerLimitStuck()) clearPowerLimitStuck(L"cpu above 28 W");
         if (inlinePage == InlinePage::hardware && !hidden) showHardwarePage();
         if (inlinePage == InlinePage::performance && !hidden) showPerformancePage();
@@ -8167,6 +8374,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             }
             return TRUE;
         }
+        if (wp == PBT_APMSUSPEND) hideBlank(L"sleep");
         if (wp == PBT_APMSUSPEND) {
             stab::screenOn = false; stab::powerChangeMs = GetTickCount64();
             bs::stability::writeGuard().hold(bs::stability::WriteGuard::suspending);
@@ -8665,6 +8873,9 @@ bool panelSelfTest(const std::wstring& path) {
     SendMessageW(mainWindow, WM_COMMAND, GoalPageId, 0);
     const auto switches = std::count_if(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::action && b.toggle >= 0; });
     check("saving_tab_switches_each_saving", inlinePage == InlinePage::goal && switches >= 3);
+    check("saving_tab_dims_the_display_when_away", std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) {
+        return b.kind == VBlock::Kind::action && int(b.amount) == IdleDisplayToggleId && b.toggle == 1; }) && idleDisplayMenuItems().size() == 3
+        && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::bars && !b.bars.empty() && b.bars[0].segments.size() == 2; }));
     SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
     // The ASUS page (preview data): every control is a row, and the key display shows without taking focus.
     SendMessageW(mainWindow, WM_COMMAND, HardwarePageId, 0);

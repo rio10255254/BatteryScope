@@ -46,6 +46,15 @@ PowerModes queryPowerModes();
 // The first change to each side saves the original so restorePowerModes can undo it.
 DWORD setPowerMode(bool pluggedIn, PowerMode mode);
 DWORD restorePowerModes();
+// The active power plan's display timers on battery: dim after and turn off after (seconds, 0 =
+// never) and the dimmed brightness (percent). Windows applies them itself: it keeps the display
+// on while a program asks for it (a playing video, a presentation) and brings it back at the
+// first input. On Modern Standby laptops a display turned off this way also starts standby.
+struct DisplayTimers { DWORD dimSeconds = 0, offSeconds = 0, dimPercent = 50; };
+bool readBatteryDisplayTimers(DisplayTimers& timers);
+DWORD writeBatteryDisplayTimers(const DisplayTimers& timers);
+// Dim before off: a dim time at or past the off time would never show, so it is dropped.
+DisplayTimers consistentTimers(DisplayTimers timers);
 // The mode Windows applies right now (documented EFFECTIVE_POWER_MODE).
 enum class EffectiveMode { unknown, energySaver, efficiency, balanced, performance, maxPerformance, game, mixedReality };
 EffectiveMode effectiveModeFromValue(int value);

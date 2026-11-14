@@ -9,6 +9,7 @@
 #include <psapi.h>
 #include <pdh.h>
 #include <pdhmsg.h>
+#include <algorithm>
 #include <set>
 #include <cwctype>
 #include <cstring>
@@ -179,6 +180,60 @@ DWORD setPowerMode(bool pluggedIn, PowerMode mode) {
     if (status) { if (!saved) clearPreviousMode(pluggedIn); return status; }
     if (saved && sameGuid(previous, target)) clearPreviousMode(pluggedIn); // back at the original
     return ERROR_SUCCESS;
+}
+namespace {
+constexpr GUID VideoGroup = {0x7516b95f, 0xf776, 0x4464, {0x8c, 0x53, 0x06, 0x16, 0x7f, 0x40, 0xcc, 0x99}};
+constexpr GUID VideoIdle = {0x3c0bc021, 0xc8a8, 0x4e07, {0xa9, 0x73, 0x6b, 0x14, 0xcb, 0xcb, 0x2b, 0x7e}};
+constexpr GUID VideoDim = {0x17aaa29b, 0x8b43, 0x4b94, {0xaa, 0xfe, 0x35, 0xf6, 0x4d, 0xaa, 0xf1, 0xee}};
+constexpr GUID DimBrightness = {0xf1fbfde2, 0xa960, 0x4165, {0x9f, 0x88, 0x50, 0x66, 0x79, 0x11, 0xce, 0x96}};
+struct PlanApi {
+    DWORD (WINAPI* active)(HKEY, GUID**) = nullptr;
+    DWORD (WINAPI* readDc)(HKEY, const GUID*, const GUID*, const GUID*, LPDWORD) = nullptr;
+    DWORD (WINAPI* writeDc)(HKEY, const GUID*, const GUID*, const GUID*, DWORD) = nullptr;
+    DWORD (WINAPI* apply)(HKEY, const GUID*) = nullptr;
+};
+const PlanApi& planApi() {
+    static PlanApi api = [] {
+        PlanApi a;
+        HMODULE module = LoadLibraryExW(L"powrprof.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        bind(module, "PowerGetActiveScheme", a.active);
+        bind(module, "PowerReadDCValueIndex", a.readDc);
+        bind(module, "PowerWriteDCValueIndex", a.writeDc);
+        bind(module, "PowerSetActiveScheme", a.apply);
+        return a;
+    }();
+    return api;
+}
+}
+DisplayTimers consistentTimers(DisplayTimers t) {
+    if (t.dimSeconds && t.offSeconds && t.dimSeconds >= t.offSeconds) t.dimSeconds = 0;
+    t.dimPercent = std::min<DWORD>(100, t.dimPercent);
+    return t;
+}
+bool readBatteryDisplayTimers(DisplayTimers& t) {
+    const auto& api = planApi();
+    if (!api.active || !api.readDc) return false;
+    GUID* scheme = nullptr;
+    if (api.active(nullptr, &scheme) != ERROR_SUCCESS || !scheme) return false;
+    const bool ok = api.readDc(nullptr, scheme, &VideoGroup, &VideoIdle, &t.offSeconds) == ERROR_SUCCESS;
+    if (api.readDc(nullptr, scheme, &VideoGroup, &VideoDim, &t.dimSeconds) != ERROR_SUCCESS) t.dimSeconds = 0;
+    if (api.readDc(nullptr, scheme, &VideoGroup, &DimBrightness, &t.dimPercent) != ERROR_SUCCESS) t.dimPercent = 50;
+    LocalFree(scheme);
+    return ok;
+}
+DWORD writeBatteryDisplayTimers(const DisplayTimers& timers) {
+    const auto& api = planApi();
+    if (!api.active || !api.writeDc || !api.apply) return ERROR_PROC_NOT_FOUND;
+    const DisplayTimers t = consistentTimers(timers);
+    GUID* scheme = nullptr;
+    DWORD status = api.active(nullptr, &scheme);
+    if (status != ERROR_SUCCESS || !scheme) return status ? status : ERROR_GEN_FAILURE;
+    status = api.writeDc(nullptr, scheme, &VideoGroup, &VideoIdle, t.offSeconds);
+    if (status == ERROR_SUCCESS) status = api.writeDc(nullptr, scheme, &VideoGroup, &VideoDim, t.dimSeconds);
+    if (status == ERROR_SUCCESS) status = api.writeDc(nullptr, scheme, &VideoGroup, &DimBrightness, t.dimPercent);
+    if (status == ERROR_SUCCESS) status = api.apply(nullptr, scheme);
+    LocalFree(scheme);
+    return status;
 }
 DWORD restorePowerModes() {
     DWORD result = ERROR_SUCCESS;

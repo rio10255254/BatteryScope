@@ -251,6 +251,11 @@ int wmain(int argc, wchar_t** argv) {
             check(powerModeFromGuid(efficiency) == PowerMode::efficiency && powerModeFromGuid(GUID{}) == PowerMode::balanced &&
                 powerModeFromGuid(performance) == PowerMode::performance && powerModeFromGuid(legacy) == PowerMode::balanced &&
                 powerModeFromGuid(oem) == PowerMode::other, "power mode overlays map to efficiency, balanced, performance, or other");
+            {
+                const auto kept = consistentTimers({60, 300, 30}), dropped = consistentTimers({300, 120, 30}), never = consistentTimers({60, 0, 130});
+                check(kept.dimSeconds == 60 && kept.offSeconds == 300 && dropped.dimSeconds == 0 && dropped.offSeconds == 120 &&
+                    never.dimSeconds == 60 && never.dimPercent == 100, "display timers dim before they turn the display off");
+            }
             check(effectiveModeFromValue(0) == EffectiveMode::energySaver && effectiveModeFromValue(2) == EffectiveMode::balanced &&
                 effectiveModeFromValue(4) == EffectiveMode::maxPerformance && effectiveModeFromValue(9) == EffectiveMode::unknown,
                 "effective power mode values follow EFFECTIVE_POWER_MODE");
