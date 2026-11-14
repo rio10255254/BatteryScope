@@ -207,6 +207,11 @@ struct GHelperSettings {
     int cpuUndervolt = 0;      // the most negative CPU value over all modes (0: none)
     int igpuUndervolt = 0;
     int gpuCore = 0, gpuMemory = 0; // the largest GPU overclock over all modes (MHz)
+    // What G-Helper sets with each mode (index: the firmware's mode number, 0 balanced, 1 turbo,
+    // 2 silent): the plan's CPU Boost ("auto_boost_N", -1 when not set) and the Windows power
+    // mode ("powermode_N": 0 best efficiency, 1 balanced, 2 best performance, -1 not set).
+    int boost[3] = {-1, -1, -1};
+    int windowsMode[3] = {-1, -1, -1};
     bool risky() const { return cpuUndervolt < 0 || igpuUndervolt < 0 || gpuCore > 0 || gpuMemory > 0; }
 };
 GHelperSettings parseGHelperConfig(const std::string& json);

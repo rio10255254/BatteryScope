@@ -776,6 +776,10 @@ int wmain(int argc, wchar_t** argv) {
                 const auto none = parseGHelperConfig("{\"performance_mode\": 0, \"cpu_uv_0\": 0}");
                 check(g.found && g.autoUndervolt && g.cpuUndervolt == -5 && g.igpuUndervolt == 0 && g.gpuCore == 155 && g.gpuMemory == 230 && g.risky() &&
                     none.found && !none.risky() && !none.autoUndervolt && !parseGHelperConfig("").found, "G-Helper's undervolt and overclock settings are read from its config");
+                const auto modes = parseGHelperConfig("{\"auto_boost_1\": 2, \"auto_boost_2\": 0, \"auto_boost_9\": 4, \"auto_boost\": 1,\n"
+                    " \"powermode_2\": \"961CC777-2547-4F9D-8174-7D86181B8A7A\", \"powermode_1\": \"ded574b5-45a0-4f42-8737-46345c09c238\", \"powermode_0\": \"nonsense\"}");
+                check(modes.boost[0] == -1 && modes.boost[1] == 2 && modes.boost[2] == 0 && modes.windowsMode[0] == -1 && modes.windowsMode[1] == 2 && modes.windowsMode[2] == 0 &&
+                    g.boost[1] == -1 && g.windowsMode[2] == -1, "G-Helper's CPU Boost and Windows power mode for each mode are read from its config");
             }
             {
                 const uint64_t noon = 20000ull * 86400 * Second + 12 * 3600 * Second; // a day's noon, UTC

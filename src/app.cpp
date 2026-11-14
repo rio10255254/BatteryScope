@@ -72,6 +72,7 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     RefreshAutoId = 266, DarkModeId = 267, AutoSaverCycleId = 268, PerfPageId = 269, FanMenuId = 270, PowerLimitMenuId = 271,
     FanPreset0Id = 272 /* ..275 */, PowerPreset0Id = 276 /* ..279 */, CpuBoostToggleId = 280, WinModeMenuId = 281,
     StabilityPageId = 282, ReportId = 283, ReportFullId = 284, MarkProblemId = 285, StabilityFolderId = 286, ProtectToggleId = 287, VerifyControlsId = 288,
+    ModeLinkMenuId = 289, ModeLinkToggleId = 290, ModeLinkWindowsId = 291, ModeLinkImportId = 292, ModeBoost0Id = 340 /* ..358: + mode * 8 + boost */,
     SettingRowId = 300 /* ..329, one per settings row */,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1, FnKeyHotkey = 10 /* ..20: F1-F11 under the software Fn lock */;
@@ -196,6 +197,12 @@ bool startupSettled = false;   // the deferred start (restores, then the remembe
 std::atomic<bool> labRestoreNow{false}; // the worker restores a setting an interrupted experiment left changed
 std::atomic<bool> controlCheckBusy{false}; // the control check owns the settings while it runs
 std::atomic<int> controlCheckAt{-1};       // the control it is on (verify::Control), for the page
+// Mode companions (see applyModeCompanions): by the firmware's mode number, 0 balanced, 1 turbo, 2 silent.
+bool modeLink = true, modeLinkWindows = true;
+DWORD modeBoost[3] = {0, 2, 0};   // the plan's CPU Boost while plugged in: 0 off, 1 on, 2 aggressive, ...
+int modeWindows[3] = {1, 2, 0};   // Windows power mode: 0 best efficiency, 1 balanced, 2 best performance
+int modeLinkDone = -1;            // the mode they were last set for while plugged in
+void loadModeLink();
 bool autoWritesPaused() {
     return protectState != 0 || !startupSettled || controlCheckBusy || bs::stability::writeGuard().automaticBlocked(GetTickCount64());
 }
@@ -3150,6 +3157,7 @@ void loadSettings() {
     updateChecks = readSetting(L"UpdateCheck", 1) != 0;
     updateAuto = readSetting(L"UpdateAuto", 1) != 0;
     gpuAuto = readSetting(L"GpuAuto", 0) != 0;
+    if (!demo && !isolatedPreview) loadModeLink();
     keyboardAutoOff = readSetting(L"KeyboardAutoOff", 0) != 0;
     asusKeysHandled = readSetting(L"AsusKeysOff", 0) == 0;
     rogKeyAction = std::min<DWORD>(2, readSetting(L"RogKey", 0));
@@ -5321,6 +5329,90 @@ void applyGpuAuto() {
     if (source == 1 && *h.gpuEco) { if (bs::asus::setGpuEco(false) == ERROR_SUCCESS) setNotice(tr(L"插電：獨顯已切到標準。")); asusReadAt = 0; }
     else if (source == 0 && !*h.gpuEco) requestGpuEco(false, true);
 }
+// ----- Mode companions -----
+// G-Helper does more than switch the firmware mode: with each mode it also sets the Windows
+// power mode (silent: best efficiency, balanced: balanced, turbo: best performance) and that
+// mode's own CPU Boost. With boost off the clock stops at the base clock and every mode draws
+// about the same (the G14 plugged in: 20 W at most in any mode), so the modes looked alike
+// without them. Done here for plugged in; on battery dynamic saving and the battery boost
+// switch own those settings.
+const wchar_t* boostName(DWORD value) {
+    static const wchar_t* names[] = {L"關", L"開", L"積極", L"高效率開", L"高效率積極", L"積極（保證時脈）", L"高效率（保證時脈）"};
+    return value < std::size(names) ? tr(names[value]) : L"?";
+}
+const wchar_t* windowsModeName(int mode) { return mode == 0 ? tr(L"效率") : mode == 2 ? tr(L"效能") : tr(L"平衡"); }
+void loadModeLink() {
+    modeLink = readSetting(L"ModeLink", 1) != 0;
+    modeLinkWindows = readSetting(L"ModeLinkWindows", 1) != 0;
+    if (readSetting(L"ModeBoost1", 0xFFFFFFFFu) == 0xFFFFFFFFu) {
+        // First run: G-Helper's own choices where it has them; otherwise silent off, balanced as
+        // the plan has it now (so a boost switched off on purpose stays off), turbo aggressive.
+        const auto g = bs::stability::readGHelperConfig();
+        const auto now = bs::verify::pluggedInBoost();
+        DWORD boost[3] = {now ? std::min<DWORD>(6, DWORD(*now)) : 0, 2, 0};
+        int windows[3] = {1, 2, 0};
+        for (int i = 0; i < 3; ++i) {
+            if (g.boost[i] >= 0) boost[i] = DWORD(g.boost[i]);
+            if (g.windowsMode[i] >= 0) windows[i] = g.windowsMode[i];
+            writeSetting((L"ModeBoost" + std::to_wstring(i)).c_str(), boost[i]);
+            writeSetting((L"ModeWindows" + std::to_wstring(i)).c_str(), DWORD(windows[i]));
+        }
+    }
+    for (int i = 0; i < 3; ++i) {
+        modeBoost[i] = std::min<DWORD>(6, readSetting((L"ModeBoost" + std::to_wstring(i)).c_str(), modeBoost[i]));
+        modeWindows[i] = int(std::min<DWORD>(2, readSetting((L"ModeWindows" + std::to_wstring(i)).c_str(), DWORD(modeWindows[i]))));
+    }
+}
+// Sets the CPU Boost and Windows power mode that go with the firmware mode, once per mode while
+// plugged in; `now` after the user picked a mode (also under protection mode, which only stops
+// automatic changes).
+void applyModeCompanions(bool now) {
+    if (!modeLink || !asusAvailable || demo || isolatedPreview || current.history.empty() || controlCheckBusy) return;
+    if (labController && labController->status().running) return;
+    if (bs::stability::writeGuard().held() || (!now && autoWritesPaused())) return;
+    const auto& p = current.history.back();
+    if (!p.acKnown || !p.onAc) { modeLinkDone = -1; return; } // set again when plugged in
+    const auto mode = bs::asus::remembered().mode;
+    if (!mode || int(*mode) > 2) return;
+    const int m = int(*mode);
+    if (!now && m == modeLinkDone) return;
+    modeLinkDone = m;
+    if (const auto boost = bs::verify::pluggedInBoost(); boost && DWORD(*boost) != modeBoost[m]) bs::verify::setPluggedInBoost(modeBoost[m]);
+    if (modeLinkWindows) {
+        const PowerMode target = modeWindows[m] == 0 ? PowerMode::efficiency : modeWindows[m] == 2 ? PowerMode::performance : PowerMode::balanced;
+        const auto modes = queryPowerModes();
+        if (modes.acKnown && modes.acSettable && modes.ac != target) setPowerMode(true, target);
+    }
+}
+std::wstring modeLinkSummary() {
+    return tr(L"Boost：靜音 ") + std::wstring(boostName(modeBoost[2])) + tr(L" · 平衡 ") + boostName(modeBoost[0]) + L" · Turbo " + boostName(modeBoost[1]);
+}
+std::vector<MenuItem> modeLinkMenuItems() {
+    const bool preview = demo || isolatedPreview;
+    std::vector<MenuItem> items;
+    items.push_back(menuItem(ModeLinkToggleId, tr(L"切換效能模式時一併調整（插電時）"), modeLink, preview));
+    auto windows = menuItem(ModeLinkWindowsId, tr(L"也調整 Windows 電源模式"), modeLink && modeLinkWindows, preview || !modeLink);
+    windows.hint = std::wstring(windowsModeName(modeWindows[2])) + L"／" + windowsModeName(modeWindows[0]) + L"／" + windowsModeName(modeWindows[1]);
+    items.push_back(windows);
+    items.push_back(menuSeparator());
+    const std::pair<int, const wchar_t*> modes[] = {{2, L"靜音"}, {0, L"平衡"}, {1, nullptr}};
+    for (const auto& [m, name] : modes) {
+        std::vector<MenuItem> choices;
+        for (DWORD value : {0u, 1u, 2u}) choices.push_back(menuItem(ModeBoost0Id + m * 8 + int(value), boostName(value), modeBoost[m] == value, preview || !modeLink));
+        auto entry = submenu((name ? std::wstring(tr(name)) : std::wstring(L"Turbo")) + tr(L" 的 CPU Boost"), choices, !modeLink);
+        entry.hint = boostName(modeBoost[m]);
+        items.push_back(entry);
+    }
+    if (!preview) {
+        const auto g = bs::stability::readGHelperConfig();
+        if (std::any_of(std::begin(g.boost), std::end(g.boost), [](int v) { return v >= 0; }) ||
+            std::any_of(std::begin(g.windowsMode), std::end(g.windowsMode), [](int v) { return v >= 0; })) {
+            items.push_back(menuSeparator());
+            items.push_back(menuItem(ModeLinkImportId, tr(L"改用 G-Helper 裡各模式的設定")));
+        }
+    }
+    return items;
+}
 // The firmware of many models forgets the charge limit at a restart and never reports the
 // mode back: what BatteryScope set (mode, charge limit, keyboard, Fn lock, Slash) is put back
 // at start and after sleep. A running test owns the mode until it ends.
@@ -5463,6 +5555,7 @@ void cycleAsusMode() {
     asusReadAt = 0;
     if (status != ERROR_SUCCESS) { showOsd(tr(L"效能模式沒有切換")); return; }
     if (dynamicEnabled) governor.hold(bs::gov::Setting::firmwareMode);
+    applyModeCompanions(true);
     showOsd(tr(L"效能模式：") + std::wstring(tr(bs::asus::modeKey(next))), -1, next == bs::asus::Mode::silent ? Green : next == bs::asus::Mode::turbo ? theme.warn : COLORREF(0));
 }
 void stepKeyboard(unsigned code) {
@@ -5797,6 +5890,10 @@ void showPerformancePage() {
         if (autoMode) selected = 0;
         else if (h.mode) selected = (dynamicEnabled ? 1 : 0) + (*h.mode == bs::asus::Mode::silent ? 0 : *h.mode == bs::asus::Mode::balanced ? 1 : 2);
         v.push_back(vSegments(std::move(labels), std::move(commands), selected));
+        // What else changes with the mode while plugged in, as G-Helper does it.
+        VBlock link = vAction(tr(L"模式連動（插電時）"), modeLink ? tr(L"開") : tr(L"關"), ModeLinkMenuId, modeLink ? Green : COLORREF(0));
+        link.text = modeLink ? modeLinkSummary() : std::wstring(tr(L"只切換韌體模式；CPU Boost 與 Windows 電源模式不動"));
+        v.push_back(std::move(link));
     } else {
         const bool plugged = !current.history.empty() && current.history.back().acKnown && current.history.back().onAc;
         const auto modes = queryPowerModes();
@@ -5872,7 +5969,8 @@ void showPerformancePage() {
     }
     if (!stabilityRow(true)) if (auto row = stabilityRow(false)) v.push_back(std::move(*row));
     v.push_back(vFold(tr(L"關於風扇與功耗"), tr(L"風扇與功耗只提供原廠範圍內的預設：風扇曲線取自韌體各模式自己的曲線，功耗上限不超過平衡模式。每次切換效能模式後會自動重新套用，選「原廠」即還原。獨顯只有在已經醒著時才讀取溫度與時脈，不會為了顯示把它叫醒。") +
-        (powerPresetsBlocked() && !preview ? std::wstring(L"\n") + tr(L"這台的 BIOS 切換效能模式不會解除功耗上限，設了只能靠重新開機還原，所以不提供功耗上限選項。") : std::wstring())));
+        (powerPresetsBlocked() && !preview ? std::wstring(L"\n") + tr(L"這台的 BIOS 切換效能模式不會解除功耗上限，設了只能靠重新開機還原，所以不提供功耗上限選項。") : std::wstring()) +
+        std::wstring(L"\n") + tr(L"模式連動：CPU Boost 關掉時時脈停在基準時脈，每個效能模式的功耗都差不多（這台插電約 20 W），模式之間看不出差別。G-Helper 會在切換模式時一併設定該模式的 CPU Boost 與 Windows 電源模式；開啟模式連動後 BatteryScope 也這樣做（只在插電時；用電池時由動態省電與下方的 Boost 開關負責）。")));
     showChartPage(InlinePage::performance, tr(L"效能"), perfPageText(), std::move(v));
 }
 // ----- Stability: crashes, freezes and problem reports -----
@@ -6232,6 +6330,8 @@ std::wstring stabilitySummary() {
         t += tr(L" · 風扇 ") + std::wstring(tr(bs::asus::fanPresetKey(tuning.fans))) + tr(L" · 功耗 ") +
             (powerLimitStuck() ? std::wstring(tr(L"15/20/25 W 未解除（重新啟動後恢復）")) : powerPresetText(tuning.power));
         if (powerRestoreBroken()) t += tr(L" · 這版 BIOS 切換模式不會解除功耗上限");
+        t += tr(L" · 模式連動 ") + (modeLink ? modeLinkSummary() + (modeLinkWindows ? tr(L"，含 Windows 電源模式") : L"") : std::wstring(tr(L"關")));
+        if (const auto boost = bs::verify::pluggedInBoost()) t += tr(L" · 插電時 CPU Boost ") + std::wstring(boostName(DWORD(*boost)));
         t += tr(L" · 獨顯自動 ") + std::wstring(gpuAuto ? tr(L"開") : tr(L"關"));
         if (r.chargeLimit) t += tr(L" · 充電上限 ") + std::to_wstring(*r.chargeLimit) + L"%";
     }
@@ -7565,6 +7665,38 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (id == ReportId || id == ReportFullId) { buildReport(id == ReportFullId); return 0; }
         if (id == MarkProblemId) { showMain(); markProblem(); return 0; }
         if (id == StabilityFolderId) { const auto dir = bs::stability::folder(); if (!dir.empty()) ShellExecuteW(nullptr, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL); return 0; }
+        if (id == ModeLinkMenuId) {
+            if (!asusAvailable) return 0;
+            if (const int chosen = showMenu(modeLinkMenuItems(), menuAnchor(), mainWindow)) SendMessageW(window, WM_COMMAND, chosen, 0);
+            return 0;
+        }
+        if (id == ModeLinkToggleId || id == ModeLinkWindowsId || id == ModeLinkImportId || (id >= ModeBoost0Id && id < ModeBoost0Id + 3 * 8)) {
+            if (demo || isolatedPreview) return 0;
+            std::wstring done;
+            if (id == ModeLinkToggleId) {
+                modeLink = !modeLink; writeSetting(L"ModeLink", modeLink ? 1 : 0);
+                done = modeLink ? tr(L"模式連動已開啟：插電時切換效能模式會一併調整 CPU Boost。") : tr(L"模式連動已關閉：切換效能模式只改韌體模式。");
+            } else if (id == ModeLinkWindowsId) {
+                modeLinkWindows = !modeLinkWindows; writeSetting(L"ModeLinkWindows", modeLinkWindows ? 1 : 0);
+                done = modeLinkWindows ? tr(L"切換效能模式時也會調整 Windows 電源模式。") : tr(L"切換效能模式時不再調整 Windows 電源模式。");
+            } else if (id == ModeLinkImportId) {
+                const auto g = bs::stability::readGHelperConfig();
+                for (int i = 0; i < 3; ++i) {
+                    if (g.boost[i] >= 0) { modeBoost[i] = DWORD(g.boost[i]); writeSetting((L"ModeBoost" + std::to_wstring(i)).c_str(), modeBoost[i]); }
+                    if (g.windowsMode[i] >= 0) { modeWindows[i] = g.windowsMode[i]; writeSetting((L"ModeWindows" + std::to_wstring(i)).c_str(), DWORD(modeWindows[i])); }
+                }
+                done = tr(L"已套用 G-Helper 的設定：") + modeLinkSummary();
+            } else {
+                const int m = (id - ModeBoost0Id) / 8, value = (id - ModeBoost0Id) % 8;
+                if (value > 6) return 0;
+                modeBoost[m] = DWORD(value); writeSetting((L"ModeBoost" + std::to_wstring(m)).c_str(), modeBoost[m]);
+                done = modeLinkSummary();
+            }
+            applyModeCompanions(true);
+            setNotice(done);
+            if (inlinePage == InlinePage::performance) showPerformancePage();
+            return 0;
+        }
         if (id == FanMenuId || id == PowerLimitMenuId) {
             if (!asusAvailable) return 0;
             if (const int chosen = showMenu(id == FanMenuId ? fanMenuItems() : powerLimitMenuItems(), menuAnchor(), mainWindow)) SendMessageW(window, WM_COMMAND, chosen, 0);
@@ -7658,6 +7790,10 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
                 const auto mode = id == AsusSilentId ? bs::asus::Mode::silent : id == AsusTurboId ? bs::asus::Mode::turbo : bs::asus::Mode::balanced;
                 status = bs::asus::setMode(mode); done = tr(L"效能模式：") + std::wstring(tr(bs::asus::modeKey(mode)));
                 if (status == ERROR_SUCCESS && dynamicEnabled) { governor.hold(bs::gov::Setting::firmwareMode); done += tr(L"（這次用電池期間動態省電不改它）"); }
+                if (status == ERROR_SUCCESS) {
+                    applyModeCompanions(true);
+                    if (modeLink && !current.history.empty() && current.history.back().onAc) done += tr(L" · CPU Boost ") + std::wstring(boostName(modeBoost[int(mode)]));
+                }
             } else if (id == GpuAutoId) {
                 gpuAuto = !gpuAuto; writeSetting(L"GpuAuto", gpuAuto ? 1 : 0);
                 done = gpuAuto ? tr(L"獨顯自動：用電池時 Eco，插電時標準。") : tr(L"獨顯自動已關閉。");
@@ -7854,6 +7990,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         recordGoalSample();
         applyGpuAuto();
         applyRefreshAuto();
+        applyModeCompanions(false);
         if (inlinePage == InlinePage::hardware && !hidden) showHardwarePage();
         if (inlinePage == InlinePage::performance && !hidden) showPerformancePage();
         if (inlinePage == InlinePage::goal && !hidden && GetTickCount64() - goalPageShownAt >= 10000) showGoalPage();
@@ -8432,6 +8569,8 @@ bool panelSelfTest(const std::wstring& path) {
     check("performance_page_is_its_own_tab", inlinePage == InlinePage::performance && activeTab() == Tab::performance && visibleTabs().front() == Tab::performance
         && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::segments && b.commands.size() >= 3; })
         && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::action && int(b.amount) == FanMenuId; }));
+    check("performance_mode_offers_the_mode_link", std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) {
+        return b.kind == VBlock::Kind::action && int(b.amount) == ModeLinkMenuId && b.text.find(L"Turbo") != std::wstring::npos; }) && modeLinkMenuItems().size() >= 5);
     // The demo has a blue screen this week: the home page shows a banner that leads to the stability page.
     check("performance_page_warns_of_recent_crashes", std::any_of(visualBlocks.begin(), visualBlocks.end(),
         [](const VBlock& b) { return b.kind == VBlock::Kind::banner && int(b.amount) == StabilityPageId; }));
