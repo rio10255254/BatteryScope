@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <iterator>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1073,8 +1074,28 @@ GHelperSettings parseGHelperConfig(const std::string& json) {
         const long value = std::strtol(json.c_str() + colon, &stop, 10);
         const bool number = stop != json.c_str() + colon;
         at = number ? size_t(stop - json.c_str()) : colon;
-        if (!number) { if (colon < json.size() && json[colon] == '"') { const size_t close = json.find('"', colon + 1); if (close == std::string::npos) break; at = close + 1; } continue; }
+        // The mode index at the end of a per-mode key ("auto_boost_1" -> 1), or -1.
+        auto modeIndex = [&](const char* prefix) {
+            const size_t n = std::strlen(prefix);
+            return key.size() == n + 1 && key.compare(0, n, prefix) == 0 && key[n] >= '0' && key[n] <= '2' ? key[n] - '0' : -1;
+        };
+        if (!number) {
+            if (colon < json.size() && json[colon] == '"') {
+                const size_t close = json.find('"', colon + 1);
+                if (close == std::string::npos) break;
+                if (const int m = modeIndex("powermode_"); m >= 0) {
+                    std::string guid = json.substr(colon + 1, close - colon - 1);
+                    for (char& c : guid) c = char(std::tolower(static_cast<unsigned char>(c)));
+                    g.windowsMode[m] = guid == "961cc777-2547-4f9d-8174-7d86181b8a7a" ? 0 : guid == "00000000-0000-0000-0000-000000000000" ? 1 :
+                        guid == "ded574b5-45a0-4f42-8737-46345c09c238" ? 2 : -1;
+                    g.found = true;
+                }
+                at = close + 1;
+            }
+            continue;
+        }
         g.found = true;
+        if (const int m = modeIndex("auto_boost_"); m >= 0) { g.boost[m] = value >= 0 && value <= 6 ? int(value) : -1; continue; }
         if (key == "auto_uv") g.autoUndervolt = value != 0;
         else if (key.rfind("cpu_uv", 0) == 0) g.cpuUndervolt = std::min(g.cpuUndervolt, int(value));
         else if (key.rfind("igpu_uv", 0) == 0) g.igpuUndervolt = std::min(g.igpuUndervolt, int(value));

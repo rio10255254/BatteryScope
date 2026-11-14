@@ -53,6 +53,9 @@ struct LoadReading { std::optional<double> packageWatts, mhz, baseMhz; };
 // (efficiency throttling, a power plan): it cannot show a power limit.
 bool heldBack(const LoadReading& reading);
 LoadReading measureLoad(int milliseconds);
+// The active plan's CPU Boost mode while plugged in (0 off, 1 on, 2 aggressive, ...), and setting it.
+std::optional<double> pluggedInBoost();
+DWORD setPluggedInBoost(DWORD value);
 
 struct Options {
     bool onBattery = false, asus = false;

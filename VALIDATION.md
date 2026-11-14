@@ -1,5 +1,12 @@
 # BatteryScope 驗證紀錄
 
+## 0.26.0：效能模式連動 CPU Boost 與 Windows 電源模式
+
+- 依據：0.25.1 回報包（2026-11-14 13:29）黑盒最近兩小時，插電、CPU Boost 關，平衡模式 313 筆心跳中負載最高 100% 時 CPU 只有 20.4 W、時脈最高 3978 MHz（基準時脈 4.0 GHz）；同一份控制檢查在 Boost 打開時，靜音 32.8 W、Turbo 37.5 W。G-Helper 原始碼（ModeControl.cs、PowerNative.cs）確認它切換模式時會一併設定 Windows 電源模式與該模式的 CPU Boost（設定檔的 `auto_boost_N`、`powermode_N`）。
+- 修正：插電時切換效能模式，一併設定該模式的 CPU Boost（插電值）與 Windows 電源模式；初始值優先沿用 G-Helper 設定檔。
+- 驗證：單元測試新增 G-Helper 各模式 Boost 與電源模式的解析；面板測試新增 `performance_mode_offers_the_mode_link`。
+- 未驗證：實機上 Turbo（Boost 開）與平衡（Boost 關）在 100 W USB-C 下的功耗差距；G-Helper 設定檔裡是否真的有這些鍵，要看使用者的設定檔。
+
 ## 0.25.1：功耗上限還原失敗後不再重測（G14，BIOS 311，2026-11-14 13:28）
 
 - 實機控制檢查：插電、Turbo、暫時打開 CPU Boost 後全核心負載 37.5 W；寫入 15/20/25 W 後 19.6 W；照 G-Helper 的做法切到平衡再切回 Turbo（間隔 1.5 秒）後仍是 19.6 W。黑盒紀錄確認寫入順序：13:28:24 寫入 0x001200A3=15、0x001200A0=20、0x001200C1=25，13:28:31 與 13:28:32 切換模式 0 → 1。結論：這版 BIOS 切換效能模式不會重設功耗上限，只能靠重新開機。
