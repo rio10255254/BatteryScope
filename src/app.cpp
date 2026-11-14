@@ -181,6 +181,11 @@ bool performanceListed(const ProcessRow& row) { return !row.name.empty() && perf
 void refreshPowerModeControls();
 void showLabPage();
 void showSettingsPage();
+bool powerPresetsBlocked();
+bool powerRestoreBroken();
+bool powerLimitStuck();
+bool lastCheckLeftLimit();
+DWORD biosKey();
 void showDynamicPage();
 void showPerformancePage();
 void showStabilityPage();
@@ -5776,6 +5781,9 @@ void showPerformancePage() {
         v.push_back(vChips(std::move(chips)));
     }
     if (auto banner = stabilityRow(true)) v.push_back(std::move(*banner));
+    if (asusAvailable && powerLimitStuck())
+        v.push_back(vBanner(1, theme.warn, tr(L"CPU 功耗上限還卡在 15 W"),
+            tr(L"控制檢查設下的上限，這版 BIOS 切換效能模式也解除不了。持續高負載（例如遊戲）時 CPU 最多 15–20 W。請「重新啟動」電腦（不是關機）就會恢復原廠。")));
     // The performance mode: ASUS's firmware modes, else Windows' power mode for the current source.
     v.push_back(vHeading(tr(L"效能模式")));
     if (asusAvailable && h.modeDevice) {
@@ -5858,10 +5866,13 @@ void showPerformancePage() {
         // Offered only where the firmware hands out its fan curves (asked once).
         static const bool fanCurves = preview || bs::asus::fanCurvesSupported();
         if (fanCurves) v.push_back(vAction(tr(L"風扇模式"), tr(bs::asus::fanPresetKey(t.fans)), FanMenuId, t.fans == bs::asus::FanPreset::quiet ? Green : COLORREF(0)));
-        v.push_back(vAction(tr(L"CPU 功耗上限"), powerPresetText(t.power), PowerLimitMenuId, t.power == bs::asus::PowerPreset::saver ? Green : COLORREF(0)));
+        // Not offered where a limit, once set, only goes away with a restart.
+        if (!powerPresetsBlocked() || preview)
+            v.push_back(vAction(tr(L"CPU 功耗上限"), powerPresetText(t.power), PowerLimitMenuId, t.power == bs::asus::PowerPreset::saver ? Green : COLORREF(0)));
     }
     if (!stabilityRow(true)) if (auto row = stabilityRow(false)) v.push_back(std::move(*row));
-    v.push_back(vFold(tr(L"關於風扇與功耗"), tr(L"風扇與功耗只提供原廠範圍內的預設：風扇曲線取自韌體各模式自己的曲線，功耗上限不超過平衡模式。每次切換效能模式後會自動重新套用，選「原廠」即還原。獨顯只有在已經醒著時才讀取溫度與時脈，不會為了顯示把它叫醒。")));
+    v.push_back(vFold(tr(L"關於風扇與功耗"), tr(L"風扇與功耗只提供原廠範圍內的預設：風扇曲線取自韌體各模式自己的曲線，功耗上限不超過平衡模式。每次切換效能模式後會自動重新套用，選「原廠」即還原。獨顯只有在已經醒著時才讀取溫度與時脈，不會為了顯示把它叫醒。") +
+        (powerPresetsBlocked() && !preview ? std::wstring(L"\n") + tr(L"這台的 BIOS 切換效能模式不會解除功耗上限，設了只能靠重新開機還原，所以不提供功耗上限選項。") : std::wstring())));
     showChartPage(InlinePage::performance, tr(L"效能"), perfPageText(), std::move(v));
 }
 // ----- Stability: crashes, freezes and problem reports -----
@@ -6218,7 +6229,9 @@ std::wstring stabilitySummary() {
         const auto r = bs::asus::remembered();
         const auto tuning = bs::asus::tuning();
         if (r.mode) t += tr(L" · 華碩模式 ") + std::wstring(*r.mode == bs::asus::Mode::silent ? tr(L"靜音") : *r.mode == bs::asus::Mode::turbo ? L"Turbo" : tr(L"平衡"));
-        t += tr(L" · 風扇 ") + std::wstring(tr(bs::asus::fanPresetKey(tuning.fans))) + tr(L" · 功耗 ") + powerPresetText(tuning.power);
+        t += tr(L" · 風扇 ") + std::wstring(tr(bs::asus::fanPresetKey(tuning.fans))) + tr(L" · 功耗 ") +
+            (powerLimitStuck() ? std::wstring(tr(L"15/20/25 W 未解除（重新啟動後恢復）")) : powerPresetText(tuning.power));
+        if (powerRestoreBroken()) t += tr(L" · 這版 BIOS 切換模式不會解除功耗上限");
         t += tr(L" · 獨顯自動 ") + std::wstring(gpuAuto ? tr(L"開") : tr(L"關"));
         if (r.chargeLimit) t += tr(L" · 充電上限 ") + std::to_wstring(*r.chargeLimit) + L"%";
     }
@@ -6262,12 +6275,40 @@ void loadControlResults() {
     MultiByteToWideChar(CP_UTF8, 0, text.data(), int(text.size()), wide.data(), int(wide.size()));
     controlResults = bs::verify::loadText(wide);
     controlCheckedUtc = readQwordSetting(L"ControlsAt");
+    // A check by an earlier version found the limit staying: remember it the way this version does.
+    if (lastCheckLeftLimit() && !powerRestoreBroken()) {
+        if (const DWORD key = biosKey()) writeSetting(L"PowerRestoreBios", key);
+        if (controlCheckedUtc > bs::stability::bootUtc()) writeQwordSetting(L"PowerStuckBoot", bs::stability::bootUtc());
+    }
 }
 // A setting found without effect here: tests leave it out.
-// The power limit was seen to stay in force after "factory" on this PC: the presets are not offered.
-bool powerPresetsBlocked() {
+// The power limit was seen to stay in force after "factory" on this PC: on the G14's BIOS 311 a
+// switch of the performance mode (G-Helper's way back) leaves it in place, and only a restart
+// clears it. That is remembered per model and BIOS: the presets are not offered and the check
+// does not write the limit again. A BIOS update tries again.
+DWORD biosKey() {
+    const std::wstring text = biosText();
+    uint32_t hash = 2166136261u;
+    for (wchar_t c : text) { hash ^= uint32_t(c); hash *= 16777619u; }
+    return text.empty() ? 0 : DWORD(hash | 1);
+}
+bool powerRestoreBroken() {
+    const DWORD key = biosKey();
+    return key && readSetting(L"PowerRestoreBios", 0) == key;
+}
+bool lastCheckLeftLimit() {
     for (const auto& r : controlResults) if (r.control == bs::verify::Control::powerRestore) return r.verdict == bs::verify::Verdict::noEffect;
     return false;
+}
+bool powerPresetsBlocked() { return powerRestoreBroken() || lastCheckLeftLimit(); }
+// The limit the check left is still in force: it was left during this boot.
+bool powerLimitStuck() {
+    return !demo && !isolatedPreview && bs::stability::sameBoot(readQwordSetting(L"PowerStuckBoot"), bs::stability::bootUtc());
+}
+void notePowerLimitLeft() {
+    if (const DWORD key = biosKey()) writeSetting(L"PowerRestoreBios", key);
+    writeQwordSetting(L"PowerStuckBoot", bs::stability::bootUtc());
+    bs::stability::note(L"power limit left in force; restore needs a restart");
 }
 bool controlKnownDead(bs::lab::Knob knob) {
     using namespace bs::verify;
@@ -6333,6 +6374,7 @@ std::wstring controlDetail(const bs::verify::Result& r) {
         if (r.note == noPowerReading) t = tr(L"韌體接受了寫入，但這台電腦讀不到 CPU 功耗，無法量效果。");
         break;
     case Control::powerLimit:
+        if (r.note == restartToClear) { t = tr(L"沒有寫入：這台的 BIOS 切換效能模式不會解除功耗上限，寫了就要重新開機才能恢復原廠，所以檢查不再測這一項，功耗上限選項也停用。BIOS 更新後會再測。"); break; }
         if (r.before && r.after) t = tr(L"全核心負載下的 CPU 功耗：原廠 ") + n(r.before, 1) + tr(L" W，設成 15 W 後 ") + n(r.after, 1) + L" W";
         if (r.note == noPowerReading) t = tr(L"韌體接受了寫入，但這台電腦讀不到 CPU 功耗，無法量效果。");
         if (r.note == loadHeldBack) t += tr(L"。負載的功耗本來就低於上限，量不出差異；請插電、把 Windows 電源模式設成平衡或效能後再檢查。");
@@ -6371,7 +6413,8 @@ std::vector<VBlock> controlCheckBlocks() {
     v.push_back(vAction(tr(L"檢查每項控制是否真的有作用"), state, VerifyControlsId, controlCheckBusy ? theme.warn : COLORREF(0)));
     const auto& results = controlResultsNow();
     if (results.empty()) {
-        v.push_back(vNote(tr(L"逐項寫入、讀回，能量測的就實際量效果（切換效能模式與功耗上限後跑幾秒全核心負載看 CPU 功耗），最後還原。檢查時風扇會轉幾秒；請先存檔，並避免在檢查中闔蓋。")));
+        v.push_back(vNote(tr(L"逐項寫入、讀回，能量測的就實際量效果（切換效能模式與功耗上限後跑幾秒全核心負載看 CPU 功耗），最後還原。檢查時風扇會轉幾秒；請先存檔，並避免在檢查中闔蓋。") + std::wstring(L"\n") +
+            tr(L"功耗上限的測試會暫時設成 15 W；有些 BIOS 要重新開機才能解除，遇到時會提醒你，之後不再測。")));
         return v;
     }
     for (const auto& r : results) {
@@ -6393,6 +6436,7 @@ void startControlCheck() {
     if (dynamicEnabled && !protectState) { stopGovernor(); governor.releaseAll(); }
     bs::verify::Options options;
     options.asus = asusAvailable;
+    options.keepPowerLimit = powerPresetsBlocked();
     if (!current.history.empty()) {
         const auto& p = current.history.back();
         options.onBattery = p.present && p.acKnown && !p.onAc && !p.charging;
@@ -6429,8 +6473,10 @@ void finishControlCheck(std::vector<bs::verify::Result>* results) {
         if (r.verdict != bs::verify::Verdict::unsupported) report += std::wstring(controlName(r.control)) + L": " + verdictName(r.verdict) + L" · " + controlDetail(r) + L"\n";
     }
     copyToClipboard(report + L"\n" + text);
-    if (powerPresetsBlocked())
-        showBalloon(tr(L"功耗上限沒有還原"), tr(L"檢查設下的 CPU 功耗上限還留著，電腦會變慢。請重新開機清除；這個選項已停用。"), BalloonTarget::stability);
+    if (lastCheckLeftLimit()) {
+        notePowerLimitLeft();
+        showBalloon(tr(L"功耗上限沒有還原"), tr(L"檢查設下的 CPU 功耗上限還留著，電腦會變慢。請「重新啟動」電腦清除；之後不會再測這一項。"), BalloonTarget::stability);
+    }
     setNotice(tr(L"檢查完成：") + std::to_wstring(works) + tr(L" 項確認有作用") + (dead ? tr(L"，") + std::to_wstring(dead) + tr(L" 項沒有作用") : std::wstring()) + tr(L"。結果已複製，可以直接貼上。"));
     asusReadAt = 0;
     if (inlinePage == InlinePage::stability) showStabilityPage();
@@ -7525,7 +7571,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (id > PowerPreset0Id && id <= PowerPreset0Id + 3 && powerPresetsBlocked()) {
-            setNotice(tr(L"這台電腦上功耗上限設了之後還原不回來，已停用這個選項。重新開機可以清除目前的上限。"));
+            setNotice(tr(L"這台電腦上功耗上限設了之後還原不回來，已停用這個選項。「重新啟動」電腦可以清除目前的上限。"));
             return 0;
         }
         if ((id >= FanPreset0Id && id <= FanPreset0Id + 3) || (id >= PowerPreset0Id && id <= PowerPreset0Id + 3)) {

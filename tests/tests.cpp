@@ -792,6 +792,8 @@ int wmain(int argc, wchar_t** argv) {
                     "the 30-day timeline puts each incident on its local day, worst kind first");
                 check(tookSystemDown(Kind::blueScreen) && tookSystemDown(Kind::forcedOff) && !tookSystemDown(Kind::freeze) && !tookSystemDown(Kind::batteryEmpty) &&
                     severity(Kind::manual) == 0, "only blue screens, power loss and forced shutdowns count as crashes");
+                check(sameBoot(noon, noon + 40 * Second) && sameBoot(noon + 40 * Second, noon) && !sameBoot(noon, noon + 3600 * Second) && !sameBoot(0, noon),
+                    "a boot time written down earlier is recognised as this boot despite small drift");
             }
             {
                 // Control check: what counts as working.
