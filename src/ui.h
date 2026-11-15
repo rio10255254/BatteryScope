@@ -33,6 +33,16 @@ bool highContrastOn();
 // rows and the system blue accent. Without it, the pixel style's own teal palette.
 Palette palette(ThemeChoice choice, bool forceContrast = false, bool mac = false);
 COLORREF mix(COLORREF a, COLORREF b, double t);
+// Every colour of `a` moved toward `b` by `t` (the day/night switch blends the whole panel).
+Palette mixPalette(const Palette& a, const Palette& b, double t);
+// The day/night switch: a soft inset track and a frosted rounded-square knob carrying a
+// dot-matrix sun or moon. `night` runs from 0 (day: knob right, sun, warm rim and halo) to 1
+// (night: knob left, moon, cool neon rim); in between the sun's dots scatter and gather into
+// the moon. `hover` (0-1) brightens the glow. Needs GDI+.
+void drawThemeToggle(HDC dc, const RECT& r, double night, double hover);
+// The dots of the sun (night = 0) and the moon (1), in cells on a 9 x 9 grid around the centre.
+std::vector<POINT> sunDots();
+std::vector<POINT> moonDots();
 
 bool startGraphics();
 void stopGraphics();

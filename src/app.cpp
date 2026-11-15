@@ -209,6 +209,15 @@ bool idleDisplay = true;
 DWORD dimAfter = 60, displayOffAfter = 300, dimLevel = 30; // seconds, seconds (0 never), percent
 bool displayTimersDone = false;
 void loadModeLink();
+// The day/night switch in the title bar (ui::drawThemeToggle). While it is dragged or settling,
+// the whole panel's colours blend between the light and the dark palette with it.
+RECT themeToggleRect{};
+bool themeDragging = false, themeDragMoved = false, themeHover = false;
+int themeDragX = 0; double themeDragFrom = 0, themeBlend = -1; // -1: not blending
+Transition themeMotion;
+void showThemeBlend(double night);
+ui::Palette blendedPalette(double night);
+void setTheme(ui::ThemeChoice choice);
 bool macLook();
 COLORREF macTrack();
 COLORREF macThumb();
@@ -1936,6 +1945,8 @@ void makeFonts() {
 }
 void applyTheme() {
     theme = ui::palette(themeChoice, previewContrast, !pixelStyle);
+    // Part way through the day/night switch: the blend wins until it settles.
+    if (themeBlend >= 0 && !theme.highContrast) theme = blendedPalette(themeBlend);
     Ink = theme.ink; Muted = theme.muted; Green = theme.accent; Background = theme.background;
     Surface = theme.surface; Border = theme.border; Selected = theme.selected; Danger = theme.danger;
     if (!mainWindow) return;
@@ -2197,6 +2208,16 @@ void stepMotion(double now) {
         InvalidateRect(item.first, nullptr, FALSE);
         active |= !hidden && item.second.active(now);
         if (!item.second.active(now)) item.second.duration = 0;
+    }
+    if (themeMotion.duration) {
+        // The day/night switch settling: the whole panel blends with it, then the theme is kept.
+        const double now = motionNow();
+        if (themeMotion.active(now)) { showThemeBlend(std::clamp(themeMotion.value(now), 0.0, 1.0)); active = true; }
+        else {
+            const bool night = themeMotion.to > .5;
+            themeMotion.duration = 0; themeBlend = -1;
+            setTheme(night ? ui::ThemeChoice::dark : ui::ThemeChoice::light);
+        }
     }
     if (tabSlide.duration) {
         // The tab highlight on its way to the selected tab.
@@ -2722,7 +2743,12 @@ void paint(HDC dc, RECT bounds) {
     const bool compact = compactLayout(h), minimal = minimalLayout(h);
     const int top = listTop();
     if (headerIcon) DrawIconEx(dc, margin, sp(15), headerIcon, sp(22), sp(22), 0, nullptr, DI_NORMAL);
-    drawText(dc, L"BatteryScope", {margin + sp(30), sp(11), w - sp(98), sp(40)}, Ink, titleFont);
+    drawText(dc, L"BatteryScope", {margin + sp(30), sp(11), w - sp(150), sp(40)}, Ink, titleFont);
+    themeToggleRect = {};
+    if (ui::graphicsReady() && !theme.highContrast) {
+        themeToggleRect = {w - sp(146), sp(18), w - sp(100), sp(42)};
+        ui::drawThemeToggle(dc, themeToggleRect, themeBlend >= 0 ? themeBlend : theme.dark ? 1.0 : 0.0, themeHover ? 1.0 : 0.0);
+    }
     mascotRect = {};
     if (showMascot && pixelStyle) { // a pixel sprite: part of the pixel style
         const int unit = std::max(2, px(2)), left = margin + sp(30) + textWidth(dc, L"BatteryScope", titleFont) + sp(10);
@@ -3360,6 +3386,38 @@ void setStyle(bool pixel) {
     makeFonts();
     RedrawWindow(mainWindow, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
     if (!writeSetting(L"Style", pixel ? 1 : 0)) setNotice(tr(L"無法儲存設定。"));
+}
+// The panel's colours at a point between day (0) and night (1). Surfaces blend evenly; text
+// flips at the middle, so it never fades into a background passing through grey.
+ui::Palette blendedPalette(double night) {
+    const auto day = ui::palette(ui::ThemeChoice::light, false, !pixelStyle), dark = ui::palette(ui::ThemeChoice::dark, false, !pixelStyle);
+    ui::Palette p = ui::mixPalette(day, dark, night);
+    // A continuous change would have to cross the background somewhere, so text changes at once
+    // at the middle (as macOS's appearance change does).
+    const double flip = night >= .5 ? 1.0 : 0.0;
+    const ui::Palette text = ui::mixPalette(day, dark, flip);
+    p.ink = text.ink; p.muted = text.muted; p.faint = text.faint; p.selectedInk = text.selectedInk; p.dark = flip > .5;
+    return p;
+}
+// Every colour of the panel at a point between day (0) and night (1), without saving anything.
+void showThemeBlend(double night) {
+    themeBlend = std::clamp(night, 0.0, 1.0);
+    theme = blendedPalette(themeBlend);
+    Ink = theme.ink; Muted = theme.muted; Green = theme.accent; Background = theme.background;
+    Surface = theme.surface; Border = theme.border; Selected = theme.selected; Danger = theme.danger;
+    if (list) { ListView_SetBkColor(list, Background); ListView_SetTextBkColor(list, Background); ListView_SetTextColor(list, Ink); }
+    if (mainWindow) RedrawWindow(mainWindow, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
+    if (miniWindow) InvalidateRect(miniWindow, nullptr, FALSE);
+}
+void setTheme(ui::ThemeChoice choice);
+// Lets the switch go to day or night: a spring from where it is, then the theme is saved.
+void settleTheme(bool night) {
+    const double from = themeBlend >= 0 ? themeBlend : theme.dark ? 1.0 : 0.0;
+    if (!canAnimate() || hidden) { themeBlend = -1; setTheme(night ? ui::ThemeChoice::dark : ui::ThemeChoice::light); return; }
+    themeMotion.from = themeMotion.to = from; themeMotion.duration = 0;
+    themeMotion.move(night ? 1.0 : 0.0, motionNow(), 620); themeMotion.spring = true;
+    if (!themeMotion.duration) { themeBlend = -1; setTheme(night ? ui::ThemeChoice::dark : ui::ThemeChoice::light); return; }
+    armMotionTimer();
 }
 void setTheme(ui::ThemeChoice choice) {
     themeChoice = choice;
@@ -8350,6 +8408,23 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case GovernorNowMessage: governorTick(); return 0;
     case WM_MOUSEMOVE: {
         RECT client{}; GetClientRect(window, &client);
+        if (themeDragging) {
+            // Dragging the knob: left is night. The panel's colours follow it.
+            const int travel = std::max(1, int(themeToggleRect.right - themeToggleRect.left) - int(themeToggleRect.bottom - themeToggleRect.top));
+            const int dx = GET_X_LPARAM(lp) - themeDragX;
+            if (std::abs(dx) > sp(3)) themeDragMoved = true;
+            if (themeDragMoved) showThemeBlend(themeDragFrom - double(dx) / travel);
+            return 0;
+        }
+        {
+            const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            const bool over = PtInRect(&themeToggleRect, pt) != 0;
+            if (over != themeHover) {
+                themeHover = over; InvalidateRect(window, &themeToggleRect, FALSE);
+                TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0}; TrackMouseEvent(&tracking);
+            }
+            if (over) SetCursor(LoadCursorW(nullptr, IDC_HAND));
+        }
         const int hover = tabAt({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}, client);
         if (hover != tabHover) {
             tabHover = hover;
@@ -8358,7 +8433,18 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         }
         break;
     }
+    case WM_LBUTTONUP: case WM_CAPTURECHANGED:
+        if (themeDragging) {
+            themeDragging = false;
+            if (message == WM_LBUTTONUP) ReleaseCapture();
+            const double at = themeBlend >= 0 ? themeBlend : themeDragFrom;
+            // A click flips it; a drag goes to the nearer side.
+            settleTheme(themeDragMoved ? at > .5 : themeDragFrom < .5);
+            return 0;
+        }
+        break;
     case WM_MOUSELEAVE:
+        if (themeHover) { themeHover = false; InvalidateRect(window, &themeToggleRect, FALSE); }
         if (tabHover >= 0) { tabHover = -1; RECT client{}; GetClientRect(window, &client); RECT bar{0, client.bottom - tabBarHeight(), client.right, client.bottom}; InvalidateRect(window, &bar, FALSE); }
         break;
     case GpuUsersMessage: finishGpuEco(reinterpret_cast<std::vector<std::wstring>*>(lp)); return 0;
@@ -8479,6 +8565,13 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_LBUTTONDOWN: {
         const POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        if (PtInRect(&themeToggleRect, point)) {
+            themeMotion.duration = 0;
+            themeDragging = true; themeDragMoved = false; themeDragX = point.x;
+            themeDragFrom = themeBlend >= 0 ? themeBlend : theme.dark ? 1.0 : 0.0;
+            SetCapture(window);
+            return 0;
+        }
         {
             RECT client{}; GetClientRect(window, &client);
             if (const int tab = tabAt(point, client); tab >= 0) {
@@ -8982,6 +9075,14 @@ bool panelSelfTest(const std::wstring& path) {
         HBITMAP surface = CreateCompatibleBitmap(screen, client.right, client.bottom);
         HGDIOBJ old = SelectObject(dc, surface); paint(dc, client); SelectObject(dc, old);
         DeleteObject(surface); DeleteDC(dc); ReleaseDC(mainWindow, screen);
+        check("theme_switch_in_title_bar", themeToggleRect.right - themeToggleRect.left > sp(30) && themeToggleRect.left > sp(150));
+        {
+            // Anywhere along the day/night switch, text stands out from the page behind it.
+            auto light = [](COLORREF c) { return (GetRValue(c) * 299 + GetGValue(c) * 587 + GetBValue(c) * 114) / 1000; };
+            bool readable = true;
+            for (int k = 0; k <= 40; ++k) { const auto p = blendedPalette(k / 40.0); readable &= std::abs(light(p.ink) - light(p.surface)) >= 70; }
+            check("theme_blend_keeps_text_readable", readable);
+        }
         check("mascot_drawn_in_header_and_speaks", showMascot && (pixelStyle ? mascotRect.right > mascotRect.left : mascotRect.right == mascotRect.left) && !mascotLine().empty());
     }
     {
@@ -9327,6 +9428,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (option(L"--smooth")) pixelStyle = false;
     if (option(L"--pixel")) pixelStyle = true;
     theme = ui::palette(themeChoice, previewContrast, !pixelStyle);
+    for (size_t i = 0; i + 1 < args.size(); ++i) if (args[i] == L"--theme-blend") themeBlend = std::clamp(_wtof(args[i + 1].c_str()), 0.0, 1.0);
     ui::startGraphics();
     ui::loadPixelFont(instance, PixelFontResource);
     if (isolatedPreview || demo) ClassName = L"BatteryScope.Preview.v3";
