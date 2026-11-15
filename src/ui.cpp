@@ -85,17 +85,18 @@ Palette palette(ThemeChoice choice, bool forceContrast, bool mac) {
     }
     const bool light = choice == ThemeChoice::light || (choice == ThemeChoice::system && systemPrefersLight());
     if (mac) {
-        // macOS system colours: window grey, a slightly lighter content area, white grouped rows
-        // with hairline separators, label and secondary label greys, system blue.
+        // macOS system colours: one window grey under toolbar and content alike (no card on a
+        // card), white grouped boxes with hairline edges and separators, label and secondary
+        // label greys, system blue. Dark: the graphite window with lifted boxes.
         if (light) {
-            p.background = RGB(232, 232, 235); p.surface = RGB(245, 245, 247); p.raised = RGB(255, 255, 255); p.border = RGB(220, 220, 224);
+            p.background = RGB(240, 240, 240); p.surface = RGB(240, 240, 240); p.raised = RGB(255, 255, 255); p.border = RGB(214, 214, 216);
             p.ink = RGB(29, 29, 31); p.muted = RGB(110, 110, 115); p.faint = RGB(160, 160, 166);
             p.accent = RGB(0, 122, 255); p.accentDim = RGB(153, 199, 255); p.accentSoft = RGB(226, 238, 255); p.accentInk = RGB(255, 255, 255);
             p.warn = RGB(214, 120, 0); p.danger = RGB(230, 45, 35);
             p.selected = RGB(226, 238, 255); p.selectedInk = p.ink;
             p.dark = false;
         } else {
-            p.background = RGB(24, 24, 26); p.surface = RGB(32, 32, 34); p.raised = RGB(46, 46, 49); p.border = RGB(60, 60, 64);
+            p.background = RGB(30, 30, 31); p.surface = RGB(30, 30, 31); p.raised = RGB(44, 44, 46); p.border = RGB(64, 64, 68);
             p.ink = RGB(245, 245, 247); p.muted = RGB(152, 152, 158); p.faint = RGB(99, 99, 104);
             p.accent = RGB(10, 132, 255); p.accentDim = RGB(28, 78, 150); p.accentSoft = RGB(22, 48, 86); p.accentInk = RGB(255, 255, 255);
             p.warn = RGB(255, 159, 10); p.danger = RGB(255, 69, 58);

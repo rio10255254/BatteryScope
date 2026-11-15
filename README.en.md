@@ -15,8 +15,8 @@
 
 From the **[Releases page](https://github.com/rio10255254/BatteryScope/releases/latest)**:
 
-- **Installer (recommended):** `BatteryScope-0.28.0-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
-- **Portable:** `BatteryScope-0.28.0-win64.zip`; extract it and run `BatteryScope.exe`.
+- **Installer (recommended):** `BatteryScope-0.29.0-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
+- **Portable:** `BatteryScope-0.29.0-win64.zip`; extract it and run `BatteryScope.exe`.
 
 Requires Windows 10 version 1703 or later (Windows 11 recommended), 64-bit. The program is not code-signed; if SmartScreen appears the first time, choose **More info → Run anyway**. It lives in the notification area, where the icon shows the battery percentage; click it to show or hide the panel.
 
@@ -53,7 +53,7 @@ Details follow.
 
 ## Using it
 
-1. Download `BatteryScope-0.28.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
+1. Download `BatteryScope-0.29.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
 2. Click its battery icon in the notification area to show or hide the panel. Esc hides it; monitoring continues at a lower frequency.
 3. Open **⋯ → Language / 語言 → English** to switch immediately. The setting persists for your Windows account. Selection and scroll position are retained.
 4. Use Background and Show filters, the mouse wheel, arrow keys, Home/End, or Page Up/Down. Enter or double-click opens details.
@@ -122,7 +122,7 @@ Turn it on from **⋯ → Dynamic power saving** or the settings page. On batter
 
 ## Interface (0.22)
 
-Tabs along the bottom of the panel:
+The panel's tabs (under the toolbar in the clean style, along the bottom in the pixel style):
 - **Perf** (home)
 - **Saving**
 - **Battery** (the battery and the programs using it)
@@ -144,7 +144,9 @@ Each tab shows live charts on top and clickable control rows below. A row switch
 
 Fans and power limits are written again after every performance mode change, and "factory" restores them.
 
-The default look is a clean, macOS-like style (system colours, grouped lists, capsule switches, segmented controls, and motion tuned frame by frame from a reference clip: quick travel, a slight lift, and a halo and edge light on landing); the pixel style is in Settings → Style.
+The default look is a clean, macOS-like style laid out like a macOS window app: a toolbar on top (title, the power mode pop-up button, the ⋯ menu), the sections as a segmented control under it (as in Activity Monitor), and pages set straight on the window with each section in one rounded box (as in System Settings): charts, meters and switches inside, hairlines between them, notes as footnotes outside. On Windows 11 22H2 and later the window is frosted glass (the system's Acrylic backdrop): toolbar, tabs and background let the blurred desktop show through, while boxes and text stay opaque. With Windows transparency effects off or energy saver on it turns solid; Settings → Appearance → Frosted glass turns it off. Motion is tuned frame by frame from a reference clip (quick travel, a slight lift, a halo and edge light on landing). The pixel style (tabs at the bottom) is in Settings → Style.
+
+The panel repaints only what changes: an animation repaints the blocks in motion, the pointer only the row under it, the live refresh only blocks whose values changed, and a page at rest nothing.
 
 **Saving** holds every saving switch, in three groups: automatic saving, screen and devices, and goal and rules. Screen and devices includes **dim and black out when away**: on battery, with nobody at the PC, the display dims to 30% after 1 minute and goes black after 5 (adjustable). The PC stays awake and is back at the first touch; videos and calls keep the display on. On battery the tab also shows the power split between the CPU and the display and the rest. **Setup** keeps reminders, looks and general options only. Each control lives in one place, and long explanations fold away under a row you can open.
 
@@ -296,7 +298,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-To avoid replacing a running executable, use `-OutputDirectory dist/v0.28.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
+To avoid replacing a running executable, use `-OutputDirectory dist/v0.29.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
 
 ```powershell
 .\dist\BatteryScope.exe --demo
