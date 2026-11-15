@@ -29,8 +29,18 @@ bool systemPrefersLight();
 bool highContrastOn();
 // Resolves "system" through the Windows app theme; a contrast theme always wins.
 // `forceContrast` previews the contrast palette from the current system colors.
-Palette palette(ThemeChoice choice, bool forceContrast = false);
+// `mac`: the clean style's colours, after macOS: neutral greys, white (or graphite) grouped
+// rows and the system blue accent. Without it, the pixel style's own teal palette.
+Palette palette(ThemeChoice choice, bool forceContrast = false, bool mac = false);
 COLORREF mix(COLORREF a, COLORREF b, double t);
+// Every colour of `a` moved toward `b` by `t` (the day/night switch blends the whole panel).
+Palette mixPalette(const Palette& a, const Palette& b, double t);
+// Light effects for the clean style's motion (after a reference clip): a soft radial glow
+// around r, reaching `spread` px past it, and a light along a rounded rect's edge that is
+// brightest toward `angle` (radians: 0 right, pi/2 down) and fades around the rest. Strength
+// 0-1. Need GDI+; nothing is drawn without it.
+void drawGlow(HDC dc, const RECT& r, COLORREF color, double strength, float spread);
+void drawRimLight(HDC dc, const RECT& r, float radius, COLORREF color, double angle, double strength);
 
 bool startGraphics();
 void stopGraphics();

@@ -120,6 +120,7 @@ inline const std::map<std::wstring_view, const wchar_t*> translations = {
     {L"後黑屏", L" idle: black screen"},
     {L"不黑屏", L"No black screen"},
     {L"多久沒操作就黑屏（動一下立刻回來）", L"Black screen after (back at the first touch)"},
+    {L"簡約", L"Clean"},
     {L"示範資料 · 關閉操作已停用", L"Demo data · Close actions disabled"},
     {L"電池與背景活動", L"Battery & background activity"},
     {L"讀取中", L"Loading"},
