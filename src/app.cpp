@@ -209,6 +209,10 @@ bool idleDisplay = true;
 DWORD dimAfter = 60, displayOffAfter = 300, dimLevel = 30; // seconds, seconds (0 never), percent
 bool displayTimersDone = false;
 void loadModeLink();
+bool macLook();
+COLORREF macTrack();
+COLORREF macThumb();
+void drawCheckGlyph(HDC dc, RECT r, COLORREF color);
 std::wstring idleDisplaySummary();
 bool autoWritesPaused() {
     return protectState != 0 || !startupSettled || controlCheckBusy || bs::stability::writeGuard().automaticBlocked(GetTickCount64());
@@ -475,10 +479,24 @@ void paintMenu(HDC dc, const MenuState& state, RECT client) {
         const RECT row = menuRow(state, i, width);
         if (item.separator) { fill(dc, {row.left + sp(8), (row.top + row.bottom) / 2, row.right - sp(8), (row.top + row.bottom) / 2 + 1}, Border); continue; }
         const bool hot = i == state.hover && !item.disabled;
-        if (hot) rounded(dc, {row.left, row.top + sp(1), row.right, row.bottom - sp(1)}, theme.highContrast ? Selected : blend(Surface, Selected, .6), 8);
-        const COLORREF text = item.disabled ? blend(Muted, Surface, .35) : hot && theme.highContrast ? theme.selectedInk : Ink;
+        // macOS menus highlight the row in the accent colour with white text.
+        if (hot) rounded(dc, {row.left, row.top + sp(1), row.right, row.bottom - sp(1)}, theme.highContrast ? Selected : macLook() ? Green : blend(Surface, Selected, .6), macLook() ? 6 : 8);
+        const COLORREF text = item.disabled ? blend(Muted, Surface, .35) : hot && theme.highContrast ? theme.selectedInk : hot && macLook() ? RGB(255, 255, 255) : Ink;
         int right = row.right - sp(12);
-        if (!item.children.empty()) { drawMenuArrow(dc, right - sp(6), (row.top + row.bottom) / 2 - sp(5), sp(10), item.disabled ? text : Muted, false); right -= sp(18); }
+        if (!item.children.empty()) { drawMenuArrow(dc, right - sp(6), (row.top + row.bottom) / 2 - sp(5), sp(10), item.disabled || (hot && macLook()) ? text : Muted, false); right -= sp(18); }
+        else if (macLook() && (item.checked || !item.hint.empty())) {
+            // macOS: the value as plain text on the right, a check mark for the chosen option.
+            const COLORREF quiet = hot ? RGB(255, 255, 255) : Muted;
+            if (!item.hint.empty()) {
+                const int w = std::min(int(right - row.left) / 2, textWidth(dc, item.hint, normalFont) + sp(4));
+                drawText(dc, item.hint, {right - w, row.top, right, row.bottom}, quiet, normalFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+                right -= w + sp(8);
+            } else {
+                const int s = sp(14), mid = (row.top + row.bottom) / 2;
+                drawCheckGlyph(dc, {right - s, mid - s / 2, right, mid + s / 2}, hot ? RGB(255, 255, 255) : Green);
+                right -= s + sp(8);
+            }
+        }
         else if (item.checked || !item.hint.empty()) {
             // An "on" pill for checked options, or the item's value.
             const std::wstring value = !item.hint.empty() ? item.hint : std::wstring(tr(L"開"));
@@ -827,7 +845,25 @@ void setFade(std::map<size_t, Transition>& map, size_t key, double target, doubl
     armVisualTimer();
 }
 // A switch: a track with a knob, in the panel's style. `on` runs from 0 (off) to 1 (on).
+// The clean style's colours for controls: a neutral track and a raised (white) thumb.
+bool macLook() { return !pixelStyle && !theme.highContrast; }
+// The clean style groups rows that follow one another into one rounded list with hairline
+// separators, as macOS's System Settings does; elsewhere each row is its own rounded box.
+bool joinsAbove(size_t i) { return macLook() && i > 0 && i < visualBlocks.size() && visualBlocks[i].kind == VBlock::Kind::action && visualBlocks[i - 1].kind == VBlock::Kind::action; }
+bool joinsBelow(size_t i) { return macLook() && i + 1 < visualBlocks.size() && visualBlocks[i].kind == VBlock::Kind::action && visualBlocks[i + 1].kind == VBlock::Kind::action; }
+COLORREF macTrack() { return blend(Surface, Ink, theme.dark ? .12 : .07); }
+COLORREF macThumb() { return theme.dark ? RGB(92, 92, 97) : RGB(255, 255, 255); }
 void drawSwitch(HDC dc, RECT r, double on) {
+    if (macLook()) {
+        // macOS: a capsule that fills with the accent, a white knob with a soft shadow.
+        const COLORREF offTrack = theme.dark ? RGB(70, 70, 75) : RGB(218, 218, 222);
+        const int h = r.bottom - r.top, pad = std::max(2, h / 10), knob = h - pad * 2;
+        ui::fillRound(dc, r, faded(blend(offTrack, Green, std::clamp(on, 0.0, 1.0))), float(h) / 2);
+        const int x = r.left + pad + int(std::lround((r.right - r.left - pad * 2 - knob) * on));
+        ui::fillRound(dc, {x, r.top + pad + 1, x + knob, r.top + pad + knob + 1}, RGB(0, 0, 0), float(knob) / 2, BYTE(40 * paintFade));
+        ui::fillRound(dc, {x, r.top + pad, x + knob, r.top + pad + knob}, faded(RGB(255, 255, 255)), float(knob) / 2);
+        return;
+    }
     const COLORREF off = blend(Surface, Border, .9), lit = Green;
     const COLORREF track = faded(blend(off, lit, on));
     const int h = r.bottom - r.top, pad = std::max(2, h / 7), knob = h - pad * 2;
@@ -868,7 +904,7 @@ void paintVisual(HDC dc, RECT client) {
         const int slide = visualEnterDir * int(std::lround((1 - appear) * sp(26)));
         if (y + h < 0 || y > client.bottom) {
             if (b.kind == VBlock::Kind::fold) visualHits.push_back({{0, y + sp(3), width, y + sp(37)}, FoldCommand, i});
-            if (b.kind == VBlock::Kind::action) visualHits.push_back({{0, y + sp(3), width, y + h - sp(3)}, int(b.amount), i});
+            if (b.kind == VBlock::Kind::action) visualHits.push_back({{0, y + (joinsAbove(i) ? 0 : sp(3)), width, y + h - (joinsBelow(i) ? 0 : sp(3))}, int(b.amount), i});
             if (b.kind == VBlock::Kind::banner && b.amount) visualHits.push_back({{0, y + sp(2), width, y + h - sp(8)}, int(b.amount), i});
             if (b.kind == VBlock::Kind::segments)
                 for (size_t k = 0; k < b.commands.size(); ++k) visualHits.push_back({{0, y + sp(4), width, y + h - sp(4)}, b.commands[k], i});
@@ -907,6 +943,10 @@ void paintVisual(HDC dc, RECT client) {
             break;
         }
         case VBlock::Kind::heading: {
+            if (macLook()) { // a plain bold label above its group, as in System Settings
+                drawText(dc, b.title, {sp(4), top + h - sp(24), width, top + h - sp(4)}, Ink, strongFont);
+                break;
+            }
             // A short accent mark leads each section.
             const int mid = top + h - sp(14);
             rounded(dc, {0, mid - sp(6), sp(4), mid + sp(6)}, Green, 2);
@@ -923,8 +963,8 @@ void paintVisual(HDC dc, RECT client) {
             drawText(dc, b.title, {0, top, width / 2, top + sp(20)}, Ink, normalFont);
             const bool over = b.goal > 0 && b.amount > b.goal;
             drawText(dc, b.value, {width / 2, top, width, top + sp(20)}, b.amount <= 0 ? Muted : over ? theme.warn : Green, normalFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
-            const RECT bar{0, top + sp(25), width, top + sp(37)};
-            rounded(dc, bar, track, 6);
+            const RECT bar = macLook() ? RECT{0, top + sp(27), width, top + sp(35)} : RECT{0, top + sp(25), width, top + sp(37)};
+            rounded(dc, bar, macLook() ? faded(macTrack()) : track, macLook() ? 4 : 6);
             const double scale = b.scale > 0 ? b.scale : std::max(b.goal * 1.6, b.amount * 1.1);
             if (b.amount > 0 && scale > 0) {
                 const double fraction = glide(std::to_wstring(i) + L"|" + b.title, std::min(1.0, b.amount / scale), now) * appear;
@@ -1022,39 +1062,57 @@ void paintVisual(HDC dc, RECT client) {
                 if (x && x + w > width) { x = 0; row += sp(28); }
                 const RECT pill{x, row, x + w, row + sp(24)};
                 const COLORREF tone = faded(color);
-                rounded(dc, pill, color ? blend(tone, Surface, .72) : blend(Surface, Border, .6), 8);
+                rounded(dc, pill, color ? blend(tone, Surface, macLook() ? .85 : .72) : macLook() ? faded(macTrack()) : blend(Surface, Border, .6), macLook() ? 12 : 8);
                 drawText(dc, label, pill, color ? (theme.dark ? Ink : blend(tone, Ink, .5)) : Muted, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
                 x += w + sp(6);
             }
             break;
         }
         case VBlock::Kind::action: {
-            const RECT row{0, top + sp(3), width, top + h - sp(3)};
+            const bool up = joinsAbove(i), down = joinsBelow(i);
+            const RECT row{0, top + (up ? 0 : sp(3)), width, top + h - (down ? 0 : sp(3))};
             const int index = int(visualHits.size());
-            visualHits.push_back({{0, y + sp(3), width, y + h - sp(3)}, int(b.amount), i});
+            visualHits.push_back({{0, y + (up ? 0 : sp(3)), width, y + h - (down ? 0 : sp(3))}, int(b.amount), i});
             const double hot = std::max(fadeValue(visualHoverFade, i, now), index == visualFocus ? 1.0 : 0.0);
             const double press = fadeValue(visualPress, i, now);
-            const COLORREF rest = blend(Surface, Background, .55), lit = blend(Surface, Selected, theme.highContrast ? 1.0 : .6);
-            RECT face = row;
-            if (press > 0) InflateRect(&face, -int(std::lround(press * sp(2))), -int(std::lround(press * sp(1))));
-            rounded(dc, face, blend(blend(rest, lit, hot), Selected, press * .35), 8);
-            if (index == visualFocus && GetFocus() == visualView) outline(dc, face, Green, 8);
+            if (macLook()) {
+                // One shape for the whole group, drawn per row through a clip: the first row has the
+                // top corners, the last the bottom ones, rows between are square. A hairline
+                // separates rows, indented to the text. Hover and press darken; nothing moves.
+                const COLORREF rest = faded(theme.raised), lit = blend(rest, Ink, theme.dark ? .07 : .045);
+                RECT shape = row;
+                if (up) shape.top -= sp(24);
+                if (down) shape.bottom += sp(24);
+                const int saved = SaveDC(dc);
+                IntersectClipRect(dc, row.left, row.top, row.right, row.bottom);
+                ui::fillRound(dc, shape, blend(blend(rest, lit, hot), Ink, press * (theme.dark ? .08 : .06)), float(sp(10)));
+                ui::strokeRound(dc, shape, faded(blend(Border, rest, .25)), float(sp(10)), 1.0f);
+                RestoreDC(dc, saved);
+                if (up) fill(dc, {row.left + sp(12), row.top, row.right, row.top + 1}, faded(blend(Border, rest, .2)));
+                if (index == visualFocus && GetFocus() == visualView) outline(dc, row, Green, up || down ? 2 : 10);
+            } else {
+                const COLORREF rest = blend(Surface, Background, .55), lit = blend(Surface, Selected, theme.highContrast ? 1.0 : .6);
+                RECT face = row;
+                if (press > 0) InflateRect(&face, -int(std::lround(press * sp(2))), -int(std::lround(press * sp(1))));
+                rounded(dc, face, blend(blend(rest, lit, hot), Selected, press * .35), 8);
+                if (index == visualFocus && GetFocus() == visualView) outline(dc, face, Green, 8);
+            }
             const COLORREF ink = hot > .5 && theme.highContrast ? theme.selectedInk : Ink;
             int right = row.right - sp(12);
             if (b.toggle >= 0) {
                 // The switch, its knob gliding to the new state.
                 auto [it, fresh] = visualKnobs.try_emplace(int(b.amount));
                 if (fresh) { it->second.from = it->second.to = b.toggle; it->second.duration = 0; }
-                else if (std::abs(it->second.to - b.toggle) > .01) it->second.move(b.toggle, now, canAnimate() ? 200 : 0);
+                else if (std::abs(it->second.to - b.toggle) > .01) { it->second.move(b.toggle, now, canAnimate() ? (macLook() ? 420 : 200) : 0); it->second.spring = macLook(); }
                 if (it->second.active(now)) visualAnimating = true;
                 const int switchHeight = sp(20), switchWidth = sp(38), mid = (row.top + row.bottom) / 2;
                 drawSwitch(dc, {right - switchWidth, mid - switchHeight / 2, right, mid + switchHeight / 2}, it->second.value(now));
                 right -= switchWidth + sp(10);
             } else {
-                drawMenuArrow(dc, right - sp(6), (row.top + row.bottom) / 2 - sp(5), sp(10), Muted, false);
+                drawMenuArrow(dc, right - sp(6), (row.top + row.bottom) / 2 - sp(5), sp(10), macLook() ? blend(Muted, Surface, .3) : Muted, false);
                 right -= sp(18);
                 if (!b.value.empty()) {
-                    const int pillWidth = std::min(width / 2, textWidth(dc, b.value, smallFont) + sp(16));
+                    const int pillWidth = std::min(width / 2, textWidth(dc, b.value, macLook() ? normalFont : smallFont) + sp(macLook() ? 4 : 16));
                     const RECT pill{right - pillWidth, row.top + sp(8), right, row.bottom - sp(8)};
                     const COLORREF tone = faded(COLORREF(b.goal));
                     // A value that just changed glows for a moment: the click was taken.
@@ -1067,10 +1125,17 @@ void paintVisual(HDC dc, RECT client) {
                     }
                     const double glow = seen->second.second.value(now);
                     if (seen->second.second.active(now)) visualAnimating = true;
-                    const COLORREF base = b.goal ? blend(tone, Surface, .72) : blend(Surface, Border, .6);
-                    rounded(dc, pill, blend(base, Green, glow * .55), 6);
-                    drawText(dc, b.value, pill, blend(b.goal ? (theme.dark ? Ink : blend(tone, Ink, .5)) : Muted, theme.dark ? Ink : Surface, glow * .6), smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
-                    right = pill.left - sp(8);
+                    if (macLook()) {
+                        // Plain secondary text beside the chevron; a change flashes it in the accent.
+                        const COLORREF valueInk = b.goal ? blend(tone, Ink, theme.dark ? .1 : .25) : Muted;
+                        drawText(dc, b.value, pill, blend(valueInk, Green, glow), normalFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+                        right = pill.left - sp(4);
+                    } else {
+                        const COLORREF base = b.goal ? blend(tone, Surface, .72) : blend(Surface, Border, .6);
+                        rounded(dc, pill, blend(base, Green, glow * .55), 6);
+                        drawText(dc, b.value, pill, blend(b.goal ? (theme.dark ? Ink : blend(tone, Ink, .5)) : Muted, theme.dark ? Ink : Surface, glow * .6), smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+                        right = pill.left - sp(8);
+                    }
                 }
             }
             if (b.text.empty()) drawText(dc, b.title, {row.left + sp(12), row.top, right, row.bottom}, ink, normalFont);
@@ -1085,25 +1150,31 @@ void paintVisual(HDC dc, RECT client) {
             // A track with one cell per choice; the selected one's highlight slides to a new choice.
             const int n = int(b.commands.size());
             const RECT bar{0, top + sp(4), width, top + h - sp(4)};
-            rounded(dc, bar, blend(Surface, Background, .6), 10);
+            if (macLook()) ui::fillRound(dc, bar, faded(macTrack()), float(sp(9)));
+            else rounded(dc, bar, blend(Surface, Background, .6), 10);
             if (!n) break;
             const int pad = sp(3), cell = (bar.right - bar.left - pad * 2) / n;
             if (b.toggle >= 0) {
                 auto [it, fresh] = visualKnobs.try_emplace(100000 + int(i));
                 if (fresh) { it->second.from = it->second.to = b.toggle; it->second.duration = 0; }
-                else if (std::abs(it->second.to - b.toggle) > .01) it->second.move(b.toggle, now, canAnimate() ? 240 : 0);
+                else if (std::abs(it->second.to - b.toggle) > .01) { it->second.move(b.toggle, now, canAnimate() ? (macLook() ? 460 : 240) : 0); it->second.spring = macLook(); }
                 if (it->second.active(now)) visualAnimating = true;
                 const int left = bar.left + pad + int(std::lround(it->second.value(now) * cell));
-                rounded(dc, {left, bar.top + pad, left + cell, bar.bottom - pad}, theme.highContrast ? Selected : faded(theme.accentSoft), 8);
+                const RECT thumb{left, bar.top + pad, left + cell, bar.bottom - pad};
+                if (macLook()) {
+                    // A raised thumb with a soft shadow, as in a macOS segmented control.
+                    ui::fillRound(dc, {thumb.left, thumb.top + 1, thumb.right, thumb.bottom + 1}, RGB(0, 0, 0), float(sp(7)), BYTE(30 * paintFade));
+                    ui::fillRound(dc, thumb, faded(macThumb()), float(sp(7)));
+                } else rounded(dc, thumb, theme.highContrast ? Selected : faded(theme.accentSoft), 8);
             }
             for (int k = 0; k < n; ++k) {
                 const RECT face{bar.left + pad + k * cell, bar.top + pad, bar.left + pad + (k + 1) * cell, bar.bottom - pad};
                 const int index = int(visualHits.size());
                 visualHits.push_back({{face.left, y + sp(4) + pad, face.right, y + h - sp(4) - pad}, b.commands[size_t(k)], i});
                 const bool on = k == b.toggle;
-                if ((index == visualHover || index == visualFocus) && !on) rounded(dc, face, blend(Surface, Selected, .5), 8);
+                if ((index == visualHover || index == visualFocus) && !on) rounded(dc, face, macLook() ? blend(macTrack(), Ink, .05) : blend(Surface, Selected, .5), 8);
                 if (index == visualFocus && GetFocus() == visualView) outline(dc, face, Green, 8);
-                drawText(dc, b.items[size_t(k)].first, face, on ? (theme.highContrast ? theme.selectedInk : Green) : Ink, on ? strongFont : normalFont,
+                drawText(dc, b.items[size_t(k)].first, face, on ? (theme.highContrast ? theme.selectedInk : macLook() ? Ink : Green) : macLook() ? blend(Muted, Ink, .5) : Ink, on ? strongFont : normalFont,
                     DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
             }
             break;
@@ -1467,7 +1538,9 @@ Transition tabSlide; bool tabSlideKnown = false;
 void drawTabs(HDC dc, RECT client) {
     const auto tabs = visibleTabs();
     const RECT bar{sp(8), client.bottom - tabBarHeight(), client.right - sp(8), client.bottom - sp(6)};
-    rounded(dc, bar, Surface, 12);
+    // The clean style: a macOS segmented control, a raised thumb sliding on a grey track.
+    if (macLook()) ui::fillRound(dc, bar, macTrack(), float(sp(12)));
+    else rounded(dc, bar, Surface, 12);
     if (theme.highContrast) outline(dc, bar, Border, 12);
     const Tab active = activeTab();
     size_t activeIndex = 0;
@@ -1475,14 +1548,15 @@ void drawTabs(HDC dc, RECT client) {
     const double now = motionNow();
     if (!tabSlideKnown) { tabSlide.from = tabSlide.to = double(activeIndex); tabSlide.duration = 0; tabSlideKnown = true; }
     else if (std::abs(tabSlide.to - double(activeIndex)) > .01) {
-        tabSlide.move(double(activeIndex), now, canAnimate() && !hidden ? 260 : 0);
+        tabSlide.move(double(activeIndex), now, canAnimate() && !hidden ? (macLook() ? 480 : 260) : 0);
+        tabSlide.spring = macLook();
         if (tabSlide.duration) armMotionTimer();
     }
     const double at = std::clamp(tabSlide.value(now), 0.0, double(tabs.size() - 1));
     for (size_t i = 0; i < tabs.size(); ++i) {
         RECT r = tabRect(i, tabs.size(), client);
         InflateRect(&r, -sp(3), -sp(3));
-        if (int(i) == tabHover && i != activeIndex) rounded(dc, r, blend(Surface, Selected, .45), 9);
+        if (int(i) == tabHover && i != activeIndex) rounded(dc, r, macLook() ? blend(macTrack(), Ink, .05) : blend(Surface, Selected, .45), 9);
     }
     {
         // The highlight between the two tabs it is passing.
@@ -1491,13 +1565,16 @@ void drawTabs(HDC dc, RECT client) {
         InflateRect(&ra, -sp(3), -sp(3)); InflateRect(&rb, -sp(3), -sp(3));
         const double f = at - double(a);
         const RECT pill{ra.left + int(std::lround((rb.left - ra.left) * f)), ra.top, ra.right + int(std::lround((rb.right - ra.right) * f)), ra.bottom};
-        rounded(dc, pill, theme.highContrast ? Selected : theme.accentSoft, 9);
+        if (macLook()) {
+            ui::fillRound(dc, {pill.left, pill.top + 1, pill.right, pill.bottom + 1}, RGB(0, 0, 0), float(sp(9)), 34);
+            ui::fillRound(dc, pill, macThumb(), float(sp(9)));
+        } else rounded(dc, pill, theme.highContrast ? Selected : theme.accentSoft, 9);
     }
     for (size_t i = 0; i < tabs.size(); ++i) {
         RECT r = tabRect(i, tabs.size(), client);
         InflateRect(&r, -sp(3), -sp(3));
         const double on = std::max(0.0, 1 - std::abs(at - double(i))), hot = int(i) == tabHover ? 1.0 : 0.0;
-        const COLORREF selectedInk = theme.highContrast ? theme.selectedInk : Green;
+        const COLORREF selectedInk = theme.highContrast ? theme.selectedInk : macLook() ? Ink : Green;
         const COLORREF ink = blend(blend(Muted, Ink, hot), selectedInk, on);
         drawText(dc, tabLabel(tabs[i]), r, ink, on > .5 ? strongFont : normalFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     }
@@ -1830,6 +1907,8 @@ void makeFonts() {
         return CreateFontW(-height, 0, 0, 0, weight, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, quality, DEFAULT_PITCH, face);
     };
+    // Segoe UI for English: Windows links it to the Chinese fonts, so program names in Chinese
+    // still show (Segoe UI Variable has no such link under GDI).
     const wchar_t* systemFace = english ? L"Segoe UI" : L"Microsoft JhengHei UI";
     auto system = [&](int height, int weight) { return make(px(height), weight, systemFace, CLEARTYPE_QUALITY); };
     if (pixelStyle && ui::pixelFontLoaded()) {
@@ -1845,7 +1924,7 @@ void makeFonts() {
         systemFont = system(12, FW_NORMAL); fallbackOwned.push_back(systemFont);
     } else {
         normalFont = system(12, FW_NORMAL); smallFont = system(11, FW_NORMAL); strongFont = system(12, FW_SEMIBOLD);
-        titleFont = system(16, FW_SEMIBOLD); valueFont = system(29, FW_SEMIBOLD); metricFont = system(16, FW_SEMIBOLD);
+        titleFont = system(17, FW_BOLD); valueFont = system(29, FW_SEMIBOLD); metricFont = system(16, FW_SEMIBOLD);
         systemFont = normalFont;
     }
     for (auto window : {list, closeButton, killButton, serviceButton, detailsButton, backgroundCheck, allCheck,
@@ -1856,7 +1935,7 @@ void makeFonts() {
         if (window) SendMessageW(window, WM_SETFONT, reinterpret_cast<WPARAM>(systemFont), TRUE);
 }
 void applyTheme() {
-    theme = ui::palette(themeChoice, previewContrast);
+    theme = ui::palette(themeChoice, previewContrast, !pixelStyle);
     Ink = theme.ink; Muted = theme.muted; Green = theme.accent; Background = theme.background;
     Surface = theme.surface; Border = theme.border; Selected = theme.selected; Danger = theme.danger;
     if (!mainWindow) return;
@@ -2645,7 +2724,7 @@ void paint(HDC dc, RECT bounds) {
     if (headerIcon) DrawIconEx(dc, margin, sp(15), headerIcon, sp(22), sp(22), 0, nullptr, DI_NORMAL);
     drawText(dc, L"BatteryScope", {margin + sp(30), sp(11), w - sp(98), sp(40)}, Ink, titleFont);
     mascotRect = {};
-    if (showMascot) {
+    if (showMascot && pixelStyle) { // a pixel sprite: part of the pixel style
         const int unit = std::max(2, px(2)), left = margin + sp(30) + textWidth(dc, L"BatteryScope", titleFont) + sp(10);
         if (left + ui::MascotCells * unit <= w - sp(112)) {
             const auto mood = currentMood();
@@ -2660,7 +2739,7 @@ void paint(HDC dc, RECT bounds) {
         inlinePage == InlinePage::performance || inlinePage == InlinePage::stability || inlinePage == InlinePage::confirm || inlinePage == InlinePage::error) {
         card(dc, {margin, sp(74), right, h - sp(14)}, Surface, 14);
         drawText(dc, inlineTitle, {margin + sp(14), sp(84), right - sp(14), sp(114)}, Ink, titleFont);
-        fill(dc, {margin + sp(14), sp(119), right - sp(14), sp(119) + 1}, Border);
+        if (pixelStyle || theme.highContrast) fill(dc, {margin + sp(14), sp(119), right - sp(14), sp(119) + 1}, Border);
         if (inlinePage == InlinePage::powerMode) {
             const bool plugged = pluggedInNow();
             const std::wstring now = effectiveMode == EffectiveMode::unknown ? tr(L"目前生效：無法讀取") :
@@ -3149,7 +3228,9 @@ void loadSettings() {
     const DWORD threshold = readSetting(L"LowBattery", 0);
     lowBatteryThreshold = threshold == 10 || threshold == 20 || threshold == 30 ? threshold : 0;
     hotkeyEnabled = readSetting(L"Hotkey", 0) == 1;
-    pixelStyle = readSetting(L"Style", 1) != 0;
+    pixelStyle = readSetting(L"Style", 0) != 0;
+    // 0.28: the clean macOS-like style is the default, once for everyone; pixel stays a choice.
+    if (readSetting(L"MacStyle", 0) == 0) { pixelStyle = false; writeSetting(L"Style", 0); writeSetting(L"MacStyle", 1); }
     trayPercent = readSetting(L"TrayPercent", 1) != 0;
     drainAlerts = readSetting(L"DrainAlert", 0) == 1;
     sleepAlerts = readSetting(L"SleepAlert", 1) != 0;
@@ -3275,6 +3356,7 @@ bool registerPanelHotkey(bool enable) {
 }
 void setStyle(bool pixel) {
     pixelStyle = pixel;
+    applyTheme(); // each style has its own colours
     makeFonts();
     RedrawWindow(mainWindow, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
     if (!writeSetting(L"Style", pixel ? 1 : 0)) setNotice(tr(L"無法儲存設定。"));
@@ -5139,7 +5221,7 @@ std::wstring rowValue(Row row) {
     case Row::drainAlert: return onOff(drainAlerts);
     case Row::sleepAlert: return onOff(sleepAlerts);
     case Row::theme: return themeChoice == ui::ThemeChoice::system ? tr(L"跟隨 Windows") : themeChoice == ui::ThemeChoice::dark ? tr(L"深色") : tr(L"淺色");
-    case Row::style: return pixelStyle ? tr(L"像素") : tr(L"平滑");
+    case Row::style: return pixelStyle ? tr(L"像素") : tr(L"簡約");
     case Row::mascot: return onOff(showMascot);
     case Row::trayPercent: return onOff(trayPercent);
     case Row::mini: return onOff(miniEnabled);
@@ -8832,7 +8914,8 @@ bool panelSelfTest(const std::wstring& path) {
         && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::card && b.text.find(L"UNEXPECTED_STORE_EXCEPTION") != std::wstring::npos; }));
     check("stability_page_has_timeline_steps_and_protection", countKind(VBlock::Kind::banner) == 1 && countKind(VBlock::Kind::timeline) == 1
         && countKind(VBlock::Kind::check) >= 4 && countKind(VBlock::Kind::card) >= 3 && stabilityAction(ProtectToggleId)
-        && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::timeline && b.series.size() == 30 && int(b.series.back()) / 16 == 3; })
+        && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { // the demo crash is a few hours ago: today, or yesterday just after midnight
+            return b.kind == VBlock::Kind::timeline && b.series.size() == 30 && (int(b.series[29]) / 16 == 3 || int(b.series[28]) / 16 == 3); })
         && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::check && b.toggle == 1; })
         && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::check && b.toggle == 0; }));
     {
@@ -8899,7 +8982,7 @@ bool panelSelfTest(const std::wstring& path) {
         HBITMAP surface = CreateCompatibleBitmap(screen, client.right, client.bottom);
         HGDIOBJ old = SelectObject(dc, surface); paint(dc, client); SelectObject(dc, old);
         DeleteObject(surface); DeleteDC(dc); ReleaseDC(mainWindow, screen);
-        check("mascot_drawn_in_header_and_speaks", showMascot && mascotRect.right > mascotRect.left && !mascotLine().empty());
+        check("mascot_drawn_in_header_and_speaks", showMascot && (pixelStyle ? mascotRect.right > mascotRect.left : mascotRect.right == mascotRect.left) && !mascotLine().empty());
     }
     {
         wchar_t folder[MAX_PATH]{}; GetTempPathW(MAX_PATH, folder);
@@ -9243,7 +9326,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     previewContrast = isolatedPreview && option(L"--high-contrast");
     if (option(L"--smooth")) pixelStyle = false;
     if (option(L"--pixel")) pixelStyle = true;
-    theme = ui::palette(themeChoice, previewContrast);
+    theme = ui::palette(themeChoice, previewContrast, !pixelStyle);
     ui::startGraphics();
     ui::loadPixelFont(instance, PixelFontResource);
     if (isolatedPreview || demo) ClassName = L"BatteryScope.Preview.v3";

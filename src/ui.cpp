@@ -65,7 +65,7 @@ COLORREF mix(COLORREF a, COLORREF b, double t) {
     auto channel = [t](int x, int y) { return int(std::lround(x + (y - x) * t)); };
     return RGB(channel(GetRValue(a), GetRValue(b)), channel(GetGValue(a), GetGValue(b)), channel(GetBValue(a), GetBValue(b)));
 }
-Palette palette(ThemeChoice choice, bool forceContrast) {
+Palette palette(ThemeChoice choice, bool forceContrast, bool mac) {
     Palette p;
     if (forceContrast || highContrastOn()) {
         // Contrast themes: all text and strokes in WindowText, emphasis through the
@@ -82,6 +82,26 @@ Palette palette(ThemeChoice choice, bool forceContrast) {
         return p;
     }
     const bool light = choice == ThemeChoice::light || (choice == ThemeChoice::system && systemPrefersLight());
+    if (mac) {
+        // macOS system colours: window grey, a slightly lighter content area, white grouped rows
+        // with hairline separators, label and secondary label greys, system blue.
+        if (light) {
+            p.background = RGB(232, 232, 235); p.surface = RGB(245, 245, 247); p.raised = RGB(255, 255, 255); p.border = RGB(220, 220, 224);
+            p.ink = RGB(29, 29, 31); p.muted = RGB(110, 110, 115); p.faint = RGB(160, 160, 166);
+            p.accent = RGB(0, 122, 255); p.accentDim = RGB(153, 199, 255); p.accentSoft = RGB(226, 238, 255); p.accentInk = RGB(255, 255, 255);
+            p.warn = RGB(214, 120, 0); p.danger = RGB(230, 45, 35);
+            p.selected = RGB(226, 238, 255); p.selectedInk = p.ink;
+            p.dark = false;
+        } else {
+            p.background = RGB(24, 24, 26); p.surface = RGB(32, 32, 34); p.raised = RGB(46, 46, 49); p.border = RGB(60, 60, 64);
+            p.ink = RGB(245, 245, 247); p.muted = RGB(152, 152, 158); p.faint = RGB(99, 99, 104);
+            p.accent = RGB(10, 132, 255); p.accentDim = RGB(28, 78, 150); p.accentSoft = RGB(22, 48, 86); p.accentInk = RGB(255, 255, 255);
+            p.warn = RGB(255, 159, 10); p.danger = RGB(255, 69, 58);
+            p.selected = RGB(22, 48, 86); p.selectedInk = p.ink;
+            p.dark = true;
+        }
+        return p;
+    }
     if (light) {
         p.background = RGB(242, 245, 248); p.surface = RGB(255, 255, 255); p.raised = RGB(235, 240, 244); p.border = RGB(214, 222, 230);
         p.ink = RGB(16, 24, 32); p.muted = RGB(84, 99, 114); p.faint = RGB(124, 136, 148);

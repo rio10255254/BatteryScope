@@ -15,8 +15,8 @@
 
 到 **[Releases 頁面](https://github.com/rio10255254/BatteryScope/releases/latest)** 下載：
 
-- **安裝版（建議）**：`BatteryScope-0.27.0-setup.exe`。不需要管理員權限，安裝到 `%LOCALAPPDATA%\Programs\BatteryScope`，會建立開始功能表捷徑，可選擇桌面捷徑與登入時啟動，並可從「設定 → 應用程式」解除安裝。
-- **免安裝版**：`BatteryScope-0.27.0-win64.zip`，解壓後執行 `BatteryScope.exe`。
+- **安裝版（建議）**：`BatteryScope-0.28.0-setup.exe`。不需要管理員權限，安裝到 `%LOCALAPPDATA%\Programs\BatteryScope`，會建立開始功能表捷徑，可選擇桌面捷徑與登入時啟動，並可從「設定 → 應用程式」解除安裝。
+- **免安裝版**：`BatteryScope-0.28.0-win64.zip`，解壓後執行 `BatteryScope.exe`。
 
 需要 Windows 10 1703 以上（建議 Windows 11），64 位元。程式沒有數位簽章，第一次開啟若出現 SmartScreen，點「其他資訊 → 仍要執行」。開啟後在右下角系統匣，圖示會顯示電量百分比；點圖示開關面板。
 
@@ -55,7 +55,7 @@
 
 ## 使用方式
 
-1. 從 [GitHub Releases](https://github.com/rio10255254/BatteryScope/releases/latest) 下載 `BatteryScope-0.27.0-win64.zip`，解壓後執行 `BatteryScope.exe`。已編譯版本適用 Windows 10（1703 以上）與 Windows 11 的 x64 筆電與桌機。
+1. 從 [GitHub Releases](https://github.com/rio10255254/BatteryScope/releases/latest) 下載 `BatteryScope-0.28.0-win64.zip`，解壓後執行 `BatteryScope.exe`。已編譯版本適用 Windows 10（1703 以上）與 Windows 11 的 x64 筆電與桌機。
    升級時先從系統匣結束舊版，再執行新版；程式會避免同時啟動多個正式監測視窗。
 2. 目前耗電顯示電池回報的整機放電功率；資料累積後顯示平均功率、耗電速度與預估續航。
 3. 硬體能源資料可用時，下方依「估計 CPU W」由高到低列出前 10 個程序／服務。每張卡片第二行顯示類型、PID 與核心分攤模型範圍。點「僅背景」切換背景篩選，點「顯示」切換前 10 名／全部；滑鼠滾輪或鍵盤上下鍵瀏覽。若能源資料不可用，會明確退回 CPU / I/O 活動排行。
@@ -100,7 +100,10 @@
 - **偵測準確率**：一鍵自動測試期間會同時記錄偵測結果，對照實際執行的情境算出準確率，寫在匯出摘要裡，逐秒紀錄在 `detection-log.csv`（含前景程式的顯示卡使用與最忙的程式），這台電腦回報的顯示卡引擎種類列在 `gpu-engines.txt`。
 - 診斷：`BatteryScope.exe --detect-test 30` 會連續 30 秒印出偵測器看到的訊號與判斷（不含顯示卡）。
 
-### 介面（0.25 起）
+### 介面（0.28 起）
+
+預設是 macOS 風格的「簡約」外觀：系統色、分組清單、膠囊開關、分段控制與彈簧動效；原本的像素風格可在「設定 → 外觀 → 風格」切換。
+
 
 面板底部有分頁：**效能**（首頁）、**省電**、**電池**、**硬體**（華碩筆電）、**實驗**、**設定**。每個分頁上面是即時圖表，下面是可以直接點的操作列，點一下就切換或就地跳出選項；方向鍵選擇、Enter 執行、Esc 回電池分頁。每個設定只在一個地方調整；長說明收在可以點開的摺疊列裡。分頁從它所在的那一側滑入，數值變更時會短暫發亮，游標指到圖表會顯示該點的數值（Windows 關閉動畫時全部停用）：
 
@@ -279,7 +282,7 @@
 .\build.ps1 -Test
 ```
 
-舊版仍在執行時，可使用 `./build.ps1 -Test -OutputDirectory dist/v0.27.0` 編譯到獨立目錄，避免覆寫使用中的 EXE。
+舊版仍在執行時，可使用 `./build.ps1 -Test -OutputDirectory dist/v0.28.0` 編譯到獨立目錄，避免覆寫使用中的 EXE。
 
 預設尋找 PATH 上的 `g++.exe`，其次使用 `C:\mingw64\bin\g++.exe`，並使用同目錄的 `windres.exe`。產出 `dist\BatteryScope.exe`。
 

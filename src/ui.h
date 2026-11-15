@@ -29,7 +29,9 @@ bool systemPrefersLight();
 bool highContrastOn();
 // Resolves "system" through the Windows app theme; a contrast theme always wins.
 // `forceContrast` previews the contrast palette from the current system colors.
-Palette palette(ThemeChoice choice, bool forceContrast = false);
+// `mac`: the clean style's colours, after macOS: neutral greys, white (or graphite) grouped
+// rows and the system blue accent. Without it, the pixel style's own teal palette.
+Palette palette(ThemeChoice choice, bool forceContrast = false, bool mac = false);
 COLORREF mix(COLORREF a, COLORREF b, double t);
 
 bool startGraphics();
