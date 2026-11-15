@@ -131,108 +131,35 @@ Palette mixPalette(const Palette& a, const Palette& b, double t) {
     p.warn = m(a.warn, b.warn); p.danger = m(a.danger, b.danger); p.selected = m(a.selected, b.selected); p.selectedInk = m(a.selectedInk, b.selectedInk);
     return p;
 }
-std::vector<POINT> sunDots() {
-    std::vector<POINT> dots;
-    for (int y = -1; y <= 1; ++y) for (int x = -1; x <= 1; ++x) dots.push_back({x, y});      // the disc
-    for (POINT p : {POINT{0, -2}, POINT{2, 0}, POINT{0, 2}, POINT{-2, 0}}) dots.push_back(p);
-    for (POINT p : {POINT{0, -4}, POINT{3, -3}, POINT{4, 0}, POINT{3, 3}, POINT{0, 4}, POINT{-3, 3}, POINT{-4, 0}, POINT{-3, -3}}) dots.push_back(p); // rays
-    return dots;
+void drawGlow(HDC dc, const RECT& r, COLORREF c, double strength, float spread) {
+    if (!graphicsToken || strength <= .01 || r.right <= r.left) return;
+    Canvas canvas(dc);
+    const float w = float(r.right - r.left) + spread * 2, h = float(r.bottom - r.top) + spread * 2;
+    Gdiplus::GraphicsPath halo; halo.AddEllipse(float(r.left) - spread, float(r.top) - spread, w, h);
+    Gdiplus::PathGradientBrush brush(&halo);
+    brush.SetCenterColor(color(c, BYTE(std::clamp(strength, 0.0, 1.0) * 120)));
+    Gdiplus::Color edge = color(c, 0); int count = 1;
+    brush.SetSurroundColors(&edge, &count);
+    canvas.g.FillPath(&brush, &halo);
 }
-std::vector<POINT> moonDots() {
-    std::vector<POINT> dots;
-    for (int y = -4; y <= 4; ++y) for (int x = -4; x <= 4; ++x) {
-        const double inside = x * x + y * y, bite = (x - 1.7) * (x - 1.7) + (y + 1.3) * (y + 1.3);
-        if (inside <= 3.7 * 3.7 && bite > 2.9 * 2.9) dots.push_back({x, y});
-    }
-    dots.push_back({3, -4}); // a star
-    return dots;
-}
-void drawThemeToggle(HDC dc, const RECT& r, double night, double hover) {
-    if (!graphicsToken || r.right <= r.left || r.bottom <= r.top) return;
-    night = std::clamp(night, 0.0, 1.0);
+void drawRimLight(HDC dc, const RECT& r, float radius, COLORREF c, double angle, double strength) {
+    if (!graphicsToken || strength <= .01 || r.right <= r.left) return;
     Canvas canvas(dc);
     auto& g = canvas.g;
-    const float w = float(r.right - r.left), h = float(r.bottom - r.top);
-    const Gdiplus::RectF track(float(r.left), float(r.top), w, h);
-    auto rgb = [](COLORREF a, COLORREF b, double t) { return mix(a, b, t); };
-    // The track: a soft drop below, a gradient body, a faint inner shade along the top.
-    {
-        Gdiplus::GraphicsPath drop; roundPath(drop, Gdiplus::RectF(track.X, track.Y + 1.5f, w, h), h * .45f);
-        Gdiplus::SolidBrush dropBrush(color(RGB(0, 0, 0), BYTE(28 + 40 * night)));
-        g.FillPath(&dropBrush, &drop);
-        Gdiplus::GraphicsPath body; roundPath(body, track, h * .45f);
-        Gdiplus::LinearGradientBrush fill(Gdiplus::PointF(track.X, track.Y), Gdiplus::PointF(track.X, track.Y + h),
-            color(rgb(RGB(222, 220, 217), RGB(14, 14, 16), night)), color(rgb(RGB(240, 238, 235), RGB(30, 30, 34), night)));
-        g.FillPath(&fill, &body);
-        Gdiplus::LinearGradientBrush shade(Gdiplus::PointF(track.X, track.Y), Gdiplus::PointF(track.X, track.Y + h),
-            color(RGB(0, 0, 0), BYTE(60 + 40 * night)), color(RGB(255, 255, 255), BYTE(70 * (1 - night))));
-        Gdiplus::Pen edge(&shade, 1.2f);
-        g.DrawPath(&edge, &body);
-    }
-    // The knob.
-    const float pad = std::max(2.0f, h * .1f), size = h - pad * 2;
-    const float x = track.X + pad + float((1 - night) * (w - pad * 2 - size)), y = track.Y + pad;
-    const Gdiplus::RectF knob(x, y, size, size);
-    const float radius = size * .3f;
-    const double day = std::clamp(1 - night * 1.6, 0.0, 1.0), dark = std::clamp((night - .375) * 1.6, 0.0, 1.0);
-    const COLORREF warm = RGB(255, 162, 32), cool = RGB(112, 118, 255);
-    const double lift = .85 + .3 * std::clamp(hover, 0.0, 1.0);
-    // The halo: a radial glow in the colour of the time of day.
-    for (const auto& [glow, amount] : {std::pair{warm, day}, std::pair{cool, dark}}) {
-        if (amount <= .01) continue;
-        const float spread = size * 1.35f;
-        Gdiplus::GraphicsPath halo; halo.AddEllipse(x + size / 2 - spread, y + size / 2 - spread, spread * 2, spread * 2);
-        Gdiplus::PathGradientBrush brush(&halo);
-        brush.SetCenterColor(color(glow, BYTE(std::min(255.0, 95 * amount * lift))));
-        Gdiplus::Color edgeColor = color(glow, 0); int count = 1;
-        brush.SetSurroundColors(&edgeColor, &count);
-        g.FillPath(&brush, &halo);
-    }
-    {
-        Gdiplus::GraphicsPath shadow; roundPath(shadow, Gdiplus::RectF(x, y + 1.5f, size, size), radius);
-        Gdiplus::SolidBrush shadowBrush(color(RGB(0, 0, 0), BYTE(45 + 50 * night)));
-        g.FillPath(&shadowBrush, &shadow);
-        Gdiplus::GraphicsPath body; roundPath(body, knob, radius);
-        Gdiplus::LinearGradientBrush fill(Gdiplus::PointF(x, y), Gdiplus::PointF(x, y + size),
-            color(rgb(RGB(255, 255, 255), RGB(78, 80, 92), night)), color(rgb(RGB(232, 230, 226), RGB(42, 44, 52), night)));
-        g.FillPath(&fill, &body);
-        // Frost: a soft light over the top half.
-        Gdiplus::GraphicsPath sheen; roundPath(sheen, Gdiplus::RectF(x + 1, y + 1, size - 2, size * .5f), radius * .8f);
-        Gdiplus::LinearGradientBrush frost(Gdiplus::PointF(x, y), Gdiplus::PointF(x, y + size * .5f),
-            color(RGB(255, 255, 255), BYTE(110 - 70 * night)), color(RGB(255, 255, 255), 0));
-        g.FillPath(&frost, &sheen);
-        // The rim light: warm along the top and right by day, cool along the left and bottom by night.
-        for (const auto& [glow, amount, fromX, fromY, toX, toY] : {
-                 std::tuple{warm, day, x, y + size, x + size, y}, std::tuple{cool, dark, x + size, y, x, y + size}}) {
-            if (amount <= .01) continue;
-            Gdiplus::LinearGradientBrush rim(Gdiplus::PointF(fromX, fromY), Gdiplus::PointF(toX, toY), color(glow, 0), color(glow, BYTE(255 * amount)));
-            Gdiplus::Pen bloom(&rim, std::max(3.0f, size * .16f)); bloom.SetLineJoin(Gdiplus::LineJoinRound);
-            Gdiplus::GraphicsState state = g.Save();
-            g.SetClip(&body);
-            g.DrawPath(&bloom, &body);
-            g.Restore(state);
-            Gdiplus::Pen line(&rim, std::max(1.3f, size * .05f));
-            g.DrawPath(&line, &body);
-        }
-    }
-    // The dot-matrix icon: the sun's dots scatter and gather into the moon on the way.
-    {
-        const auto sun = sunDots(), moon = moonDots();
-        const size_t count = std::max(sun.size(), moon.size());
-        const double m = std::clamp((night - .2) / .6, 0.0, 1.0), morph = m * m * (3 - 2 * m);
-        const double scatter = std::sin(3.14159265 * morph);
-        const float cell = size * .068f, dot = cell * .82f * float(1 - .35 * scatter);
-        const COLORREF ink = rgb(RGB(62, 60, 58), RGB(238, 240, 255), night);
-        Gdiplus::SolidBrush brush(color(ink));
-        for (size_t i = 0; i < count; ++i) {
-            const POINT a = sun[i % sun.size()], b = moon[i * moon.size() / count];
-            // A fixed pseudo-random direction per dot for the scatter.
-            const unsigned hash = unsigned(i) * 2654435761u;
-            const double dx = double(hash % 1000) / 500 - 1, dy = double((hash / 1000) % 1000) / 500 - 1;
-            const double cx = a.x + (b.x - a.x) * morph + dx * 2.6 * scatter, cy = a.y + (b.y - a.y) * morph + dy * 2.6 * scatter;
-            g.FillRectangle(&brush, float(x + size / 2 + cx * cell - dot / 2), float(y + size / 2 + cy * cell - dot / 2), dot, dot);
-        }
-    }
+    const auto box = rectF(r);
+    const float cx = box.X + box.Width / 2, cy = box.Y + box.Height / 2, reach = std::max(box.Width, box.Height) / 2;
+    const float dx = float(std::cos(angle)) * reach, dy = float(std::sin(angle)) * reach;
+    const BYTE alpha = BYTE(std::clamp(strength, 0.0, 1.0) * 255);
+    Gdiplus::LinearGradientBrush rim(Gdiplus::PointF(cx - dx, cy - dy), Gdiplus::PointF(cx + dx + .01f, cy + dy + .01f), color(c, 0), color(c, alpha));
+    Gdiplus::GraphicsPath path; roundPath(path, box, radius);
+    // A wide soft band inside the edge, then a thin bright line on it.
+    Gdiplus::GraphicsState state = g.Save();
+    g.SetClip(&path);
+    Gdiplus::Pen bloom(&rim, std::max(3.0f, box.Height * .18f)); bloom.SetLineJoin(Gdiplus::LineJoinRound);
+    g.DrawPath(&bloom, &path);
+    g.Restore(state);
+    Gdiplus::Pen line(&rim, 1.4f); line.SetLineJoin(Gdiplus::LineJoinRound);
+    g.DrawPath(&line, &path);
 }
 bool startGraphics() {
     if (graphicsToken) return true;

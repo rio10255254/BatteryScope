@@ -144,7 +144,7 @@ Each tab shows live charts on top and clickable control rows below. A row switch
 
 Fans and power limits are written again after every performance mode change, and "factory" restores them.
 
-The default look is a clean, macOS-like style (system colours, grouped lists, capsule switches, segmented controls and spring motion); the pixel style is in Settings → Style.
+The default look is a clean, macOS-like style (system colours, grouped lists, capsule switches, segmented controls, and motion tuned frame by frame from a reference clip: quick travel, a slight lift, and a halo and edge light on landing); the pixel style is in Settings → Style.
 
 **Saving** holds every saving switch, in three groups: automatic saving, screen and devices, and goal and rules. Screen and devices includes **dim and black out when away**: on battery, with nobody at the PC, the display dims to 30% after 1 minute and goes black after 5 (adjustable). The PC stays awake and is back at the first touch; videos and calls keep the display on. On battery the tab also shows the power split between the CPU and the display and the rest. **Setup** keeps reminders, looks and general options only. Each control lives in one place, and long explanations fold away under a row you can open.
 

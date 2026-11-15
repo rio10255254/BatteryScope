@@ -209,11 +209,9 @@ bool idleDisplay = true;
 DWORD dimAfter = 60, displayOffAfter = 300, dimLevel = 30; // seconds, seconds (0 never), percent
 bool displayTimersDone = false;
 void loadModeLink();
-// The day/night switch in the title bar (ui::drawThemeToggle). While it is dragged or settling,
-// the whole panel's colours blend between the light and the dark palette with it.
-RECT themeToggleRect{};
-bool themeDragging = false, themeDragMoved = false, themeHover = false;
-int themeDragX = 0; double themeDragFrom = 0, themeBlend = -1; // -1: not blending
+// A change between light and dark crossfades the whole panel (themeBlend: 0 light .. 1 dark,
+// -1 when not blending), quickly and evenly, as in the reference clip (100-130 ms).
+double themeBlend = -1;
 Transition themeMotion;
 void showThemeBlend(double night);
 ui::Palette blendedPalette(double night);
@@ -275,7 +273,9 @@ std::deque<uint64_t> actionMarks;
 constexpr UINT_PTR MotionTimer = 92, NoticeTimer = 93, UpdateTimer = 94, GovernorTimer = 95, KeyboardTimer = 96, AsusTimer = 97, StabilityTimer = 98, StartupTimer = 99;
 constexpr int PanelWidth = 360, PanelHeight = 640, RowHeight = 51;
 bool motionEnabled = true, suppressMotion = false, panelTargetShown = false, motionTimerRunning = false;
+double motionClock = -1; // screenshots of motion: a fixed clock instead of the real one
 double motionNow() {
+    if (motionClock >= 0) return motionClock;
     static const double frequency = [] { LARGE_INTEGER f{}; QueryPerformanceFrequency(&f); return double(f.QuadPart); }();
     LARGE_INTEGER counter{}; QueryPerformanceCounter(&counter);
     return counter.QuadPart * 1000.0 / frequency;
@@ -808,7 +808,9 @@ std::map<int, Transition> visualKnobs;                    // switches, by comman
 std::map<size_t, Transition> visualHoverFade, visualPress; // rows, by block index
 bool visualAnimating = false, visualTimerOn = false;
 int visualEnterDir = 0;                                    // the page slides in from the right (1) or the left (-1); 0 rises
-std::map<std::wstring, std::pair<std::wstring, Transition>> visualPulse; // action rows: the value last shown, and a glow when it changes
+// Action rows: the value shown, the one before it, and a 0-1 timeline since it changed.
+struct ValuePulse { std::wstring shown, previous; Transition time; };
+std::map<std::wstring, ValuePulse> visualPulse;
 POINT visualMouse{-1, -1};                                 // the pointer over the view, for chart readouts
 std::vector<RECT> visualPlots;                             // charts as last painted
 double paintFade = 1;                                      // the block being painted, 0 (hidden) to 1
@@ -817,12 +819,22 @@ double easeOut(double t) { t = std::clamp(t, 0.0, 1.0); return 1 - (1 - t) * (1 
 void armVisualTimer() {
     if (visualView && !visualTimerOn) visualTimerOn = SetTimer(visualView, VisualTimer, USER_TIMER_MINIMUM, nullptr) != 0;
 }
-// How far block `index` has come in (0-1) while the page opens.
+// How far block `index` has come in (0-1) while the page opens. The clean style does it in two
+// stages, as in the reference clip: each block moves into place quickly and evenly
+// (blockMove, 170 ms), and its colours settle in over a longer ease-out (360 ms).
 double blockAppear(size_t index, double now) {
     if (visualEnterAt < 0) return 1;
-    const double t = (now - visualEnterAt - 32.0 * double(std::min<size_t>(index, 12))) / 300.0;
+    const bool clean = macLook();
+    const double t = (now - visualEnterAt - (clean ? 16.0 : 32.0) * double(std::min<size_t>(index, 12))) / (clean ? 360.0 : 300.0);
     if (t < 1) visualAnimating = true;
-    return easeOut(t);
+    return clean ? settleEase(t) : easeOut(t);
+}
+double blockMove(size_t index, double now) {
+    if (visualEnterAt < 0) return 1;
+    if (!macLook()) return blockAppear(index, now);
+    const double t = (now - visualEnterAt - 16.0 * double(std::min<size_t>(index, 12))) / 170.0;
+    if (t < 1) visualAnimating = true;
+    return quickEase(t);
 }
 // A value that glides to `target` when it changes (bars and meters on a live page).
 double glide(const std::wstring& key, double target, double now) {
@@ -862,15 +874,44 @@ bool joinsAbove(size_t i) { return macLook() && i > 0 && i < visualBlocks.size()
 bool joinsBelow(size_t i) { return macLook() && i + 1 < visualBlocks.size() && visualBlocks[i].kind == VBlock::Kind::action && visualBlocks[i + 1].kind == VBlock::Kind::action; }
 COLORREF macTrack() { return blend(Surface, Ink, theme.dark ? .12 : .07); }
 COLORREF macThumb() { return theme.dark ? RGB(92, 92, 97) : RGB(255, 255, 255); }
-void drawSwitch(HDC dc, RECT r, double on) {
+// ----- Arrival (the clean style's motion, learned frame by frame from a reference clip) -----
+// A thumb travels quickly and evenly (quickEase), lifting a little on the way. As it lands a
+// soft halo blooms and then fades, and a light sweeps a quarter turn along its edge from the
+// side it came from: the move is quick, the light settles after.
+constexpr double TravelMs = 160, SettleMs = 460;
+struct Arrival { double lift = 0, glow = 0, angle = 0; bool active = false; };
+Arrival arrival(double since, int direction) {
+    Arrival a;
+    if (since < 0 || since > TravelMs + SettleMs) return a;
+    a.active = true;
+    const double p = std::clamp(since / TravelMs, 0.0, 1.0);
+    a.lift = std::sin(3.14159265 * p);
+    const double settle = since <= TravelMs ? 0 : settleEase((since - TravelMs) / SettleMs);
+    a.glow = since <= TravelMs ? quickEase(p) : 1 - settle;
+    const double start = direction >= 0 ? 0.0 : 3.14159265;
+    a.angle = start + (direction >= 0 ? 1 : -1) * 1.5707963 * settle;
+    return a;
+}
+// When each switch or segmented control last changed and which way (by its key).
+std::map<int, std::pair<double, int>> visualChangedAt;
+double tabChangedAt = -1; int tabDirection = 1;
+void drawSwitch(HDC dc, RECT r, double on, double stretch = 0, const Arrival& motion = {}) {
     if (macLook()) {
-        // macOS: a capsule that fills with the accent, a white knob with a soft shadow.
+        // macOS: a capsule that fills with the accent, a white knob with a soft shadow. Pressed,
+        // the knob stretches; moving, it lifts; landing on, the track glows and a light sweeps
+        // the knob's edge.
         const COLORREF offTrack = theme.dark ? RGB(70, 70, 75) : RGB(218, 218, 222);
-        const int h = r.bottom - r.top, pad = std::max(2, h / 10), knob = h - pad * 2;
+        const int h = r.bottom - r.top, pad = std::max(2, h / 10), base = h - pad * 2;
+        if (on > .5 && motion.glow > 0) ui::drawGlow(dc, r, Green, motion.glow * .75 * paintFade, float(sp(9)));
         ui::fillRound(dc, r, faded(blend(offTrack, Green, std::clamp(on, 0.0, 1.0))), float(h) / 2);
-        const int x = r.left + pad + int(std::lround((r.right - r.left - pad * 2 - knob) * on));
-        ui::fillRound(dc, {x, r.top + pad + 1, x + knob, r.top + pad + knob + 1}, RGB(0, 0, 0), float(knob) / 2, BYTE(40 * paintFade));
-        ui::fillRound(dc, {x, r.top + pad, x + knob, r.top + pad + knob}, faded(RGB(255, 255, 255)), float(knob) / 2);
+        const double scale = 1 + .08 * motion.lift;
+        const int kh = int(std::lround(base * scale)), kw = int(std::lround(base * scale * (1 + .3 * std::clamp(stretch, 0.0, 1.0))));
+        const int travel = (r.right - r.left) - pad * 2 - kw;
+        const int x = r.left + pad + int(std::lround(travel * std::clamp(on, 0.0, 1.0))), y = (r.top + r.bottom - kh) / 2;
+        const RECT knob{x, y, x + kw, y + kh};
+        ui::fillRound(dc, {knob.left, knob.top + 1, knob.right, knob.bottom + 1}, RGB(0, 0, 0), float(kh) / 2, BYTE((40 + 45 * motion.lift) * paintFade));
+        ui::fillRound(dc, knob, faded(RGB(255, 255, 255)), float(kh) / 2);
+        if (motion.glow > 0) ui::drawRimLight(dc, knob, float(kh) / 2, on > .5 ? Green : (theme.dark ? RGB(220, 220, 230) : RGB(150, 150, 160)), motion.angle, motion.glow * .9 * paintFade);
         return;
     }
     const COLORREF off = blend(Surface, Border, .9), lit = Green;
@@ -909,8 +950,9 @@ void paintVisual(HDC dc, RECT client) {
         const int h = blockHeight(dc, b, width, i == 0);
         const double appear = blockAppear(i, now);
         // A page from another tab slides in from that side; anything else rises into place.
-        const int rise = visualEnterDir ? 0 : int(std::lround((1 - appear) * sp(14)));
-        const int slide = visualEnterDir * int(std::lround((1 - appear) * sp(26)));
+        const double move = blockMove(i, now);
+        const int rise = visualEnterDir ? 0 : int(std::lround((1 - move) * sp(14)));
+        const int slide = visualEnterDir * int(std::lround((1 - move) * sp(26)));
         if (y + h < 0 || y > client.bottom) {
             if (b.kind == VBlock::Kind::fold) visualHits.push_back({{0, y + sp(3), width, y + sp(37)}, FoldCommand, i});
             if (b.kind == VBlock::Kind::action) visualHits.push_back({{0, y + (joinsAbove(i) ? 0 : sp(3)), width, y + h - (joinsBelow(i) ? 0 : sp(3))}, int(b.amount), i});
@@ -1112,10 +1154,18 @@ void paintVisual(HDC dc, RECT client) {
                 // The switch, its knob gliding to the new state.
                 auto [it, fresh] = visualKnobs.try_emplace(int(b.amount));
                 if (fresh) { it->second.from = it->second.to = b.toggle; it->second.duration = 0; }
-                else if (std::abs(it->second.to - b.toggle) > .01) { it->second.move(b.toggle, now, canAnimate() ? (macLook() ? 420 : 200) : 0); it->second.spring = macLook(); }
+                else if (std::abs(it->second.to - b.toggle) > .01) {
+                    it->second.move(b.toggle, now, canAnimate() ? (macLook() ? TravelMs : 200) : 0); it->second.quick = macLook();
+                    if (canAnimate()) visualChangedAt[int(b.amount)] = {now, b.toggle ? 1 : -1};
+                }
                 if (it->second.active(now)) visualAnimating = true;
+                Arrival motion;
+                if (auto changed = visualChangedAt.find(int(b.amount)); changed != visualChangedAt.end() && macLook()) {
+                    motion = arrival(now - changed->second.first, changed->second.second);
+                    if (motion.active) visualAnimating = true;
+                }
                 const int switchHeight = sp(20), switchWidth = sp(38), mid = (row.top + row.bottom) / 2;
-                drawSwitch(dc, {right - switchWidth, mid - switchHeight / 2, right, mid + switchHeight / 2}, it->second.value(now));
+                drawSwitch(dc, {right - switchWidth, mid - switchHeight / 2, right, mid + switchHeight / 2}, it->second.value(now), press, motion);
                 right -= switchWidth + sp(10);
             } else {
                 drawMenuArrow(dc, right - sp(6), (row.top + row.bottom) / 2 - sp(5), sp(10), macLook() ? blend(Muted, Surface, .3) : Muted, false);
@@ -1126,18 +1176,31 @@ void paintVisual(HDC dc, RECT client) {
                     const COLORREF tone = faded(COLORREF(b.goal));
                     // A value that just changed glows for a moment: the click was taken.
                     auto [seen, fresh] = visualPulse.try_emplace(b.title);
-                    if (fresh) seen->second.first = b.value;
-                    else if (seen->second.first != b.value) {
-                        seen->second.first = b.value;
-                        auto& glow = seen->second.second;
-                        glow.from = 1; glow.to = 0; glow.started = now; glow.duration = canAnimate() ? 900 : 0; glow.tangent = 0;
+                    auto& pulse = seen->second;
+                    if (fresh) pulse.shown = b.value;
+                    else if (pulse.shown != b.value) {
+                        pulse.previous = pulse.shown; pulse.shown = b.value;
+                        pulse.time.from = 1; pulse.time.to = 0; pulse.time.started = now; pulse.time.tangent = 0;
+                        pulse.time.duration = canAnimate() ? (macLook() ? 620 : 900) : 0;
                     }
-                    const double glow = seen->second.second.value(now);
-                    if (seen->second.second.active(now)) visualAnimating = true;
+                    const double glow = pulse.time.value(now);
+                    if (pulse.time.active(now)) visualAnimating = true;
                     if (macLook()) {
-                        // Plain secondary text beside the chevron; a change flashes it in the accent.
+                        // Plain secondary text beside the chevron. A change dissolves and re-forms, as
+                        // in the reference clip: the old value rises and fades in the first 120 ms, the
+                        // new one comes up from below, lit in the accent, and settles to its colour.
                         const COLORREF valueInk = b.goal ? blend(tone, Ink, theme.dark ? .1 : .25) : Muted;
-                        drawText(dc, b.value, pill, blend(valueInk, Green, glow), normalFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+                        const double since = pulse.time.duration ? now - pulse.time.started : 1e9;
+                        const COLORREF rowFill = theme.raised;
+                        if (since < 120 && !pulse.previous.empty()) {
+                            const double out = quickEase(since / 120);
+                            RECT old = pill; OffsetRect(&old, 0, -int(std::lround(out * sp(5))));
+                            drawText(dc, pulse.previous, old, blend(valueInk, rowFill, out), normalFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+                        }
+                        const double in = since >= 1e8 ? 1.0 : settleEase((since - 60) / 300);
+                        const double light = since >= 1e8 ? 0.0 : 1 - settleEase((since - 120) / 500);
+                        RECT now_ = pill; OffsetRect(&now_, 0, int(std::lround((1 - in) * sp(5))));
+                        drawText(dc, b.value, now_, blend(rowFill, blend(valueInk, Green, light), in), normalFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
                         right = pill.left - sp(4);
                     } else {
                         const COLORREF base = b.goal ? blend(tone, Surface, .72) : blend(Surface, Border, .6);
@@ -1166,14 +1229,28 @@ void paintVisual(HDC dc, RECT client) {
             if (b.toggle >= 0) {
                 auto [it, fresh] = visualKnobs.try_emplace(100000 + int(i));
                 if (fresh) { it->second.from = it->second.to = b.toggle; it->second.duration = 0; }
-                else if (std::abs(it->second.to - b.toggle) > .01) { it->second.move(b.toggle, now, canAnimate() ? (macLook() ? 460 : 240) : 0); it->second.spring = macLook(); }
+                else if (std::abs(it->second.to - b.toggle) > .01) {
+                    const int way = b.toggle > it->second.to ? 1 : -1;
+                    it->second.move(b.toggle, now, canAnimate() ? (macLook() ? TravelMs + 20 : 240) : 0); it->second.quick = macLook();
+                    if (canAnimate()) visualChangedAt[100000 + int(i)] = {now, way};
+                }
                 if (it->second.active(now)) visualAnimating = true;
                 const int left = bar.left + pad + int(std::lround(it->second.value(now) * cell));
-                const RECT thumb{left, bar.top + pad, left + cell, bar.bottom - pad};
+                RECT thumb{left, bar.top + pad, left + cell, bar.bottom - pad};
                 if (macLook()) {
-                    // A raised thumb with a soft shadow, as in a macOS segmented control.
-                    ui::fillRound(dc, {thumb.left, thumb.top + 1, thumb.right, thumb.bottom + 1}, RGB(0, 0, 0), float(sp(7)), BYTE(30 * paintFade));
+                    // A raised thumb with a soft shadow, as in a macOS segmented control. It lifts as it
+                    // travels; as it lands a halo blooms behind it and a light sweeps its edge.
+                    Arrival motion;
+                    if (auto changed = visualChangedAt.find(100000 + int(i)); changed != visualChangedAt.end()) {
+                        motion = arrival(now - changed->second.first, changed->second.second);
+                        if (motion.active) visualAnimating = true;
+                    }
+                    const int grow = int(std::lround(motion.lift * sp(2)));
+                    InflateRect(&thumb, grow, grow / 2);
+                    if (motion.glow > 0) ui::drawGlow(dc, thumb, Green, motion.glow * .45 * paintFade, float(sp(8)));
+                    ui::fillRound(dc, {thumb.left, thumb.top + 1, thumb.right, thumb.bottom + 1}, RGB(0, 0, 0), float(sp(7)), BYTE((30 + 40 * motion.lift) * paintFade));
                     ui::fillRound(dc, thumb, faded(macThumb()), float(sp(7)));
+                    if (motion.glow > 0) ui::drawRimLight(dc, thumb, float(sp(7)), Green, motion.angle, motion.glow * .85 * paintFade);
                 } else rounded(dc, thumb, theme.highContrast ? Selected : faded(theme.accentSoft), 8);
             }
             for (int k = 0; k < n; ++k) {
@@ -1183,7 +1260,11 @@ void paintVisual(HDC dc, RECT client) {
                 const bool on = k == b.toggle;
                 if ((index == visualHover || index == visualFocus) && !on) rounded(dc, face, macLook() ? blend(macTrack(), Ink, .05) : blend(Surface, Selected, .5), 8);
                 if (index == visualFocus && GetFocus() == visualView) outline(dc, face, Green, 8);
-                drawText(dc, b.items[size_t(k)].first, face, on ? (theme.highContrast ? theme.selectedInk : macLook() ? Ink : Green) : macLook() ? blend(Muted, Ink, .5) : Ink, on ? strongFont : normalFont,
+                // The clean style: a label brightens as the thumb arrives under it, not before.
+                double lit = on ? 1.0 : 0.0;
+                if (macLook()) if (auto knob = visualKnobs.find(100000 + int(i)); knob != visualKnobs.end()) lit = std::clamp(1 - std::abs(knob->second.value(now) - k), 0.0, 1.0);
+                const COLORREF labelInk = macLook() ? blend(blend(Muted, Ink, .5), Ink, lit) : on ? (theme.highContrast ? theme.selectedInk : Green) : Ink;
+                drawText(dc, b.items[size_t(k)].first, face, labelInk, (macLook() ? lit > .5 : on) ? strongFont : normalFont,
                     DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
             }
             break;
@@ -1468,7 +1549,7 @@ void showVisual(std::vector<VBlock> blocks, bool keepScroll) {
     if (!keepScroll) {
         visualScroll = 0; visualFocus = -1; visualHover = -1; visualScrollMotion.duration = 0;
         // A new page comes in: its blocks rise into place, bars grow, switches start where they are.
-        visualValues.clear(); visualKnobs.clear(); visualHoverFade.clear(); visualPress.clear(); visualPulse.clear(); visualFolds.clear();
+        visualValues.clear(); visualKnobs.clear(); visualHoverFade.clear(); visualPress.clear(); visualPulse.clear(); visualFolds.clear(); visualChangedAt.clear();
         visualMouse = {-1, -1};
         visualEnterAt = canAnimate() ? motionNow() : -1;
         if (visualEnterAt >= 0) armVisualTimer();
@@ -1557,8 +1638,10 @@ void drawTabs(HDC dc, RECT client) {
     const double now = motionNow();
     if (!tabSlideKnown) { tabSlide.from = tabSlide.to = double(activeIndex); tabSlide.duration = 0; tabSlideKnown = true; }
     else if (std::abs(tabSlide.to - double(activeIndex)) > .01) {
-        tabSlide.move(double(activeIndex), now, canAnimate() && !hidden ? (macLook() ? 480 : 260) : 0);
-        tabSlide.spring = macLook();
+        tabDirection = double(activeIndex) > tabSlide.to ? 1 : -1;
+        tabSlide.move(double(activeIndex), now, canAnimate() && !hidden ? (macLook() ? TravelMs + 40 : 260) : 0);
+        tabSlide.quick = macLook();
+        tabChangedAt = canAnimate() && !hidden ? now : -1;
         if (tabSlide.duration) armMotionTimer();
     }
     const double at = std::clamp(tabSlide.value(now), 0.0, double(tabs.size() - 1));
@@ -1575,8 +1658,16 @@ void drawTabs(HDC dc, RECT client) {
         const double f = at - double(a);
         const RECT pill{ra.left + int(std::lround((rb.left - ra.left) * f)), ra.top, ra.right + int(std::lround((rb.right - ra.right) * f)), ra.bottom};
         if (macLook()) {
-            ui::fillRound(dc, {pill.left, pill.top + 1, pill.right, pill.bottom + 1}, RGB(0, 0, 0), float(sp(9)), 34);
-            ui::fillRound(dc, pill, macThumb(), float(sp(9)));
+            // The thumb lifts on its way and lands with a halo and a light sweeping its edge.
+            const Arrival motion = tabChangedAt >= 0 ? arrival(now - tabChangedAt, tabDirection) : Arrival{};
+            RECT thumb = pill;
+            const int grow = int(std::lround(motion.lift * sp(2)));
+            InflateRect(&thumb, grow, grow / 2);
+            if (motion.glow > 0) ui::drawGlow(dc, thumb, Green, motion.glow * .4, float(sp(8)));
+            ui::fillRound(dc, {thumb.left, thumb.top + 1, thumb.right, thumb.bottom + 1}, RGB(0, 0, 0), float(sp(9)), BYTE(34 + 40 * motion.lift));
+            ui::fillRound(dc, thumb, macThumb(), float(sp(9)));
+            if (motion.glow > 0) ui::drawRimLight(dc, thumb, float(sp(9)), Green, motion.angle, motion.glow * .85);
+            if (motion.active) armMotionTimer();
         } else rounded(dc, pill, theme.highContrast ? Selected : theme.accentSoft, 9);
     }
     for (size_t i = 0; i < tabs.size(); ++i) {
@@ -2210,14 +2301,19 @@ void stepMotion(double now) {
         if (!item.second.active(now)) item.second.duration = 0;
     }
     if (themeMotion.duration) {
-        // The day/night switch settling: the whole panel blends with it, then the theme is kept.
+        // Light and dark crossfading: every colour of the panel, then the theme itself.
         const double now = motionNow();
         if (themeMotion.active(now)) { showThemeBlend(std::clamp(themeMotion.value(now), 0.0, 1.0)); active = true; }
-        else {
-            const bool night = themeMotion.to > .5;
-            themeMotion.duration = 0; themeBlend = -1;
-            setTheme(night ? ui::ThemeChoice::dark : ui::ThemeChoice::light);
-        }
+        else { themeMotion.duration = 0; themeBlend = -1; applyTheme(); }
+    }
+    if (tabChangedAt >= 0) {
+        // The tab thumb's light settles after the thumb has landed.
+        if (now - tabChangedAt < TravelMs + SettleMs && !hidden) {
+            RECT client{}; GetClientRect(mainWindow, &client);
+            RECT tabBar{0, client.bottom - tabBarHeight(), client.right, client.bottom};
+            InvalidateRect(mainWindow, &tabBar, FALSE);
+            active = true;
+        } else tabChangedAt = -1;
     }
     if (tabSlide.duration) {
         // The tab highlight on its way to the selected tab.
@@ -2743,12 +2839,7 @@ void paint(HDC dc, RECT bounds) {
     const bool compact = compactLayout(h), minimal = minimalLayout(h);
     const int top = listTop();
     if (headerIcon) DrawIconEx(dc, margin, sp(15), headerIcon, sp(22), sp(22), 0, nullptr, DI_NORMAL);
-    drawText(dc, L"BatteryScope", {margin + sp(30), sp(11), w - sp(150), sp(40)}, Ink, titleFont);
-    themeToggleRect = {};
-    if (ui::graphicsReady() && !theme.highContrast) {
-        themeToggleRect = {w - sp(146), sp(18), w - sp(100), sp(42)};
-        ui::drawThemeToggle(dc, themeToggleRect, themeBlend >= 0 ? themeBlend : theme.dark ? 1.0 : 0.0, themeHover ? 1.0 : 0.0);
-    }
+    drawText(dc, L"BatteryScope", {margin + sp(30), sp(11), w - sp(98), sp(40)}, Ink, titleFont);
     mascotRect = {};
     if (showMascot && pixelStyle) { // a pixel sprite: part of the pixel style
         const int unit = std::max(2, px(2)), left = margin + sp(30) + textWidth(dc, L"BatteryScope", titleFont) + sp(10);
@@ -3410,19 +3501,20 @@ void showThemeBlend(double night) {
     if (miniWindow) InvalidateRect(miniWindow, nullptr, FALSE);
 }
 void setTheme(ui::ThemeChoice choice);
-// Lets the switch go to day or night: a spring from where it is, then the theme is saved.
-void settleTheme(bool night) {
-    const double from = themeBlend >= 0 ? themeBlend : theme.dark ? 1.0 : 0.0;
-    if (!canAnimate() || hidden) { themeBlend = -1; setTheme(night ? ui::ThemeChoice::dark : ui::ThemeChoice::light); return; }
-    themeMotion.from = themeMotion.to = from; themeMotion.duration = 0;
-    themeMotion.move(night ? 1.0 : 0.0, motionNow(), 620); themeMotion.spring = true;
-    if (!themeMotion.duration) { themeBlend = -1; setTheme(night ? ui::ThemeChoice::dark : ui::ThemeChoice::light); return; }
-    armMotionTimer();
-}
 void setTheme(ui::ThemeChoice choice) {
+    const bool wasDark = theme.dark, contrast = theme.highContrast;
     themeChoice = choice;
-    applyTheme();
     if (!writeSetting(L"Theme", DWORD(choice))) setNotice(tr(L"無法儲存設定。"));
+    const bool nowDark = ui::palette(choice, previewContrast, !pixelStyle).dark;
+    if (canAnimate() && !hidden && !contrast && !ui::highContrastOn() && wasDark != nowDark) {
+        // Light to dark (or back): every colour crossfades on the quick curve, then the theme is applied.
+        themeMotion.from = themeMotion.to = wasDark ? 1.0 : 0.0; themeMotion.duration = 0;
+        themeMotion.move(nowDark ? 1.0 : 0.0, motionNow(), 160); themeMotion.quick = true;
+        armMotionTimer();
+        return;
+    }
+    themeMotion.duration = 0; themeBlend = -1;
+    applyTheme();
 }
 void refreshPowerModeControls() {
     const bool editable = !demo && !isolatedPreview;
@@ -8408,23 +8500,6 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case GovernorNowMessage: governorTick(); return 0;
     case WM_MOUSEMOVE: {
         RECT client{}; GetClientRect(window, &client);
-        if (themeDragging) {
-            // Dragging the knob: left is night. The panel's colours follow it.
-            const int travel = std::max(1, int(themeToggleRect.right - themeToggleRect.left) - int(themeToggleRect.bottom - themeToggleRect.top));
-            const int dx = GET_X_LPARAM(lp) - themeDragX;
-            if (std::abs(dx) > sp(3)) themeDragMoved = true;
-            if (themeDragMoved) showThemeBlend(themeDragFrom - double(dx) / travel);
-            return 0;
-        }
-        {
-            const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-            const bool over = PtInRect(&themeToggleRect, pt) != 0;
-            if (over != themeHover) {
-                themeHover = over; InvalidateRect(window, &themeToggleRect, FALSE);
-                TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0}; TrackMouseEvent(&tracking);
-            }
-            if (over) SetCursor(LoadCursorW(nullptr, IDC_HAND));
-        }
         const int hover = tabAt({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}, client);
         if (hover != tabHover) {
             tabHover = hover;
@@ -8433,18 +8508,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         }
         break;
     }
-    case WM_LBUTTONUP: case WM_CAPTURECHANGED:
-        if (themeDragging) {
-            themeDragging = false;
-            if (message == WM_LBUTTONUP) ReleaseCapture();
-            const double at = themeBlend >= 0 ? themeBlend : themeDragFrom;
-            // A click flips it; a drag goes to the nearer side.
-            settleTheme(themeDragMoved ? at > .5 : themeDragFrom < .5);
-            return 0;
-        }
-        break;
     case WM_MOUSELEAVE:
-        if (themeHover) { themeHover = false; InvalidateRect(window, &themeToggleRect, FALSE); }
         if (tabHover >= 0) { tabHover = -1; RECT client{}; GetClientRect(window, &client); RECT bar{0, client.bottom - tabBarHeight(), client.right, client.bottom}; InvalidateRect(window, &bar, FALSE); }
         break;
     case GpuUsersMessage: finishGpuEco(reinterpret_cast<std::vector<std::wstring>*>(lp)); return 0;
@@ -8565,13 +8629,6 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_LBUTTONDOWN: {
         const POINT point{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-        if (PtInRect(&themeToggleRect, point)) {
-            themeMotion.duration = 0;
-            themeDragging = true; themeDragMoved = false; themeDragX = point.x;
-            themeDragFrom = themeBlend >= 0 ? themeBlend : theme.dark ? 1.0 : 0.0;
-            SetCapture(window);
-            return 0;
-        }
         {
             RECT client{}; GetClientRect(window, &client);
             if (const int tab = tabAt(point, client); tab >= 0) {
@@ -9075,7 +9132,6 @@ bool panelSelfTest(const std::wstring& path) {
         HBITMAP surface = CreateCompatibleBitmap(screen, client.right, client.bottom);
         HGDIOBJ old = SelectObject(dc, surface); paint(dc, client); SelectObject(dc, old);
         DeleteObject(surface); DeleteDC(dc); ReleaseDC(mainWindow, screen);
-        check("theme_switch_in_title_bar", themeToggleRect.right - themeToggleRect.left > sp(30) && themeToggleRect.left > sp(150));
         {
             // Anywhere along the day/night switch, text stands out from the page behind it.
             auto light = [](COLORREF c) { return (GetRValue(c) * 299 + GetGValue(c) * 587 + GetBValue(c) * 114) / 1000; };
@@ -9558,6 +9614,25 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
                 int open = -1;
                 for (int i = 0; option(L"--menu-lab") && i < int(items.size()); ++i) if (items[size_t(i)].label == tr(L"省電實驗室")) open = i;
                 shotOK = captureMenu(items, args[1], open);
+            } else if (screenshot && option(L"--motion-frames")) {
+                // Frames of the clean style's motion at fixed times: a switch flips, the mode
+                // moves to the next choice and a value changes, then 22 frames 33 ms apart.
+                visualEnterAt = -1;
+                suppressMotion = false; motionEnabled = true; // this capture is about the motion
+                const double t0 = motionNow();
+                motionClock = t0;
+                std::wstring base = args[1];
+                if (base.size() > 4) base.resize(base.size() - 4);
+                shotOK = captureWindow(base + L"_00.bmp");
+                for (auto& b : visualBlocks) if (b.kind == VBlock::Kind::action && b.toggle >= 0) { b.toggle = 1 - b.toggle; break; }
+                for (auto& b : visualBlocks) if (b.kind == VBlock::Kind::segments && b.toggle >= 0 && !b.commands.empty()) { b.toggle = (b.toggle + 1) % int(b.commands.size()); break; }
+                for (auto& b : visualBlocks) if (b.kind == VBlock::Kind::action && b.toggle < 0 && !b.value.empty()) { b.value = L"5 min"; break; }
+                for (int k = 1; k <= 22; ++k) {
+                    motionClock = t0 + (k - 1) * 33.3;
+                    wchar_t suffix[16]; swprintf(suffix, 16, L"_%02d.bmp", k);
+                    shotOK = captureWindow(base + suffix) && shotOK;
+                }
+                motionClock = -1;
             } else shotOK = trayTest ? panelSelfTest(args[1]) : captureWindow(args[1]);
             DestroyWindow(window); continue;
         }
