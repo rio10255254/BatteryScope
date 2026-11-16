@@ -663,6 +663,8 @@ inline const std::map<std::wstring_view, const wchar_t*> translations = {
     {L"標準（需要時使用）", L"Standard (used when needed)"},
     {L"混合（內顯）", L"Hybrid (integrated GPU)"},
     {L"溫度", L"Temperatures"},
+    {L"時脈 GHz", L"Clock GHz"},
+    {L"負載", L"Load"},
     {L"獨顯", L"Discrete GPU"},
     {L"獨顯 Eco", L"GPU Eco"},
     {L"獨顯 標準", L"GPU standard"},

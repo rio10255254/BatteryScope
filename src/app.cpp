@@ -961,7 +961,7 @@ struct VBar {
     std::vector<VSegment> segments;     // stacked parts instead of one fill
 };
 struct VBlock {
-    enum class Kind { heading, note, meter, bars, series, chips, legend, action, segments, banner, timeline, card, check, fold, display } kind = Kind::note;
+    enum class Kind { heading, note, meter, bars, series, chips, legend, action, segments, banner, timeline, card, check, fold, display, tiles } kind = Kind::note;
     std::wstring title, text, value;
     double amount = 0, goal = 0, scale = 0;
     std::vector<VBar> bars;
@@ -987,6 +987,8 @@ VBlock vDisplay(const std::wstring& label, const std::wstring& digits, const std
     b.amount = fraction; b.toggle = charging ? 1 : 0;
     return b;
 }
+// Readings side by side, each in its own small well: items are "label\nvalue" (colour 0 = neutral).
+VBlock vTiles(std::vector<std::pair<std::wstring, COLORREF>> tiles) { VBlock b; b.kind = VBlock::Kind::tiles; b.items = std::move(tiles); return b; }
 VBlock vChips(std::vector<std::pair<std::wstring, COLORREF>> chips) { VBlock b; b.kind = VBlock::Kind::chips; b.items = std::move(chips); return b; }
 VBlock vLegend(std::vector<std::pair<std::wstring, COLORREF>> entries) { VBlock b; b.kind = VBlock::Kind::legend; b.items = std::move(entries); return b; }
 // A row that does something: a command, or a menu of choices opened at the row.
@@ -1083,6 +1085,7 @@ int blockHeight(HDC dc, const VBlock& b, int width, bool first) {
     case VBlock::Kind::card: return sp(30) + (b.text.empty() ? 0 : noteHeight(dc, b.text, width - sp(18))) + sp(8);
     case VBlock::Kind::check: return sp(30) + (b.text.empty() ? 0 : noteHeight(dc, b.text, width - sp(28)));
     case VBlock::Kind::display: return sp(112);
+    case VBlock::Kind::tiles: return sp(68);
     }
     return 0;
 }
@@ -1164,12 +1167,12 @@ std::vector<char> visualMoving;               // blocks still in motion when las
 // its blocks are set in from the left by visualInset() and are visualWidth() wide. Painting
 // happens in block coordinates (x = 0 at the inset); hit areas, the pointer and repaint
 // rectangles are in the view's client coordinates.
-int visualInset() { return sp(14); }
+int visualInset() { return sp(16); }
 // A page arriving: painted once, then that picture slides and fades in, one blend a frame.
 double visualSlideAt = -1; bool visualSlideReady = false;
 constexpr double VisualSlideMs = 300;
 Transition visualBounce; // the page giving at an end of its scroll: from = how far (px, signed)
-int visualWidth(const RECT& client) { return int(client.right) - sp(30); }
+int visualWidth(const RECT& client) { return int(client.right) - sp(32); }
 RECT visualDirty{};
 void addVisualDirty(const RECT& r) {
     if (r.bottom <= r.top) return;
@@ -1893,6 +1896,27 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
             }
             break;
         }
+        case VBlock::Kind::tiles: {
+            // Each reading in its own well: a quiet label over the value at twice the size.
+            const int count = int(b.items.size()), gap = sp(8);
+            for (int t = 0; t < count; ++t) {
+                const auto& [text, color] = b.items[size_t(t)];
+                const size_t cut = text.find(L'\n');
+                const std::wstring label = text.substr(0, cut), value = cut == std::wstring::npos ? std::wstring() : text.substr(cut + 1);
+                const int left = t * (width + gap) / count, right = (t + 1) * (width + gap) / count - gap;
+                const RECT box{left, top + sp(2), right, top + h - sp(8)};
+                card(dc, box, Surface, 12);
+                int tx = left + sp(10);
+                if (color) {
+                    const COLORREF light = lightOf(color);
+                    ui::led(dc, {tx, box.top + sp(12), tx + sp(7), box.top + sp(19)}, light, ledHalo(light), paintFade, theme.ledOff);
+                    tx += sp(12);
+                }
+                drawText(dc, label, {tx, box.top + sp(6), right - sp(6), box.top + sp(24)}, Muted, smallFont);
+                drawText(dc, value, {left + sp(10), box.top + sp(24), right - sp(4), box.bottom - sp(5)}, Ink, titleFont, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            }
+            break;
+        }
         case VBlock::Kind::legend: {
             int x = sp(4);
             for (const auto& [label, color] : b.items) {
@@ -2237,7 +2261,7 @@ enum class Tab { ranking, saving, battery, hardware, lab, settings, performance 
 // The sections are a row of keys along the bottom of the panel, like the bottom row of a
 // keyboard: each with its dot-matrix icon and name; the one you are on is lit from inside.
 int tabBarHeight() { return sp(78); } // room above the keys for the open tab's light
-RECT tabStrip(RECT client) { return {sp(14), client.bottom - tabBarHeight() + sp(20), client.right - sp(14), client.bottom - sp(10)}; }
+RECT tabStrip(RECT client) { return {sp(16), client.bottom - tabBarHeight() + sp(20), client.right - sp(16), client.bottom - sp(10)}; }
 RECT tabArea(RECT client) { // what to repaint when the tabs change (their light reaches past them)
     return {0, client.bottom - tabBarHeight() - sp(14), client.right, client.bottom};
 }
@@ -2342,7 +2366,7 @@ void drawTabs(HDC dc, RECT client) {
     const ui::LightBounds lightBounds(dc, {0, client.bottom - tabBarHeight(), client.right, client.bottom});
     // The tabs lie on the panel itself (no tray under them: its edge showed through the lit
     // key's light as a step), a dotted line above them.
-    dottedRule(dc, sp(18), client.right - sp(18), client.bottom - tabBarHeight() + sp(6), blend(Background, Muted, .3));
+    dottedRule(dc, sp(16), client.right - sp(16), client.bottom - tabBarHeight() + sp(6), blend(Background, Muted, .3));
     const ui::LightBounds inTray(dc, [&] { RECT tray = tabStrip(client); InflateRect(&tray, sp(5), sp(5)); return tray; }(), true);
     // Only the open tab's key stands up, lit, and it glides to the tab that is opened; another
     // key rises under the pointer.
@@ -2669,7 +2693,7 @@ void showNoticeCard(const std::wstring& text) {
     RECT panel{}; GetWindowRect(mainWindow, &panel);
     const int width = panel.right - panel.left - sp(36);
     const int height = noticeHeight(text, width);
-    const int x = panel.left + sp(18), y = panel.bottom - tabBarHeight() - height - sp(10);
+    const int x = panel.left + sp(16), y = panel.bottom - tabBarHeight() - height - sp(10);
     noticePopup.body = text; noticePopup.color = 0;
     showPopup(noticePopup, {x, y, x + width, y + height}, std::clamp<uint64_t>(2600 + text.size() * 45, 3200, 9000));
 }
@@ -3179,12 +3203,50 @@ std::optional<ProcessRow> selection() {
     if (selected < 0 || size_t(selected) >= displayed.size()) return {};
     return displayed[size_t(selected)];
 }
+// The ranking's commands appear only while a program is selected, and only those that apply
+// to it: details, then close (it has a window), stop service (it hosts one that can stop) and
+// force quit. Up to three share one row; four take two. The list has the room otherwise.
+std::vector<HWND> shownActions;
+std::vector<HWND> actionsFor(const std::optional<ProcessRow>& row) {
+    std::vector<HWND> out;
+    if (!row) return out;
+    out.push_back(detailsButton);
+    if (row->actionable && row->window) out.push_back(closeButton);
+    if (std::any_of(row->services.begin(), row->services.end(), [](const ServiceInfo& s) { return s.stoppable; })) out.push_back(serviceButton);
+    if (row->actionable) out.push_back(killButton);
+    return out;
+}
+int actionRows() { return shownActions.empty() ? 0 : shownActions.size() > 3 ? 2 : 1; }
+void placeActions() {
+    RECT r{}; GetClientRect(mainWindow, &r);
+    const int w = r.right, h = r.bottom - tabBarHeight(), margin = sp(16), top = listTop(), gap = sp(8), inner = w - margin * 2;
+    const int bottom = h - sp(64) - actionRows() * sp(40);
+    MoveWindow(viewport, margin, top, inner, std::max(sp(40), bottom - top), TRUE);
+    const int count = int(shownActions.size()), perRow = count > 3 ? 2 : std::max(1, count);
+    for (int i = 0; i < count; ++i) {
+        const int col = i % perRow, left = margin + col * (inner + gap) / perRow, right = margin + (col + 1) * (inner + gap) / perRow - gap;
+        MoveWindow(shownActions[size_t(i)], left, bottom + sp(10) + (i / perRow) * sp(40), right - left, sp(32), TRUE);
+    }
+    for (HWND b : {detailsButton, closeButton, serviceButton, killButton}) {
+        const bool on = inlinePage == InlinePage::none && std::find(shownActions.begin(), shownActions.end(), b) != shownActions.end();
+        if (!on) MoveWindow(b, margin, bottom + sp(10), sp(10), sp(32), FALSE); // parked under the list, hidden
+        ShowWindow(b, on ? SW_SHOWNA : SW_HIDE);
+    }
+}
+void keepSelectionInView();
+void fitListColumn();
 void updateButtons() {
     auto row = selection(); bool ready = row.has_value() && !pendingAction && !demo;
     EnableWindow(closeButton, ready && row->actionable && row->window);
     EnableWindow(killButton, ready && row->actionable);
     EnableWindow(serviceButton, ready && std::any_of(row->services.begin(), row->services.end(), [](const ServiceInfo& s) { return s.stoppable; }));
     EnableWindow(detailsButton, row.has_value());
+    if (auto wanted = actionsFor(row); wanted != shownActions) {
+        const int before = actionRows();
+        shownActions = std::move(wanted);
+        placeActions();
+        if (actionRows() != before) { applyScroll(scrollPosition); fitListColumn(); if (actionRows() > before) keepSelectionInView(); }
+    } else if (inlinePage == InlinePage::none) placeActions();
     InvalidateRect(mainWindow, nullptr, FALSE);
 }
 bool isModeButton(UINT id) { return id >= ModeAcEfficiencyId && id <= ModeDcPerformanceId; }
@@ -3341,6 +3403,15 @@ void scrollTo(double target, bool immediate = false) {
     hoveredRow = -1; updateRowFeedback();
     if (scrollMotion.duration) armMotionTimer(); else applyScroll(target);
 }
+// After the list gives room to the commands, the selected row stays in view.
+void keepSelectionInView() {
+    const int selected = ListView_GetNextItem(list, -1, LVNI_SELECTED);
+    if (selected < 0) return;
+    RECT r{}; GetClientRect(viewport, &r);
+    const double y = double(selected) * px(RowHeight);
+    if (y < scrollPosition) scrollTo(y);
+    else if (y + px(RowHeight) > scrollPosition + r.bottom) scrollTo(y + px(RowHeight) - r.bottom);
+}
 void wheelScroll(WPARAM wp) {
     UINT lines = 3; SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
     RECT r{}; GetClientRect(viewport, &r);
@@ -3412,25 +3483,21 @@ void refreshList() {
 }
 void layout() {
     RECT r{}; GetClientRect(mainWindow, &r);
-    const int w = r.right, h = r.bottom - tabBarHeight(), margin = sp(18), top = listTop();
-    const int bottom = h - sp(144), inner = w - margin * 2, gap = sp(8), half = (inner - gap) / 2;
-    MoveWindow(viewport, margin, top, inner, std::max(sp(40), bottom - top), TRUE);
+    const int w = r.right, h = r.bottom - tabBarHeight(), margin = sp(16), top = listTop();
+    const int inner = w - margin * 2, gap = sp(8), half = (inner - gap) / 2;
+    placeActions();
     applyScroll(scrollPosition); stopScroll();
     fitListColumn();
-    MoveWindow(detailsButton, margin, bottom + sp(10), half, sp(32), TRUE);
-    MoveWindow(closeButton, margin + half + gap, bottom + sp(10), half, sp(32), TRUE);
-    MoveWindow(serviceButton, margin, bottom + sp(50), half, sp(32), TRUE);
-    MoveWindow(killButton, margin + half + gap, bottom + sp(50), half, sp(32), TRUE);
     MoveWindow(backgroundCheck, margin, top - sp(38), half, sp(28), TRUE);
     MoveWindow(allCheck, margin + half + gap, top - sp(38), half, sp(28), TRUE);
     // Header keys, right to left: hide, the ⋯ menu, and under them the power mode key.
     // The header's keys: ⋯ and hide level with the name; under them, level with the line of
     // text, the power mode key. Its window is larger than its key so its light has room.
-    MoveWindow(hideButton, w - sp(18) - sp(32), sp(8), sp(32), sp(32), TRUE);
-    MoveWindow(menuButton, w - sp(18) - sp(70), sp(8), sp(32), sp(32), TRUE);
+    MoveWindow(hideButton, w - sp(16) - sp(32), sp(8), sp(32), sp(32), TRUE);
+    MoveWindow(menuButton, w - sp(16) - sp(70), sp(8), sp(32), sp(32), TRUE);
     {
         const int key = english ? sp(96) : sp(70); // "Efficiency" is longer than 效率
-        MoveWindow(powerButton, w - sp(18) - sp(70) - key - sp(16), sp(8), key + sp(16), sp(32), TRUE);
+        MoveWindow(powerButton, w - sp(16) - sp(70) - key - sp(16), sp(8), key + sp(16), sp(32), TRUE);
     }
     const bool fullPage = inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history || inlinePage == InlinePage::lab || inlinePage == InlinePage::ledger || inlinePage == InlinePage::hardware ||
         inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic || inlinePage == InlinePage::goal || inlinePage == InlinePage::performance || inlinePage == InlinePage::stability ||
@@ -3701,7 +3768,7 @@ void paint(HDC dc, RECT bounds) {
     const ui::LightBounds lightBounds(dc, bounds);
     heroMoving = false; // set again below while the battery tab's digits are on the move
     drawTabs(dc, bounds);
-    const int w = bounds.right, margin = sp(18), right = w - margin;
+    const int w = bounds.right, margin = sp(16), right = w - margin;
     // The header is one row: the page's name on the left, its keys (power mode, ⋯, hide) as
     // child windows on the right. Everything under it sits `lift` higher than it used to.
     mascotRect = {};
@@ -3720,7 +3787,7 @@ void paint(HDC dc, RECT bounds) {
                 titleDecodeAt = canAnimate() && !hidden && keyLook() ? motionNow() : -1;
                 if (titleDecodeAt >= 0) armMotionTimer();
             }
-            const RECT at{margin, sp(8), w - sp(18) - sp(76) - (english ? sp(112) : sp(86)), sp(42)};
+            const RECT at{margin, sp(8), w - sp(16) - sp(76) - (english ? sp(112) : sp(86)), sp(42)};
             const double elapsed = titleDecodeAt >= 0 ? motionNow() - titleDecodeAt : 1e9;
             size_t settled = inlineTitle.size();
             const std::wstring shown = decodedTitle(inlineTitle, elapsed, settled);
@@ -3748,7 +3815,7 @@ void paint(HDC dc, RECT bounds) {
         const double shown = listBarShown();
         if (shown > 0 && listBarGeometry(track, thumb)) ui::fillRound(dc, thumb, blend(Background, Ink, .4), float(sp(2)), BYTE(255 * shown));
     }
-    drawText(dc, tabLabel(activeTab()), {margin, sp(8), w - sp(18) - sp(76) - (english ? sp(112) : sp(86)), sp(42)}, Ink, titleFont, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    drawText(dc, tabLabel(activeTab()), {margin, sp(8), w - sp(16) - sp(76) - (english ? sp(112) : sp(86)), sp(42)}, Ink, titleFont, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
     // The rest is drawn where it always was and shown `lift` higher (the header lost a row).
     struct Lifted {
         HDC dc; POINT was{};
@@ -7212,13 +7279,16 @@ void showPerformancePage() {
     // CPU.
     v.push_back(vHeading(L"CPU"));
     {
-        std::vector<std::pair<std::wstring, COLORREF>> chips;
-        if (h.cpuTemp) chips.push_back({std::to_wstring(*h.cpuTemp) + L" °C", *h.cpuTemp >= 90 ? theme.danger : *h.cpuTemp >= 80 ? theme.warn : COLORREF(0)});
-        if (perf.cpuMhz) chips.push_back({number(*perf.cpuMhz / 1000, 2) + L" GHz", 0});
+        // Temperature, clock and load: three readings side by side, a dash where one is unknown.
+        std::vector<std::pair<std::wstring, COLORREF>> tiles;
+        tiles.push_back({tr(L"溫度") + std::wstring(L"\n") + (h.cpuTemp ? std::to_wstring(*h.cpuTemp) + L" °C" : std::wstring(L"—")),
+            h.cpuTemp && *h.cpuTemp >= 90 ? theme.danger : h.cpuTemp && *h.cpuTemp >= 80 ? theme.warn : COLORREF(0)});
+        tiles.push_back({tr(L"時脈 GHz") + std::wstring(L"\n") + (perf.cpuMhz ? number(*perf.cpuMhz / 1000, 2) : std::wstring(L"—")), 0});
         double busy = 0; for (const auto& core : current.energy.cores) busy += core.busyLogicalCores;
-        if (current.energy.ready) chips.push_back({tr(L"負載 ") + number(busy * 100 / std::max<DWORD>(1, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)), 0) + L"%", 0});
+        tiles.push_back({tr(L"負載") + std::wstring(L"\n") + (current.energy.ready ?
+            number(busy * 100 / std::max<DWORD>(1, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)), 0) + L"%" : std::wstring(L"—")), 0});
+        v.push_back(vTiles(std::move(tiles)));
         DWORD boost = 0;
-        v.push_back(vChips(std::move(chips)));
         const Value watts = current.energy.packageWatts ? current.energy.packageWatts : current.energy.coreWatts;
         const auto limits = bs::asus::powerLimits(bs::asus::tuning().power);
         v.push_back(vMeter(tr(L"功耗"), valueText(watts, L" W") + (limits.spl ? L" / " + std::to_wstring(limits.spl) + L" W" : std::wstring()),
@@ -10221,6 +10291,8 @@ bool panelSelfTest(const std::wstring& path) {
         const RECT first = tabRect(0, visibleTabs().size(), client);
         check("tabs_are_keys_along_the_bottom", first.top > client.bottom - tabBarHeight() && first.bottom < client.bottom);
         // The page opens with its display: the reading in dot-matrix digits.
+        check("cpu_readings_sit_in_three_wells", std::any_of(visualBlocks.begin(), visualBlocks.end(),
+            [](const VBlock& b) { return b.kind == VBlock::Kind::tiles && b.items.size() == 3; }));
         check("performance_page_opens_with_the_display", !visualBlocks.empty() && visualBlocks.front().kind == VBlock::Kind::display && !visualBlocks.front().value.empty());
         // Effects beyond the window: the overlay shows while something moves and is gone after;
         // light round the screen's edge the same. (The test's clock is fixed, so nothing is timing.)
@@ -10498,6 +10570,16 @@ bool panelSelfTest(const std::wstring& path) {
     SendMessageW(mainWindow, WM_COMMAND, AllId, 0);
     check("all_processes_toggle", showAll);
     check("demo_destructive_actions_disabled", !IsWindowEnabled(killButton) && !IsWindowEnabled(serviceButton));
+    {
+        // The ranking's commands show only while a program is selected; the list has the room otherwise.
+        ListView_SetItemState(list, -1, 0, LVIS_SELECTED); updateButtons();
+        RECT open{}; GetWindowRect(viewport, &open);
+        const bool none = shownActions.empty();
+        ListView_SetItemState(list, 0, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED); updateButtons();
+        RECT tight{}, key{}; GetWindowRect(viewport, &tight); GetWindowRect(detailsButton, &key);
+        check("actions_show_only_with_a_selection", none && !shownActions.empty() && shownActions.front() == detailsButton &&
+            tight.bottom < open.bottom && key.top >= tight.bottom && key.left == tight.left);
+    }
     SendMessageW(mainWindow, WM_COMMAND, PowerModeId, 0);
     check("power_mode_page_shows_both_sources_read_only_in_demo", inlinePage == InlinePage::powerMode &&
         IsWindowVisible(modeButtons[0]) && IsWindowVisible(modeButtons[5]) && !IsWindowEnabled(modeButtons[0]) &&
