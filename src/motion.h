@@ -11,17 +11,27 @@ inline double quickEase(double t) {
     return t < .5 ? 4 * t * t * t : 1 - std::pow(-2 * t + 2, 3) / 2;
 }
 inline double settleEase(double t) { t = std::clamp(t, 0.0, 1.0); return 1 - (1 - t) * (1 - t) * (1 - t); }
+// A damped spring: there in about a third of the time, a little past (about 6%), and back.
+// Keys that travel and pages that arrive use it, so they land instead of stopping.
+inline double springEase(double t) {
+    if (t <= 0) return 0;
+    if (t >= 1) return 1;
+    const double settle = t > .8 ? (1 - t) / .2 : 1; // the last ripple is damped out so it ends exactly there
+    return 1 - std::exp(-7.5 * t) * (std::cos(9.5 * t) + .35 * std::sin(9.5 * t)) * settle;
+}
 // Finite cubic Hermite easing: zero endpoint velocity, and a bounded tangent
 // carried into same-direction retargets. Reversals start at the current value
 // without overshooting the new target or moving away from the user's input.
 struct Transition {
     double from = 0, to = 0, started = 0, duration = 0, tangent = 0;
-    bool quick = false; // quickEase instead of the Hermite curve
+    bool quick = false;  // quickEase instead of the Hermite curve
+    bool spring = false; // springEase: it overshoots a little and settles
     double progress(double now) const { return duration > 0 ? std::clamp((now - started) / duration, 0.0, 1.0) : 1.0; }
     bool active(double now) const { return duration > 0 && now < started + duration; }
     double value(double now) const {
         if (!active(now)) return to;
         const double t = std::clamp((now - started) / duration, 0.0, 1.0);
+        if (spring) return from + (to - from) * springEase(t);
         if (quick) return from + (to - from) * quickEase(t);
         return from + (to - from) * (t * t * (3 - 2 * t)) + tangent * t * (1 - t) * (1 - t);
     }

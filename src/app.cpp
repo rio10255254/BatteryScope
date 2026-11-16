@@ -447,6 +447,32 @@ RECT glideBetween(const RECT& a, const RECT& b, double f) {
     const int x = int(std::lround(a.left + (b.left - a.left) * f)), y = int(std::lround(a.top + (b.top - a.top) * f));
     return {x, y, x + int(like.right - like.left), y + int(like.bottom - like.top)};
 }
+// The lit key moving like a drop of liquid (after the way selection moves in iOS's liquid
+// glass): its leading edge darts toward the new place while its trailing edge clings to the
+// old one and follows late, so the drop is pulled long and thin between them; arriving, it
+// is squashed wide and wobbles back to its shape. `t` is the plain progress of the move, 0-1.
+// `round` receives how far toward a full capsule its corners should go (0-1).
+RECT liquidBetween(const RECT& a, const RECT& b, double t, double* round = nullptr) {
+    t = std::clamp(t, 0.0, 1.0);
+    const auto out = [](double v) { v = std::clamp(v, 0.0, 1.0); return 1 - (1 - v) * (1 - v) * (1 - v); };
+    const auto inOut = [](double v) { v = std::clamp(v, 0.0, 1.0); return v * v * (3 - 2 * v); };
+    const double lead = out(t / .5), trail = inOut((t - .22) / .5);
+    const bool right = b.left >= a.left;
+    double left = a.left + (b.left - a.left) * (right ? trail : lead), rightEdge = a.right + (b.right - a.right) * (right ? lead : trail);
+    const double base = double(b.right - b.left), height = double(b.bottom - b.top);
+    const double stretch = std::max(0.0, (rightEdge - left) / std::max(1.0, base) - 1);
+    // Pulled long it thins; landing (the last quarter of the move) it squashes and wobbles.
+    double thin = std::min(.24, stretch * .2);
+    if (t > .72) {
+        const double w = (t - .72) / .28, jelly = std::sin(w * 3.14159265 * 2.5) * (1 - w) * (1 - w) * .09;
+        left -= base * jelly / 2; rightEdge += base * jelly / 2; thin += jelly * .9;
+    }
+    const double top = a.top + (b.top - a.top) * inOut(t) + height * thin / 2, bottom = a.bottom + (b.bottom - a.bottom) * inOut(t) - height * thin / 2;
+    if (round) *round = std::clamp(stretch * 2.2, 0.0, 1.0);
+    // Even sizes: fewer different key bitmaps on the way.
+    const int x0 = int(std::lround(left / 2)) * 2, x1 = int(std::lround(rightEdge / 2)) * 2, y0 = int(std::lround(top)), y1 = int(std::lround(bottom));
+    return {x0, y0, std::max(x0 + 4, x1), std::max(y0 + 4, y1)};
+}
 // A dotted hairline: between the rows of a list, and after a section's label.
 void dottedRule(HDC dc, int left, int right, int y, COLORREF color) {
     const int unit = std::max(1, px(1)), pitch = unit * 4;
@@ -1101,9 +1127,9 @@ double blockAppear(size_t index, double now) {
 double blockMove(size_t index, double now) {
     if (visualEnterAt < 0) return 1;
     if (!keyLook()) return blockAppear(index, now);
-    const double t = (now - visualEnterAt - 16.0 * double(std::min<size_t>(index, 12))) / 170.0;
+    const double t = (now - visualEnterAt - 16.0 * double(std::min<size_t>(index, 12))) / 400.0;
     if (t < 1) visualAnimating = true;
-    return quickEase(t);
+    return springEase(t); // a block lands: a little past its place, then back
 }
 // A value that glides to `target` when it changes (bars and meters on a live page).
 double glide(const std::wstring& key, double target, double now) {
@@ -1150,7 +1176,7 @@ void addVisualDirty(const RECT& r) {
 void invalidateBlock(size_t block) {
     if (!visualView || block >= visualSpans.size()) { if (visualView) InvalidateRect(visualView, nullptr, FALSE); return; }
     RECT r{}; GetClientRect(visualView, &r);
-    const RECT span{0, visualSpans[block].first - sp(16), r.right, visualSpans[block].first + visualSpans[block].second + sp(16)};
+    const RECT span{0, visualSpans[block].first - sp(38), r.right, visualSpans[block].first + visualSpans[block].second + sp(38)};
     InvalidateRect(visualView, &span, FALSE);
 }
 void setFade(std::map<size_t, Transition>& map, size_t key, double target, double ms) {
@@ -1216,17 +1242,19 @@ bool heroMoving = false;  // the battery tab's digits are counting or scanning i
 // lit from inside. Pressed it stretches toward where it will go; moving, it lifts; landing,
 // its light blooms and runs a quarter turn along its edge.
 void drawSwitch(HDC dc, RECT r, double on, double stretch = 0, const Arrival& motion = {}) {
+    const double place = std::clamp(on, -.08, 1.08); // the spring carries the key a little past its end
     on = std::clamp(on, 0.0, 1.0);
     const int h = r.bottom - r.top, pad = std::max(2, h / 10);
     ui::well(dc, r, float(h) * .34f, theme);
     const int kh = h - pad * 2, kw = int(std::lround(kh * (1.1 + .25 * std::clamp(stretch, 0.0, 1.0))));
     const int travel = (r.right - r.left) - pad * 2 - kw;
-    const int x = r.left + pad + int(std::lround(travel * on)), y = r.top + pad - int(std::lround(motion.lift * sp(1)));
+    const int x = r.left + pad + int(std::lround(travel * place)), y = r.top + pad - int(std::lround(motion.lift * sp(1)));
     const RECT knob{x, y, x + kw, y + kh};
     const float radius = float(kh) * .3f;
     const ui::LightBounds inGroove(dc, r, true);
     ui::keycap(dc, knob, radius, theme, (on > .5 ? std::max(on, motion.glow) : on) * paintFade);
-    if (motion.glow > 0 && keyLook()) ui::drawRimLight(dc, knob, radius, theme.rim, motion.angle, motion.glow * .8 * paintFade);
+    // On, the key keeps a thin neon line on the edge it rests against; landing, the line runs round to it.
+    if (keyLook() && (motion.glow > 0 || on > .5)) ui::drawRimLight(dc, knob, radius, theme.rim, motion.glow > 0 ? motion.angle : 0.0, (motion.glow > 0 ? std::max(.6 * on, motion.glow * .9) : .6 * on) * paintFade);
 }
 // A check mark from five small cells (dot-matrix, as every glyph of the style).
 void drawCheckGlyph(HDC dc, RECT r, COLORREF color) {
@@ -1384,7 +1412,7 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
     // Light and shadows stay inside the view at its sides (above and below, the page scrolls away).
     const RECT lightArea{-inset, -30000, int(client.right) - inset, 30000};
     visualAnimating = false;
-    if (visualEnterAt >= 0 && now - visualEnterAt > 32.0 * 12 + 300) visualEnterAt = -1;
+    if (visualEnterAt >= 0 && now - visualEnterAt > 16.0 * 12 + 600) visualEnterAt = -1;
     // Springing back from an end: out fast, back slowly.
     const int bounce = visualBounce.active(now) ? int(std::lround(visualBounce.from * std::sin(3.14159265 * std::pow(visualBounce.progress(now), .45)))) : 0;
     int y = -visualScroll + bounce;
@@ -1414,7 +1442,7 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
         const int slide = visualEnterDir * int(std::lround((1 - move) * sp(26)));
         // Off screen, or outside the part being repainted: only its hit areas. Motion off screen
         // needs no frames (it runs on the clock); a block left out keeps what it was doing.
-        const int reach = sp(18); // light and shadows reach a little past a block
+        const int reach = sp(40); // light and shadows reach past a block
         const bool offScreen = y + h + reach < 0 || y - reach > client.bottom;
         if (offScreen || (update && (y + h + reach < update->top || y - reach > update->bottom))) {
             if (offScreen) visualMoving[i] = 0; else if (visualAnimating) visualMoving[i] = 1;
@@ -1595,16 +1623,29 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
             if (i > 0 && visualBlocks[i - 1].kind == VBlock::Kind::action) dottedRule(dc, sp(4), width - sp(4), top, blend(Surface, Muted, .3));
             if (isSwitch) {
                 if (hot > 0) rounded(dc, {key.left, key.top, key.right, key.bottom}, blend(Surface, theme.highContrast ? Selected : blend(Surface, Ink, .05), hot), 12);
-            } else if (hot > 0 || press > 0) { keycap(dc, key, 12, 0, press, 1, std::max(hot, press)); keyLight(key, 12, hot); }
+            } else if (hot > 0 || press > 0) {
+                // The key swells up under the pointer like a bubble, from a little smaller.
+                const double grown = std::max(hot, press);
+                const int shrink = int(std::lround((1 - grown) * sp(5))) / 2 * 2;
+                const RECT bubble{key.left + shrink * 2, key.top + shrink, key.right - shrink * 2, key.bottom - shrink};
+                keycap(dc, bubble, 12, 0, press, 1, grown); keyLight(bubble, 12, hot);
+            }
             if (index == visualFocus && focused) outline(dc, key, Green, 12, 2.0f);
             const COLORREF ink = hot > .5 && theme.highContrast ? theme.selectedInk : Ink;
             int right = row.right - sp(4);
             if (isSwitch) {
                 // The switch, its key gliding to the new state.
                 auto [it, fresh] = visualKnobs.try_emplace(int(b.amount));
-                if (fresh) { it->second.from = it->second.to = b.toggle; it->second.duration = 0; }
+                if (fresh) {
+                    it->second.from = it->second.to = b.toggle; it->second.duration = 0;
+                    // As a page opens, the switches that are on flick on one after another.
+                    if (b.toggle && visualEnterAt >= 0 && canAnimate() && keyLook()) {
+                        it->second.from = 0; it->second.to = 1; it->second.tangent = 0; it->second.spring = true;
+                        it->second.started = visualEnterAt + 16.0 * double(std::min<size_t>(i, 12)) + 150; it->second.duration = 420;
+                    }
+                }
                 else if (std::abs(it->second.to - b.toggle) > .01) {
-                    it->second.move(b.toggle, now, canAnimate() ? TravelMs : 0); it->second.quick = true;
+                    it->second.move(b.toggle, now, canAnimate() ? 420 : 0); it->second.spring = true;
                     if (canAnimate()) visualChangedAt[int(b.amount)] = {now, b.toggle ? 1 : -1};
                     if (visualLive) { // sparks from where the key lands, some past the panel's edge
                         POINT at{b.toggle ? right - sp(14) : right - sp(36), (row.top + row.bottom) / 2};
@@ -1677,7 +1718,7 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
                 if (fresh) { it->second.from = it->second.to = b.toggle; it->second.duration = 0; }
                 else if (std::abs(it->second.to - b.toggle) > .01) {
                     const int way = b.toggle > it->second.to ? 1 : -1;
-                    it->second.move(b.toggle, now, canAnimate() ? TravelMs + 20 : 0); it->second.quick = true;
+                    it->second.move(b.toggle, now, canAnimate() ? 460 : 0); it->second.spring = true;
                     if (canAnimate()) visualChangedAt[100000 + int(i)] = {now, way};
                     if (visualLive && b.toggle < n) {
                         const RECT key = segmentKey(tray, n, b.toggle);
@@ -1703,11 +1744,20 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
                 if (hot * (1 - lit) > 0) { keycap(dc, key, 10, 0, 0, 1, hot * (1 - lit)); keyLight(key, 10, hot); }
             }
             if (b.toggle >= 0) {
-                const int from = std::clamp(int(std::floor(at)), 0, n - 1), to = std::min(n - 1, from + 1);
-                const RECT thumb = glideBetween(segmentKey(tray, n, from), segmentKey(tray, n, to), std::clamp(at - from, 0.0, 1.0));
-                keycap(dc, thumb, 10, paintFade, 1, 0, paintFade);
+                // It moves like a drop of liquid from where it was to the new choice.
+                RECT thumb = segmentKey(tray, n, std::clamp(b.toggle, 0, n - 1));
+                double round = 0;
+                if (const auto knob = visualKnobs.find(100000 + int(i)); knob != visualKnobs.end() && knob->second.active(now)) {
+                    const double origin = std::clamp(knob->second.from, 0.0, double(n - 1));
+                    const int lower = std::clamp(int(std::floor(origin)), 0, std::max(0, n - 2));
+                    const RECT start = glideBetween(segmentKey(tray, n, lower), segmentKey(tray, n, std::min(n - 1, lower + 1)), origin - lower);
+                    thumb = liquidBetween(start, thumb, knob->second.progress(now), &round);
+                }
+                const float thumbRadius = float(sp(10)) + float(round) * std::max(0.0f, float(thumb.bottom - thumb.top) / 2 - float(sp(10)));
+                ui::keycap(dc, thumb, thumbRadius, theme, paintFade, 1, 0, paintFade);
                 keyLight(thumb, 10, 1);
-                if (motion.glow > 0) ui::drawRimLight(dc, thumb, float(sp(10)), theme.rim, motion.angle, motion.glow * .8 * paintFade);
+                // A thin neon line rests along the lit key's top edge; arriving, it runs round from the side the key came from.
+                if (keyLook()) ui::drawRimLight(dc, thumb, thumbRadius, theme.rim, motion.glow > 0 && round <= 0 ? motion.angle : -1.5707963, (motion.glow > 0 && round <= 0 ? std::max(.6, motion.glow * .9) : .6) * paintFade);
             }
             for (int k = 0; k < n; ++k) {
                 const RECT key = segmentKey(tray, n, k);
@@ -1854,7 +1904,7 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
     for (size_t i = 0; i < visualBlocks.size(); ++i) {
         if (!visualMoving[i]) continue;
         const auto [top, h] = visualSpans[i];
-        addVisualDirty({0, top - sp(18), client.right, visualBlocks[i].kind == VBlock::Kind::fold ? client.bottom : top + h + sp(18)});
+        addVisualDirty({0, top - sp(38), client.right, visualBlocks[i].kind == VBlock::Kind::fold ? client.bottom : top + h + sp(38)});
     }
     visualContent = y + visualScroll - bounce;
     SetViewportOrgEx(dc, clientOrigin.x, clientOrigin.y, nullptr);
@@ -2143,8 +2193,8 @@ enum class Tab { ranking, saving, battery, hardware, lab, settings, performance 
 // moves the page down to make room for it.
 // The sections are a row of keys along the bottom of the panel, like the bottom row of a
 // keyboard: each with its dot-matrix icon and name; the one you are on is lit from inside.
-int tabBarHeight() { return sp(68); }
-RECT tabStrip(RECT client) { return {sp(14), client.bottom - tabBarHeight() + sp(10), client.right - sp(14), client.bottom - sp(10)}; }
+int tabBarHeight() { return sp(78); } // room above the keys for the open tab's light
+RECT tabStrip(RECT client) { return {sp(14), client.bottom - tabBarHeight() + sp(20), client.right - sp(14), client.bottom - sp(10)}; }
 RECT tabArea(RECT client) { // what to repaint when the tabs change (their light reaches past them)
     return {0, client.bottom - tabBarHeight() - sp(14), client.right, client.bottom};
 }
@@ -2230,8 +2280,8 @@ void drawTabs(HDC dc, RECT client) {
     if (!tabSlideKnown) { tabSlide.from = tabSlide.to = double(activeIndex); tabSlide.duration = 0; tabSlideKnown = true; }
     else if (std::abs(tabSlide.to - double(activeIndex)) > .01) {
         tabDirection = double(activeIndex) > tabSlide.to ? 1 : -1;
-        tabSlide.move(double(activeIndex), now, canAnimate() && !hidden ? TravelMs + 40 : 0);
-        tabSlide.quick = true;
+        tabSlide.move(double(activeIndex), now, canAnimate() && !hidden ? 480 : 0);
+        tabSlide.spring = true;
         tabChangedAt = canAnimate() && !hidden ? now : -1;
         if (tabSlide.duration) {
             armMotionTimer();
@@ -2241,7 +2291,7 @@ void drawTabs(HDC dc, RECT client) {
             fxTab(at);
         }
     }
-    const double at = std::clamp(tabSlide.value(now), 0.0, double(tabs.size() - 1));
+    const double at = std::clamp(tabSlide.value(now), -.07, double(tabs.size() - 1) + .07); // the spring carries it a little past
     const Arrival motion = tabChangedAt >= 0 ? arrival(now - tabChangedAt, tabDirection) : Arrival{};
     if (motion.active) armMotionTimer();
     const int unit = std::max(2, sp(2));
@@ -2262,10 +2312,18 @@ void drawTabs(HDC dc, RECT client) {
         if (hot * (1 - lit) > 0) keycap(dc, r, 12, 0, 0, 1, hot * (1 - lit));
     }
     {
-        const size_t from = size_t(std::floor(at)), to = std::min(tabs.size() - 1, from + 1);
-        const RECT thumb = glideBetween(tabRect(from, tabs.size(), client), tabRect(to, tabs.size(), client), std::clamp(at - double(from), 0.0, 1.0));
-        keycap(dc, thumb, 12, 1, 1, 0);
-        if (motion.glow > 0) ui::drawRimLight(dc, thumb, float(sp(12)), theme.rim, motion.angle, motion.glow * .8);
+        // It moves like a drop of liquid from the tab it was on to the one that is opened.
+        RECT thumb = tabRect(activeIndex, tabs.size(), client);
+        double round = 0;
+        if (tabSlide.active(now)) {
+            const double origin = std::clamp(tabSlide.from, 0.0, double(tabs.size() - 1));
+            const size_t lower = size_t(std::clamp(int(std::floor(origin)), 0, std::max(0, int(tabs.size()) - 2)));
+            const RECT start = glideBetween(tabRect(lower, tabs.size(), client), tabRect(std::min(tabs.size() - 1, lower + 1), tabs.size(), client), origin - double(lower));
+            thumb = liquidBetween(start, thumb, tabSlide.progress(now), &round);
+        }
+        const float thumbRadius = float(sp(12)) + float(round) * std::max(0.0f, float(thumb.bottom - thumb.top) / 2 - float(sp(12)));
+        ui::keycap(dc, thumb, thumbRadius, theme, 1, 1, 0);
+        if (keyLook()) ui::drawRimLight(dc, thumb, thumbRadius, theme.rim, motion.glow > 0 && round <= 0 ? motion.angle : -1.5707963, motion.glow > 0 && round <= 0 ? std::max(.6, motion.glow * .9) : .6);
     }
     for (size_t i = 0; i < tabs.size(); ++i) {
         RECT r = tabRect(i, tabs.size(), client);
@@ -2281,7 +2339,17 @@ void drawTabs(HDC dc, RECT client) {
         int rows = 0; const char* const* icon = tabIcon(tabs[i], rows);
         const int columns = int(strlen(icon[0])), iconWidth = columns * unit, iconHeight = rows * unit;
         const int mid = (r.top + r.bottom) / 2;
-        ui::pixelIcon(dc, icon, rows, (r.left + r.right - iconWidth) / 2, mid - sp(4) - iconHeight + (7 - rows) * unit / 2, unit, ink, 0);
+        const int iconX = (r.left + r.right - iconWidth) / 2, iconY = mid - sp(4) - iconHeight + (7 - rows) * unit / 2;
+        const double gather = i == activeIndex && tabChangedAt >= 0 && keyLook() ? settleEase((now - tabChangedAt - 120) / 420.0) : 1.0;
+        if (gather >= 1) ui::pixelIcon(dc, icon, rows, iconX, iconY, unit, ink, 0);
+        else for (int row = 0; row < rows; ++row) for (int column = 0; icon[row][column]; ++column) {
+            // The opened tab's icon gathers from scattered dots, as the sun and moon do in the clip.
+            if (icon[row][column] != '#') continue;
+            unsigned h = unsigned(row * 31 + column * 17 + int(i) * 101) * 2654435761u; h ^= h >> 15; h *= 2246822519u; h ^= h >> 13;
+            const double angle = (h & 1023) / 1023.0 * 6.2831853, away = (.4 + ((h >> 10) & 255) / 255.0 * .6) * sp(13) * (1 - gather);
+            const int x = iconX + column * unit + int(std::lround(std::cos(angle) * away)), y = iconY + row * unit + int(std::lround(std::sin(angle) * away));
+            fill(dc, {x, y, x + unit, y + unit}, blend(theme.keyTop, ink, .35 + .65 * gather));
+        }
         drawText(dc, tabLabel(tabs[i]), {r.left, mid, r.right, r.bottom - sp(4)}, ink, lit > .5 ? strongFont : normalFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     }
 }
@@ -3005,7 +3073,7 @@ void stepMotion(double now) {
     }
     if (tabChangedAt >= 0) {
         // The tab thumb's light settles after the thumb has landed.
-        if (now - tabChangedAt < TravelMs + SettleMs && !hidden) {
+        if (now - tabChangedAt < 620 && !hidden) {
             RECT client{}; GetClientRect(mainWindow, &client);
             RECT tabBar = tabArea(client);
             InvalidateRect(mainWindow, &tabBar, FALSE);
@@ -10753,7 +10821,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
                 motionClock = t1;
                 visualHover = -1; visualMouse = {-1, -1}; visualRippleStart = -1; visualHoverFade.clear();
                 visualEnterAt = t1; visualEnterDir = 1; titleDecodeAt = t1;
-                tabSlide.from = tabSlide.to > 1 ? 0 : 4; tabSlide.started = t1; tabSlide.duration = TravelMs + 40; tabSlide.quick = true; tabSlide.tangent = 0;
+                tabSlide.from = tabSlide.to > 1 ? 0 : 4; tabSlide.started = t1; tabSlide.duration = 480; tabSlide.spring = true; tabSlide.tangent = 0;
                 tabChangedAt = t1; tabDirection = 1;
                 for (int k = 1; k <= 16; ++k) {
                     motionClock = t1 + (k - 1) * 25.0;
