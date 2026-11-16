@@ -1127,9 +1127,8 @@ double blockAppear(size_t index, double now) {
 double blockMove(size_t index, double now) {
     if (visualEnterAt < 0) return 1;
     if (!keyLook()) return blockAppear(index, now);
-    const double t = (now - visualEnterAt - 16.0 * double(std::min<size_t>(index, 12))) / 400.0;
-    if (t < 1) visualAnimating = true;
-    return springEase(t); // a block lands: a little past its place, then back
+    (void)index; (void)now;
+    return 1; // blocks keep their places: the whole page slides in as one picture
 }
 // A value that glides to `target` when it changes (bars and meters on a live page).
 double glide(const std::wstring& key, double target, double now) {
@@ -1166,6 +1165,9 @@ std::vector<char> visualMoving;               // blocks still in motion when las
 // happens in block coordinates (x = 0 at the inset); hit areas, the pointer and repaint
 // rectangles are in the view's client coordinates.
 int visualInset() { return sp(14); }
+// A page arriving: painted once, then that picture slides and fades in, one blend a frame.
+double visualSlideAt = -1; bool visualSlideReady = false;
+constexpr double VisualSlideMs = 300;
 Transition visualBounce; // the page giving at an end of its scroll: from = how far (px, signed)
 int visualWidth(const RECT& client) { return int(client.right) - sp(30); }
 RECT visualDirty{};
@@ -1275,7 +1277,7 @@ int drawMatrix(HDC dc, const std::wstring& key, const std::wstring& text, int x,
     const double now = motionNow();
     auto [it, fresh] = matrixStates.try_emplace(key);
     auto& state = it->second;
-    if (fresh) { state.shown = text; state.firstAt = canAnimate() ? now : -1; }
+    if (fresh) { state.shown = text; state.firstAt = canAnimate() ? (key.rfind(L"v|", 0) == 0 ? std::max(now, visualEnterAt) : now) : -1; } // a page's digits wait until the page has arrived
     else if (state.shown != text) {
         state.previous = state.shown; state.shown = text;
         std::string was[7];
@@ -1289,7 +1291,7 @@ int drawMatrix(HDC dc, const std::wstring& key, const std::wstring& text, int x,
         size_t digits = 0; int decimals = -1;
         while (digits < text.size() && (iswdigit(text[digits]) || (text[digits] == L'.' && decimals < 0))) { if (text[digits] == L'.') decimals = 0; else if (decimals >= 0) ++decimals; ++digits; }
         if (digits) {
-            const double t = (now - state.firstAt) / 620, eased = 1 - (1 - t) * (1 - t) * (1 - t);
+            const double t = std::max(0.0, (now - state.firstAt) / 620), eased = 1 - (1 - t) * (1 - t) * (1 - t);
             const std::wstring counted = number(_wtof(text.substr(0, digits).c_str()) * eased, std::max(0, decimals)) + text.substr(digits);
             if (ui::drawPixelDigits(dc, counted, place(counted), y, unit, color, gap, ghost)) return 1;
         }
@@ -1448,7 +1450,7 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
             if (offScreen) visualMoving[i] = 0; else if (visualAnimating) visualMoving[i] = 1;
             y += h; continue;
         }
-        paintFade = appear;
+        paintFade = keyLook() ? 1.0 : appear; // the page arrives as one picture (see the view's WM_PAINT); its blocks do not fade one by one
         Ink = faded(inkBase); Muted = faded(mutedBase); Green = faded(greenBase); Border = faded(borderBase); Selected = faded(selectedBase); theme.warn = faded(warnBase);
         if (slide) SetViewportOrgEx(dc, origin.x + slide, origin.y, nullptr);
         const ui::LightBounds lightBounds(dc, lightArea); // moves with a sliding page: the same key bitmaps serve every frame
@@ -1489,7 +1491,7 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
             break;
         }
         case VBlock::Kind::heading:
-            drawEngraved(dc, b.title, {sp(4), top + h - sp(22), width, top + h - sp(4)}, Muted, settleEase(move));
+            drawEngraved(dc, b.title, {sp(4), top + h - sp(22), width, top + h - sp(4)}, Muted, appear);
             break;
         case VBlock::Kind::note:
             drawText(dc, b.text, {sp(4), top, width - sp(4), top + h}, Muted, smallFont, DT_LEFT | DT_WORDBREAK);
@@ -1624,11 +1626,7 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
             if (isSwitch) {
                 if (hot > 0) rounded(dc, {key.left, key.top, key.right, key.bottom}, blend(Surface, theme.highContrast ? Selected : blend(Surface, Ink, .05), hot), 12);
             } else if (hot > 0 || press > 0) {
-                // The key swells up under the pointer like a bubble, from a little smaller.
-                const double grown = std::max(hot, press);
-                const int shrink = int(std::lround((1 - grown) * sp(5))) / 2 * 2;
-                const RECT bubble{key.left + shrink * 2, key.top + shrink, key.right - shrink * 2, key.bottom - shrink};
-                keycap(dc, bubble, 12, 0, press, 1, grown); keyLight(bubble, 12, hot);
+                keycap(dc, key, 12, 0, press, 1, std::max(hot, press)); keyLight(key, 12, hot);
             }
             if (index == visualFocus && focused) outline(dc, key, Green, 12, 2.0f);
             const COLORREF ink = hot > .5 && theme.highContrast ? theme.selectedInk : Ink;
@@ -1708,8 +1706,10 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
             // Keys in a tray; the light moves to the chosen one, quickly, then blooms and settles.
             const int n = int(b.commands.size());
             const RECT tray{0, top + sp(4), width, top + h - sp(4)};
-            card(dc, tray, Surface, 14);
-            const ui::LightBounds inTray(dc, tray, true); // the keys' shadows fall inside the tray
+            // The choices sit in an outlined slot (not a filled tray: its edge showed through the
+            // lit key's light as a step).
+            outline(dc, tray, blend(Surface, Muted, .28), 14);
+            const ui::LightBounds inTray(dc, tray, true); // the keys' shadows fall inside the slot
             if (!n) break;
             double at = b.toggle;
             Arrival motion;
@@ -1753,8 +1753,10 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
                     const RECT start = glideBetween(segmentKey(tray, n, lower), segmentKey(tray, n, std::min(n - 1, lower + 1)), origin - lower);
                     thumb = liquidBetween(start, thumb, knob->second.progress(now), &round);
                 }
-                const float thumbRadius = float(sp(10)) + float(round) * std::max(0.0f, float(thumb.bottom - thumb.top) / 2 - float(sp(10)));
-                ui::keycap(dc, thumb, thumbRadius, theme, paintFade, 1, 0, paintFade);
+                const float thumbRadius = float(sp(10));
+                const RECT rest = segmentKey(tray, n, std::clamp(b.toggle, 0, n - 1));
+                if (EqualRect(&thumb, &rest)) ui::keycap(dc, thumb, thumbRadius, theme, paintFade, 1, 0, paintFade);
+                else ui::keycapStretched(dc, thumb, int(rest.right - rest.left), int(rest.bottom - rest.top), thumbRadius, theme, paintFade);
                 keyLight(thumb, 10, 1);
                 // A thin neon line rests along the lit key's top edge; arriving, it runs round from the side the key came from.
                 if (keyLook()) ui::drawRimLight(dc, thumb, thumbRadius, theme.rim, motion.glow > 0 && round <= 0 ? motion.angle : -1.5707963, (motion.glow > 0 && round <= 0 ? std::max(.6, motion.glow * .9) : .6) * paintFade);
@@ -1978,6 +1980,10 @@ void stepVisual() {
         scrollVisual(int(std::lround(visualScrollMotion.value(now))));
         if (visualScrollMotion.active(now)) scrolling = true; else visualScrollMotion.duration = 0;
     }
+    if (visualSlideAt >= 0) { // a page arriving as one picture
+        if (motionNow() - visualSlideAt < VisualSlideMs) scrolling = true; else visualSlideAt = -1;
+        InvalidateRect(window, nullptr, FALSE);
+    }
     if (visualBounce.duration) { // springing back from an end
         if (visualBounce.active(motionNow())) scrolling = true; else visualBounce.duration = 0;
         InvalidateRect(window, nullptr, FALSE);
@@ -2015,10 +2021,32 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (whole || IsRectEmpty(&part)) part = r;
         IntersectRect(&part, &part, &r);
         const bool full = part.left <= 0 && part.top <= 0 && part.right >= r.right && part.bottom >= r.bottom;
+        const double sliding = visualSlideAt >= 0 ? (motionNow() - visualSlideAt) / VisualSlideMs : 1;
+        if (sliding < 1) {
+            // Arriving: the page is painted once; each frame lays that picture over the bare
+            // panel, moved by what is left of its way and faded by how far it has come.
+            static HDC stage = nullptr; static HBITMAP stageBitmap = nullptr; static HGDIOBJ stageOld = nullptr; static SIZE stageSize{};
+            if (!stage || stageSize.cx != want.cx || stageSize.cy != want.cy) {
+                if (stage) { SelectObject(stage, stageOld); DeleteObject(stageBitmap); DeleteDC(stage); }
+                void* unused = nullptr;
+                stage = CreateCompatibleDC(target); stageBitmap = makeBuffer(target, want, &unused); stageOld = SelectObject(stage, stageBitmap); stageSize = want;
+            }
+            if (!visualSlideReady || whole) { visualLive = true; paintVisual(buffer, r, nullptr); visualLive = false; visualSlideReady = true; }
+            const double place = springEase(sliding), shown = settleEase(sliding * 1.6);
+            const int dx = visualEnterDir * int(std::lround((1 - place) * sp(34))), dy = visualEnterDir ? 0 : int(std::lround((1 - place) * sp(16)));
+            fill(stage, r, Surface);
+            BLENDFUNCTION blend{AC_SRC_OVER, 0, BYTE(std::clamp(shown, 0.0, 1.0) * 255), 0};
+            GdiAlphaBlend(stage, dx, dy, r.right, r.bottom, buffer, 0, 0, r.right, r.bottom, blend);
+            BitBlt(target, 0, 0, r.right, r.bottom, stage, 0, 0, SRCCOPY);
+            EndPaint(window, &ps);
+            return 0;
+        }
         visualLive = true;
-        paintVisual(buffer, r, full ? nullptr : &part);
+        paintVisual(buffer, r, full || !visualSlideReady ? nullptr : &part);
         visualLive = false;
-        BitBlt(target, part.left, part.top, part.right - part.left, part.bottom - part.top, buffer, part.left, part.top, SRCCOPY);
+        visualSlideReady = true;
+        if (full || IsRectEmpty(&ps.rcPaint)) BitBlt(target, 0, 0, r.right, r.bottom, buffer, 0, 0, SRCCOPY);
+        else BitBlt(target, part.left, part.top, part.right - part.left, part.bottom - part.top, buffer, part.left, part.top, SRCCOPY);
         EndPaint(window, &ps);
         return 0;
     }
@@ -2166,8 +2194,11 @@ void showVisual(std::vector<VBlock> blocks, bool keepScroll) {
         for (auto it = matrixStates.begin(); it != matrixStates.end();) it = it->first.rfind(L"v|", 0) == 0 ? matrixStates.erase(it) : std::next(it); // the page's digits count up again
         visualRippleStart = -1;
         visualMouse = {-1, -1};
-        visualEnterAt = canAnimate() ? motionNow() : -1;
-        if (visualEnterAt >= 0) armVisualTimer();
+        // The page slides in as one picture (260 ms), then its parts come alive: digits count,
+        // meters fill, section rules run out, switches flick on.
+        visualSlideAt = canAnimate() && keyLook() ? motionNow() : -1; visualSlideReady = false;
+        visualEnterAt = canAnimate() ? motionNow() + (visualSlideAt >= 0 ? 200 : 0) : -1;
+        if (visualEnterAt >= 0 || visualSlideAt >= 0) armVisualTimer();
         visualScrollSeenAt = motionNow(); // a taller page shows its indicator for a moment, as macOS does
         visualMoving.clear();
     }
@@ -2297,11 +2328,9 @@ void drawTabs(HDC dc, RECT client) {
     const int unit = std::max(2, sp(2));
     // The page above is another window: the tabs' light has to be gone by the top of their bar.
     const ui::LightBounds lightBounds(dc, {0, client.bottom - tabBarHeight(), client.right, client.bottom});
-    {
-        // The tabs lie in one tray; the open one is the lit key in it.
-        RECT tray = tabStrip(client); InflateRect(&tray, sp(5), sp(5));
-        card(dc, tray, Surface, 16);
-    }
+    // The tabs lie on the panel itself (no tray under them: its edge showed through the lit
+    // key's light as a step), a dotted line above them.
+    dottedRule(dc, sp(18), client.right - sp(18), client.bottom - tabBarHeight() + sp(6), blend(Background, Muted, .3));
     const ui::LightBounds inTray(dc, [&] { RECT tray = tabStrip(client); InflateRect(&tray, sp(5), sp(5)); return tray; }(), true);
     // Only the open tab's key stands up, lit, and it glides to the tab that is opened; another
     // key rises under the pointer.
@@ -2321,8 +2350,10 @@ void drawTabs(HDC dc, RECT client) {
             const RECT start = glideBetween(tabRect(lower, tabs.size(), client), tabRect(std::min(tabs.size() - 1, lower + 1), tabs.size(), client), origin - double(lower));
             thumb = liquidBetween(start, thumb, tabSlide.progress(now), &round);
         }
-        const float thumbRadius = float(sp(12)) + float(round) * std::max(0.0f, float(thumb.bottom - thumb.top) / 2 - float(sp(12)));
-        ui::keycap(dc, thumb, thumbRadius, theme, 1, 1, 0);
+        const float thumbRadius = float(sp(12));
+        const RECT rest = tabRect(activeIndex, tabs.size(), client);
+        if (EqualRect(&thumb, &rest)) ui::keycap(dc, thumb, thumbRadius, theme, 1, 1, 0);
+        else ui::keycapStretched(dc, thumb, int(rest.right - rest.left), int(rest.bottom - rest.top), thumbRadius, theme, 1);
         if (keyLook()) ui::drawRimLight(dc, thumb, thumbRadius, theme.rim, motion.glow > 0 && round <= 0 ? motion.angle : -1.5707963, motion.glow > 0 && round <= 0 ? std::max(.6, motion.glow * .9) : .6);
     }
     for (size_t i = 0; i < tabs.size(); ++i) {
