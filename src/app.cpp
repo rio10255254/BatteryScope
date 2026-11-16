@@ -1700,9 +1700,9 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
             drawText(dc, b.text, {sp(16), box.bottom - sp(27), textRight, box.bottom - sp(7)}, Muted, smallFont);
             if (battery) {
                 const COLORREF light = lightOf(b.items.empty() ? COLORREF(0) : b.items[0].second);
-                const int small = std::max(2, sp(3));
+                const int dotUnit = std::max(2, sp(3));
                 if (!b.items.empty()) {
-                    const int percent = drawMatrix(dc, L"v|" + std::to_wstring(i) + L"|p", b.items[0].first, width - sp(16), box.top + sp(14), small, Ink, std::max(1, small / 3), true);
+                    const int percent = drawMatrix(dc, L"v|" + std::to_wstring(i) + L"|p", b.items[0].first, width - sp(16), box.top + sp(14), dotUnit, Ink, std::max(1, dotUnit / 3), true);
                     if (percent < 0) drawText(dc, b.items[0].first, {width - sp(110), box.top + sp(8), width - sp(16), box.top + sp(40)}, Ink, titleFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
                     if (percent > 0) visualAnimating = true;
                 }
