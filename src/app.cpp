@@ -202,7 +202,7 @@ std::atomic<bool> controlCheckBusy{false}; // the control check owns the setting
 std::atomic<int> controlCheckAt{-1};       // the control it is on (verify::Control), for the page
 // Mode companions (see applyModeCompanions): by the firmware's mode number, 0 balanced, 1 turbo, 2 silent.
 bool modeLink = true, modeLinkWindows = true;
-DWORD modeBoost[3] = {0, 2, 0};   // the plan's CPU Boost while plugged in: 0 off, 1 on, 2 aggressive, ...
+DWORD modeBoost[3] = {3, 2, 0};   // the plan's CPU Boost while plugged in: 0 off, 1 on, 2 aggressive, ...
 int modeWindows[3] = {1, 2, 0};   // Windows power mode: 0 best efficiency, 1 balanced, 2 best performance
 int modeLinkDone = -1;            // the mode they were last set for while plugged in
 // Away from the PC on battery: Windows dims the display, then turns it off (see applyDisplayTimers).
@@ -6481,6 +6481,13 @@ void loadModeLink() {
         modeBoost[i] = std::min<DWORD>(6, readSetting((L"ModeBoost" + std::to_wstring(i)).c_str(), modeBoost[i]));
         modeWindows[i] = int(std::min<DWORD>(2, readSetting((L"ModeWindows" + std::to_wstring(i)).c_str(), DWORD(modeWindows[i]))));
     }
+    // 0.35: balanced with Boost off held the CPU at its base clock (about 18-20 W on the G14
+    // under full load). Balanced moves once to "efficient enabled": no boost in light use, boost
+    // when a load lasts. A choice made in the menu afterwards is kept.
+    if (readSetting(L"ModeBoostBalancedV2", 0) == 0) {
+        if (modeBoost[0] == 0) { modeBoost[0] = 3; if (!demo && !isolatedPreview) writeSetting(L"ModeBoost0", modeBoost[0]); }
+        if (!demo && !isolatedPreview) writeSetting(L"ModeBoostBalancedV2", 1);
+    }
 }
 // Sets the CPU Boost and Windows power mode that go with the firmware mode, once per mode while
 // plugged in; `now` after the user picked a mode (also under protection mode, which only stops
@@ -6518,7 +6525,7 @@ std::vector<MenuItem> modeLinkMenuItems() {
     const std::pair<int, const wchar_t*> modes[] = {{2, L"靜音"}, {0, L"平衡"}, {1, nullptr}};
     for (const auto& [m, name] : modes) {
         std::vector<MenuItem> choices;
-        for (DWORD value : {0u, 1u, 2u}) choices.push_back(menuItem(ModeBoost0Id + m * 8 + int(value), boostName(value), modeBoost[m] == value, preview || !modeLink));
+        for (DWORD value : {0u, 3u, 1u, 2u}) choices.push_back(menuItem(ModeBoost0Id + m * 8 + int(value), boostName(value), modeBoost[m] == value, preview || !modeLink));
         auto entry = submenu((name ? std::wstring(tr(name)) : std::wstring(L"Turbo")) + tr(L" 的 CPU Boost"), choices, !modeLink);
         entry.hint = boostName(modeBoost[m]);
         items.push_back(entry);

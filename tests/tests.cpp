@@ -1141,6 +1141,11 @@ int wmain(int argc, wchar_t** argv) {
                 gov::Governor g; gov::Options o; g.setOptions(o);
                 check(g.profileFor(Activity::burst, 0).values[size_t(Setting::powerMode)] == DWORD(1) && g.profileFor(Activity::burst, 1).values[size_t(Setting::powerMode)] == DWORD(0),
                     "a burst gets balanced, and efficiency when saving harder");
+                check(g.profileFor(Activity::heavy, 0).values[size_t(Setting::cpuBoost)] == DWORD(2) && g.profileFor(Activity::burst, 0).values[size_t(Setting::cpuBoost)] == DWORD(3),
+                    "heavy work and bursts switch Boost on themselves: a plan with Boost off must not hold them at the base clock");
+                check(g.profileFor(Activity::heavy, 1).values[size_t(Setting::cpuBoost)] == DWORD(2) && g.profileFor(Activity::heavy, 1).values[size_t(Setting::powerMode)] == DWORD(1)
+                    && g.profileFor(Activity::heavy, 2).values[size_t(Setting::cpuBoost)] == DWORD(0),
+                    "being behind the battery target does not throttle heavy work; a very low battery does");
                 gov::Input li; li.onBattery = true; li.actual = {DWORD(1), DWORD(60), DWORD(0), DWORD(120)}; li.detected = Activity::interactive; li.ms = 100;
                 li.batteryPercent = 50.0; g.update(li);
                 check(g.stretchLevel() == 0, "no extra saving with half a battery");
