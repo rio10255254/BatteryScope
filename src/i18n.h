@@ -439,6 +439,7 @@ inline const std::map<std::wstring_view, const wchar_t*> translations = {
     {L"CSV 檔案", L"CSV file"},
     {L"匯出 CSV", L"Export CSV"},
     {L"介面診斷", L"Interface diagnostic"},
+    {L"自動：用電池時只省電、不開 Boost；插電時是平衡。", L"Automatic: on battery it only saves, without Boost; plugged in it is balanced."},
     {L"介面診斷已存到桌面：BatteryScope-ui-diagnostic.txt", L"Interface diagnostic saved to the desktop: BatteryScope-ui-diagnostic.txt"},
     {L"介面診斷無法寫入桌面。", L"The interface diagnostic could not be written to the desktop."},
     {L"已匯出程序排行與電量紀錄（-power.csv）。", L"Exported the process ranking and battery history (-power.csv)."},
