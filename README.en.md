@@ -1,6 +1,6 @@
 # BatteryScope
 
-**A Windows laptop battery monitor that shows how much power each app is using.** One portable EXE, no installer, everything stays on your PC. Pixel-style interface (smooth style available), English and Traditional Chinese, dark and light themes.
+**A Windows laptop battery monitor that shows how much power each app is using.** One portable EXE, no installer, everything stays on your PC. A backlit-keycap interface (keys, wells, LEDs and dot-matrix type), English and Traditional Chinese, day and night themes.
 
 [繁體中文](README.md) | English
 
@@ -15,8 +15,8 @@
 
 From the **[Releases page](https://github.com/rio10255254/BatteryScope/releases/latest)**:
 
-- **Installer (recommended):** `BatteryScope-0.29.0-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
-- **Portable:** `BatteryScope-0.29.0-win64.zip`; extract it and run `BatteryScope.exe`.
+- **Installer (recommended):** `BatteryScope-0.30.0-setup.exe`. No administrator rights; installs to `%LOCALAPPDATA%\Programs\BatteryScope`, adds a Start menu shortcut, optionally a desktop shortcut and launch at sign-in, and uninstalls from Settings → Apps.
+- **Portable:** `BatteryScope-0.30.0-win64.zip`; extract it and run `BatteryScope.exe`.
 
 Requires Windows 10 version 1703 or later (Windows 11 recommended), 64-bit. The program is not code-signed; if SmartScreen appears the first time, choose **More info → Run anyway**. It lives in the notification area, where the icon shows the battery percentage; click it to show or hide the panel.
 
@@ -53,7 +53,7 @@ Details follow.
 
 ## Using it
 
-1. Download `BatteryScope-0.29.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
+1. Download `BatteryScope-0.30.0-win64.zip` from [Releases](https://github.com/rio10255254/BatteryScope/releases/latest), extract it, and run `BatteryScope.exe` on a Windows 10 (1703 or later) or Windows 11 x64 laptop or desktop.
 2. Click its battery icon in the notification area to show or hide the panel. Esc hides it; monitoring continues at a lower frequency.
 3. Open **⋯ → Language / 語言 → English** to switch immediately. The setting persists for your Windows account. Selection and scroll position are retained.
 4. Use Background and Show filters, the mouse wheel, arrow keys, Home/End, or Page Up/Down. Enter or double-click opens details.
@@ -63,7 +63,7 @@ The ⋯ menu keeps only the common items: power mode, dynamic power saving and i
 
 **Appearance and extras**
 
-- **Style:** **⋯ → Appearance** offers *Pixel style* (default) or *Smooth style*. Pixel style uses stair-stepped corners, pixel outlines, and buttons that sink into their shadow when pressed; the battery shows level cells, the 30-minute chart becomes pixel bars, process meters become segmented blocks, and large numbers use bitmap digits. Titles, labels, and buttons use an embedded pixel font. Process names, service names, and long detail text from Windows or apps keep the system font: any string with a character the pixel font lacks is drawn entirely in the system font, never as boxes.
+- **Style:** one backlit-keycap style (from 0.30, replacing the clean and pixel styles). Titles, labels and buttons use an embedded dot-matrix font; process names, service names and long detail text from Windows or apps fall back to the system font for any string with a character the font lacks, never boxes.
 - **Theme:** **⋯ → Appearance** offers *Use Windows setting* (default; follows the Windows app light/dark mode live), *Dark*, or *Light*. When a Windows contrast theme is on, the panel always uses system colors and outlines cards and buttons. Shapes, the chart, and the battery glyph are antialiased with GDI+; ranking rows show each app's icon, with a letter tile for protected processes whose path cannot be read.
 - **Tray tooltip:** shows battery level, discharge watts, and estimated time left; while charging, charging watts and estimated time to full.
 - **Tray percentage:** the notification icon shows the battery percentage in pixel digits (on by default; turn off with **⋯ → Show battery % as tray icon**). The badge color shows the state: green when plugged in or charging, amber at 20% or below, red at 10% or below, dark gray otherwise, readable on dark and light taskbars.
@@ -122,7 +122,7 @@ Turn it on from **⋯ → Dynamic power saving** or the settings page. On batter
 
 ## Interface (0.22)
 
-The panel's tabs (under the toolbar in the clean style, along the bottom in the pixel style):
+The panel's tabs, a row of keys along the bottom:
 - **Perf** (home)
 - **Saving**
 - **Battery** (the battery and the programs using it)
@@ -144,7 +144,7 @@ Each tab shows live charts on top and clickable control rows below. A row switch
 
 Fans and power limits are written again after every performance mode change, and "factory" restores them.
 
-The default look is a clean, macOS-like style laid out like a macOS window app: a toolbar on top (title, the power mode pop-up button, the ⋯ menu), the sections as a segmented control under it (as in Activity Monitor), and pages set straight on the window with each section in one rounded box (as in System Settings): charts, meters and switches inside, hairlines between them, notes as footnotes outside. On Windows 11 22H2 and later the window is frosted glass (the system's Acrylic backdrop): toolbar, tabs and background let the blurred desktop show through, while boxes and text stay opaque. With Windows transparency effects off or energy saver on it turns solid; Settings → Appearance → Frosted glass turns it off. Motion is tuned frame by frame from a reference clip (quick travel, a slight lift, a halo and edge light on landing). The pixel style (tabs at the bottom) is in Settings → Style.
+The panel looks like a small device that glows (designed from a reference clip): whatever you can press is a matte keycap (command rows, buttons, the tab keys, the three performance-mode keys), readings sit in wells sunk into the panel (dot-matrix numbers, LED meters, dot charts), and status shows as indicator LEDs; only what is active lights up from inside. By day the keys are ivory with an amber backlight, by night smoked with an ice-blue neon, following the theme. Chinese and English text use the embedded Cubic 11 dot-matrix font; numbers and icons are dot matrix. Motion is tuned frame by frame from the clip: quick, short travel (about 150 ms), then the light blooms, runs along the edge and settles. Shadows and halos are worked out once as small images and only copied, and a page at rest repaints nothing. Windows contrast themes get system colours and outlines.
 
 The panel repaints only what changes: an animation repaints the blocks in motion, the pointer only the row under it, the live refresh only blocks whose values changed, and a page at rest nothing.
 
@@ -298,7 +298,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-To avoid replacing a running executable, use `-OutputDirectory dist/v0.29.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
+To avoid replacing a running executable, use `-OutputDirectory dist/v0.30.0`. The version lives only in `src/version.h`; CMake checks that `app.manifest` matches. The tests read `src/` from the working directory to verify every UI string has an English translation. The CMake test suite includes an isolated panel integration test. Preview and test modes do not save preferences or terminate existing user processes.
 
 ```powershell
 .\dist\BatteryScope.exe --demo
