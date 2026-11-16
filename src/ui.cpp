@@ -616,8 +616,17 @@ const Baked& keySprite(const KeyId& id, const Palette& p) {
         const double band = std::max(1.0, double(unit) * (lit > .5 ? 2.0 : 1.0));
         const COLORREF catchLight = mix(p.dark ? RGB(80, 82, 92) : RGB(255, 255, 255), p.rim, lit);
         const double catchAlpha = (p.dark ? 40 + 150 * lit : 230) / 255.0;
-        const double glowAlpha = (p.dark ? 150 : 140) / 255.0 * lit, shadowAlpha = (p.dark ? 150 : 52) / 255.0, contactAlpha = (p.dark ? 110 : 34) / 255.0;
+        const double glowAlpha = (p.dark ? 150 : 140) / 255.0 * lit, shadowAlpha = (p.dark ? 150 : 52) / 255.0 * (1 - .9 * lit), contactAlpha = (p.dark ? 110 : 34) / 255.0 * (1 - .9 * lit); // a key lit from inside throws light, not a dark ring: its shadow would muddy its own glow
         const double rimWidth = p.dark ? 1.6 : 1.1, rimAlpha = (p.dark ? 235 : 150) / 255.0 * lit;
+        // Light along the top of the face. Unlit: a thin catch light. Lit: the light inside shows
+        // strongest at the top and thins smoothly down the face (a hard stripe read as a block).
+        const COLORREF unlitCatch = p.dark ? RGB(80, 82, 92) : RGB(255, 255, 255);
+        const auto topLight = [&](COLORREF face, double rel) {
+            if (lit < 1 && rel < band) face = mix(face, unlitCatch, (p.dark ? 40 : 230) / 255.0 * (1 - lit));
+            if (lit > 0) face = mix(face, p.rim, lit * (p.dark ? .5 : .62) * smoothStep(1 - rel / (h * .34)));
+            return face;
+        };
+        (void)catchLight; (void)catchAlpha;
         for (int y = 0; y < H; ++y) for (int x = 0; x < W; ++x) {
             const double px = x + .5, py = y + .5;
             Px pixel;
@@ -625,7 +634,7 @@ const Baked& keySprite(const KeyId& id, const Palette& p) {
             if (body < -1) { // well inside the face: nothing under it shows
                 const double t = std::clamp((py - press - margin) / h, 0.0, 1.0);
                 COLORREF face = t < .62 ? mix(top, middle, t / .62) : mix(middle, bottom, (t - .62) / .38);
-                if (py - press - margin < band) face = mix(face, catchLight, catchAlpha);
+                face = topLight(face, py - press - margin);
                 if (lit > 0) face = mix(face, p.rim, std::clamp(rimWidth + body + .5, 0.0, 1.0) * rimAlpha);
                 out[size_t(y) * size_t(W) + size_t(x)] = 0xFF000000u | (uint32_t(GetRValue(face)) << 16) | (uint32_t(GetGValue(face)) << 8) | GetBValue(face);
                 continue;
@@ -646,7 +655,7 @@ const Baked& keySprite(const KeyId& id, const Palette& p) {
             if (cover > 0) {
                 const double t = std::clamp((py - press - margin) / h, 0.0, 1.0);
                 COLORREF face = t < .62 ? mix(top, middle, t / .62) : mix(middle, bottom, (t - .62) / .38);
-                if (py - press - margin < band) face = mix(face, catchLight, catchAlpha);
+                face = topLight(face, py - press - margin);
                 if (lit > 0) face = mix(face, p.rim, std::clamp(rimWidth + body + .5, 0.0, 1.0) * rimAlpha);
                 pixel.over(face, cover);
             }

@@ -1255,8 +1255,7 @@ void drawSwitch(HDC dc, RECT r, double on, double stretch = 0, const Arrival& mo
     const float radius = float(kh) * .3f;
     const ui::LightBounds inGroove(dc, r, true);
     ui::keycap(dc, knob, radius, theme, (on > .5 ? std::max(on, motion.glow) : on) * paintFade);
-    // On, the key keeps a thin neon line on the edge it rests against; landing, the line runs round to it.
-    if (keyLook() && (motion.glow > 0 || on > .5)) ui::drawRimLight(dc, knob, radius, theme.rim, motion.glow > 0 ? motion.angle : 0.0, (motion.glow > 0 ? std::max(.6 * on, motion.glow * .9) : .6 * on) * paintFade);
+    (void)radius;
 }
 // A check mark from five small cells (dot-matrix, as every glyph of the style).
 void drawCheckGlyph(HDC dc, RECT r, COLORREF color) {
@@ -1758,8 +1757,7 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
                 if (EqualRect(&thumb, &rest)) ui::keycap(dc, thumb, thumbRadius, theme, paintFade, 1, 0, paintFade);
                 else ui::keycapStretched(dc, thumb, int(rest.right - rest.left), int(rest.bottom - rest.top), thumbRadius, theme, paintFade);
                 keyLight(thumb, 10, 1);
-                // A thin neon line rests along the lit key's top edge; arriving, it runs round from the side the key came from.
-                if (keyLook()) ui::drawRimLight(dc, thumb, thumbRadius, theme.rim, motion.glow > 0 && round <= 0 ? motion.angle : -1.5707963, (motion.glow > 0 && round <= 0 ? std::max(.6, motion.glow * .9) : .6) * paintFade);
+                // (No line drawn over the key: its own bitmap carries its lit edge; a line laid on top showed steps at the corners.)
             }
             for (int k = 0; k < n; ++k) {
                 const RECT key = segmentKey(tray, n, k);
@@ -2354,7 +2352,7 @@ void drawTabs(HDC dc, RECT client) {
         const RECT rest = tabRect(activeIndex, tabs.size(), client);
         if (EqualRect(&thumb, &rest)) ui::keycap(dc, thumb, thumbRadius, theme, 1, 1, 0);
         else ui::keycapStretched(dc, thumb, int(rest.right - rest.left), int(rest.bottom - rest.top), thumbRadius, theme, 1);
-        if (keyLook()) ui::drawRimLight(dc, thumb, thumbRadius, theme.rim, motion.glow > 0 && round <= 0 ? motion.angle : -1.5707963, motion.glow > 0 && round <= 0 ? std::max(.6, motion.glow * .9) : .6);
+        (void)round;
     }
     for (size_t i = 0; i < tabs.size(); ++i) {
         RECT r = tabRect(i, tabs.size(), client);
