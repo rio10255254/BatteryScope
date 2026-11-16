@@ -74,7 +74,7 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     RefreshAutoId = 266, DarkModeId = 267, AutoSaverCycleId = 268, PerfPageId = 269, FanMenuId = 270, PowerLimitMenuId = 271,
     FanPreset0Id = 272 /* ..275 */, PowerPreset0Id = 276 /* ..279 */, CpuBoostToggleId = 280, WinModeMenuId = 281,
     StabilityPageId = 282, ReportId = 283, ReportFullId = 284, MarkProblemId = 285, StabilityFolderId = 286, ProtectToggleId = 287, VerifyControlsId = 288,
-    ModeLinkMenuId = 289, ModeLinkToggleId = 290, ModeLinkWindowsId = 291, ModeLinkImportId = 292, PowerLimitResetId = 293, IdleDisplayToggleId = 294, IdleDisplayMenuId = 295, EffectsCycleId = 296,
+    ModeLinkMenuId = 289, ModeLinkToggleId = 290, ModeLinkWindowsId = 291, ModeLinkImportId = 292, PowerLimitResetId = 293, IdleDisplayToggleId = 294, IdleDisplayMenuId = 295, EffectsCycleId = 296, UiDiagId = 297,
     DimAfter0Id = 370 /* ..375 */, DisplayOff0Id = 380 /* ..386 */, DimLevel0Id = 390 /* ..393 */, ModeBoost0Id = 340 /* ..358: + mode * 8 + boost */,
     SettingRowId = 300 /* ..329, one per settings row */,
     TrayShow = 200, TrayExit = 201;
@@ -1078,7 +1078,7 @@ int blockHeight(HDC dc, const VBlock& b, int width, bool first) {
     case VBlock::Kind::legend: return sp(24);
     case VBlock::Kind::action: return b.text.empty() ? sp(44) : sp(56);
     case VBlock::Kind::segments: return sp(54);
-    case VBlock::Kind::banner: return sp(30) + noteHeight(dc, b.text, width - sp(26)) + (b.value.empty() ? 0 : sp(42)) + sp(8);
+    case VBlock::Kind::banner: return b.amount && !b.value.empty() ? sp(44) : sp(30) + noteHeight(dc, b.text, width - sp(26)) + (b.value.empty() ? 0 : sp(42)) + sp(8); // one that leads somewhere is a single row
     case VBlock::Kind::timeline: return sp(88);
     case VBlock::Kind::card: return sp(30) + (b.text.empty() ? 0 : noteHeight(dc, b.text, width - sp(18))) + sp(8);
     case VBlock::Kind::check: return sp(30) + (b.text.empty() ? 0 : noteHeight(dc, b.text, width - sp(28)));
@@ -1782,6 +1782,20 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
                 hot = std::max(fadeValue(visualHoverFade, i, now), index == visualFocus ? 1.0 : 0.0);
                 press = fadeValue(visualPress, i, now);
             }
+            if (b.amount && !b.value.empty()) {
+                // One row: an indicator LED, what is the matter, and where it leads.
+                const RECT bar{0, top + sp(2), width, top + h - sp(8)};
+                rounded(dc, bar, blend(Surface, light, theme.dark ? .14 + .08 * hot : .2 + .1 * hot), 10);
+                keyLight(bar, 10, hot);
+                const int mid = (bar.top + bar.bottom) / 2, shift = int(std::lround(press * sp(1)));
+                ui::led(dc, {sp(12), mid - sp(4), sp(20), mid + sp(4)}, light, ledHalo(light), paintFade, theme.ledOff);
+                drawMenuArrow(dc, width - sp(18), mid - sp(5) + shift, sp(10), Muted, false);
+                const int valueWidth = textWidth(dc, b.value, smallFont) + sp(4);
+                drawText(dc, b.value, {width - sp(24) - valueWidth, bar.top + shift, width - sp(24), bar.bottom + shift}, Muted, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+                drawText(dc, b.title, {sp(30), bar.top + shift, width - sp(30) - valueWidth, bar.bottom + shift}, Ink, normalFont);
+                if (index >= 0 && index == visualFocus && focused) outline(dc, bar, Green, 10, 2.0f);
+                break;
+            }
             ui::led(dc, {sp(5), top + sp(10), sp(15), top + sp(20)}, light, ledHalo(light), paintFade, theme.ledOff);
             drawText(dc, b.title, {sp(26), top + sp(4), width, top + sp(28)}, Ink, strongFont);
             const int textHeight = noteHeight(dc, b.text, width - sp(26));
@@ -2434,10 +2448,12 @@ std::wstring etaLabel(const ChargeEta& eta) {
 // list sits below an empty gap where the chart would be.
 bool compactLayout(int height) { return height < px(600) - tabBarHeight(); }
 bool minimalLayout(int height) { return height < px(480) - tabBarHeight(); }
+// How much higher the main page sits since its header became one row.
+int headerLift() { return sp(26); }
 int listTop() {
     RECT r{}; GetClientRect(mainWindow, &r);
     const int h = r.bottom - tabBarHeight();
-    return sp(minimalLayout(h) ? 270 : compactLayout(h) ? 308 : 366);
+    return sp(minimalLayout(h) ? 270 : compactLayout(h) ? 308 : 366) - headerLift();
 }
 // ----- Popups: the key display, notices in the panel and notifications -----
 // Small layered windows painted in the panel's style (pixel or smooth, dark or light).
@@ -3083,13 +3099,13 @@ void stepMotion(double now) {
     if (heroMoving) {
         // The battery tab's dot-matrix digits counting or scanning in.
         RECT client{}; GetClientRect(mainWindow, &client);
-        RECT hero{0, sp(70), client.right, sp(184)};
+        RECT hero{0, sp(70) - headerLift(), client.right, sp(184) - headerLift()};
         if (!hidden) { InvalidateRect(mainWindow, &hero, FALSE); active = true; } else heroMoving = false;
     }
     if (titleDecodeAt >= 0) {
         // A page's title decoding: only its line repaints.
         RECT client{}; GetClientRect(mainWindow, &client);
-        RECT line{0, sp(82), client.right, sp(122)};
+        RECT line{0, sp(4), client.right, sp(46)};
         if (!hidden) InvalidateRect(mainWindow, &line, FALSE);
         if (now - titleDecodeAt < 360 && !hidden) active = true; else titleDecodeAt = -1;
     }
@@ -3414,20 +3430,20 @@ void layout() {
     MoveWindow(menuButton, w - sp(18) - sp(70), sp(8), sp(32), sp(32), TRUE);
     {
         const int key = english ? sp(96) : sp(70); // "Efficiency" is longer than 效率
-        MoveWindow(powerButton, w - sp(18) + sp(6) - key - sp(16), sp(35), key + sp(16), sp(32), TRUE);
+        MoveWindow(powerButton, w - sp(18) - sp(70) - key - sp(16), sp(8), key + sp(16), sp(32), TRUE);
     }
     const bool fullPage = inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history || inlinePage == InlinePage::lab || inlinePage == InlinePage::ledger || inlinePage == InlinePage::hardware ||
         inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic || inlinePage == InlinePage::goal || inlinePage == InlinePage::performance || inlinePage == InlinePage::stability ||
         inlinePage == InlinePage::confirm || inlinePage == InlinePage::error;
     const bool section = sectionPage(inlinePage);
-    const int textTop = inlinePage == InlinePage::powerMode ? sp(318) : section ? sp(134) : fullPage ? sp(128) : top - sp(37);
+    const int textTop = inlinePage == InlinePage::powerMode ? sp(248) : section ? sp(52) : fullPage ? sp(52) : top - sp(37);
     {
         const int pageLeft = margin + sp(12), pageWidth = inner - sp(24), modeGap = sp(6);
         const int third = (pageWidth - 2 * modeGap) / 3, pageHalf = (pageWidth - modeGap) / 2;
         for (int i = 0; i < 6; ++i)
-            MoveWindow(modeButtons[i], pageLeft + (i % 3) * (third + modeGap), i < 3 ? sp(176) : sp(234), third, sp(30), TRUE);
-        MoveWindow(restoreModesButton, pageLeft, sp(276), pageHalf, sp(30), TRUE);
-        MoveWindow(energySettingsButton, pageLeft + pageHalf + modeGap, sp(276), pageWidth - pageHalf - modeGap, sp(30), TRUE);
+            MoveWindow(modeButtons[i], pageLeft + (i % 3) * (third + modeGap), i < 3 ? sp(106) : sp(164), third, sp(30), TRUE);
+        MoveWindow(restoreModesButton, pageLeft, sp(206), pageHalf, sp(30), TRUE);
+        MoveWindow(energySettingsButton, pageLeft + pageHalf + modeGap, sp(206), pageWidth - pageHalf - modeGap, sp(30), TRUE);
     }
     const int textBottom = inlinePage == InlinePage::process ? h - sp(140) : section ? h - sp(4) : h - sp(94);
     MoveWindow(inlineText, margin + sp(12), textTop, inner - sp(24), std::max(sp(55), textBottom - textTop), TRUE);
@@ -3686,27 +3702,13 @@ void paint(HDC dc, RECT bounds) {
     heroMoving = false; // set again below while the battery tab's digits are on the move
     drawTabs(dc, bounds);
     const int w = bounds.right, margin = sp(18), right = w - margin;
-    const std::wstring subtitle = demo ? tr(L"示範資料 · 關閉操作已停用") : tr(L"電池與背景活動");
-    // The header: the name, the battery mascot when it is on, and a line on what this is.
-    // Its keys (power mode, ⋯, hide) are child windows on the right.
-    drawText(dc, L"BatteryScope", {margin, sp(10), w - sp(100), sp(38)}, Ink, titleFont);
+    // The header is one row: the page's name on the left, its keys (power mode, ⋯, hide) as
+    // child windows on the right. Everything under it sits `lift` higher than it used to.
     mascotRect = {};
-    if (showMascot) {
-        const int unit = std::max(2, px(2)), left = margin + textWidth(dc, L"BatteryScope", titleFont) + sp(10);
-        if (left + ui::MascotCells * unit <= w - sp(100)) {
-            const auto mood = currentMood();
-            const double hop = mascotHopAt >= 0 ? std::clamp((motionNow() - mascotHopAt) / 360.0, 0.0, 1.0) : 1.0;
-            const int lift = hop < 1 ? int(std::lround(std::sin(3.14159265 * hop) * sp(6))) : 0;
-            mascotRect = {left, sp(9), left + ui::MascotCells * unit, sp(9) + ui::MascotRows * unit};
-            mascotLook = mascotLookNow();
-            ui::drawMascot(dc, left, sp(9) - lift, unit, mood, mascotLevel(), sampleTick % 5 == 4 || hop < 1 ? 1 : 0, mascotColors(mood), mascotLook);
-        }
-    }
-    drawText(dc, subtitle, {margin, sp(40), w - (english ? sp(136) : sp(116)), sp(62)}, Muted, smallFont);
     const bool fullPage = fullPanelPage(inlinePage);
     const int h = bounds.bottom - tabBarHeight();
     const bool compact = compactLayout(h), minimal = minimalLayout(h);
-    const int top = listTop();
+    const int top = listTop() + headerLift(); // in the coordinates the main page is drawn in (see Lifted below)
     if (fullPage) {
         // A page sits on the panel's face under its title; no card around it.
         {
@@ -3718,7 +3720,7 @@ void paint(HDC dc, RECT bounds) {
                 titleDecodeAt = canAnimate() && !hidden && keyLook() ? motionNow() : -1;
                 if (titleDecodeAt >= 0) armMotionTimer();
             }
-            const RECT at{margin, sp(86), right, sp(118)};
+            const RECT at{margin, sp(8), w - sp(18) - sp(76) - (english ? sp(112) : sp(86)), sp(42)};
             const double elapsed = titleDecodeAt >= 0 ? motionNow() - titleDecodeAt : 1e9;
             size_t settled = inlineTitle.size();
             const std::wstring shown = decodedTitle(inlineTitle, elapsed, settled);
@@ -3733,10 +3735,10 @@ void paint(HDC dc, RECT bounds) {
             const bool plugged = pluggedInNow();
             const std::wstring now = effectiveMode == EffectiveMode::unknown ? tr(L"目前生效：無法讀取") :
                 tr(L"目前生效：") + std::wstring(effectiveName(effectiveMode)) + (plugged ? tr(L"（插電中）") : tr(L"（用電池）"));
-            drawText(dc, now, {margin + sp(14), sp(126), right - sp(14), sp(148)}, Ink, strongFont);
-            drawText(dc, std::wstring(tr(L"插電時")) + (plugged ? tr(L" · 目前") : L""), {margin + sp(14), sp(154), right - sp(14), sp(174)},
+            drawText(dc, now, {margin + sp(14), sp(56), right - sp(14), sp(78)}, Ink, strongFont);
+            drawText(dc, std::wstring(tr(L"插電時")) + (plugged ? tr(L" · 目前") : L""), {margin + sp(14), sp(84), right - sp(14), sp(104)},
                 plugged ? Green : Muted, smallFont);
-            drawText(dc, std::wstring(tr(L"用電池時")) + (!plugged ? tr(L" · 目前") : L""), {margin + sp(14), sp(212), right - sp(14), sp(232)},
+            drawText(dc, std::wstring(tr(L"用電池時")) + (!plugged ? tr(L" · 目前") : L""), {margin + sp(14), sp(142), right - sp(14), sp(162)},
                 !plugged ? Green : Muted, smallFont);
         }
         return; // notices show as a card above the tabs
@@ -3746,6 +3748,13 @@ void paint(HDC dc, RECT bounds) {
         const double shown = listBarShown();
         if (shown > 0 && listBarGeometry(track, thumb)) ui::fillRound(dc, thumb, blend(Background, Ink, .4), float(sp(2)), BYTE(255 * shown));
     }
+    drawText(dc, tabLabel(activeTab()), {margin, sp(8), w - sp(18) - sp(76) - (english ? sp(112) : sp(86)), sp(42)}, Ink, titleFont, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    // The rest is drawn where it always was and shown `lift` higher (the header lost a row).
+    struct Lifted {
+        HDC dc; POINT was{};
+        Lifted(HDC target, int lift) : dc(target) { GetViewportOrgEx(dc, &was); SetViewportOrgEx(dc, was.x, was.y - lift, nullptr); }
+        ~Lifted() { SetViewportOrgEx(dc, was.x, was.y, nullptr); }
+    } lifted(dc, headerLift());
     PowerSample p; if (!current.history.empty()) p = current.history.back();
     const auto& m = current.power;
     const auto charge = calculateCharging(current.history);
@@ -3797,7 +3806,7 @@ void paint(HDC dc, RECT bounds) {
         const int gap = sp(8), half = (right - margin - gap) / 2;
         const RECT rateCard{margin, sp(187), margin + half, sp(228)}, timeCard{margin + half + gap, sp(187), right, sp(228)};
         card(dc, rateCard, Surface, 12); card(dc, timeCard, Surface, 12);
-        batteryCardsRect = desktop ? RECT{} : RECT{rateCard.left, rateCard.top, timeCard.right, timeCard.bottom};
+        batteryCardsRect = desktop ? RECT{} : RECT{rateCard.left, rateCard.top - headerLift(), timeCard.right, timeCard.bottom - headerLift()};
         if (!desktop) drawMenuArrow(dc, timeCard.right - sp(16), (timeCard.top + timeCard.bottom) / 2 - sp(4), sp(8), Muted, false); // opens the details
         // Plugged in without charging, battery health is more useful than a rate.
         const auto health = batteryHealth(p);
@@ -3897,7 +3906,7 @@ void paint(HDC dc, RECT bounds) {
         drawText(dc, backgroundOnly ? tr(L"目前沒有符合篩選的程序") : tr(L"正在讀取程序…"),
             {margin, top + sp(12), right, top + sp(44)}, Muted, normalFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     }
-    int footer = h - sp(51);
+    int footer = h - sp(51) + headerLift(); // anchored to the bottom: not lifted with the rest
     std::wstring status = current.processes.empty() ? notice : selectionHint();
     drawText(dc, status, {margin, footer, right, footer + sp(19)}, Muted, smallFont);
     drawText(dc, tr(L"個別瓦數僅估計 CPU，非程式總耗電"),
@@ -6196,7 +6205,7 @@ const SettingRow settingRows[] = {
     {Row::section, L"提醒", nullptr}, {Row::lowBattery, L"低電量提醒", nullptr}, {Row::chargeReminder, L"充電提醒", nullptr},
     {Row::drainAlert, L"背景耗電提醒", L"有程式在背景持續耗電時通知"}, {Row::sleepAlert, L"睡眠耗電提醒", L"睡眠時掉電太快時通知"},
     {Row::section, L"外觀", nullptr}, {Row::theme, L"主題", nullptr}, {Row::effects, L"動態特效", nullptr}, {Row::language, L"語言 / Language", nullptr},
-    {Row::mascot, L"電池小精靈", nullptr}, {Row::trayPercent, L"系統匣顯示電量", nullptr}, {Row::mini, L"迷你浮動視窗", nullptr},
+    {Row::trayPercent, L"系統匣顯示電量", nullptr}, {Row::mini, L"迷你浮動視窗", nullptr},
     {Row::section, L"一般", nullptr}, {Row::startup, L"登入時啟動", nullptr}, {Row::hotkey, L"快速鍵 Ctrl+Alt+B", L"隨時叫出或收起面板"},
     {Row::history, L"記錄每日歷史", L"只存在這台電腦，保留 60 天"}, {Row::clearHistory, L"清除歷史紀錄", nullptr}, {Row::updates, L"更新", nullptr}};
 bool rowIsSwitch(Row row) {
@@ -8498,6 +8507,7 @@ std::vector<MenuItem> mainMenuItems() {
     items.push_back(menuSeparator());
     std::vector<MenuItem> tools;
     tools.push_back(menuItem(ExportCsvId, tr(L"匯出 CSV"), false, preview));
+    tools.push_back(menuItem(UiDiagId, tr(L"介面診斷"), false, preview));
     tools.push_back(menuItem(ShareCardId, tr(L"分享今日卡片"), false, preview));
     tools.push_back(menuItem(MiniToggleId, tr(L"迷你浮動視窗"), miniEnabled));
     items.push_back(submenu(tr(L"工具"), tools));
@@ -8561,13 +8571,74 @@ std::wstring controlTip(HWND control) {
     if (control == killButton) return tr(L"強制結束前會再次確認，未儲存資料可能遺失");
     return tr(L"選擇宿主內要停止的服務，不結束整個宿主");
 }
+// ----- Interface diagnostic -----
+// Measures the panel's motion where it runs: opens each tab in turn, twice, and records for
+// every frame when it came and how long its step took. The result is a text file on the
+// desktop to send back; nothing else is collected.
+constexpr UINT_PTR UiDiagTimer = 104;
+struct UiDiag { bool on = false; int step = 0; std::vector<std::pair<double, double>> frames; std::vector<double> marks; } uiDiag;
+void finishUiDiag();
+void stepUiDiag() {
+    const auto tabs = visibleTabs();
+    if (tabs.empty() || uiDiag.step >= int(tabs.size()) * 2) { finishUiDiag(); return; }
+    uiDiag.marks.push_back(motionNow());
+    SendMessageW(mainWindow, WM_COMMAND, tabCommand(tabs[size_t(uiDiag.step) % tabs.size()]), 0);
+    ++uiDiag.step;
+}
+void startUiDiag() {
+    if (uiDiag.on || !mainWindow) return;
+    uiDiag = {}; uiDiag.on = true;
+    SetTimer(mainWindow, UiDiagTimer, 900, nullptr);
+    stepUiDiag();
+}
+void finishUiDiag() {
+    KillTimer(mainWindow, UiDiagTimer);
+    uiDiag.on = false;
+    constexpr GUID Desktop = {0xB4BFCC3A, 0xDB2C, 0x424C, {0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41}};
+    PWSTR folder = nullptr; std::wstring path;
+    if (SUCCEEDED(SHGetKnownFolderPath(Desktop, 0, nullptr, &folder)) && folder) path = std::wstring(folder) + L"\\BatteryScope-ui-diagnostic.txt";
+    if (folder) CoTaskMemFree(folder);
+    DEVMODEW mode{}; mode.dmSize = sizeof(mode);
+    const int hz = EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &mode) ? int(mode.dmDisplayFrequency) : 0;
+    std::vector<double> gaps, costs;
+    for (size_t i = 0; i < uiDiag.frames.size(); ++i) {
+        costs.push_back(uiDiag.frames[i].second);
+        if (i && uiDiag.frames[i].first - uiDiag.frames[i - 1].first < 100) gaps.push_back(uiDiag.frames[i].first - uiDiag.frames[i - 1].first);
+    }
+    const auto at = [](std::vector<double> v, double q) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end()); return v[std::min(v.size() - 1, size_t(q * double(v.size())))]; };
+    const double period = hz > 0 ? 1000.0 / hz : 0;
+    size_t late = 0; for (double g : gaps) if (period > 0 && g > period * 1.5) ++late;
+    FILE* out = path.empty() ? nullptr : _wfopen(path.c_str(), L"w");
+    if (out) {
+        fprintf(out, "BatteryScope %s interface diagnostic\n", BS_VERSION_STRING);
+        fprintf(out, "display %d Hz (frame %.2f ms), dpi %u, effects level %d, frame clock %s\n", hz, period, dpi, effectsLevel, frameClockFailed ? "window timers" : "compositor");
+        fprintf(out, "frames %zu, late frames (gap > 1.5 frames) %zu\n", uiDiag.frames.size(), late);
+        fprintf(out, "gap between frames ms: median %.2f, 95%% %.2f, worst %.2f\n", at(gaps, .5), at(gaps, .95), at(gaps, .999));
+        fprintf(out, "work per frame ms: median %.2f, 95%% %.2f, worst %.2f\n", at(costs, .5), at(costs, .95), at(costs, .999));
+        fprintf(out, "\ntab opened at ms:");
+        for (double m : uiDiag.marks) fprintf(out, " %.0f", m - (uiDiag.marks.empty() ? 0 : uiDiag.marks.front()));
+        fprintf(out, "\n\ntime ms, gap ms, work ms\n");
+        const double zero = uiDiag.frames.empty() ? 0 : uiDiag.frames.front().first;
+        for (size_t i = 0; i < uiDiag.frames.size(); ++i)
+            fprintf(out, "%.1f, %.2f, %.2f\n", uiDiag.frames[i].first - zero, i ? uiDiag.frames[i].first - uiDiag.frames[i - 1].first : 0.0, uiDiag.frames[i].second);
+        fclose(out);
+    }
+    setNotice(out ? tr(L"介面診斷已存到桌面：BatteryScope-ui-diagnostic.txt") : tr(L"介面診斷無法寫入桌面。"));
+}
 // One frame: everything in motion takes its step. When nothing moves any more the clock stops.
 void stepFrame() {
     frameSteppedAt = GetTickCount64();
+    LARGE_INTEGER before{}, after{}, frequency{};
+    if (uiDiag.on) QueryPerformanceCounter(&before);
     if (motionTimerRunning) stepMotion(motionNow());
     if (visualTimerOn) stepVisual();
     if (fxTimerOn) stepFx();
     const bool popups = stepPopups(motionNow());
+    if (uiDiag.on && uiDiag.frames.size() < 20000) {
+        GdiFlush();
+        QueryPerformanceCounter(&after); QueryPerformanceFrequency(&frequency);
+        uiDiag.frames.emplace_back(motionNow(), double(after.QuadPart - before.QuadPart) * 1000 / double(frequency.QuadPart));
+    }
     if (!motionTimerRunning && !visualTimerOn && !fxTimerOn && !popups) frameWanted = false;
 }
 LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
@@ -8696,6 +8767,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (wp == MotionTimer) { stepMotion(motionNow()); return 0; }
         if (wp == FxTimer) { stepFx(); return 0; }
         if (wp == TrayShowTimer) { stepTrayShow(); return 0; }
+        if (wp == UiDiagTimer) { stepUiDiag(); return 0; }
         if (wp == ListBarTimer) {
             RECT track{}, thumb{};
             const double since = listBarSeenAt < 0 ? 1e9 : motionNow() - listBarSeenAt;
@@ -8807,6 +8879,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (id == PowerDetailsId) { showPowerDetails(); return 0; }
         if (id == LedgerId) { showLedger(); return 0; }
         if (id == ExportCsvId) { if (!demo && !isolatedPreview) chooseCsvExport(); return 0; }
+        if (id == UiDiagId) { if (!isolatedPreview) startUiDiag(); return 0; }
         if (id >= LowBatteryOffId && id <= LowBattery30Id) {
             if (!demo && !isolatedPreview) setLowBatteryThreshold(unsigned(id - LowBatteryOffId) * 10);
             return 0;
@@ -10075,7 +10148,7 @@ bool panelSelfTest(const std::wstring& path) {
     const auto themeBefore = themeChoice;
     check("settings_page_lists_every_option", inlinePage == InlinePage::settings && IsWindowVisible(visualView) && !IsWindowVisible(inlineText) &&
         visualBlocks.size() == std::size(settingRows) + 1);
-    check("settings_switches_are_switches", std::count_if(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::action && b.toggle >= 0; }) == 8 &&
+    check("settings_switches_are_switches", std::count_if(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::action && b.toggle >= 0; }) == 7 &&
         std::none_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.amount == DynamicToggleId || b.amount == RefreshAutoId; }));
     SendMessageW(mainWindow, WM_COMMAND, SettingRowId + int(Row::theme), 0);
     check("settings_rows_do_not_change_demo_settings", themeChoice == themeBefore);
@@ -10233,7 +10306,7 @@ bool panelSelfTest(const std::wstring& path) {
     {
         // The default panel has room for the 30-minute chart, and the list starts below it with no gap.
         RECT client{}; GetClientRect(mainWindow, &client);
-        check("default_panel_shows_chart_without_gap", !compactLayout(client.bottom - tabBarHeight()) && listTop() == sp(366));
+        check("default_panel_shows_chart_without_gap", !compactLayout(client.bottom - tabBarHeight()) && listTop() == sp(366) - headerLift());
     }
     // Home: the performance dashboard, with the mode as segments, fans and power presets; the battery tab holds history.
     SendMessageW(mainWindow, WM_COMMAND, PerfPageId, 0);
@@ -10328,7 +10401,12 @@ bool panelSelfTest(const std::wstring& path) {
             for (int k = 0; k <= 40; ++k) { const auto p = blendedPalette(k / 40.0); readable &= std::abs(light(p.ink) - light(p.surface)) >= 70; }
             check("theme_blend_keeps_text_readable", readable);
         }
-        check("mascot_drawn_in_header_and_speaks", showMascot && mascotRect.right > mascotRect.left && !mascotLine().empty());
+        {
+            // The header is one row: the page's name, and its three keys level with each other; no mascot in it.
+            RECT power{}, menu{}, hide{};
+            GetWindowRect(powerButton, &power); GetWindowRect(menuButton, &menu); GetWindowRect(hideButton, &hide);
+            check("header_is_one_row", IsRectEmpty(&mascotRect) && power.top == menu.top && menu.top == hide.top && power.right <= menu.left);
+        }
     }
     {
         wchar_t folder[MAX_PATH]{}; GetTempPathW(MAX_PATH, folder);
