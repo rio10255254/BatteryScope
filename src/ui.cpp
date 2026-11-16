@@ -84,26 +84,27 @@ Palette palette(ThemeChoice choice, bool forceContrast) {
     }
     const bool light = choice == ThemeChoice::light || (choice == ThemeChoice::system && systemPrefersLight());
     if (light) {
-        // Day: an ivory panel, keys a shade lighter, wells a shade darker, amber light.
-        p.background = p.surface = RGB(230, 227, 222); p.raised = RGB(241, 238, 233); p.border = RGB(205, 201, 195);
-        p.ink = RGB(42, 40, 37); p.muted = RGB(87, 83, 77); p.faint = RGB(140, 135, 127);
-        p.accent = RGB(135, 84, 10); p.accentDim = RGB(217, 181, 122); p.accentSoft = RGB(243, 223, 184); p.accentInk = RGB(42, 40, 37);
-        p.warn = RGB(161, 92, 0); p.danger = RGB(184, 53, 44);
-        p.selected = RGB(243, 223, 184); p.selectedInk = p.ink;
-        p.keyTop = RGB(243, 240, 235); p.keyBottom = RGB(228, 224, 218);
-        p.litTop = RGB(248, 213, 146); p.litMid = RGB(244, 232, 210); p.litBottom = RGB(242, 237, 230);
-        p.rim = RGB(240, 170, 66); p.well = RGB(211, 207, 201); p.glow = RGB(245, 195, 103); p.halo = RGB(244, 175, 61);
-        p.ledOff = RGB(195, 190, 183); p.shadow = RGB(90, 78, 60);
+        // Day: a cool, neutral panel (so the amber light reads as light, not as the panel's own
+        // colour), keys nearly white, wells a shade darker, text dark enough to read at a glance.
+        p.background = p.surface = RGB(236, 238, 242); p.raised = RGB(246, 247, 249); p.border = RGB(204, 207, 214);
+        p.ink = RGB(24, 26, 31); p.muted = RGB(66, 70, 79); p.faint = RGB(124, 128, 138);
+        p.accent = RGB(150, 82, 0); p.accentDim = RGB(222, 184, 120); p.accentSoft = RGB(250, 228, 186); p.accentInk = RGB(30, 26, 20);
+        p.warn = RGB(166, 90, 0); p.danger = RGB(190, 48, 40);
+        p.selected = RGB(250, 228, 186); p.selectedInk = p.ink;
+        p.keyTop = RGB(253, 253, 254); p.keyBottom = RGB(232, 234, 239);
+        p.litTop = RGB(250, 212, 142); p.litMid = RGB(251, 236, 210); p.litBottom = RGB(249, 244, 234);
+        p.rim = RGB(238, 162, 52); p.well = RGB(219, 222, 228); p.glow = RGB(244, 186, 86); p.halo = RGB(246, 170, 50);
+        p.ledOff = RGB(198, 202, 210); p.shadow = RGB(52, 60, 78);
         p.dark = false;
     } else {
         // Night: a charcoal panel, smoked keys, deep wells, an ice-blue neon light.
         p.background = p.surface = RGB(27, 27, 29); p.raised = RGB(46, 47, 53); p.border = RGB(52, 53, 59);
-        p.ink = RGB(236, 236, 239); p.muted = RGB(164, 164, 172); p.faint = RGB(110, 110, 118);
+        p.ink = RGB(240, 240, 243); p.muted = RGB(182, 183, 192); p.faint = RGB(120, 121, 130);
         p.accent = RGB(180, 195, 255); p.accentDim = RGB(74, 85, 144); p.accentSoft = RGB(37, 43, 69); p.accentInk = RGB(242, 246, 255);
         p.warn = RGB(242, 169, 59); p.danger = RGB(255, 107, 99);
         p.selected = RGB(37, 43, 69); p.selectedInk = p.ink;
         p.keyTop = RGB(49, 50, 56); p.keyBottom = RGB(37, 38, 43);
-        p.litTop = RGB(70, 71, 83); p.litMid = RGB(52, 53, 61); p.litBottom = RGB(43, 44, 50);
+        p.litTop = RGB(92, 96, 122); p.litMid = RGB(60, 62, 78); p.litBottom = RGB(46, 47, 58); // frosted glass over the dark: lighter and a little blue
         p.rim = RGB(220, 246, 255); p.well = RGB(14, 14, 16); p.glow = RGB(221, 246, 255); p.halo = RGB(125, 145, 255);
         p.ledOff = RGB(36, 37, 43); p.shadow = RGB(0, 0, 0);
         p.dark = true;
@@ -139,7 +140,7 @@ void drawRimLight(HDC dc, const RECT& r, float radius, COLORREF c, double angle,
     Gdiplus::Pen bloom(&rim, std::max(3.0f, box.Height * .18f)); bloom.SetLineJoin(Gdiplus::LineJoinRound);
     g.DrawPath(&bloom, &path);
     g.Restore(state);
-    Gdiplus::Pen line(&rim, 1.4f); line.SetLineJoin(Gdiplus::LineJoinRound);
+    Gdiplus::Pen line(&rim, std::max(1.4f, box.Height * .035f)); line.SetLineJoin(Gdiplus::LineJoinRound);
     g.DrawPath(&line, &path);
 }
 bool startGraphics() {
@@ -473,15 +474,27 @@ double roundDistance(double px, double py, double cx, double cy, double hw, doub
     return std::hypot(std::max(qx, 0.0), std::max(qy, 0.0)) + std::min(std::max(qx, qy), 0.0) - r;
 }
 double smoothStep(double a) { a = std::clamp(a, 0.0, 1.0); return a * a * (3 - 2 * a); }
-// Source over, into a premultiplied pixel.
-void blendOver(uint32_t& pixel, COLORREF c, double alpha) {
-    const uint32_t a = uint32_t(std::lround(std::clamp(alpha, 0.0, 1.0) * 255));
-    if (!a) return;
-    const uint32_t inv = 255 - a, da = pixel >> 24, dr = (pixel >> 16) & 255, dg = (pixel >> 8) & 255, db = pixel & 255;
-    const uint32_t oa = std::min<uint32_t>(255, a + (da * inv + 127) / 255);
-    const uint32_t r = (GetRValue(c) * a + dr * inv + 127) / 255, g = (GetGValue(c) * a + dg * inv + 127) / 255, b = (GetBValue(c) * a + db * inv + 127) / 255;
-    pixel = (oa << 24) | (std::min(r, oa) << 16) | (std::min(g, oa) << 8) | std::min(b, oa);
+// A sprite's pixel while it is worked out: premultiplied, in floating point, so that soft light
+// is not rounded layer by layer. It is rounded once, with a little ordered noise: a glow that
+// falls off over dozens of pixels would otherwise show its 8-bit steps as bands.
+struct Px {
+    double a = 0, r = 0, g = 0, b = 0;
+    void over(COLORREF c, double alpha) {
+        alpha = std::clamp(alpha, 0.0, 1.0);
+        r = GetRValue(c) * alpha + r * (1 - alpha); g = GetGValue(c) * alpha + g * (1 - alpha); b = GetBValue(c) * alpha + b * (1 - alpha);
+        a = alpha + a * (1 - alpha);
+    }
+};
+uint32_t pack(const Px& p, int x, int y) {
+    uint32_t h = uint32_t(x) * 374761393u + uint32_t(y) * 668265263u; h = (h ^ (h >> 13)) * 1274126177u; h ^= h >> 16;
+    const double n1 = (h & 0xFFFF) / 65536.0, n2 = ((h >> 16) & 0xFFFF) / 65536.0, noise = (n1 + n2) / 2 - .5 + (n1 - .5) * .5; // roughly triangular, about +-0.75
+    const auto level = [&](double v, double top) { return uint32_t(std::clamp(std::floor(v + .5 + noise), 0.0, top)); };
+    const uint32_t alpha = p.a <= 0 ? 0 : level(p.a * 255, 255);
+    if (!alpha) return 0;
+    return (alpha << 24) | (level(p.r, alpha) << 16) | (level(p.g, alpha) << 8) | level(p.b, alpha);
 }
+// How light thins with distance: bright by its source and a long, faint tail.
+double glowFalloff(double d, double spread) { const double s = std::clamp(1 - d / spread, 0.0, 1.0); return s * s * (3 - 2 * s) * (.35 + .65 * s); }
 struct Baked { HBITMAP bitmap = nullptr; int w = 0, h = 0, margin = 0; };
 HDC bakeDC = nullptr;
 size_t bakedBytes = 0;
@@ -563,9 +576,9 @@ const Baked& haloSprite(const HaloId& id) {
             const double ox = x + .5 - w / 2.0, oy = y + .5 - h / 2.0;
             double d = roundDistance(x + .5, y + .5, w / 2.0, h / 2.0, hw, hh, r);
             if (d > 0) d *= squeeze(id.room, spread, ox, oy, std::abs(ox) - (hw - r), std::abs(oy) - (hh - r));
-            uint32_t pixel = 0;
-            blendOver(pixel, id.color, d <= 0 ? 1 : smoothStep(1 - d / spread)); // smoothstep: a soft edge without a visible ring
-            out[size_t(y) * size_t(w) + size_t(x)] = pixel;
+            Px pixel;
+            pixel.over(id.color, d <= 0 ? 1 : glowFalloff(d, spread));
+            out[size_t(y) * size_t(w) + size_t(x)] = pack(pixel, x, y);
         }
         baked.margin = id.spread;
     }
@@ -574,7 +587,7 @@ const Baked& haloSprite(const HaloId& id) {
 // The most a key's light and shadow reach past its face, in any state.
 int keyMargin(int h, bool lit) {
     const int unit = std::max(1, h / 22);
-    return std::max(lit ? std::max(8, h / 2) : 0, (unit * 6 + 2) + (unit * 4 + 1)) + 1;
+    return std::max(lit ? std::max(10, h * 4 / 5) : 0, (unit * 6 + 2) + (unit * 4 + 1)) + 1;
 }
 // A key: its light on the panel (when lit), its shadow, its face from top to bottom, the catch
 // light along its top edge and, lit, the light showing along its rim.
@@ -583,7 +596,7 @@ const Baked& keySprite(const KeyId& id, const Palette& p) {
     const double lit = id.lit / 16.0, pressed = id.pressed / 4.0, hover = id.hover / 4.0;
     const int w = id.w, h = id.h, unit = std::max(1, h / 22);
     const double radius = std::min({double(id.radius), w / 2.0, h / 2.0});
-    const int glowSpread = std::max(8, h / 2);
+    const int glowSpread = std::max(10, h * 4 / 5); // the light spreads wide and thin over the panel, as in the reference clip
     // Under the pointer the shadow lengthens, as if the key stood a little taller; pressed, it shortens.
     const int drop = int(std::lround((1 - pressed) * unit * (2.5 + 1.5 * hover))) + 1;
     const int shadowSpread = unit * 4 + 2 + int(std::lround(hover * unit * 2));
@@ -603,11 +616,11 @@ const Baked& keySprite(const KeyId& id, const Palette& p) {
         const double band = std::max(1.0, double(unit) * (lit > .5 ? 2.0 : 1.0));
         const COLORREF catchLight = mix(p.dark ? RGB(80, 82, 92) : RGB(255, 255, 255), p.rim, lit);
         const double catchAlpha = (p.dark ? 40 + 150 * lit : 230) / 255.0;
-        const double glowAlpha = (p.dark ? 115 : 105) / 255.0 * lit, shadowAlpha = (p.dark ? 150 : 52) / 255.0, contactAlpha = (p.dark ? 110 : 34) / 255.0;
+        const double glowAlpha = (p.dark ? 150 : 140) / 255.0 * lit, shadowAlpha = (p.dark ? 150 : 52) / 255.0, contactAlpha = (p.dark ? 110 : 34) / 255.0;
         const double rimWidth = p.dark ? 1.6 : 1.1, rimAlpha = (p.dark ? 235 : 150) / 255.0 * lit;
         for (int y = 0; y < H; ++y) for (int x = 0; x < W; ++x) {
             const double px = x + .5, py = y + .5;
-            uint32_t pixel = 0;
+            Px pixel;
             const double body = roundDistance(px, py - press, cx, cy, hw, hh, radius);
             if (body < -1) { // well inside the face: nothing under it shows
                 const double t = std::clamp((py - press - margin) / h, 0.0, 1.0);
@@ -621,23 +634,23 @@ const Baked& keySprite(const KeyId& id, const Palette& p) {
             if (lit > 0) {
                 double d = roundDistance(px, py, cx, cy, hw, hh, radius);
                 if (d > 0) d *= squeeze(id.room, glowSpread, ox, py - cy, ax, std::abs(py - cy) - (hh - radius));
-                blendOver(pixel, p.halo, (d <= 0 ? 1 : smoothStep(1 - d / glowSpread)) * glowAlpha);
+                pixel.over(p.halo, (d <= 0 ? 1 : glowFalloff(d, glowSpread)) * glowAlpha);
             }
             {
                 double d = roundDistance(px, py - drop, cx, cy, hw, hh, radius);
                 if (d > 0) d *= squeeze(id.shade, shadowSpread, ox, py - drop - cy, ax, std::abs(py - drop - cy) - (hh - radius), drop);
-                blendOver(pixel, p.shadow, (d <= 0 ? 1 : smoothStep(1 - d / shadowSpread)) * shadowAlpha);
+                pixel.over(p.shadow, (d <= 0 ? 1 : smoothStep(1 - d / shadowSpread)) * shadowAlpha);
             }
-            if (id.shade.bottom >= 3) { const double d = roundDistance(px, py - 1, cx, cy, hw, hh, radius); blendOver(pixel, p.shadow, (d <= 0 ? 1 : smoothStep(1 - d / 2)) * contactAlpha); }
+            if (id.shade.bottom >= 3) { const double d = roundDistance(px, py - 1, cx, cy, hw, hh, radius); pixel.over(p.shadow, (d <= 0 ? 1 : smoothStep(1 - d / 2)) * contactAlpha); }
             const double cover = std::clamp(.5 - body, 0.0, 1.0);
             if (cover > 0) {
                 const double t = std::clamp((py - press - margin) / h, 0.0, 1.0);
                 COLORREF face = t < .62 ? mix(top, middle, t / .62) : mix(middle, bottom, (t - .62) / .38);
                 if (py - press - margin < band) face = mix(face, catchLight, catchAlpha);
                 if (lit > 0) face = mix(face, p.rim, std::clamp(rimWidth + body + .5, 0.0, 1.0) * rimAlpha);
-                blendOver(pixel, face, cover);
+                pixel.over(face, cover);
             }
-            out[size_t(y) * size_t(W) + size_t(x)] = pixel;
+            out[size_t(y) * size_t(W) + size_t(x)] = pack(pixel, x, y);
         }
     }
     return keys.emplace(id, baked).first->second;
@@ -655,9 +668,9 @@ const Baked& wellSprite(const WellId& id, const Palette& p) {
             if (y + .5 < shade) row = mix(row, p.shadow, shadeAlpha * (1 - (y + .5) / shade));
             if (y == id.h - 1) row = mix(row, RGB(255, 255, 255), lineAlpha);
             for (int x = 0; x < id.w; ++x) {
-                uint32_t pixel = 0;
-                blendOver(pixel, row, std::clamp(.5 - roundDistance(x + .5, y + .5, hw, hh, hw, hh, radius), 0.0, 1.0));
-                out[size_t(y) * size_t(id.w) + size_t(x)] = pixel;
+                Px pixel;
+                pixel.over(row, std::clamp(.5 - roundDistance(x + .5, y + .5, hw, hh, hw, hh, radius), 0.0, 1.0));
+                out[size_t(y) * size_t(id.w) + size_t(x)] = pack(pixel, x, y);
             }
         }
     }
