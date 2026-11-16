@@ -55,6 +55,10 @@ void keycap(HDC dc, RECT r, float radius, const Palette& p, double lit, double p
 void well(HDC dc, const RECT& r, float radius, const Palette& p);
 // An LED cell: `lit` 0-1 blends `off` to `on` and adds a halo in `halo`.
 void led(HDC dc, const RECT& r, COLORREF on, COLORREF halo, double lit, COLORREF off);
+// A pool of light on a key's face under the pointer (`at`), clipped to the key.
+void spotlight(HDC dc, const RECT& key, float radius, POINT at, COLORREF color, double strength, int reach);
+// A ring of light spreading over a key from where it was pressed, clipped to the key. progress 0-1.
+void ripple(HDC dc, const RECT& key, float radius, POINT at, COLORREF color, double progress);
 // A dot-matrix pixel icon: rows of '#' cells, each cell `unit` px with a small gap.
 void pixelIcon(HDC dc, const char* const* rows, int count, int x, int y, int unit, COLORREF color);
 
@@ -70,6 +74,9 @@ void strokeRound(HDC dc, const RECT& r, COLORREF color, float radius, float widt
 // if `text` holds any other character; width is 0 in that case.
 // `gap` leaves that many pixels between cells, so the digits read as a dot matrix.
 int pixelDigitsWidth(const std::wstring& text, int unit);
+// The lit cells of `text` in the 5x7 digits: seven rows of '#' and '.', glyphs one column apart.
+// False (rows untouched) if the text holds a character the digits lack.
+bool pixelDigitRows(const std::wstring& text, std::string rows[7]);
 bool drawPixelDigits(HDC dc, const std::wstring& text, int x, int y, int unit, COLORREF color, int gap = 0);
 
 // A square notification-area icon showing `percent` (0-100) in 3x5 pixel

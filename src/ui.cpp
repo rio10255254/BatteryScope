@@ -213,6 +213,15 @@ int pixelDigitsWidth(const std::wstring& text, int unit) {
     }
     return width > 0 ? width - unit : 0;
 }
+bool pixelDigitRows(const std::wstring& text, std::string rows[7]) {
+    if (text.empty() || !pixelDigitsWidth(text, 1)) return false;
+    for (int row = 0; row < 7; ++row) rows[row].clear();
+    for (size_t i = 0; i < text.size(); ++i) {
+        const auto* glyph = digitGlyph(text[i]);
+        for (int row = 0; row < 7; ++row) { rows[row].append(glyph->rows[row], size_t(glyph->width)); if (i + 1 < text.size()) rows[row] += '.'; }
+    }
+    return true;
+}
 bool drawPixelDigits(HDC dc, const std::wstring& text, int x, int y, int unit, COLORREF color, int gap) {
     if (text.empty() || !pixelDigitsWidth(text, unit)) return false;
     gap = std::clamp(gap, 0, unit - 1);
@@ -413,60 +422,185 @@ void IconCache::clear() {
 // ----- Keycap style -----
 namespace ui {
 namespace {
-// Soft rounded-rect halos, worked out once per size, radius, spread and colour: a keycap's
-// shadow and a lit key's glow are copies of these, not something computed every frame.
-struct SpriteKey {
-    int w, h, radius, spread; COLORREF color; BYTE alpha;
-    bool operator<(const SpriteKey& o) const { return std::tie(w, h, radius, spread, color, alpha) < std::tie(o.w, o.h, o.radius, o.spread, o.color, o.alpha); }
-};
-struct Sprite { HDC dc = nullptr; HBITMAP bitmap = nullptr; HGDIOBJ original = nullptr; };
-std::map<SpriteKey, Sprite> sprites;
-const Sprite* haloSprite(const SpriteKey& key) {
-    if (auto found = sprites.find(key); found != sprites.end()) return &found->second;
-    if (sprites.size() > 400) clearSprites(); // sizes change with the window; keep the cache small
-    const int w = key.w + key.spread * 2, h = key.h + key.spread * 2;
-    if (w <= 0 || h <= 0 || w > 4096 || h > 4096) return nullptr;
+// Everything soft in this style is worked out once and then only copied: a key with its
+// shadow and light, a well with its shading, the halo of an LED. Each is a small bitmap with
+// per-pixel alpha, made in plain arithmetic from the distance to a rounded rect and kept by
+// size, state and colours; drawing one is a single blend.
+double roundDistance(double px, double py, double cx, double cy, double hw, double hh, double r) {
+    const double qx = std::abs(px - cx) - (hw - r), qy = std::abs(py - cy) - (hh - r);
+    return std::hypot(std::max(qx, 0.0), std::max(qy, 0.0)) + std::min(std::max(qx, qy), 0.0) - r;
+}
+double smoothStep(double a) { a = std::clamp(a, 0.0, 1.0); return a * a * (3 - 2 * a); }
+// Source over, into a premultiplied pixel.
+void blendOver(uint32_t& pixel, COLORREF c, double alpha) {
+    const uint32_t a = uint32_t(std::lround(std::clamp(alpha, 0.0, 1.0) * 255));
+    if (!a) return;
+    const uint32_t inv = 255 - a, da = pixel >> 24, dr = (pixel >> 16) & 255, dg = (pixel >> 8) & 255, db = pixel & 255;
+    const uint32_t oa = std::min<uint32_t>(255, a + (da * inv + 127) / 255);
+    const uint32_t r = (GetRValue(c) * a + dr * inv + 127) / 255, g = (GetGValue(c) * a + dg * inv + 127) / 255, b = (GetBValue(c) * a + db * inv + 127) / 255;
+    pixel = (oa << 24) | (std::min(r, oa) << 16) | (std::min(g, oa) << 8) | std::min(b, oa);
+}
+struct Baked { HBITMAP bitmap = nullptr; int w = 0, h = 0, margin = 0; };
+HDC bakeDC = nullptr;
+size_t bakedBytes = 0;
+Baked bake(int w, int h, uint32_t** bits) {
+    Baked baked;
+    if (w <= 0 || h <= 0 || w > 4096 || h > 4096) return baked;
     BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(info.bmiHeader);
     info.bmiHeader.biWidth = w; info.bmiHeader.biHeight = -h; info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32;
-    void* bits = nullptr;
     HDC screen = GetDC(nullptr);
-    HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
-    HDC dc = CreateCompatibleDC(screen);
+    if (!bakeDC) bakeDC = CreateCompatibleDC(screen);
+    void* memory = nullptr;
+    baked.bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &memory, nullptr, 0);
     ReleaseDC(nullptr, screen);
-    if (!bitmap || !dc || !bits) { if (bitmap) DeleteObject(bitmap); if (dc) DeleteDC(dc); return nullptr; }
-    // Distance from each pixel to the rounded rect; inside is solid, outside fades to nothing.
-    const double hw = key.w / 2.0, hh = key.h / 2.0, r = std::min({double(key.radius), hw, hh});
-    const double cx = w / 2.0, cy = h / 2.0, spread = std::max(1, key.spread);
-    auto* out = static_cast<uint32_t*>(bits);
-    for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
-        const double qx = std::abs(x + .5 - cx) - (hw - r), qy = std::abs(y + .5 - cy) - (hh - r);
-        const double d = std::hypot(std::max(qx, 0.0), std::max(qy, 0.0)) + std::min(std::max(qx, qy), 0.0) - r;
-        double a = d <= 0 ? 1 : std::max(0.0, 1 - d / spread);
-        a = a * a * (3 - 2 * a) * key.alpha / 255.0; // smoothstep: a soft edge without a visible ring
-        const uint32_t A = uint32_t(std::lround(a * 255));
-        out[size_t(y) * size_t(w) + size_t(x)] = (A << 24) | (uint32_t(GetRValue(key.color) * A / 255) << 16) |
-            (uint32_t(GetGValue(key.color) * A / 255) << 8) | uint32_t(GetBValue(key.color) * A / 255);
+    if (!baked.bitmap || !memory) { if (baked.bitmap) DeleteObject(baked.bitmap); return Baked{}; }
+    baked.w = w; baked.h = h; *bits = static_cast<uint32_t*>(memory);
+    bakedBytes += size_t(w) * size_t(h) * 4;
+    return baked;
+}
+void stamp(HDC dc, const Baked& baked, int x, int y, BYTE alpha = 255) {
+    if (!baked.bitmap || !bakeDC) return;
+    HGDIOBJ old = SelectObject(bakeDC, baked.bitmap);
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
+    GdiAlphaBlend(dc, x, y, baked.w, baked.h, bakeDC, 0, 0, baked.w, baked.h, blend);
+    SelectObject(bakeDC, old);
+}
+// The colours a key or a well is made of, as one number: a changed theme makes new bitmaps.
+uint32_t paletteTag(const Palette& p) {
+    uint32_t tag = 2166136261u;
+    for (COLORREF c : {p.keyTop, p.keyBottom, p.litTop, p.litMid, p.litBottom, p.rim, p.well, p.halo, p.shadow}) tag = (tag ^ c) * 16777619u;
+    return tag ^ (p.dark ? 0x80000000u : 0);
+}
+struct HaloId {
+    int w, h, radius, spread; COLORREF color;
+    bool operator<(const HaloId& o) const { return std::tie(w, h, radius, spread, color) < std::tie(o.w, o.h, o.radius, o.spread, o.color); }
+};
+struct KeyId {
+    int w, h, radius; unsigned char lit, pressed, hover; uint32_t tag;
+    bool operator<(const KeyId& o) const { return std::tie(w, h, radius, lit, pressed, hover, tag) < std::tie(o.w, o.h, o.radius, o.lit, o.pressed, o.hover, o.tag); }
+};
+struct WellId {
+    int w, h, radius; uint32_t tag;
+    bool operator<(const WellId& o) const { return std::tie(w, h, radius, tag) < std::tie(o.w, o.h, o.radius, o.tag); }
+};
+std::map<HaloId, Baked> halos;
+std::map<KeyId, Baked> keys;
+std::map<WellId, Baked> wells;
+// A soft halo round a rounded rect at full strength; its strength is chosen when it is drawn.
+const Baked& haloSprite(const HaloId& id) {
+    if (auto found = halos.find(id); found != halos.end()) return found->second;
+    const int w = id.w + id.spread * 2, h = id.h + id.spread * 2;
+    uint32_t* out = nullptr;
+    Baked baked = bake(w, h, &out);
+    if (baked.bitmap) {
+        const double hw = id.w / 2.0, hh = id.h / 2.0, r = std::min({double(id.radius), hw, hh}), spread = std::max(1, id.spread);
+        for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
+            const double d = roundDistance(x + .5, y + .5, w / 2.0, h / 2.0, hw, hh, r);
+            uint32_t pixel = 0;
+            blendOver(pixel, id.color, d <= 0 ? 1 : smoothStep(1 - d / spread)); // smoothstep: a soft edge without a visible ring
+            out[size_t(y) * size_t(w) + size_t(x)] = pixel;
+        }
+        baked.margin = id.spread;
     }
-    Sprite sprite{dc, bitmap, SelectObject(dc, bitmap)};
-    return &sprites.emplace(key, sprite).first->second;
+    return halos.emplace(id, baked).first->second;
+}
+// A key: its light on the panel (when lit), its shadow, its face from top to bottom, the catch
+// light along its top edge and, lit, the light showing along its rim.
+const Baked& keySprite(const KeyId& id, const Palette& p) {
+    if (auto found = keys.find(id); found != keys.end()) return found->second;
+    const double lit = id.lit / 16.0, pressed = id.pressed / 4.0, hover = id.hover / 4.0;
+    const int w = id.w, h = id.h, unit = std::max(1, h / 22);
+    const double radius = std::min({double(id.radius), w / 2.0, h / 2.0});
+    const int glowSpread = std::max(8, h / 2);
+    // Under the pointer the shadow lengthens, as if the key stood a little taller; pressed, it shortens.
+    const int drop = int(std::lround((1 - pressed) * unit * (3 + 2 * hover))) + 1;
+    const int shadowSpread = unit * 5 + 2 + int(std::lround(hover * unit * 2));
+    const int margin = std::max(lit > 0 ? glowSpread : 0, shadowSpread + drop) + 1;
+    const int W = w + margin * 2, H = h + margin * 2;
+    uint32_t* out = nullptr;
+    Baked baked = bake(W, H, &out);
+    if (baked.bitmap) {
+        baked.margin = margin;
+        const double cx = W / 2.0, cy = H / 2.0, hw = w / 2.0, hh = h / 2.0;
+        const int press = int(std::lround(pressed * unit));
+        const COLORREF lift = RGB(255, 255, 255);
+        const double brighten = hover * (p.dark ? .05 : .25);
+        const COLORREF top = mix(mix(p.keyTop, p.litTop, lit), lift, brighten);
+        const COLORREF middle = mix(mix(mix(p.keyTop, p.keyBottom, .62), p.litMid, lit), lift, brighten);
+        const COLORREF bottom = mix(mix(p.keyBottom, p.litBottom, lit), lift, brighten);
+        const double band = std::max(1.0, double(unit) * (lit > .5 ? 2.0 : 1.0));
+        const COLORREF catchLight = mix(p.dark ? RGB(80, 82, 92) : RGB(255, 255, 255), p.rim, lit);
+        const double catchAlpha = (p.dark ? 40 + 150 * lit : 230) / 255.0;
+        const double glowAlpha = (p.dark ? 115 : 105) / 255.0 * lit, shadowAlpha = (p.dark ? 150 : 52) / 255.0, contactAlpha = (p.dark ? 110 : 34) / 255.0;
+        const double rimWidth = p.dark ? 1.6 : 1.1, rimAlpha = (p.dark ? 235 : 150) / 255.0 * lit;
+        for (int y = 0; y < H; ++y) for (int x = 0; x < W; ++x) {
+            const double px = x + .5, py = y + .5;
+            uint32_t pixel = 0;
+            const double body = roundDistance(px, py - press, cx, cy, hw, hh, radius);
+            if (body < -1) { // well inside the face: nothing under it shows
+                const double t = std::clamp((py - press - margin) / h, 0.0, 1.0);
+                COLORREF face = t < .62 ? mix(top, middle, t / .62) : mix(middle, bottom, (t - .62) / .38);
+                if (py - press - margin < band) face = mix(face, catchLight, catchAlpha);
+                if (lit > 0) face = mix(face, p.rim, std::clamp(rimWidth + body + .5, 0.0, 1.0) * rimAlpha);
+                out[size_t(y) * size_t(W) + size_t(x)] = 0xFF000000u | (uint32_t(GetRValue(face)) << 16) | (uint32_t(GetGValue(face)) << 8) | GetBValue(face);
+                continue;
+            }
+            if (lit > 0) { const double d = roundDistance(px, py, cx, cy, hw, hh, radius); blendOver(pixel, p.halo, (d <= 0 ? 1 : smoothStep(1 - d / glowSpread)) * glowAlpha); }
+            { const double d = roundDistance(px, py - drop, cx, cy, hw, hh, radius); blendOver(pixel, p.shadow, (d <= 0 ? 1 : smoothStep(1 - d / shadowSpread)) * shadowAlpha); }
+            { const double d = roundDistance(px, py - 1, cx, cy, hw, hh, radius); blendOver(pixel, p.shadow, (d <= 0 ? 1 : smoothStep(1 - d / 2)) * contactAlpha); }
+            const double cover = std::clamp(.5 - body, 0.0, 1.0);
+            if (cover > 0) {
+                const double t = std::clamp((py - press - margin) / h, 0.0, 1.0);
+                COLORREF face = t < .62 ? mix(top, middle, t / .62) : mix(middle, bottom, (t - .62) / .38);
+                if (py - press - margin < band) face = mix(face, catchLight, catchAlpha);
+                if (lit > 0) face = mix(face, p.rim, std::clamp(rimWidth + body + .5, 0.0, 1.0) * rimAlpha);
+                blendOver(pixel, face, cover);
+            }
+            out[size_t(y) * size_t(W) + size_t(x)] = pixel;
+        }
+    }
+    return keys.emplace(id, baked).first->second;
+}
+// A well: the panel sunk in, shaded under its top edge, a faint light along its lower edge.
+const Baked& wellSprite(const WellId& id, const Palette& p) {
+    if (auto found = wells.find(id); found != wells.end()) return found->second;
+    uint32_t* out = nullptr;
+    Baked baked = bake(id.w, id.h, &out);
+    if (baked.bitmap) {
+        const double hw = id.w / 2.0, hh = id.h / 2.0, radius = std::min({double(id.radius), hw, hh});
+        const double shade = std::clamp(id.h * .22, 3.0, 9.0), shadeAlpha = (p.dark ? 200 : 60) / 255.0, lineAlpha = (p.dark ? 14 : 150) / 255.0;
+        for (int y = 0; y < id.h; ++y) {
+            COLORREF row = p.well;
+            if (y + .5 < shade) row = mix(row, p.shadow, shadeAlpha * (1 - (y + .5) / shade));
+            if (y == id.h - 1) row = mix(row, RGB(255, 255, 255), lineAlpha);
+            for (int x = 0; x < id.w; ++x) {
+                uint32_t pixel = 0;
+                blendOver(pixel, row, std::clamp(.5 - roundDistance(x + .5, y + .5, hw, hh, hw, hh, radius), 0.0, 1.0));
+                out[size_t(y) * size_t(id.w) + size_t(x)] = pixel;
+            }
+        }
+    }
+    return wells.emplace(id, baked).first->second;
 }
 void solid(HDC dc, const RECT& r, COLORREF c) {
     if (r.right <= r.left || r.bottom <= r.top) return;
     SetDCBrushColor(dc, c); FillRect(dc, &r, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
 }
+// Sizes and colours change with the window, the scale and the theme: past this much, start over.
+void trimSprites() { if (bakedBytes > 40u * 1024 * 1024 || halos.size() + keys.size() + wells.size() > 1500) clearSprites(); }
 }
 void clearSprites() {
-    for (auto& [key, sprite] : sprites) { SelectObject(sprite.dc, sprite.original); DeleteObject(sprite.bitmap); DeleteDC(sprite.dc); }
-    sprites.clear();
+    for (auto* cache : {&halos}) for (auto& [id, baked] : *cache) if (baked.bitmap) DeleteObject(baked.bitmap);
+    for (auto& [id, baked] : keys) if (baked.bitmap) DeleteObject(baked.bitmap);
+    for (auto& [id, baked] : wells) if (baked.bitmap) DeleteObject(baked.bitmap);
+    halos.clear(); keys.clear(); wells.clear(); bakedBytes = 0;
 }
 void softHalo(HDC dc, const RECT& r, float radius, COLORREF c, BYTE alpha, int spread, int dx, int dy) {
     if (alpha == 0 || r.right <= r.left || r.bottom <= r.top) return;
-    const SpriteKey key{int(r.right - r.left), int(r.bottom - r.top), int(std::lround(radius)), std::max(1, spread), c, alpha};
-    const Sprite* sprite = haloSprite(key);
-    if (!sprite) return;
-    const int w = key.w + key.spread * 2, h = key.h + key.spread * 2;
-    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-    GdiAlphaBlend(dc, r.left - key.spread + dx, r.top - key.spread + dy, w, h, sprite->dc, 0, 0, w, h, blend);
+    trimSprites();
+    const HaloId id{int(r.right - r.left), int(r.bottom - r.top), int(std::lround(radius)), std::max(1, spread), c};
+    const Baked& baked = haloSprite(id);
+    stamp(dc, baked, r.left - id.spread + dx, r.top - id.spread + dy, alpha);
 }
 void keycap(HDC dc, RECT r, float radius, const Palette& p, double lit, double pressed, double hover) {
     if (r.right <= r.left || r.bottom <= r.top) return;
@@ -476,63 +610,55 @@ void keycap(HDC dc, RECT r, float radius, const Palette& p, double lit, double p
         strokeRound(dc, r, lit > .5 ? p.selectedInk : p.border, radius, lit > .5 ? 2.0f : 1.0f);
         return;
     }
-    const int h = r.bottom - r.top, unit = std::max(1, h / 22);
-    // Light first (it spills onto the panel round the key), then the key's shadow on the panel.
-    if (lit > 0) softHalo(dc, r, radius, p.halo, BYTE((p.dark ? 115 : 105) * lit), std::max(8, h / 2));
-    const int drop = int(std::lround((1 - pressed) * unit * 3));
-    softHalo(dc, r, radius, p.shadow, BYTE(p.dark ? 150 : 52), unit * 5 + 2, 0, drop + 1);
-    softHalo(dc, r, radius, p.shadow, BYTE(p.dark ? 110 : 34), 2, 0, 1);
-    OffsetRect(&r, 0, int(std::lround(pressed * unit)));
-    // The face: lighter at the top, a little brighter under the pointer, warm (or cool) when lit.
-    const COLORREF lift = RGB(255, 255, 255);
-    const double brighten = hover * (p.dark ? .05 : .25);
-    const COLORREF top = mix(mix(p.keyTop, p.litTop, lit), lift, brighten);
-    const COLORREF middle = mix(mix(mix(p.keyTop, p.keyBottom, .62), p.litMid, lit), lift, brighten);
-    const COLORREF bottom = mix(mix(p.keyBottom, p.litBottom, lit), lift, brighten);
-    if (!graphicsToken) { gdiRound(dc, r, middle, nullptr, radius); return; }
+    trimSprites();
+    // A key in a given state is one bitmap: light, shadow, face and edges together.
+    const KeyId id{int(r.right - r.left), int(r.bottom - r.top), int(std::lround(radius)),
+        static_cast<unsigned char>(std::lround(lit * 16)), static_cast<unsigned char>(std::lround(pressed * 4)), static_cast<unsigned char>(std::lround(hover * 4)), paletteTag(p)};
+    const Baked& baked = keySprite(id, p);
+    stamp(dc, baked, r.left - baked.margin, r.top - baked.margin);
+}
+void spotlight(HDC dc, const RECT& key, float radius, POINT at, COLORREF c, double strength, int reach) {
+    if (!graphicsToken || strength <= .01 || reach <= 0 || key.right <= key.left) return;
     Canvas canvas(dc);
     auto& g = canvas.g;
-    const auto box = rectF(r);
-    Gdiplus::GraphicsPath path; roundPath(path, box, radius);
-    Gdiplus::LinearGradientBrush face(Gdiplus::PointF(0, box.Y - 1), Gdiplus::PointF(0, box.Y + box.Height + 1), color(top), color(bottom));
-    Gdiplus::Color stops[] = {color(top), color(middle), color(bottom)};
-    Gdiplus::REAL positions[] = {0.0f, .62f, 1.0f};
-    face.SetInterpolationColors(stops, positions, 3);
-    g.FillPath(&face, &path);
-    // The edge: a catch light along the top when unlit; lit, the light shows along the rim.
+    Gdiplus::GraphicsPath face; roundPath(face, rectF(key), radius);
     Gdiplus::GraphicsState state = g.Save();
-    g.SetClip(&path);
-    const float band = std::max(1.0f, float(unit) * (lit > .5 ? 2.0f : 1.0f));
-    const COLORREF catchLight = mix(p.dark ? RGB(80, 82, 92) : RGB(255, 255, 255), p.rim, lit);
-    Gdiplus::SolidBrush edge(color(catchLight, BYTE(p.dark ? 40 + 150 * lit : 230)));
-    g.FillRectangle(&edge, box.X, box.Y, box.Width, band);
+    g.SetClip(&face);
+    Gdiplus::GraphicsPath pool; pool.AddEllipse(float(at.x - reach), float(at.y - reach), float(reach * 2), float(reach * 2));
+    Gdiplus::PathGradientBrush brush(&pool);
+    brush.SetCenterPoint(Gdiplus::PointF(float(at.x), float(at.y)));
+    brush.SetCenterColor(color(c, BYTE(std::clamp(strength, 0.0, 1.0) * 255)));
+    Gdiplus::Color edge = color(c, 0); int count = 1;
+    brush.SetSurroundColors(&edge, &count);
+    g.FillPath(&brush, &pool);
     g.Restore(state);
-    if (lit > 0) {
-        auto inner = box; inner.Inflate(-.5f, -.5f);
-        Gdiplus::GraphicsPath rimPath; roundPath(rimPath, inner, std::max(0.0f, radius - .5f));
-        Gdiplus::Pen rim(color(p.rim, BYTE((p.dark ? 235 : 150) * lit)), p.dark ? 1.5f : 1.0f);
-        g.DrawPath(&rim, &rimPath);
-    }
+}
+void ripple(HDC dc, const RECT& key, float radius, POINT at, COLORREF c, double progress) {
+    if (!graphicsToken || progress <= 0 || progress >= 1 || key.right <= key.left) return;
+    Canvas canvas(dc);
+    auto& g = canvas.g;
+    Gdiplus::GraphicsPath face; roundPath(face, rectF(key), radius);
+    Gdiplus::GraphicsState state = g.Save();
+    g.SetClip(&face);
+    // Far enough to pass the key's farthest corner.
+    double reach = 0;
+    for (const POINT corner : {POINT{key.left, key.top}, POINT{key.right, key.top}, POINT{key.left, key.bottom}, POINT{key.right, key.bottom}})
+        reach = std::max(reach, std::hypot(double(corner.x - at.x), double(corner.y - at.y)));
+    const double eased = 1 - (1 - progress) * (1 - progress);
+    const float r = float(reach * eased), width = float(std::max(2.0, (key.bottom - key.top) * .12 * (1 + progress)));
+    const BYTE alpha = BYTE(190 * (1 - progress));
+    Gdiplus::SolidBrush wash(color(c, BYTE(alpha / 5)));
+    g.FillEllipse(&wash, float(at.x) - r, float(at.y) - r, r * 2, r * 2);
+    Gdiplus::Pen pen(color(c, alpha), width);
+    g.DrawEllipse(&pen, float(at.x) - r, float(at.y) - r, r * 2, r * 2);
+    g.Restore(state);
 }
 void well(HDC dc, const RECT& r, float radius, const Palette& p) {
     if (r.right <= r.left || r.bottom <= r.top) return;
     if (p.highContrast) { strokeRound(dc, r, p.border, radius, 1.0f); return; }
-    if (!graphicsToken) { gdiRound(dc, r, p.well, nullptr, radius); return; }
-    Canvas canvas(dc);
-    auto& g = canvas.g;
-    const auto box = rectF(r);
-    Gdiplus::GraphicsPath path; roundPath(path, box, radius);
-    Gdiplus::SolidBrush fill(color(p.well));
-    g.FillPath(&fill, &path);
-    Gdiplus::GraphicsState state = g.Save();
-    g.SetClip(&path);
-    // Shade under the top edge, as if the panel overhangs; a faint light on the lower edge.
-    const float shade = std::clamp(box.Height * .22f, 3.0f, 9.0f);
-    Gdiplus::LinearGradientBrush top(Gdiplus::PointF(0, box.Y - .5f), Gdiplus::PointF(0, box.Y + shade), color(p.shadow, BYTE(p.dark ? 200 : 60)), color(p.shadow, 0));
-    g.FillRectangle(&top, box.X, box.Y, box.Width, shade);
-    Gdiplus::SolidBrush lower(color(RGB(255, 255, 255), BYTE(p.dark ? 14 : 150)));
-    g.FillRectangle(&lower, box.X, box.Y + box.Height - 1, box.Width, 1.0f);
-    g.Restore(state);
+    trimSprites();
+    const WellId id{int(r.right - r.left), int(r.bottom - r.top), int(std::lround(radius)), paletteTag(p)};
+    stamp(dc, wellSprite(id, p), r.left, r.top);
 }
 void led(HDC dc, const RECT& r, COLORREF on, COLORREF halo, double lit, COLORREF off) {
     lit = std::clamp(lit, 0.0, 1.0);

@@ -7,6 +7,7 @@
 #include "../src/stability.h"
 #include "../src/verify.h"
 #include "../src/motion.h"
+#include "../src/fx.h"
 #include "../src/i18n.h"
 #include <shellapi.h>
 #include <algorithm>
@@ -141,6 +142,55 @@ int wmain(int argc, wchar_t** argv) {
         easing.move(300, 1300, 180); double reversal = easing.value(1380); easing.move(0, 1380, 180);
         check(easing.value(1380) == reversal && easing.value(1381) < reversal, "scroll reversal immediately follows input without a jump");
         easing.move(50, 1382, 0); check(easing.value(1382) == 50 && !easing.active(1382), "reduced motion resolves immediately");
+        {
+            // Effects beyond the window: drawn in software, premultiplied, deterministic, and gone when over.
+            using namespace bs::fx;
+            auto premultiplied = [](const Canvas& c) {
+                for (int i = 0; i < c.w * c.h; ++i) {
+                    const uint32_t p = c.px[i], a = p >> 24;
+                    if (((p >> 16) & 255) > a || ((p >> 8) & 255) > a || (p & 255) > a) return false;
+                }
+                return true;
+            };
+            auto lit = [](const Canvas& c) { int n = 0; for (int i = 0; i < c.w * c.h; ++i) n += (c.px[i] >> 24) != 0; return n; };
+            Stage stage; stage.own({100, 200, 400, 440});
+            stage.add(burst({250, 320}, RGB(245, 195, 103), RGB(244, 175, 61), 14, 80, 3, 500, 7), 1000);
+            stage.add(ring({250, 320}, RGB(244, 175, 61), 4, 90, 6, 400), 1000);
+            RECT changed{};
+            const bool alive = stage.render(1200, &changed);
+            const int during = lit(stage.canvas());
+            check(alive && during > 200 && premultiplied(stage.canvas()) && changed.right > changed.left && changed.left >= 0 && changed.bottom <= 240,
+                "effects draw premultiplied light inside their canvas");
+            Stage twin; twin.own({100, 200, 400, 440});
+            twin.add(burst({250, 320}, RGB(245, 195, 103), RGB(244, 175, 61), 14, 80, 3, 500, 7), 1000);
+            twin.add(ring({250, 320}, RGB(244, 175, 61), 4, 90, 6, 400), 1000);
+            twin.render(1200);
+            check(std::memcmp(stage.canvas().px, twin.canvas().px, size_t(stage.canvas().w) * size_t(stage.canvas().h) * 4) == 0, "an effect frame is the same picture every time");
+            const bool over = stage.render(1600, &changed);
+            check(!over && lit(stage.canvas()) == 0 && changed.right > changed.left, "finished effects leave a clear canvas and report what to erase");
+            // The old theme wiped away in a growing circle.
+            Stage wipe; wipe.own({0, 0, 120, 100});
+            wipe.reveal(std::vector<uint32_t>(60 * 50, 0xFF204060u), 60, 50, {30, 25}, {60, 50}, 60, 400, RGB(255, 255, 255), 3, 0);
+            wipe.render(1);
+            const auto at = [&](int x, int y) { return wipe.canvas().px[size_t(y) * 120 + size_t(x)]; };
+            const bool whole = at(31, 26) == 0xFF204060u && at(88, 73) == 0xFF204060u && at(10, 10) == 0;
+            wipe.render(40);
+            const bool opened = (at(60, 50) >> 24) == 0 && at(31, 26) == 0xFF204060u;
+            const bool wiped = !wipe.render(401) && lit(wipe.canvas()) == 0;
+            check(whole && opened && wiped, "the theme reveal opens from its centre and ends clear");
+            // Light round the screen: plugging in starts at the bottom centre and reaches the top last.
+            EdgeLights edge; edge.layout({0, 0, 400, 300}, 10);
+            edge.play(EdgeShow::connect, RGB(244, 175, 61), 1000, 0);
+            const bool early = edge.intensity(.02, .3) > .3 && edge.intensity(.9, .3) == 0;
+            const bool late = edge.intensity(.98, .62) > .5;
+            edge.render(300);
+            const Canvas& bottom = edge.canvas(2); const Canvas& top = edge.canvas(0);
+            const bool bottomLit = (bottom.px[size_t(9) * 400 + 200] >> 24) > 60 && lit(top) == 0 && premultiplied(bottom);
+            const bool ended = !edge.render(1001) && lit(bottom) == 0 && lit(edge.canvas(1)) == 0;
+            check(early && late && bottomLit && ended, "edge light runs from the bottom centre to the top and ends dark");
+            edge.play(EdgeShow::burst, RGB(255, 120, 60), 600, 0, .4);
+            check(edge.intensity(.2, .5) > 0 && edge.intensity(.6, .5) == 0, "a mode burst stays within its reach");
+        }
         english = true; check(std::wstring(tr(L"充電功率")) == L"Charging power", "charging strings are localized");
         english = false; check(std::wstring(tr(L"充電功率")) == L"充電功率", "language switch returns to Chinese");
         {
