@@ -3503,7 +3503,7 @@ void layout() {
         inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic || inlinePage == InlinePage::goal || inlinePage == InlinePage::performance || inlinePage == InlinePage::stability ||
         inlinePage == InlinePage::confirm || inlinePage == InlinePage::error;
     const bool section = sectionPage(inlinePage);
-    const int textTop = inlinePage == InlinePage::powerMode ? sp(248) : section ? sp(52) : fullPage ? sp(52) : top - sp(37);
+    const int textTop = section ? sp(52) : fullPage ? sp(52) : top - sp(37);
     {
         const int pageLeft = margin + sp(12), pageWidth = inner - sp(24), modeGap = sp(6);
         const int third = (pageWidth - 2 * modeGap) / 3, pageHalf = (pageWidth - modeGap) / 2;
@@ -3512,7 +3512,7 @@ void layout() {
         MoveWindow(restoreModesButton, pageLeft, sp(206), pageHalf, sp(30), TRUE);
         MoveWindow(energySettingsButton, pageLeft + pageHalf + modeGap, sp(206), pageWidth - pageHalf - modeGap, sp(30), TRUE);
     }
-    const int textBottom = inlinePage == InlinePage::process ? h - sp(140) : section ? h - sp(4) : h - sp(94);
+    const int textBottom = section ? h - sp(4) : h - sp(94);
     MoveWindow(inlineText, margin + sp(12), textTop, inner - sp(24), std::max(sp(55), textBottom - textTop), TRUE);
     // Chart pages run across the panel's face (less its margins): no card around them.
     if (visualView) MoveWindow(visualView, 0, textTop, w, std::max(sp(55), textBottom - textTop), TRUE);
@@ -3522,10 +3522,11 @@ void layout() {
         MoveWindow(perfAppButton, pageLeft + pageHalf + sp(8), h - sp(103), pageWidth - pageHalf - sp(8), sp(32), TRUE);
     }
     SendMessageW(inlineText, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(sp(4), sp(4)));
-    const int inlineWidth = inner - sp(24);
-    MoveWindow(inlineBack, margin + sp(12), h - sp(59),
+    const bool chart = inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode; // chart pages run margin to margin
+    const int inlineWidth = chart ? inner : inner - sp(24), inlineLeft = chart ? margin : margin + sp(12);
+    MoveWindow(inlineBack, inlineLeft, h - sp(59),
         inlinePage == InlinePage::confirm ? (inlineWidth - sp(8)) / 2 : inlineWidth, sp(34), TRUE);
-    MoveWindow(inlineConfirm, margin + sp(12) + (inlineWidth - sp(8)) / 2 + sp(8), h - sp(59),
+    MoveWindow(inlineConfirm, inlineLeft + (inlineWidth - sp(8)) / 2 + sp(8), h - sp(59),
         (inlineWidth - sp(8)) / 2, sp(34), TRUE);
     InvalidateRect(mainWindow, nullptr, FALSE);
 }
@@ -3560,16 +3561,12 @@ void showInlinePage(InlinePage page, const std::wstring& title, const std::wstri
     ShowWindow(inlineBack, sectionPage(page) ? SW_HIDE : SW_SHOW); // sections are left through the tabs (or Esc)
     if (visualView) ShowWindow(visualView, SW_HIDE); // a chart page shows it again with showVisual
     ShowWindow(inlineConfirm, page == InlinePage::confirm ? SW_SHOW : SW_HIDE);
-    for (HWND control : modeButtons) ShowWindow(control, page == InlinePage::powerMode ? SW_SHOW : SW_HIDE);
-    for (HWND control : {ecoButton, perfAppButton}) ShowWindow(control, page == InlinePage::process ? SW_SHOW : SW_HIDE);
-    for (HWND control : {restoreModesButton, energySettingsButton}) ShowWindow(control, page == InlinePage::powerMode ? SW_SHOW : SW_HIDE);
+    // The power mode and program pages are chart pages now: their old buttons only hold state.
+    for (HWND control : modeButtons) ShowWindow(control, SW_HIDE);
+    for (HWND control : {ecoButton, perfAppButton, restoreModesButton, energySettingsButton}) ShowWindow(control, SW_HIDE);
     SetWindowTextW(inlineBack, page == InlinePage::confirm ? tr(L"取消") : tr(L"返回排行"));
     layout();
     HWND focus = page == InlinePage::confirm ? inlineBack : inlineText;
-    if (page == InlinePage::powerMode) {
-        focus = inlineBack;
-        for (HWND control : modeButtons) if (IsWindowEnabled(control)) { focus = control; break; }
-    }
     SetFocus(focus);
 }
 void finishInlineClose() {
@@ -3797,16 +3794,6 @@ void paint(HDC dc, RECT bounds) {
                 drawText(dc, head, at, Ink, titleFont, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
                 drawText(dc, shown.substr(settled), {at.left + (settled ? textWidth(dc, head, titleFont) : 0), at.top, at.right, at.bottom}, Green, titleFont, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
             }
-        }
-        if (inlinePage == InlinePage::powerMode) {
-            const bool plugged = pluggedInNow();
-            const std::wstring now = effectiveMode == EffectiveMode::unknown ? tr(L"目前生效：無法讀取") :
-                tr(L"目前生效：") + std::wstring(effectiveName(effectiveMode)) + (plugged ? tr(L"（插電中）") : tr(L"（用電池）"));
-            drawText(dc, now, {margin + sp(14), sp(56), right - sp(14), sp(78)}, Ink, strongFont);
-            drawText(dc, std::wstring(tr(L"插電時")) + (plugged ? tr(L" · 目前") : L""), {margin + sp(14), sp(84), right - sp(14), sp(104)},
-                plugged ? Green : Muted, smallFont);
-            drawText(dc, std::wstring(tr(L"用電池時")) + (!plugged ? tr(L" · 目前") : L""), {margin + sp(14), sp(142), right - sp(14), sp(162)},
-                !plugged ? Green : Muted, smallFont);
         }
         return; // notices show as a card above the tabs
     }
@@ -4457,6 +4444,8 @@ void setTheme(ui::ThemeChoice choice) {
     themeMotion.duration = 0; themeBlend = -1;
     applyTheme();
 }
+std::vector<VBlock> powerModeBlocks();
+std::wstring powerModeText();
 void refreshPowerModeControls() {
     const bool editable = !demo && !isolatedPreview;
     if (editable) powerModes = queryPowerModes();
@@ -4477,6 +4466,8 @@ void refreshPowerModeControls() {
     EnableWindow(restoreModesButton, editable && (handBack || (powerModes.restorable && !dynamicEnabled)));
     EnableWindow(energySettingsButton, editable);
     InvalidateRect(mainWindow, nullptr, FALSE);
+    if (inlinePage == InlinePage::powerMode && visualView && IsWindowVisible(visualView))
+        showChartPage(InlinePage::powerMode, tr(L"電源模式"), powerModeText(), powerModeBlocks()); // the page follows the change
 }
 std::wstring powerModeText() {
     std::wstring text = tr(L"「插電時」與「用電池時」是 Windows 的兩個獨立設定，各自只在對應的供電狀態生效。");
@@ -4486,8 +4477,8 @@ std::wstring powerModeText() {
             tr(L"。節能工具會再限制背景活動，請在「Windows 節能設定」調整。");
     if (powerModes.error == ERROR_PROC_NOT_FOUND) text += tr(L"\n\n此 Windows 版本未提供電源模式設定，只能檢視。");
     else if (batteryAbsent()) text += tr(L"\n\n這台電腦沒有電池，只有「插電時」的設定會生效。");
-    else if (powerModes.legacy) text += tr(L"\n\nWindows 10 只能變更目前供電來源的設定（另一項為灰色）；接上或拔除電源後即可變更另一項。");
-    else if (!powerModes.acKnown || !powerModes.dcKnown) text += tr(L"\n\n灰色的選項表示此電腦未提供該設定。");
+    else if (powerModes.legacy) text += tr(L"\n\nWindows 10 只能變更目前供電來源的設定（另一項只能檢視）；接上或拔除電源後即可變更另一項。");
+    else if (!powerModes.acKnown || !powerModes.dcKnown) text += tr(L"\n\n只能檢視的項目表示此電腦未提供該設定。");
     text += tr(L"\n\nBatteryScope 第一次變更某一項時會記住原本的設定，可用「還原原本設定」恢復；不會結束任何程式。");
     return text;
 }
@@ -4841,9 +4832,34 @@ void showLabPage() {
     showChartPage(InlinePage::lab, tr(L"省電實驗室"), labPageText(), labBlocks(labController->status()));
     labPageShownAt = GetTickCount64();
 }
+// The power mode page, set out like every other page: what is in effect, a row of three
+// choices for each power source, then the commands and the explanation.
+std::vector<VBlock> powerModeBlocks() {
+    const bool editable = !demo && !isolatedPreview, plugged = pluggedInNow(), noBattery = batteryAbsent();
+    std::vector<VBlock> v;
+    v.push_back(vChips({{effectiveMode == EffectiveMode::unknown ? std::wstring(tr(L"目前生效：無法讀取")) :
+        tr(L"目前生效：") + std::wstring(effectiveName(effectiveMode)) + (plugged ? tr(L"（插電中）") : tr(L"（用電池）")), Green}}));
+    for (int source = 0; source < 2; ++source) {
+        const bool ac = source == 0;
+        const bool known = ac ? powerModes.acKnown : powerModes.dcKnown;
+        const bool settable = known && (ac ? powerModes.acSettable : powerModes.dcSettable && !noBattery);
+        const PowerMode mode = ac ? powerModes.ac : powerModes.dc;
+        const int base = ac ? ModeAcEfficiencyId : ModeDcEfficiencyId;
+        v.push_back(vHeading(std::wstring(ac ? tr(L"插電時") : tr(L"用電池時")) + (ac == plugged ? tr(L" · 目前") : L"")));
+        if (settable) v.push_back(vSegments({tr(L"效率"), tr(L"平衡"), tr(L"效能")}, {base, base + 1, base + 2}, mode != PowerMode::other ? int(mode) : -1));
+        else v.push_back(vChips({{known ? std::wstring(modeName(mode)) + tr(L" · 只能檢視") : std::wstring(tr(L"此電腦未提供這項設定")), 0}}));
+    }
+    v.push_back(vHeading(tr(L"其他")));
+    const bool handBack = powerModeHeld();
+    if (editable && (handBack || (powerModes.restorable && !dynamicEnabled)))
+        v.push_back(vAction(handBack ? tr(L"交給動態省電") : tr(L"還原原本設定"), L"", RestoreModesId));
+    v.push_back(vAction(tr(L"Windows 節能設定"), L"", EnergySaverSettingsId));
+    v.push_back(vNote(powerModeText()));
+    return v;
+}
 void showPowerModePage() {
     refreshPowerModeControls();
-    showInlinePage(InlinePage::powerMode, tr(L"電源模式"), powerModeText());
+    showChartPage(InlinePage::powerMode, tr(L"電源模式"), powerModeText(), powerModeBlocks());
     releaseInteraction();
 }
 std::wstring candidatesText() {
@@ -5022,53 +5038,80 @@ std::wstring energySourceText(const CpuEnergyReport& energy) {
 }
 void showDetails(const ProcessRow& row) {
     if (!inlineProcess || &row != &*inlineProcess) inlineProcess = row;
-    std::wstring content = row.name + L"\nPID: " + std::to_wstring(row.pid) +
-        tr(L"\n路徑：") + (row.path.empty() ? tr(L"未知") : row.path) +
-        tr(L"\n\nCPU（全機比例）: ") + number(row.cpu) + tr(L"%\n30 秒平滑 CPU: ") + number(row.averageCpu) +
+    // The page is written once as sections; the plain text (for copying and screen readers) joins them.
+    std::wstring usage, energy, method, totals, about, services, status;
+    const std::wstring identity = row.name + L"\nPID: " + std::to_wstring(row.pid) +
+        tr(L"\n路徑：") + (row.path.empty() ? tr(L"未知") : row.path);
+    usage = tr(L"\n\nCPU（全機比例）: ") + number(row.cpu) + tr(L"%\n30 秒平滑 CPU: ") + number(row.averageCpu) +
         L"%\nI/O: " + (row.ioKnown ? number(row.ioMB, 2) + L" MB/s" : tr(L"未知")) +
         tr(L"\n記憶體: ") + (row.memoryKnown ? number(row.memoryMB) + tr(L" MB（") + number(row.memoryAgeSeconds, 0) + tr(L" 秒前）") : tr(L"未知")) +
         tr(L"\n活動: ") + activityText(row) +
         tr(L"\nGPU 使用率: ") + (row.gpuPercent ? number(*row.gpuPercent, 0) + tr(L"%（最忙碌的 GPU 引擎；不是瓦數）") : std::wstring(tr(L"未取得")));
     if (row.cpuWatts) {
-        content += tr(L"\n\n本次 CPU 估計: ") + valueText(row.cpuWatts, L" W", 2) +
+        energy += tr(L"\n\n本次 CPU 估計: ") + valueText(row.cpuWatts, L" W", 2) +
             tr(L"\n30 秒平滑 CPU 估計: ") + valueText(row.averageCpuWatts, L" W", 2) +
             tr(L"\n30 秒平滑的核心分攤模型範圍: ") + valueText(row.cpuWattsLow, L"", 2) + L"–" + valueText(row.cpuWattsHigh, L" W", 2) +
             tr(L"\n監測期間 CPU 估計能量: ") + valueText(row.cpuMilliWh, L" mWh", 2);
-        content += tr(L"\n能源來源: ") + energySourceText(current.energy);
+        energy += tr(L"\n能源來源: ") + energySourceText(current.energy);
         if (current.energy.source == EnergySource::perCore)
-            content += tr(L"\n本次固定核心資訊覆蓋: ") + number(row.placementCoverage*100,0) + L"%";
-        content += tr(L"\n全機 CPU 時間覆蓋: ") + number(current.energy.observedCpuCoverage*100,0) +
+            energy += tr(L"\n本次固定核心資訊覆蓋: ") + number(row.placementCoverage*100,0) + L"%";
+        energy += tr(L"\n全機 CPU 時間覆蓋: ") + number(current.energy.observedCpuCoverage*100,0) +
             tr(L"%（可讀程序時間／系統忙碌時間，非準確率）");
-        content += tr(L"\n觀測品質: ") + qualityText(current.energy.quality) +
+        energy += tr(L"\n觀測品質: ") + qualityText(current.energy.quality) +
             tr(L" · 採樣端點差 ") + number(current.energy.sampleSkewMs, 0) + L" ms";
         if (!current.history.empty() && current.history.back().fullWh && row.averageCpuWatts)
-            content += tr(L"\nCPU 部分估計耗電速度: ") + number(*row.averageCpuWatts / *current.history.back().fullWh * 100, 2) + tr(L" 百分點／小時");
+            energy += tr(L"\nCPU 部分估計耗電速度: ") + number(*row.averageCpuWatts / *current.history.back().fullWh * 100, 2) + tr(L" 百分點／小時");
         if (current.energy.source == EnergySource::coreTotal)
-            content += tr(L"\n\n這台電腦的 EMI 只提供全部核心的總能源，沒有每核心資料，因此依 CPU 時間（有週期資料時依週期）分攤。範圍固定為估計值的 0.8–1.25 倍，代表各核心時脈與負載不同造成的不確定性，並非統計信賴區間。");
+            method += tr(L"\n\n這台電腦的 EMI 只提供全部核心的總能源，沒有每核心資料，因此依 CPU 時間（有週期資料時依週期）分攤。範圍固定為估計值的 0.8–1.25 倍，代表各核心時脈與負載不同造成的不確定性，並非統計信賴區間。");
         else if (current.energy.source == EnergySource::package)
-            content += tr(L"\n\n這台電腦的 EMI 只提供 CPU 封裝能源（含記憶體控制器、內建顯示等共用部分）。先扣除近 10 分鐘最低的封裝功率作為閒置基準（目前 ") +
+            method += tr(L"\n\n這台電腦的 EMI 只提供 CPU 封裝能源（含記憶體控制器、內建顯示等共用部分）。先扣除近 10 分鐘最低的封裝功率作為閒置基準（目前 ") +
                 valueText(current.energy.packageFloorWatts, L" W") +
                 tr(L"），其餘依 CPU 時間分攤；範圍上限是連閒置基準也按比例分攤的值。");
         else
-            content += tr(L"\n\n用 EMI 量到的核心能源約束分攤。持續固定在同一核心的執行緒優先按該核心分配；其餘依 CPU 時間估計。範圍反映未知的核心排程位置，並非統計信賴區間；不同指令與 SMT 仍可能產生誤差。");
+            method += tr(L"\n\n用 EMI 量到的核心能源約束分攤。持續固定在同一核心的執行緒優先按該核心分配；其餘依 CPU 時間估計。範圍反映未知的核心排程位置，並非統計信賴區間；不同指令與 SMT 仍可能產生誤差。");
         if (!current.history.empty() && row.averageCpuWatts)
             if (auto gain = extraMinutesIfStopped(current.power, current.history.back(), *row.averageCpuWatts))
-                content += tr(L"\n若關閉此程式：CPU 部分約可多用 ") + std::to_wstring(int(*gain)) + tr(L" 分鐘（依近 5 分鐘耗電估算；不含 GPU、螢幕，非保證）");
+                energy += tr(L"\n若關閉此程式：CPU 部分約可多用 ") + std::to_wstring(int(*gain)) + tr(L" 分鐘（依近 5 分鐘耗電估算；不含 GPU、螢幕，非保證）");
         if (current.energy.cycleWeighted)
-            content += tr(L"\n本次其餘部分依 CPU 週期加權：同樣的 CPU 時間在較高時脈下會分到較多能源。");
+            method += tr(L"\n本次其餘部分依 CPU 週期加權：同樣的 CPU 時間在較高時脈下會分到較多能源。");
     }
-    content += tr(L"\n\n本次 CPU 核心 ") + valueText(current.energy.coreWatts, L" W") +
+    totals = tr(L"\n\n本次 CPU 核心 ") + valueText(current.energy.coreWatts, L" W") +
         tr(L" · CPU 未歸因 ") + valueText(current.energy.unassignedCpuWatts, L" W") +
         tr(L"\nCPU 以外／未歸因 ") + valueText(current.energy.otherSystemWatts, L" W");
-    content += tr(L"\n\n這是 CPU 能源分攤（包含活躍核心的共用開銷），不是程式總功率或關閉後保證能省的瓦數。GPU、螢幕、儲存等沒有硬分配給程序。");
-    if (!row.actionable && row.services.empty()) content += tr(L"\n\n此程序受保護、屬於其他使用者，或無法確認安全狀態，因此不提供關閉操作。");
+    about = tr(L"\n\n這是 CPU 能源分攤（包含活躍核心的共用開銷），不是程式總功率或關閉後保證能省的瓦數。GPU、螢幕、儲存等沒有硬分配給程序。");
+    if (!row.actionable && row.services.empty()) status += tr(L"\n\n此程序受保護、屬於其他使用者，或無法確認安全狀態，因此不提供關閉操作。");
     if (!row.services.empty()) {
-        content += tr(L"\n\n所屬服務（共用程序時無法分別歸因）：");
-        for (const auto& s : row.services) content += L"\n• " + s.display + L" (" + s.name + L")";
+        services = tr(L"\n\n所屬服務（共用程序時無法分別歸因）：");
+        for (const auto& s : row.services) services += L"\n• " + s.display + L" (" + s.name + L")";
     }
-    if (isEfficient(row)) content += tr(L"\n\n效率模式：開啟（由 BatteryScope 設定；結束 BatteryScope 時會還原）。");
-    if (performanceListed(row)) content += tr(L"\n效能清單：此程式執行時，插電與用電池都會自動切到效能模式。");
-    showInlinePage(InlinePage::process, tr(L"程序詳情"), content);
+    if (isEfficient(row)) status += tr(L"\n\n效率模式：開啟（由 BatteryScope 設定；結束 BatteryScope 時會還原）。");
+    if (performanceListed(row)) status += tr(L"\n效能清單：此程式執行時，插電與用電池都會自動切到效能模式。");
+    const std::wstring content = identity + usage + energy + method + totals + about + status + services;
+    const auto bare = [](std::wstring text) { while (!text.empty() && text[0] == L'\n') text.erase(0, 1); return text; };
+    std::vector<VBlock> v;
+    v.push_back(vCard(row.name, L"PID " + std::to_wstring(row.pid), row.path.empty() ? std::wstring(tr(L"路徑未知")) : row.path, 0));
+    v.push_back(vTiles({{L"CPU\n" + number(row.cpu) + L"%", 0},
+        {tr(L"估計 W") + std::wstring(L"\n") + (row.averageCpuWatts ? valueText(row.averageCpuWatts, L"", 2) : std::wstring(L"—")), 0},
+        {tr(L"記憶體 MB") + std::wstring(L"\n") + (row.memoryKnown ? number(row.memoryMB, 0) : std::wstring(L"—")), 0}}));
+    v.push_back(vHeading(tr(L"程式設定")));
+    if (isEfficient(row) || row.actionable)
+        v.push_back(vToggle(tr(L"效率模式"), tr(L"降低優先順序並以省電方式執行"), isEfficient(row), EcoToggleId));
+    if (!row.name.empty()) {
+        bool learned = false;
+        const auto rule = performanceListed(row) ? bs::gov::AppRule::performance : detector.ruleFor(lowerName(row.name), &learned);
+        v.push_back(vAction(tr(L"動態省電規則"), tr(bs::gov::ruleKey(rule)), PerfAppToggleId));
+    }
+    if (!status.empty()) v.push_back(vNote(bare(status)));
+    v.push_back(vHeading(tr(L"使用情況")));
+    v.push_back(vNote(bare(usage)));
+    if (!energy.empty()) {
+        v.push_back(vHeading(tr(L"CPU 能源估計")));
+        v.push_back(vNote(bare(energy)));
+        v.push_back(vFold(tr(L"估計方式與限制"), bare(method) + L"\n" + bare(about)));
+    } else v.push_back(vNote(bare(about)));
+    v.push_back(vNote(bare(totals)));
+    if (!services.empty()) { v.push_back(vHeading(tr(L"所屬服務"))); v.push_back(vNote(bare(services).substr(bare(services).find(L'\n') + 1))); }
+    showChartPage(InlinePage::process, tr(L"程序詳情"), content, std::move(v));
     refreshProcessButtons();
 }
 void showForceConfirmation(const ProcessRow& row) {
@@ -6243,6 +6286,7 @@ void showChartPage(InlinePage page, const std::wstring& title, const std::wstrin
         std::wstring lines;
         for (size_t i = 0; i < text.size(); ++i) { if (text[i] == L'\n' && (i == 0 || text[i - 1] != L'\r')) lines += L'\r'; lines += text[i]; }
         SetWindowTextW(inlineText, lines.c_str());
+        if (inlineTitle != title) { inlineTitle = title; InvalidateRect(mainWindow, nullptr, FALSE); } // the language changed
         showVisual(std::move(blocks), true);
         return;
     }
@@ -9037,8 +9081,9 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             const auto current = performanceApps.count(name) ? bs::gov::AppRule::performance : detector.ruleFor(name);
             std::vector<MenuItem> items;
             for (int r = 0; r < int(bs::gov::AppRule::count); ++r) items.push_back(menuItem(1000 + r, tr(bs::gov::ruleKey(bs::gov::AppRule(r))), current == bs::gov::AppRule(r)));
-            RECT button{}; GetWindowRect(perfAppButton, &button);
-            const int chosen = showMenu(items, {button.left, button.bottom}, mainWindow);
+            POINT at{}; GetCursorPos(&at); // under the rule's row, or at the pointer
+            for (const auto& hit : visualHits) if (hit.command == PerfAppToggleId) { at = {hit.rect.left, hit.rect.bottom}; ClientToScreen(visualView, &at); break; }
+            const int chosen = showMenu(items, at, mainWindow);
             if (chosen >= 1000) {
                 saveAppRule(name, bs::gov::AppRule(chosen - 1000));
                 refreshDetectorRules();
@@ -10171,14 +10216,16 @@ bool panelSelfTest(const std::wstring& path) {
     auto before = selection(); refreshList(); auto after = selection();
     check("refresh_reuses_native_items", listStructuralChanges == structuralBefore);
     if (after) showDetails(*after);
-    check("details_open_inside_panel", inlinePage == InlinePage::process && IsWindowVisible(inlineText) &&
+    check("details_open_inside_panel", inlinePage == InlinePage::process && visualView && IsWindowVisible(visualView) &&
         !IsWindowVisible(viewport) && IsWindowVisible(inlineBack));
     int textLength = GetWindowTextLengthW(inlineText);
     std::wstring detailText(size_t(textLength) + 1, L'\0');
     GetWindowTextW(inlineText, detailText.data(), int(detailText.size()));
     check("inline_details_keep_paragraphs", detailText.find(L"\r\n") != std::wstring::npos);
-    check("details_offer_efficiency_and_performance_list_read_only_in_demo", IsWindowVisible(ecoButton) && IsWindowVisible(perfAppButton) &&
-        !IsWindowEnabled(ecoButton) && !IsWindowEnabled(perfAppButton));
+    check("details_offer_efficiency_and_performance_list_read_only_in_demo", !IsWindowVisible(ecoButton) && !IsWindowVisible(perfAppButton) &&
+        !IsWindowEnabled(ecoButton) && !IsWindowEnabled(perfAppButton) &&
+        std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::action && int(b.amount) == PerfAppToggleId; }) &&
+        std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::tiles; }));
     check("details_estimate_battery_gain_when_closed", after && after->averageCpuWatts &&
         extraMinutesIfStopped(current.power, current.history.back(), *after->averageCpuWatts).has_value() &&
         detailText.find(tr(L"\n若關閉此程式：CPU 部分約可多用 ")) != std::wstring::npos);
@@ -10582,7 +10629,8 @@ bool panelSelfTest(const std::wstring& path) {
     }
     SendMessageW(mainWindow, WM_COMMAND, PowerModeId, 0);
     check("power_mode_page_shows_both_sources_read_only_in_demo", inlinePage == InlinePage::powerMode &&
-        IsWindowVisible(modeButtons[0]) && IsWindowVisible(modeButtons[5]) && !IsWindowEnabled(modeButtons[0]) &&
+        !IsWindowVisible(modeButtons[0]) && visualView && IsWindowVisible(visualView) && !IsWindowEnabled(modeButtons[0]) &&
+        std::count_if(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::segments; }) == 2 &&
         !IsWindowEnabled(restoreModesButton) && modeSelected(ModeAcPerformanceId) && modeSelected(ModeDcEfficiencyId) &&
         !modeSelected(ModeAcEfficiencyId) && IsWindowEnabled(powerButton));
     SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
