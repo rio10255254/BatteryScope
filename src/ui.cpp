@@ -218,18 +218,20 @@ bool pixelDigitRows(const std::wstring& text, std::string rows[7]) {
     for (int row = 0; row < 7; ++row) rows[row].clear();
     for (size_t i = 0; i < text.size(); ++i) {
         const auto* glyph = digitGlyph(text[i]);
-        for (int row = 0; row < 7; ++row) { rows[row].append(glyph->rows[row], size_t(glyph->width)); if (i + 1 < text.size()) rows[row] += '.'; }
+        for (int row = 0; row < 7; ++row) { rows[row].append(glyph->rows[row], size_t(glyph->width)); if (i + 1 < text.size()) rows[row] += ' '; } // ' ': between glyphs
     }
     return true;
 }
-bool drawPixelDigits(HDC dc, const std::wstring& text, int x, int y, int unit, COLORREF color, int gap) {
+bool drawPixelDigits(HDC dc, const std::wstring& text, int x, int y, int unit, COLORREF color, int gap, COLORREF ghost) {
     if (text.empty() || !pixelDigitsWidth(text, unit)) return false;
     gap = std::clamp(gap, 0, unit - 1);
     for (wchar_t c : text) {
         const auto* glyph = digitGlyph(c);
-        for (int row = 0; row < 7; ++row) for (int column = 0; column < glyph->width; ++column)
-            if (glyph->rows[row][column] == '#')
-                rectFill(dc, {x + column * unit, y + row * unit, x + (column + 1) * unit - gap, y + (row + 1) * unit - gap}, color);
+        for (int row = 0; row < 7; ++row) for (int column = 0; column < glyph->width; ++column) {
+            const bool on = glyph->rows[row][column] == '#';
+            if (on || ghost != CLR_INVALID)
+                rectFill(dc, {x + column * unit, y + row * unit, x + (column + 1) * unit - gap, y + (row + 1) * unit - gap}, on ? color : ghost);
+        }
         x += (glyph->width + 1) * unit;
     }
     return true;
@@ -471,13 +473,36 @@ uint32_t paletteTag(const Palette& p) {
     for (COLORREF c : {p.keyTop, p.keyBottom, p.litTop, p.litMid, p.litBottom, p.rim, p.well, p.halo, p.shadow}) tag = (tag ^ c) * 16777619u;
     return tag ^ (p.dark ? 0x80000000u : 0);
 }
+// The room light and shadow have on each side before they must be gone (see LightBounds).
+struct Room {
+    short left = 32767, top = 32767, right = 32767, bottom = 32767;
+    bool operator<(const Room& o) const { return std::tie(left, top, right, bottom) < std::tie(o.left, o.top, o.right, o.bottom); }
+    Room within(int margin) const {
+        const auto cap = [&](short v) { return short(std::clamp<int>(v, 0, margin)); };
+        return {cap(left), cap(top), cap(right), cap(bottom)};
+    }
+    bool open(int margin) const { return left >= margin && top >= margin && right >= margin && bottom >= margin; }
+};
+// How much farther away a point counts as being, so that light reaching `spread` px in the open
+// is gone at the edge of the room on that side. (ox, oy): the point's offset from the shape's
+// centre; (ax, ay): how far it lies beyond the shape's straight sides. `down` shifts the room
+// for something drawn that much lower (a shadow).
+double squeeze(const Room& room, double spread, double ox, double oy, double ax, double ay, int down = 0) {
+    const double rx = ox < 0 ? room.left : room.right, ry = oy < 0 ? room.top + down : room.bottom - down;
+    const double fx = rx >= spread ? 1 : spread / std::max(rx, .5), fy = ry >= spread ? 1 : spread / std::max(ry, .5);
+    if (fx == 1 && fy == 1) return 1;
+    if (ax <= 0 && ay <= 0) return std::max(fx, fy);
+    if (ay <= 0) return fx;
+    if (ax <= 0) return fy;
+    return std::sqrt((ax * ax * fx * fx + ay * ay * fy * fy) / (ax * ax + ay * ay));
+}
 struct HaloId {
-    int w, h, radius, spread; COLORREF color;
-    bool operator<(const HaloId& o) const { return std::tie(w, h, radius, spread, color) < std::tie(o.w, o.h, o.radius, o.spread, o.color); }
+    int w, h, radius, spread; COLORREF color; Room room;
+    bool operator<(const HaloId& o) const { return std::tie(w, h, radius, spread, color, room) < std::tie(o.w, o.h, o.radius, o.spread, o.color, o.room); }
 };
 struct KeyId {
-    int w, h, radius; unsigned char lit, pressed, hover; uint32_t tag;
-    bool operator<(const KeyId& o) const { return std::tie(w, h, radius, lit, pressed, hover, tag) < std::tie(o.w, o.h, o.radius, o.lit, o.pressed, o.hover, o.tag); }
+    int w, h, radius; unsigned char lit, pressed, hover; uint32_t tag; Room room, shade; // room for its light, and for its shadow
+    bool operator<(const KeyId& o) const { return std::tie(w, h, radius, lit, pressed, hover, tag, room, shade) < std::tie(o.w, o.h, o.radius, o.lit, o.pressed, o.hover, o.tag, o.room, o.shade); }
 };
 struct WellId {
     int w, h, radius; uint32_t tag;
@@ -495,7 +520,9 @@ const Baked& haloSprite(const HaloId& id) {
     if (baked.bitmap) {
         const double hw = id.w / 2.0, hh = id.h / 2.0, r = std::min({double(id.radius), hw, hh}), spread = std::max(1, id.spread);
         for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
-            const double d = roundDistance(x + .5, y + .5, w / 2.0, h / 2.0, hw, hh, r);
+            const double ox = x + .5 - w / 2.0, oy = y + .5 - h / 2.0;
+            double d = roundDistance(x + .5, y + .5, w / 2.0, h / 2.0, hw, hh, r);
+            if (d > 0) d *= squeeze(id.room, spread, ox, oy, std::abs(ox) - (hw - r), std::abs(oy) - (hh - r));
             uint32_t pixel = 0;
             blendOver(pixel, id.color, d <= 0 ? 1 : smoothStep(1 - d / spread)); // smoothstep: a soft edge without a visible ring
             out[size_t(y) * size_t(w) + size_t(x)] = pixel;
@@ -503,6 +530,11 @@ const Baked& haloSprite(const HaloId& id) {
         baked.margin = id.spread;
     }
     return halos.emplace(id, baked).first->second;
+}
+// The most a key's light and shadow reach past its face, in any state.
+int keyMargin(int h, bool lit) {
+    const int unit = std::max(1, h / 22);
+    return std::max(lit ? std::max(8, h / 2) : 0, (unit * 6 + 2) + (unit * 4 + 1)) + 1;
 }
 // A key: its light on the panel (when lit), its shadow, its face from top to bottom, the catch
 // light along its top edge and, lit, the light showing along its rim.
@@ -513,9 +545,9 @@ const Baked& keySprite(const KeyId& id, const Palette& p) {
     const double radius = std::min({double(id.radius), w / 2.0, h / 2.0});
     const int glowSpread = std::max(8, h / 2);
     // Under the pointer the shadow lengthens, as if the key stood a little taller; pressed, it shortens.
-    const int drop = int(std::lround((1 - pressed) * unit * (3 + 2 * hover))) + 1;
-    const int shadowSpread = unit * 5 + 2 + int(std::lround(hover * unit * 2));
-    const int margin = std::max(lit > 0 ? glowSpread : 0, shadowSpread + drop) + 1;
+    const int drop = int(std::lround((1 - pressed) * unit * (2.5 + 1.5 * hover))) + 1;
+    const int shadowSpread = unit * 4 + 2 + int(std::lround(hover * unit * 2));
+    const int margin = keyMargin(h, lit > 0);
     const int W = w + margin * 2, H = h + margin * 2;
     uint32_t* out = nullptr;
     Baked baked = bake(W, H, &out);
@@ -545,9 +577,18 @@ const Baked& keySprite(const KeyId& id, const Palette& p) {
                 out[size_t(y) * size_t(W) + size_t(x)] = 0xFF000000u | (uint32_t(GetRValue(face)) << 16) | (uint32_t(GetGValue(face)) << 8) | GetBValue(face);
                 continue;
             }
-            if (lit > 0) { const double d = roundDistance(px, py, cx, cy, hw, hh, radius); blendOver(pixel, p.halo, (d <= 0 ? 1 : smoothStep(1 - d / glowSpread)) * glowAlpha); }
-            { const double d = roundDistance(px, py - drop, cx, cy, hw, hh, radius); blendOver(pixel, p.shadow, (d <= 0 ? 1 : smoothStep(1 - d / shadowSpread)) * shadowAlpha); }
-            { const double d = roundDistance(px, py - 1, cx, cy, hw, hh, radius); blendOver(pixel, p.shadow, (d <= 0 ? 1 : smoothStep(1 - d / 2)) * contactAlpha); }
+            const double ox = px - cx, ax = std::abs(ox) - (hw - radius);
+            if (lit > 0) {
+                double d = roundDistance(px, py, cx, cy, hw, hh, radius);
+                if (d > 0) d *= squeeze(id.room, glowSpread, ox, py - cy, ax, std::abs(py - cy) - (hh - radius));
+                blendOver(pixel, p.halo, (d <= 0 ? 1 : smoothStep(1 - d / glowSpread)) * glowAlpha);
+            }
+            {
+                double d = roundDistance(px, py - drop, cx, cy, hw, hh, radius);
+                if (d > 0) d *= squeeze(id.shade, shadowSpread, ox, py - drop - cy, ax, std::abs(py - drop - cy) - (hh - radius), drop);
+                blendOver(pixel, p.shadow, (d <= 0 ? 1 : smoothStep(1 - d / shadowSpread)) * shadowAlpha);
+            }
+            if (id.shade.bottom >= 3) { const double d = roundDistance(px, py - 1, cx, cy, hw, hh, radius); blendOver(pixel, p.shadow, (d <= 0 ? 1 : smoothStep(1 - d / 2)) * contactAlpha); }
             const double cover = std::clamp(.5 - body, 0.0, 1.0);
             if (cover > 0) {
                 const double t = std::clamp((py - press - margin) / h, 0.0, 1.0);
@@ -595,27 +636,60 @@ void clearSprites() {
     for (auto& [id, baked] : wells) if (baked.bitmap) DeleteObject(baked.bitmap);
     halos.clear(); keys.clear(); wells.clear(); bakedBytes = 0;
 }
+namespace {
+// What light (0) and shadows (1) must stay inside, in device coordinates.
+struct Bounds { bool set = false; RECT area{}; } boundsOf[2];
+// The room round `r` (logical) inside the current bounds, at most `margin` on a side.
+Room roomFor(HDC dc, const RECT& r, int margin, int kind) {
+    Room room;
+    if (boundsOf[kind].set) {
+        const RECT& bounds = boundsOf[kind].area;
+        POINT corners[2] = {{r.left, r.top}, {r.right, r.bottom}};
+        LPtoDP(dc, corners, 2);
+        const auto side = [](long v) { return short(std::clamp<long>(v, 0, 32767)); };
+        room = {side(corners[0].x - bounds.left), side(corners[0].y - bounds.top), side(bounds.right - corners[1].x), side(bounds.bottom - corners[1].y)};
+    }
+    return room.open(margin) ? Room{} : room.within(margin);
+}
+}
+LightBounds::LightBounds(HDC dc, const RECT& area, bool shadowsOnly) {
+    POINT corners[2] = {{area.left, area.top}, {area.right, area.bottom}};
+    LPtoDP(dc, corners, 2);
+    for (int kind = 0; kind < 2; ++kind) {
+        had_[kind] = boundsOf[kind].set; previous_[kind] = boundsOf[kind].area;
+        if (kind == 0 && shadowsOnly) continue;
+        boundsOf[kind].area = {corners[0].x, corners[0].y, corners[1].x, corners[1].y};
+        boundsOf[kind].set = true;
+    }
+}
+LightBounds::~LightBounds() { for (int kind = 0; kind < 2; ++kind) { boundsOf[kind].set = had_[kind]; boundsOf[kind].area = previous_[kind]; } }
 void softHalo(HDC dc, const RECT& r, float radius, COLORREF c, BYTE alpha, int spread, int dx, int dy) {
     if (alpha == 0 || r.right <= r.left || r.bottom <= r.top) return;
     trimSprites();
-    const HaloId id{int(r.right - r.left), int(r.bottom - r.top), int(std::lround(radius)), std::max(1, spread), c};
+    spread = std::max(1, spread);
+    const RECT placed{r.left + dx, r.top + dy, r.right + dx, r.bottom + dy};
+    const HaloId id{int(r.right - r.left), int(r.bottom - r.top), int(std::lround(radius)), spread, c, roomFor(dc, placed, spread, 0)};
     const Baked& baked = haloSprite(id);
     stamp(dc, baked, r.left - id.spread + dx, r.top - id.spread + dy, alpha);
 }
-void keycap(HDC dc, RECT r, float radius, const Palette& p, double lit, double pressed, double hover) {
-    if (r.right <= r.left || r.bottom <= r.top) return;
+void keycap(HDC dc, RECT r, float radius, const Palette& p, double lit, double pressed, double hover, double opacity) {
+    if (r.right <= r.left || r.bottom <= r.top || opacity <= .004) return;
+    opacity = std::min(opacity, 1.0);
     lit = std::clamp(lit, 0.0, 1.0); pressed = std::clamp(pressed, 0.0, 1.0); hover = std::clamp(hover, 0.0, 1.0);
     if (p.highContrast) {
+        if (opacity < .5) return;
         fillRound(dc, r, lit > .5 ? p.selected : p.raised, radius);
         strokeRound(dc, r, lit > .5 ? p.selectedInk : p.border, radius, lit > .5 ? 2.0f : 1.0f);
         return;
     }
     trimSprites();
     // A key in a given state is one bitmap: light, shadow, face and edges together.
-    const KeyId id{int(r.right - r.left), int(r.bottom - r.top), int(std::lround(radius)),
-        static_cast<unsigned char>(std::lround(lit * 16)), static_cast<unsigned char>(std::lround(pressed * 4)), static_cast<unsigned char>(std::lround(hover * 4)), paletteTag(p)};
+    const int height = int(r.bottom - r.top);
+    const KeyId id{int(r.right - r.left), height, int(std::lround(radius)),
+        static_cast<unsigned char>(std::lround(lit * 16)), static_cast<unsigned char>(std::lround(pressed * 4)), static_cast<unsigned char>(std::lround(hover * 4)), paletteTag(p),
+        roomFor(dc, r, keyMargin(height, lit > 0), 0), roomFor(dc, r, keyMargin(height, false), 1)};
     const Baked& baked = keySprite(id, p);
-    stamp(dc, baked, r.left - baked.margin, r.top - baked.margin);
+    stamp(dc, baked, r.left - baked.margin, r.top - baked.margin, BYTE(std::lround(opacity * 255)));
 }
 void spotlight(HDC dc, const RECT& key, float radius, POINT at, COLORREF c, double strength, int reach) {
     if (!graphicsToken || strength <= .01 || reach <= 0 || key.right <= key.left) return;
@@ -665,8 +739,8 @@ void led(HDC dc, const RECT& r, COLORREF on, COLORREF halo, double lit, COLORREF
     if (lit > 0) softHalo(dc, r, 1.0f, halo, BYTE(150 * lit), std::max(3, int(std::min(r.right - r.left, r.bottom - r.top)) / 2 + 2));
     solid(dc, r, mix(off, on, lit));
 }
-void pixelIcon(HDC dc, const char* const* rows, int count, int x, int y, int unit, COLORREF c) {
-    const int gap = unit >= 3 ? std::max(1, unit / 4) : 0;
+void pixelIcon(HDC dc, const char* const* rows, int count, int x, int y, int unit, COLORREF c, int gap) {
+    if (gap < 0) gap = unit >= 3 ? std::max(1, unit / 4) : 0;
     for (int row = 0; row < count; ++row)
         for (int column = 0; rows[row][column]; ++column)
             if (rows[row][column] == '#') solid(dc, {x + column * unit, y + row * unit, x + (column + 1) * unit - gap, y + (row + 1) * unit - gap}, c);

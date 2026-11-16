@@ -381,8 +381,13 @@ void card(HDC dc, RECT rect, COLORREF color, int radius) {
     rounded(dc, rect, color, radius);
     if (theme.highContrast) outline(dc, rect, Border, radius);
 }
-void keycap(HDC dc, const RECT& rect, int radius, double lit, double pressed = 0, double hover = 0) {
-    ui::keycap(dc, rect, float(sp(radius)), theme, lit, pressed, hover);
+void keycap(HDC dc, const RECT& rect, int radius, double lit, double pressed = 0, double hover = 0, double opacity = 1) {
+    ui::keycap(dc, rect, float(sp(radius)), theme, lit, pressed, hover, opacity);
+}
+// A dotted hairline: between the rows of a list, and after a section's label.
+void dottedRule(HDC dc, int left, int right, int y, COLORREF color) {
+    const int unit = std::max(1, px(1)), pitch = unit * 4;
+    for (int x = left; x + unit <= right; x += pitch) fill(dc, {x, y, x + unit, y + unit}, color);
 }
 int textWidth(HDC dc, const std::wstring& text, HFONT face) {
     font(dc, fontFor(face, text)); SIZE size{}; GetTextExtentPoint32W(dc, text.c_str(), int(text.size()), &size); return size.cx;
@@ -663,6 +668,7 @@ void paintMenu(HDC dc, const MenuState& state, RECT client) {
     // a chosen option shows a lit LED, a value sits on the right in quiet text.
     const int width = client.right - client.left;
     fill(dc, client, Background);
+    const ui::LightBounds lightBounds(dc, client);
     outline(dc, client, theme.highContrast ? Border : blend(Border, Background, .2), 12);
     if (state.nested()) {
         const RECT header = menuRow(state, -1, width);
@@ -858,7 +864,7 @@ bool captureMenu(const std::vector<MenuItem>& items, const std::wstring& path, i
 struct VSegment { double amount = 0; COLORREF color = 0; };
 struct VBar {
     std::wstring label, value;
-    double amount = 0, whisker = 0;     // whisker: ± range drawn around the end of the bar
+    double amount = 0, whisker = 0;     // whisker: ± range, shown as dimmer LEDs around the end of the bar
     COLORREF color = 0;                 // 0: accent
     std::vector<VSegment> segments;     // stacked parts instead of one fill
 };
@@ -978,7 +984,7 @@ int blockHeight(HDC dc, const VBlock& b, int width, bool first) {
     case VBlock::Kind::series: return sp(114);
     case VBlock::Kind::chips: return chipRowsHeight(dc, b, width) + sp(4);
     case VBlock::Kind::legend: return sp(24);
-    case VBlock::Kind::action: return b.text.empty() ? sp(48) : sp(60);
+    case VBlock::Kind::action: return b.text.empty() ? sp(44) : sp(56);
     case VBlock::Kind::segments: return sp(54);
     case VBlock::Kind::banner: return sp(30) + noteHeight(dc, b.text, width - sp(26)) + (b.value.empty() ? 0 : sp(42)) + sp(8);
     case VBlock::Kind::timeline: return sp(88);
@@ -1063,6 +1069,12 @@ double fadeValue(std::map<size_t, Transition>& map, size_t key, double now) {
 // content changed. A page at rest repaints nothing.
 std::vector<std::pair<int, int>> visualSpans; // top and height of each block, view coordinates
 std::vector<char> visualMoving;               // blocks still in motion when last painted
+// The view runs the whole width of the panel so that light and shadows have room at its sides;
+// its blocks are set in from the left by visualInset() and are visualWidth() wide. Painting
+// happens in block coordinates (x = 0 at the inset); hit areas, the pointer and repaint
+// rectangles are in the view's client coordinates.
+int visualInset() { return sp(14); }
+int visualWidth(const RECT& client) { return int(client.right) - sp(30); }
 RECT visualDirty{};
 void addVisualDirty(const RECT& r) {
     if (r.bottom <= r.top) return;
@@ -1082,7 +1094,9 @@ void setFade(std::map<size_t, Transition>& map, size_t key, double target, doubl
 }
 // Where a block's rows, keys and chart are, in view coordinates: worked out the same way
 // whether the block was just painted or not, so a partial repaint keeps every target exact.
-RECT commandKey(int y, int width, int height) { return {0, y + sp(3), width, y + height - sp(6)}; } // a command row's keycap
+// The key that rises out of a command row under the pointer: a little wider than the row, so
+// the row's text has room inside it.
+RECT commandKey(int y, int width, int height) { return {-sp(8), y + sp(2), width + sp(8), y + height - sp(3)}; }
 RECT segmentKey(const RECT& tray, int count, int k) {
     const int pad = sp(5), gap = sp(5);
     const int cell = (int(tray.right - tray.left) - pad * 2 - gap * (count - 1)) / std::max(1, count);
@@ -1090,19 +1104,20 @@ RECT segmentKey(const RECT& tray, int count, int k) {
     return {x, tray.top + pad, k + 1 == count ? tray.right - pad : x + cell, tray.bottom - pad};
 }
 void pushBlockHits(const VBlock& b, size_t i, int y, int width, int height) {
+    const int inset = visualInset();
+    const auto placed = [&](RECT r) { OffsetRect(&r, inset, 0); return r; };
     switch (b.kind) {
-    case VBlock::Kind::fold: visualHits.push_back({{0, y + sp(3), width, y + sp(37)}, FoldCommand, i}); break;
+    case VBlock::Kind::fold: visualHits.push_back({placed({0, y + sp(3), width, y + sp(37)}), FoldCommand, i}); break;
     case VBlock::Kind::action:
-        if (b.toggle >= 0) visualHits.push_back({{0, y, width, y + height}, int(b.amount), i});
-        else visualHits.push_back({commandKey(y, width, height), int(b.amount), i});
+        visualHits.push_back({placed({0, y, width, y + height}), int(b.amount), i});
         break;
-    case VBlock::Kind::banner: if (b.amount) visualHits.push_back({{0, y, width, y + height}, int(b.amount), i}); break;
+    case VBlock::Kind::banner: if (b.amount) visualHits.push_back({placed({0, y, width, y + height}), int(b.amount), i}); break;
     case VBlock::Kind::segments: {
         const RECT tray{0, y + sp(4), width, y + height - sp(4)};
-        for (size_t k = 0; k < b.commands.size(); ++k) visualHits.push_back({segmentKey(tray, int(b.commands.size()), int(k)), b.commands[k], i});
+        for (size_t k = 0; k < b.commands.size(); ++k) visualHits.push_back({placed(segmentKey(tray, int(b.commands.size()), int(k))), b.commands[k], i});
         break;
     }
-    case VBlock::Kind::series: visualPlots.push_back({0, y + sp(24), width, y + sp(108)}); break;
+    case VBlock::Kind::series: visualPlots.push_back(placed({0, y + sp(24), width, y + sp(108)})); break;
     default: break;
     }
 }
@@ -1141,6 +1156,7 @@ void drawSwitch(HDC dc, RECT r, double on, double stretch = 0, const Arrival& mo
     const int x = r.left + pad + int(std::lround(travel * on)), y = r.top + pad - int(std::lround(motion.lift * sp(1)));
     const RECT knob{x, y, x + kw, y + kh};
     const float radius = float(kh) * .3f;
+    const ui::LightBounds inGroove(dc, r, true);
     ui::keycap(dc, knob, radius, theme, (on > .5 ? std::max(on, motion.glow) : on) * paintFade);
     if (motion.glow > 0 && keyLook()) ui::drawRimLight(dc, knob, radius, theme.rim, motion.angle, motion.glow * .8 * paintFade);
 }
@@ -1170,6 +1186,8 @@ int drawMatrix(HDC dc, const std::wstring& key, const std::wstring& text, int x,
         state.changedAt = canAnimate() && ui::pixelDigitRows(state.previous, was) ? now : -1;
     }
     auto place = [&](const std::wstring& shown) { return rightAlign ? x - ui::pixelDigitsWidth(shown, unit) : x; };
+    // The display's unlit dots show faintly behind the lit ones, as on a real matrix.
+    const COLORREF ghost = keyLook() ? blend(theme.well, color, theme.dark ? .075 : .085) : CLR_INVALID;
     // Counting up from nothing when the page opens.
     if (state.firstAt >= 0 && now - state.firstAt < 620) {
         size_t digits = 0; int decimals = -1;
@@ -1177,7 +1195,7 @@ int drawMatrix(HDC dc, const std::wstring& key, const std::wstring& text, int x,
         if (digits) {
             const double t = (now - state.firstAt) / 620, eased = 1 - (1 - t) * (1 - t) * (1 - t);
             const std::wstring counted = number(_wtof(text.substr(0, digits).c_str()) * eased, std::max(0, decimals)) + text.substr(digits);
-            if (ui::drawPixelDigits(dc, counted, place(counted), y, unit, color, gap)) return 1;
+            if (ui::drawPixelDigits(dc, counted, place(counted), y, unit, color, gap, ghost)) return 1;
         }
     }
     state.firstAt = -1;
@@ -1199,12 +1217,13 @@ int drawMatrix(HDC dc, const std::wstring& key, const std::wstring& text, int x,
                 const RECT cell{left + column * unit, y + row * unit, left + (column + 1) * unit - gap, y + (row + 1) * unit - gap};
                 if (head) ui::led(dc, cell, theme.glow, theme.halo, on ? 1.0 : .25, on ? color : Surface);
                 else if (on) fill(dc, cell, color);
+                else if (ghost != CLR_INVALID && index >= 0 && index < int(source[row].size()) && source[row][size_t(index)] == '.') fill(dc, cell, ghost);
             }
         }
         return 1;
     }
     state.changedAt = -1;
-    ui::drawPixelDigits(dc, text, place(text), y, unit, color, gap);
+    ui::drawPixelDigits(dc, text, place(text), y, unit, color, gap, ghost);
     return 0;
 }
 // Ten battery cells lit up to the level; while charging, a light marches up the empty cells
@@ -1265,11 +1284,10 @@ void ledRow(HDC dc, const RECT& r, const std::vector<std::pair<double, COLORREF>
         fill(dc, at, blend(cells[size_t(lead)].color, RGB(255, 255, 255), .5 * flare));
     }
 }
-// Section labels are engraved: small, spaced and quiet.
+// Section labels are quiet, and a dotted rule runs on from the label to the edge.
 void drawEngraved(HDC dc, const std::wstring& text, RECT r, COLORREF color) {
-    SetTextCharacterExtra(dc, std::max(1, sp(2)));
     drawText(dc, text, r, color, strongFont);
-    SetTextCharacterExtra(dc, 0);
+    dottedRule(dc, int(r.left) + textWidth(dc, text, strongFont) + sp(10), int(r.right), (int(r.top) + int(r.bottom)) / 2, blend(Surface, color, .38));
 }
 double benchKinds[16] = {}; bool benchOn = false; // --paint-bench: time per kind of block
 bool visualLive = false; // painting the view on screen (not a capture): changes may throw sparks
@@ -1280,9 +1298,14 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
     const int clipSaved = update ? SaveDC(dc) : 0;
     if (update) IntersectClipRect(dc, update->left, update->top, update->right, update->bottom);
     fill(dc, update ? *update : client, Surface);
-    const int width = client.right - sp(10); // room for the scroll indicator
+    const int inset = visualInset(), width = visualWidth(client);
     const double now = motionNow();
     POINT origin{}; GetViewportOrgEx(dc, &origin); // a capture may draw the view somewhere inside its picture
+    const POINT clientOrigin = origin;
+    origin.x += inset; SetViewportOrgEx(dc, origin.x, origin.y, nullptr); // blocks draw from x = 0
+    const POINT pointer{visualMouse.x - inset, visualMouse.y}, rippleAt{visualRippleAt.x - inset, visualRippleAt.y};
+    // Light and shadows stay inside the view at its sides (above and below, the page scrolls away).
+    const RECT lightArea{-inset, -30000, int(client.right) - inset, 30000};
     visualAnimating = false;
     if (visualEnterAt >= 0 && now - visualEnterAt > 32.0 * 12 + 300) visualEnterAt = -1;
     int y = -visualScroll;
@@ -1321,6 +1344,7 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
         paintFade = appear;
         Ink = faded(inkBase); Muted = faded(mutedBase); Green = faded(greenBase); Border = faded(borderBase); Selected = faded(selectedBase); theme.warn = faded(warnBase);
         if (slide) SetViewportOrgEx(dc, origin.x + slide, origin.y, nullptr);
+        const ui::LightBounds lightBounds(dc, lightArea); // moves with a sliding page: the same key bitmaps serve every frame
         const double benchStart = benchOn ? motionNow() : 0;
         const int top = y + rise;
         const bool focused = GetFocus() == visualView;
@@ -1330,9 +1354,9 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
         if (rippleT >= 0 && rippleT < 1) visualAnimating = true;
         auto keyLight = [&](const RECT& key, int radius, double hot) {
             if (!keyLook()) return;
-            const POINT mouse{visualMouse.x, visualMouse.y + rise};
+            const POINT mouse{pointer.x, pointer.y + rise};
             if (hot > 0 && PtInRect(&key, mouse)) ui::spotlight(dc, key, float(sp(radius)), mouse, theme.glow, (theme.dark ? .22 : .5) * hot * paintFade, sp(64));
-            const POINT pressed{visualRippleAt.x, visualRippleAt.y + rise};
+            const POINT pressed{rippleAt.x, rippleAt.y + rise};
             if (rippleT > 0 && rippleT < 1 && PtInRect(&key, pressed)) ui::ripple(dc, key, float(sp(radius)), pressed, theme.glow, rippleT);
         };
         switch (b.kind) {
@@ -1399,20 +1423,21 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
                 std::vector<std::pair<double, COLORREF>> parts;
                 if (scale > 0) {
                     if (bar.segments.empty()) {
-                        const double fraction = glide(std::to_wstring(i) + L"|" + bar.label, std::clamp(bar.amount / scale, 0.0, 1.0), now) * appear;
-                        parts.emplace_back(fraction, lightOf(bar.color));
+                        const double share = std::clamp(bar.amount / scale, 0.0, 1.0);
+                        const double fraction = glide(std::to_wstring(i) + L"|" + bar.label, share, now) * appear;
+                        const COLORREF light = lightOf(bar.color);
+                        if (bar.whisker > 0 && share > 0) {
+                            // The estimate's range, in the LEDs themselves: bright up to its low end,
+                            // a little dimmer up to the estimate, and dim from there to its high end.
+                            const double grown = fraction / share; // how far the bar has grown in
+                            const double low = std::clamp((bar.amount - bar.whisker) / scale, 0.0, 1.0) * grown, high = std::clamp((bar.amount + bar.whisker) / scale, 0.0, 1.0) * grown;
+                            parts.emplace_back(low, light);
+                            parts.emplace_back(fraction - low, blend(theme.ledOff, light, .68));
+                            parts.emplace_back(std::max(0.0, high - fraction), blend(theme.ledOff, light, .3));
+                        } else parts.emplace_back(fraction, light);
                     } else for (const auto& s : bar.segments) parts.emplace_back(std::clamp(s.amount / scale, 0.0, 1.0) * appear, lightOf(s.color));
                 }
                 ledRow(dc, cells, parts);
-                if (bar.whisker > 0 && scale > 0 && appear >= 1) {
-                    // The range of the estimate, a bracket above the LEDs.
-                    const double span = double(cells.right - cells.left);
-                    const int a = cells.left + int(std::clamp((bar.amount - bar.whisker) / scale, 0.0, 1.0) * span);
-                    const int z = cells.left + int(std::clamp((bar.amount + bar.whisker) / scale, 0.0, 1.0) * span);
-                    fill(dc, {a, strip.top - sp(2), z, strip.top - sp(1)}, Ink);
-                    fill(dc, {a, strip.top - sp(3), a + sp(1), strip.top + sp(1)}, Ink);
-                    fill(dc, {z - sp(1), strip.top - sp(3), z, strip.top + sp(1)}, Ink);
-                }
                 row += sp(38);
             }
             break;
@@ -1435,8 +1460,8 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
                 const size_t n = b.series.size();
                 // Under the pointer a column lights up and the corner shows its value.
                 int pointed = -1;
-                if (visualMouse.x >= left && visualMouse.x < right && visualMouse.y >= y + sp(24) && visualMouse.y < y + sp(108) && appear >= 1)
-                    pointed = std::clamp(int(std::lround((visualMouse.x - left - dot / 2) / pitch)), 0, columns - 1);
+                if (pointer.x >= left && pointer.x < right && pointer.y >= y + sp(24) && pointer.y < y + sp(108) && appear >= 1)
+                    pointed = std::clamp(int(std::lround((pointer.x - left - dot / 2) / pitch)), 0, columns - 1);
                 for (int c = 0; c < columns; ++c) {
                     const size_t from = size_t(c) * n / size_t(columns), to = std::max(from + 1, size_t(c + 1) * n / size_t(columns));
                     double v = 0; for (size_t k = from; k < to && k < n; ++k) v = std::max(v, b.series[k]);
@@ -1485,14 +1510,16 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
             const double hot = std::max(fadeValue(visualHoverFade, i, now), index == visualFocus ? 1.0 : 0.0);
             const double press = fadeValue(visualPress, i, now);
             const bool isSwitch = b.toggle >= 0;
-            // A command is a keycap; a switch row is the panel itself with a keycap switch on it.
-            const RECT row = isSwitch ? RECT{0, top, width, top + h} : commandKey(top, width, h);
+            // Rows lie flat on the panel, a dotted line between one and the next. A command row
+            // rises as a key under the pointer; a switch row carries a keycap switch.
+            const RECT row{0, top, width, top + h}, key = commandKey(top, width, h);
+            if (i > 0 && visualBlocks[i - 1].kind == VBlock::Kind::action) dottedRule(dc, sp(4), width - sp(4), top, blend(Surface, Muted, .3));
             if (isSwitch) {
-                if (hot > 0) rounded(dc, {row.left, row.top + sp(2), row.right, row.bottom - sp(2)}, blend(Surface, theme.highContrast ? Selected : blend(Surface, Ink, .05), hot), 12);
-            } else { keycap(dc, row, 12, 0, press, hot); keyLight(row, 12, hot); }
-            if (index == visualFocus && focused) outline(dc, row, Green, 12, 2.0f);
+                if (hot > 0) rounded(dc, {key.left, key.top, key.right, key.bottom}, blend(Surface, theme.highContrast ? Selected : blend(Surface, Ink, .05), hot), 12);
+            } else if (hot > 0 || press > 0) { keycap(dc, key, 12, 0, press, 1, std::max(hot, press)); keyLight(key, 12, hot); }
+            if (index == visualFocus && focused) outline(dc, key, Green, 12, 2.0f);
             const COLORREF ink = hot > .5 && theme.highContrast ? theme.selectedInk : Ink;
-            int right = row.right - sp(14);
+            int right = row.right - sp(4);
             if (isSwitch) {
                 // The switch, its key gliding to the new state.
                 auto [it, fresh] = visualKnobs.try_emplace(int(b.amount));
@@ -1502,7 +1529,7 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
                     if (canAnimate()) visualChangedAt[int(b.amount)] = {now, b.toggle ? 1 : -1};
                     if (visualLive) { // sparks from where the key lands, some past the panel's edge
                         POINT at{b.toggle ? right - sp(14) : right - sp(36), (row.top + row.bottom) / 2};
-                        ClientToScreen(visualView, &at);
+                        at.x += inset; ClientToScreen(visualView, &at);
                         fxToggle(at, b.toggle != 0);
                     }
                 }
@@ -1534,7 +1561,7 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
                         pulse.time.duration = canAnimate() ? 620 : 0;
                     }
                     if (pulse.time.active(now)) visualAnimating = true;
-                    const COLORREF valueInk = b.goal ? Green : Muted, face = theme.keyTop;
+                    const COLORREF valueInk = b.goal ? Green : Muted, face = blend(Surface, theme.keyTop, hot);
                     const double since = pulse.time.duration ? now - pulse.time.started : 1e9;
                     if (since < 120 && !pulse.previous.empty()) {
                         const double out = quickEase(since / 120);
@@ -1549,11 +1576,11 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
                 }
             }
             const int shift = isSwitch ? 0 : int(std::lround(press * sp(1)));
-            if (b.text.empty()) drawText(dc, b.title, {row.left + sp(14), row.top + shift, right, row.bottom + shift}, ink, normalFont);
+            if (b.text.empty()) drawText(dc, b.title, {row.left + sp(4), row.top + shift, right, row.bottom + shift}, ink, normalFont);
             else {
                 const int mid = (row.top + row.bottom) / 2 + shift;
-                drawText(dc, b.title, {row.left + sp(14), mid - sp(19), right, mid + sp(1)}, ink, normalFont);
-                drawText(dc, b.text, {row.left + sp(14), mid + sp(1), right, mid + sp(19)}, Muted, smallFont);
+                drawText(dc, b.title, {row.left + sp(4), mid - sp(19), right, mid + sp(1)}, ink, normalFont);
+                drawText(dc, b.text, {row.left + sp(4), mid + sp(1), right, mid + sp(19)}, Muted, smallFont);
             }
             break;
         }
@@ -1562,6 +1589,7 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
             const int n = int(b.commands.size());
             const RECT tray{0, top + sp(4), width, top + h - sp(4)};
             card(dc, tray, Surface, 14);
+            const ui::LightBounds inTray(dc, tray, true); // the keys' shadows fall inside the tray
             if (!n) break;
             double at = b.toggle;
             Arrival motion;
@@ -1575,7 +1603,7 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
                     if (visualLive && b.toggle < n) {
                         const RECT key = segmentKey(tray, n, b.toggle);
                         POINT at{(key.left + key.right) / 2, (key.top + key.bottom) / 2};
-                        ClientToScreen(visualView, &at);
+                        at.x += inset; ClientToScreen(visualView, &at);
                         fxChoice(at);
                     }
                 }
@@ -1591,8 +1619,9 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
                 const int index = int(hitsBefore) + k;
                 const double lit = b.toggle >= 0 ? std::clamp(1 - std::abs(at - k), 0.0, 1.0) : 0.0;
                 const double hot = index == visualHover || index == visualFocus ? 1.0 : 0.0;
-                keycap(dc, key, 10, lit * paintFade, lit, hot * (1 - lit));
-                keyLight(key, 10, std::max(hot, lit));
+                // Only the chosen key stands up, lit; another rises under the pointer.
+                keycap(dc, key, 10, lit * paintFade, lit, hot * (1 - lit), std::max(lit, hot));
+                if (std::max(hot, lit) > 0) keyLight(key, 10, std::max(hot, lit));
                 if (k == b.toggle && motion.glow > 0) ui::drawRimLight(dc, key, float(sp(10)), theme.rim, motion.angle, motion.glow * .8 * paintFade);
                 if (index == visualFocus && focused) outline(dc, key, Green, 10, 2.0f);
                 const int down = int(std::lround(lit * sp(1)));
@@ -1738,16 +1767,17 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
         addVisualDirty({0, top - sp(18), client.right, visualBlocks[i].kind == VBlock::Kind::fold ? client.bottom : top + h + sp(18)});
     }
     visualContent = y + visualScroll;
+    SetViewportOrgEx(dc, clientOrigin.x, clientOrigin.y, nullptr);
     // A thin scroll indicator on the right when the page is taller than the view: it shows while
     // scrolling (and briefly when a page opens or the pointer comes near), then fades.
     if (visualContent > client.bottom) {
         const int trackHeight = int(client.bottom), thumb = std::max(sp(24), trackHeight * trackHeight / visualContent);
         const int top = (trackHeight - thumb) * visualScroll / std::max(1, visualContent - trackHeight);
-        const RECT bar{client.right - sp(6), top + sp(2), client.right - sp(2), top + thumb - sp(2)};
+        const RECT bar{client.right - sp(11), top + sp(2), client.right - sp(7), top + thumb - sp(2)};
         const double since = visualScrollSeenAt < 0 ? 1e9 : now - visualScrollSeenAt;
         double shown = since < 700 ? 1 : std::clamp(1 - (since - 700) / 260, 0.0, 1.0);
         if (visualDragOffset >= 0 || theme.highContrast) shown = 1;
-        if (shown > 0 && since >= 700 && since < 960) addVisualDirty({client.right - sp(10), 0, client.right, client.bottom});
+        if (shown > 0 && since >= 700 && since < 960) addVisualDirty({client.right - sp(16), 0, client.right, client.bottom});
         else if (since < 700 && visualView) SetTimer(visualView, ScrollFadeTimer, UINT(700 - since) + 1, nullptr); // wakes once to fade it
         if (shown > 0) ui::fillRound(dc, bar, blend(Surface, Ink, .4), float(sp(2)), BYTE(255 * shown));
     }
@@ -1810,7 +1840,7 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         }
         if (wp == ScrollFadeTimer) {
             KillTimer(window, ScrollFadeTimer);
-            RECT r{}; GetClientRect(window, &r); r.left = r.right - sp(10);
+            RECT r{}; GetClientRect(window, &r); r.left = r.right - sp(16);
             InvalidateRect(window, &r, FALSE); armVisualTimer();
             return 0;
         }
@@ -1842,7 +1872,7 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_LBUTTONDOWN: {
         SetFocus(window);
         RECT r{}; GetClientRect(window, &r);
-        if (visualContent > r.bottom && GET_X_LPARAM(lp) >= r.right - sp(12)) { // drag the indicator
+        if (visualContent > r.bottom && GET_X_LPARAM(lp) >= r.right - sp(16)) { // drag the indicator
             visualDragOffset = GET_Y_LPARAM(lp); SetCapture(window);
             scrollVisual(GET_Y_LPARAM(lp) * (visualContent - r.bottom) / std::max<LONG>(1, r.bottom));
             return 0;
@@ -1869,17 +1899,17 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             visualMouse = pt;
             for (const auto& plot : visualPlots)
                 if (PtInRect(&plot, pt) || PtInRect(&plot, before)) {
-                    const RECT area{0, plot.top - sp(28), plot.right + sp(10), plot.bottom + sp(6)};
+                    RECT area{}; GetClientRect(window, &area); area.top = plot.top - sp(28); area.bottom = plot.bottom + sp(6);
                     InvalidateRect(window, &area, FALSE);
                 }
         }
         // Near the right edge the scroll indicator comes back.
         if (visualContent > 0) {
             RECT r{}; GetClientRect(window, &r);
-            if (visualContent > r.bottom && pt.x >= r.right - sp(12)) {
+            if (visualContent > r.bottom && pt.x >= r.right - sp(16)) {
                 const bool wasShown = visualScrollSeenAt >= 0 && motionNow() - visualScrollSeenAt < 700;
                 visualScrollSeenAt = motionNow();
-                if (!wasShown) { r.left = r.right - sp(10); InvalidateRect(window, &r, FALSE); }
+                if (!wasShown) { r.left = r.right - sp(16); InvalidateRect(window, &r, FALSE); }
             }
         }
         int hover = -1;
@@ -1898,7 +1928,7 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_MOUSELEAVE:
         if (visualMouse.x >= 0) {
             for (const auto& plot : visualPlots)
-                if (PtInRect(&plot, visualMouse)) { const RECT area{0, plot.top - sp(28), plot.right + sp(10), plot.bottom + sp(6)}; InvalidateRect(window, &area, FALSE); }
+                if (PtInRect(&plot, visualMouse)) { RECT area{}; GetClientRect(window, &area); area.top = plot.top - sp(28); area.bottom = plot.bottom + sp(6); InvalidateRect(window, &area, FALSE); }
             visualMouse = {-1, -1};
         }
         if (visualHover >= 0) {
@@ -1966,7 +1996,7 @@ void showVisual(std::vector<VBlock> blocks, bool keepScroll) {
         HDC dc = GetDC(visualView);
         for (size_t i = 0; i < blocks.size() && !whole; ++i) {
             if (sameBlock(blocks[i], visualBlocks[i])) continue;
-            if (blocks[i].kind == VBlock::Kind::fold || blockHeight(dc, blocks[i], r.right - sp(10), i == 0) != visualSpans[i].second) whole = true;
+            if (blocks[i].kind == VBlock::Kind::fold || blockHeight(dc, blocks[i], visualWidth(r), i == 0) != visualSpans[i].second) whole = true;
             else changed.push_back(i);
         }
         ReleaseDC(visualView, dc);
@@ -2010,7 +2040,7 @@ enum class Tab { ranking, saving, battery, hardware, lab, settings, performance 
 // The sections are a row of keys along the bottom of the panel, like the bottom row of a
 // keyboard: each with its dot-matrix icon and name; the one you are on is lit from inside.
 int tabBarHeight() { return sp(68); }
-RECT tabStrip(RECT client) { return {sp(12), client.bottom - tabBarHeight() + sp(6), client.right - sp(12), client.bottom - sp(10)}; }
+RECT tabStrip(RECT client) { return {sp(14), client.bottom - tabBarHeight() + sp(10), client.right - sp(14), client.bottom - sp(10)}; }
 RECT tabArea(RECT client) { // what to repaint when the tabs change (their light reaches past them)
     return {0, client.bottom - tabBarHeight() - sp(14), client.right, client.bottom};
 }
@@ -2111,11 +2141,19 @@ void drawTabs(HDC dc, RECT client) {
     const Arrival motion = tabChangedAt >= 0 ? arrival(now - tabChangedAt, tabDirection) : Arrival{};
     if (motion.active) armMotionTimer();
     const int unit = std::max(2, sp(2));
+    // The page above is another window: the tabs' light has to be gone by the top of their bar.
+    const ui::LightBounds lightBounds(dc, {0, client.bottom - tabBarHeight(), client.right, client.bottom});
+    {
+        // The tabs lie in one tray; the open one is the lit key in it.
+        RECT tray = tabStrip(client); InflateRect(&tray, sp(5), sp(5));
+        card(dc, tray, Surface, 16);
+    }
+    const ui::LightBounds inTray(dc, [&] { RECT tray = tabStrip(client); InflateRect(&tray, sp(5), sp(5)); return tray; }(), true);
     for (size_t i = 0; i < tabs.size(); ++i) {
         RECT r = tabRect(i, tabs.size(), client);
         const double lit = std::clamp(1 - std::abs(at - double(i)), 0.0, 1.0);
         const double hot = int(i) == tabHover ? 1.0 : 0.0;
-        keycap(dc, r, 12, lit, lit, hot * (1 - lit));
+        keycap(dc, r, 12, lit, lit, hot * (1 - lit), std::max(lit, hot)); // only the open tab's key stands up
         if (keyLook()) {
             if (hot > 0 && PtInRect(&r, tabMouse)) ui::spotlight(dc, r, float(sp(12)), tabMouse, theme.glow, theme.dark ? .22 : .5, sp(48));
             const double rippleT = tabRippleStart >= 0 && int(i) == tabRippleIndex ? (now - tabRippleStart) / 420.0 : -1;
@@ -2127,7 +2165,7 @@ void drawTabs(HDC dc, RECT client) {
         int rows = 0; const char* const* icon = tabIcon(tabs[i], rows);
         const int columns = int(strlen(icon[0])), iconWidth = columns * unit, iconHeight = rows * unit;
         const int mid = (r.top + r.bottom) / 2;
-        ui::pixelIcon(dc, icon, rows, (r.left + r.right - iconWidth) / 2, mid - sp(4) - iconHeight + (7 - rows) * unit / 2, unit, ink);
+        ui::pixelIcon(dc, icon, rows, (r.left + r.right - iconWidth) / 2, mid - sp(4) - iconHeight + (7 - rows) * unit / 2, unit, ink, 0);
         drawText(dc, tabLabel(tabs[i]), {r.left, mid, r.right, r.bottom - sp(4)}, ink, lit > .5 ? strongFont : normalFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     }
 }
@@ -2227,6 +2265,7 @@ RECT popupClose(RECT client) { return {client.right - sp(30), client.top + sp(8)
 void paintPopup(HDC dc, RECT r, const Popup& p) {
     // The panel's face, a hairline edge, an indicator LED in the popup's colour.
     fill(dc, r, Background);
+    const ui::LightBounds lightBounds(dc, r);
     outline(dc, r, theme.highContrast ? Border : blend(Border, Background, .2), 12);
     const COLORREF accent = p.color ? p.color : Green;
     const COLORREF light = !p.color || p.color == theme.accent ? theme.glow : p.color == theme.warn ? RGB(242, 169, 59) : p.color == theme.danger ? RGB(240, 82, 74) : p.color;
@@ -2942,16 +2981,43 @@ double scrollMaximum() {
     RECT r{}; GetClientRect(viewport, &r);
     return std::max(0, int(displayed.size()) * px(RowHeight) - int(r.bottom));
 }
+// The ranking's scroll indicator: a slim bar in the panel's right margin beside the list, where
+// the pages have theirs (no Windows scroll bar). It shows while the list scrolls or the pointer
+// is near it, then fades; it can be dragged.
+constexpr UINT_PTR ListBarTimer = 101;
+double listBarSeenAt = -1; bool listBarDrag = false; int listBarGrab = 0;
+// The bar's track and thumb in the panel's coordinates; false when the list is hidden or fits.
+bool listBarGeometry(RECT& track, RECT& thumb) {
+    if (!viewport || !mainWindow || !IsWindowVisible(viewport)) return false;
+    RECT view{}; GetWindowRect(viewport, &view); MapWindowPoints(nullptr, mainWindow, reinterpret_cast<POINT*>(&view), 2);
+    RECT client{}; GetClientRect(mainWindow, &client);
+    const int page = view.bottom - view.top, content = int(displayed.size()) * px(RowHeight);
+    if (page <= 0 || content <= page) return false;
+    track = {client.right - sp(16), view.top, client.right, view.bottom};
+    const int length = page - sp(4), size = std::max(sp(24), length * page / content);
+    const int top = view.top + sp(2) + int(std::lround((length - size) * scrollPosition / std::max(1.0, scrollMaximum())));
+    thumb = {client.right - sp(11), top, client.right - sp(7), top + size};
+    return true;
+}
+void showListBar() {
+    RECT track{}, thumb{};
+    if (!listBarGeometry(track, thumb)) return;
+    listBarSeenAt = motionNow();
+    InvalidateRect(mainWindow, &track, FALSE);
+    SetTimer(mainWindow, ListBarTimer, 720, nullptr); // wakes once to fade it
+}
+double listBarShown() {
+    if (listBarDrag || theme.highContrast) return 1;
+    const double since = listBarSeenAt < 0 ? 1e9 : motionNow() - listBarSeenAt;
+    return since < 700 ? 1 : std::clamp(1 - (since - 700) / 260, 0.0, 1.0);
+}
 void applyScroll(double position) {
     if (!list || !viewport || applyingScroll) return;
     applyingScroll = true;
+    const double before = scrollPosition;
     scrollPosition = std::clamp(position, 0.0, scrollMaximum());
+    if (std::abs(scrollPosition - before) > .01) showListBar();
     RECT r{}; GetClientRect(viewport, &r);
-    SCROLLINFO info{}; info.cbSize = sizeof(info); info.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
-    info.nMax = std::max(0, int(displayed.size()) * px(RowHeight) - 1);
-    info.nPage = UINT(r.bottom); info.nPos = int(std::lround(scrollPosition));
-    SetScrollInfo(viewport, SB_VERT, &info, TRUE);
-    GetClientRect(viewport, &r);
     int offset = int(std::lround(scrollPosition)), row = offset / px(RowHeight), remainder = offset % px(RowHeight);
     // Native report lists only scroll whole rows. Move a clipped viewport by the
     // fractional remainder; native selection and hit testing move with the HWND.
@@ -3058,11 +3124,13 @@ void layout() {
     MoveWindow(backgroundCheck, margin, top - sp(38), half, sp(28), TRUE);
     MoveWindow(allCheck, margin + half + gap, top - sp(38), half, sp(28), TRUE);
     // Header keys, right to left: hide, the ⋯ menu, and under them the power mode key.
-    MoveWindow(hideButton, w - sp(18) - sp(32), sp(14), sp(32), sp(32), TRUE);
-    MoveWindow(menuButton, w - sp(18) - sp(70), sp(14), sp(32), sp(32), TRUE);
+    // The header's keys: ⋯ and hide level with the name; under them, level with the line of
+    // text, the power mode key. Its window is larger than its key so its light has room.
+    MoveWindow(hideButton, w - sp(18) - sp(32), sp(8), sp(32), sp(32), TRUE);
+    MoveWindow(menuButton, w - sp(18) - sp(70), sp(8), sp(32), sp(32), TRUE);
     {
-        const int key = english ? sp(112) : sp(92); // "Efficiency" is longer than 效率
-        MoveWindow(powerButton, w - sp(18) - key, sp(50), key, sp(26), TRUE);
+        const int key = english ? sp(96) : sp(70); // "Efficiency" is longer than 效率
+        MoveWindow(powerButton, w - sp(18) + sp(6) - key - sp(16), sp(35), key + sp(16), sp(32), TRUE);
     }
     const bool fullPage = inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history || inlinePage == InlinePage::lab || inlinePage == InlinePage::ledger || inlinePage == InlinePage::hardware ||
         inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic || inlinePage == InlinePage::goal || inlinePage == InlinePage::performance || inlinePage == InlinePage::stability ||
@@ -3080,7 +3148,7 @@ void layout() {
     const int textBottom = inlinePage == InlinePage::process ? h - sp(140) : section ? h - sp(4) : h - sp(94);
     MoveWindow(inlineText, margin + sp(12), textTop, inner - sp(24), std::max(sp(55), textBottom - textTop), TRUE);
     // Chart pages run across the panel's face (less its margins): no card around them.
-    if (visualView) MoveWindow(visualView, sp(14), textTop, w - sp(20), std::max(sp(55), textBottom - textTop), TRUE);
+    if (visualView) MoveWindow(visualView, 0, textTop, w, std::max(sp(55), textBottom - textTop), TRUE);
     {
         const int pageLeft = margin + sp(12), pageWidth = inner - sp(24), pageHalf = (pageWidth - sp(8)) / 2;
         MoveWindow(ecoButton, pageLeft, h - sp(103), pageHalf, sp(32), TRUE);
@@ -3173,18 +3241,31 @@ void drawButton(const DRAWITEMSTRUCT& item) {
     const bool pressed = (item.itemState & ODS_SELECTED) != 0;
     const UINT id = item.CtlID;
     fill(dc, r, Background);
+    const ui::LightBounds lightBounds(dc, r);
     const double hover = disabled ? 0 : buttonMotions[item.hwndItem].value(motionNow());
     const double press = std::max(pressMotions[item.hwndItem].value(motionNow()), pressed ? 1.0 : 0.0);
     wchar_t title[128]{}; GetWindowTextW(item.hwndItem, title, int(std::size(title)));
-    // The key sits inside the button's window with room for its shadow below.
-    const RECT key{r.left + sp(2), r.top + sp(1), r.right - sp(2), r.bottom - sp(4)};
+    // The key sits inside the button's window with room for its shadow below (the power mode
+    // key, which is lit, with room for its light all round).
+    const RECT key = id == PowerModeId ? RECT{r.left + sp(8), r.top + sp(6), r.right - sp(8), r.bottom - sp(6)}
+        : RECT{r.left + sp(2), r.top + sp(1), r.right - sp(2), r.bottom - sp(4)};
     const bool checked = (id == BackgroundId && backgroundOnly) || (id == AllId && showAll) || (id == PowerModeId && powerSaving) || modeSelected(id) ||
         (id == EcoToggleId && inlineProcess && isEfficient(*inlineProcess)) || (id == PerfAppToggleId && inlineProcess && performanceListed(*inlineProcess));
     const double lit = checked ? (disabled ? .55 : 1.0) : 0.0;
-    keycap(dc, key, id == MenuId || id == HideId ? 10 : 11, lit, std::max(press, lit), hover * (1 - lit));
-    const int down = int(std::lround(std::max(press, lit) * sp(1)));
+    // Not everything pressable stands up as a key. A choice or a filter lies flat until it is
+    // chosen (then it is the lit key) or the pointer is on it; a command that cannot be used
+    // now is an empty outline. What is left standing are the commands that can be pressed.
+    bool choice = id == BackgroundId || id == AllId || id == EcoToggleId || id == PerfAppToggleId;
+    for (HWND mode : modeButtons) choice |= mode == item.hwndItem;
+    const bool filter = id == BackgroundId || id == AllId; // filters stay quiet when on: an LED, not a lit key
+    const double standing = disabled ? 0.0 : filter ? std::max(hover, press) : choice ? std::max({lit, hover, press}) : 1.0;
+    const double keyLit = filter ? 0.0 : lit;
+    if (disabled && !theme.highContrast) outline(dc, key, blend(Background, Muted, .22), 11);
+    keycap(dc, key, id == MenuId || id == HideId ? 10 : 11, keyLit, std::max(press, keyLit), hover * (1 - keyLit), theme.highContrast ? 1.0 : standing);
+    const int down = int(std::lround(std::max(press, keyLit) * sp(1)));
     RECT face = key; OffsetRect(&face, 0, down);
-    const COLORREF ink = disabled ? theme.faint : theme.highContrast && lit > .5 ? theme.selectedInk : lit > .5 ? theme.accentInk : blend(Muted, Ink, .4 + .6 * hover);
+    const COLORREF ink = disabled ? theme.faint : theme.highContrast && lit > .5 ? theme.selectedInk : filter ? (lit > .5 ? Green : blend(Muted, Ink, .2 + .8 * hover))
+        : keyLit > .5 ? theme.accentInk : blend(Muted, Ink, .4 + .6 * hover);
     if (id == MenuId || id == HideId) {
         static const char* dots[] = {"#.#.#"};
         static const char* chevron[] = {"#...#", ".#.#.", "..#.."};
@@ -3193,7 +3274,7 @@ void drawButton(const DRAWITEMSTRUCT& item) {
         const int rows = id == MenuId ? 1 : 3, columns = 5;
         ui::pixelIcon(dc, glyph, rows, (face.left + face.right - columns * unit) / 2, (face.top + face.bottom - rows * unit) / 2, unit, ink);
     } else {
-        HFONT faceFont = lit > .5 || id == CloseId || id == InlineConfirmId ? strongFont : normalFont;
+        HFONT faceFont = keyLit > .5 || id == CloseId || id == InlineConfirmId ? strongFont : normalFont;
         COLORREF text = ink;
         int left = face.left;
         if (!disabled && (id == KillId || id == InlineConfirmId)) {
@@ -3204,6 +3285,18 @@ void drawButton(const DRAWITEMSTRUCT& item) {
             ui::led(dc, {left, mid - s / 2, left + s, mid - s / 2 + s}, RGB(240, 82, 74), RGB(240, 82, 74), 1, theme.ledOff);
             text = theme.highContrast ? Ink : Danger;
             drawText(dc, title, {left + s + sp(6), face.top, face.right, face.bottom}, text, faceFont, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        } else if (filter && lit > .5 && !theme.highContrast) {
+            // A filter that is on: an LED beside its name.
+            const int s = sp(6), mid = (face.top + face.bottom) / 2;
+            left = (face.left + face.right - (textWidth(dc, title, faceFont) + s + sp(6))) / 2;
+            ui::led(dc, {left, mid - s / 2, left + s, mid - s / 2 + s}, theme.glow, theme.halo, 1, theme.ledOff);
+            drawText(dc, title, {left + s + sp(6), face.top, face.right, face.bottom}, text, faceFont, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        } else if (filter && !theme.highContrast) {
+            // A filter reads as a row does: its setting, and the small arrow that says it changes.
+            const int width = textWidth(dc, title, faceFont) + sp(16);
+            left = std::max(int(face.left) + sp(4), int(face.left + face.right - width) / 2);
+            drawText(dc, title, {left, face.top, face.right - sp(16), face.bottom}, text, faceFont, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            drawMenuArrow(dc, std::min(int(face.right) - sp(14), left + width - sp(8)), (face.top + face.bottom) / 2 - sp(5), sp(10), Muted, false);
         } else drawText(dc, title, face, text, faceFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
     }
     if ((item.itemState & ODS_FOCUS) && !(item.itemState & ODS_NOFOCUSRECT))
@@ -3216,10 +3309,14 @@ void drawProcess(const DRAWITEMSTRUCT& item) {
     const auto& row = displayed[item.itemID]; HDC dc = item.hDC; RECT r = item.rcItem;
     const bool selected = (item.itemState & ODS_SELECTED) != 0;
     fill(dc, r, Background);
+    const ui::LightBounds lightBounds(dc, r);
     const double focus = item.itemID < rowMotions.size() ? rowMotions[item.itemID].selected.value(motionNow()) : double(selected);
     const double hover = item.itemID < rowMotions.size() ? rowMotions[item.itemID].hover.value(motionNow()) : 0;
     const RECT tile{r.left + sp(2), r.top + sp(1), r.right - sp(2), r.bottom - sp(7)};
-    keycap(dc, tile, 12, focus, 0, hover * (1 - focus));
+    // A row lies flat, a dotted line under it; the chosen one is the lit key, and one rises
+    // under the pointer.
+    if (!theme.highContrast) dottedRule(dc, tile.left + sp(8), tile.right - sp(8), r.bottom - sp(4), blend(Background, Muted, .3));
+    keycap(dc, tile, 12, focus, 0, hover * (1 - focus), theme.highContrast ? 1.0 : std::max(focus, hover));
     const bool inverted = theme.highContrast && selected;
     const COLORREF ink = inverted ? theme.selectedInk : focus > .5 ? theme.accentInk : Ink;
     const COLORREF sub = inverted ? theme.selectedInk : Muted, accent = inverted ? theme.selectedInk : focus > .5 ? theme.accentInk : Green;
@@ -3236,23 +3333,23 @@ void drawProcess(const DRAWITEMSTRUCT& item) {
     }
     const int left = iconX + iconSize + sp(10), right = tile.right - sp(12), y = tile.top;
     if (row.services.size() > 1) name += L" · " + std::to_wstring(row.services.size()) + tr(L" 項服務");
-    drawText(dc, name, {left, y + sp(5), right - sp(90), y + sp(26)}, ink, normalFont);
-    drawText(dc, valueText(row.averageCpuWatts, L" W", 2), {right - sp(90), y + sp(4), right, y + sp(27)}, accent, metricFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    drawText(dc, name, {left, y + sp(3), right - sp(90), y + sp(24)}, ink, normalFont);
+    drawText(dc, valueText(row.averageCpuWatts, L" W", 2), {right - sp(90), y + sp(2), right, y + sp(25)}, accent, metricFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
     // Kind and PID as quiet text; an LED when Windows runs it in efficiency mode.
     int x = left;
     if (isEfficient(row)) {
-        ui::led(dc, {x, y + sp(33), x + sp(6), y + sp(39)}, theme.glow, theme.halo, 1, theme.ledOff);
+        ui::led(dc, {x, y + sp(30), x + sp(6), y + sp(36)}, theme.glow, theme.halo, 1, theme.ledOff);
         x += sp(10);
     }
     const std::wstring kind = std::wstring(tr(row.kind.c_str())) + (isEfficient(row) ? tr(L" · 效率") : L"") + L" · PID " + std::to_wstring(row.pid);
     // CPU share is easier to read at a glance; the watt range is on the details page.
     std::wstring range = L"CPU " + (row.measured ? number(row.cpu) + L"%" : L"—");
     if (row.gpuPercent && *row.gpuPercent >= 1) range += L" · GPU " + number(*row.gpuPercent, 0) + L"%";
-    drawText(dc, kind, {x, y + sp(27), right - sp(110), y + sp(45)}, sub, smallFont);
-    drawText(dc, range, {right - sp(108), y + sp(27), right, y + sp(45)}, sub, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    drawText(dc, kind, {x, y + sp(24), right - sp(110), y + sp(42)}, sub, smallFont);
+    drawText(dc, range, {right - sp(108), y + sp(24), right, y + sp(42)}, sub, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
     if (row.averageCpuWatts && !displayed.empty() && displayed.front().averageCpuWatts && *displayed.front().averageCpuWatts > 0) {
         const double ratio = item.itemID < rowMotions.size() ? rowMotions[item.itemID].bar.value(motionNow()) : 0;
-        ledRow(dc, {left, y + sp(48), right, y + sp(48) + std::max(2, sp(3))}, {{ratio, theme.glow}});
+        ledRow(dc, {left, y + sp(44), right, y + sp(44) + std::max(2, sp(3))}, {{ratio, theme.glow}});
     }
     if ((item.itemState & ODS_FOCUS) && GetFocus() == list && !(SendMessageW(list, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS))
         outline(dc, tile, theme.highContrast ? ink : blend(Green, Background, .25), 12, float(std::max(2, px(2))));
@@ -3265,6 +3362,7 @@ bool fullPanelPage(InlinePage page) {
 }
 void paint(HDC dc, RECT bounds) {
     fill(dc, bounds, Background);
+    const ui::LightBounds lightBounds(dc, bounds);
     heroMoving = false; // set again below while the battery tab's digits are on the move
     drawTabs(dc, bounds);
     const int w = bounds.right, margin = sp(18), right = w - margin;
@@ -3302,6 +3400,11 @@ void paint(HDC dc, RECT bounds) {
                 !plugged ? Green : Muted, smallFont);
         }
         return; // notices show as a card above the tabs
+    }
+    {
+        RECT track{}, thumb{};
+        const double shown = listBarShown();
+        if (shown > 0 && listBarGeometry(track, thumb)) ui::fillRound(dc, thumb, blend(Background, Ink, .4), float(sp(2)), BYTE(255 * shown));
     }
     PowerSample p; if (!current.history.empty()) p = current.history.back();
     const auto& m = current.power;
@@ -3688,6 +3791,7 @@ void chooseShareCard() {
 // The mini window: battery level, watts, and the mascot, always on top.
 void paintMini(HDC dc, RECT r) {
     fill(dc, r, Background);
+    const ui::LightBounds lightBounds(dc, r);
     card(dc, r, Surface, 10);
     const int unit = std::max(2, px(2));
     const auto mood = currentMood();
@@ -4259,7 +4363,7 @@ std::vector<VBlock> labBlocks(const bs::lab::Controller::Status& st) {
         v.push_back(vAction(tr(L"完整測試"), tr(L"約 1.5 小時"), LabAutoId));
         v.push_back(vAction(tr(L"單項實驗"), st.running ? tr(L"進行中") : std::wstring(), LabSingleMenuId));
     }
-    // What each setting saves, per activity: the bar is the saving, the whisker its 95% range.
+    // What each setting saves, per activity: the bar is the saving, the dimmer LEDs its 95% range.
     std::vector<VBar> savings;
     for (const auto& r : st.results) {
         if (r.arm0.empty() || r.arm1.empty() || r.battery.pairs < 2) continue;
@@ -4278,7 +4382,7 @@ std::vector<VBlock> labBlocks(const bs::lab::Controller::Status& st) {
     else {
         v.push_back(vBars(std::move(savings)));
         v.push_back(vLegend({{tr(L"差異明確"), Green}, {tr(L"差異不明確"), blend(Muted, Surface, .35)}}));
-        v.push_back(vFold(tr(L"怎麼看這張圖"), tr(L"每條是兩種設定輪流量測的平均差，細線是 95% 範圍；「明確」才會被動態省電採用。")));
+        v.push_back(vFold(tr(L"怎麼看這張圖"), tr(L"每條是兩種設定輪流量測的平均差：亮燈到平均差為止，兩側較暗的燈是 95% 範圍；「明確」才會被動態省電採用。")));
     }
     // Where battery power goes per activity: CPU cores, the rest of the processor, and everything else.
     std::vector<VBar> split;
@@ -4888,28 +4992,6 @@ LRESULT CALLBACK viewportProc(HWND window, UINT message, WPARAM wp, LPARAM lp, U
     if (message == WM_MOUSEWHEEL) { wheelScroll(wp); return 0; }
     if (message == WM_ERASEBKGND) {
         RECT r{}; GetClientRect(window, &r); fill(reinterpret_cast<HDC>(wp), r, Background); return TRUE;
-    }
-    if (message == WM_VSCROLL) {
-        RECT r{}; GetClientRect(window, &r);
-        double target = scrollMotion.active(motionNow()) ? scrollMotion.to : scrollPosition;
-        switch (LOWORD(wp)) {
-        case SB_LINEUP: scrollTo(target - px(RowHeight)); break;
-        case SB_LINEDOWN: scrollTo(target + px(RowHeight)); break;
-        case SB_PAGEUP: scrollTo(target - r.bottom); break;
-        case SB_PAGEDOWN: scrollTo(target + r.bottom); break;
-        case SB_TOP: scrollTo(0); break;
-        case SB_BOTTOM: scrollTo(scrollMaximum()); break;
-        case SB_THUMBTRACK:
-        case SB_THUMBPOSITION: {
-            SCROLLINFO info{}; info.cbSize = sizeof(info); info.fMask = SIF_TRACKPOS; GetScrollInfo(window, SB_VERT, &info);
-            stopScroll(); scrollingThumb = true; scrollTo(info.nTrackPos, true); break;
-        }
-        case SB_ENDSCROLL:
-            scrollingThumb = false;
-            if (listRefreshPending) { listRefreshPending = false; refreshList(); }
-            break;
-        }
-        return 0;
     }
     if (message == WM_NCDESTROY) RemoveWindowSubclass(window, viewportProc, 1);
     return DefSubclassProc(window, message, wp, lp);
@@ -8147,7 +8229,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         dpi = GetDpiForWindow(window);
         if (!refreshIcons()) return -1;
         readMotionPreference();
-        viewport = CreateWindowExW(WS_EX_CONTROLPARENT, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN | WS_VSCROLL,
+        viewport = CreateWindowExW(WS_EX_CONTROLPARENT, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
             0, 0, 0, 0, window, nullptr, nullptr, nullptr);
         SetWindowSubclass(viewport, viewportProc, 1, 0);
         list = CreateWindowExW(0, WC_LISTVIEWW, tr(L"CPU 耗電排行"), WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOCOLUMNHEADER | LVS_OWNERDRAWFIXED,
@@ -8258,6 +8340,14 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_TIMER:
         if (wp == MotionTimer) { stepMotion(motionNow()); return 0; }
         if (wp == FxTimer) { stepFx(); return 0; }
+        if (wp == ListBarTimer) {
+            RECT track{}, thumb{};
+            const double since = listBarSeenAt < 0 ? 1e9 : motionNow() - listBarSeenAt;
+            if (!listBarGeometry(track, thumb) || since >= 960) KillTimer(window, ListBarTimer);
+            else SetTimer(window, ListBarTimer, since < 700 ? UINT(700 - since) + 1 : 16, nullptr);
+            if (!IsRectEmpty(&track)) InvalidateRect(window, &track, FALSE);
+            return 0;
+        }
         if (wp == NoticeTimer) { KillTimer(window, NoticeTimer); noticeUntil = 0; InvalidateRect(window, nullptr, FALSE); return 0; }
         if (wp == UpdateTimer) { SetTimer(window, UpdateTimer, 6 * 3600 * 1000, nullptr); maybeCheckForUpdate(); return 0; }
         if (wp == GovernorTimer) { governorTick(); return 0; }
@@ -8952,8 +9042,29 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         return DefWindowProcW(window, message, wp, lp);
     }
     case GovernorNowMessage: governorTick(); return 0;
+    case WM_LBUTTONUP: case WM_CAPTURECHANGED:
+        if (listBarDrag) {
+            listBarDrag = false; scrollingThumb = false;
+            if (message == WM_LBUTTONUP) ReleaseCapture();
+            showListBar();
+            if (listRefreshPending) { listRefreshPending = false; refreshList(); }
+            return 0;
+        }
+        break;
     case WM_MOUSEMOVE: {
         RECT client{}; GetClientRect(window, &client);
+        {
+            RECT track{}, thumb{};
+            const POINT at{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            if (listBarGeometry(track, thumb)) {
+                if (listBarDrag) {
+                    const int length = int(track.bottom - track.top) - sp(4) - int(thumb.bottom - thumb.top);
+                    scrollTo((at.y - listBarGrab - track.top - sp(2)) * scrollMaximum() / std::max(1, length), true);
+                    return 0;
+                }
+                if (PtInRect(&track, at) && listBarShown() < 1) showListBar(); // near it, it comes back
+            }
+        }
         const int hover = tabAt({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}, client);
         tabMouse = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         if (hover != tabHover) {
@@ -9102,6 +9213,18 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
                 if (canAnimate()) { tabRippleIndex = tab; tabRippleAt = point; tabRippleStart = motionNow(); armMotionTimer(); }
                 const Tab target = visibleTabs()[size_t(tab)];
                 if (target != activeTab() || (target == Tab::ranking && inlinePage != InlinePage::none) || (target == Tab::performance && inlinePage == InlinePage::stability)) SendMessageW(window, WM_COMMAND, tabCommand(target), 0);
+                return 0;
+            }
+        }
+        {
+            RECT track{}, thumb{};
+            if (inlinePage == InlinePage::none && listBarGeometry(track, thumb) && PtInRect(&track, point)) {
+                // Grab the bar; a press beside it brings its middle there.
+                listBarGrab = PtInRect(&thumb, point) || (point.y >= thumb.top && point.y < thumb.bottom) ? point.y - thumb.top : int(thumb.bottom - thumb.top) / 2;
+                stopScroll(); listBarDrag = true; scrollingThumb = true; SetCapture(window);
+                const int length = int(track.bottom - track.top) - sp(4) - int(thumb.bottom - thumb.top);
+                scrollTo((point.y - listBarGrab - track.top - sp(2)) * scrollMaximum() / std::max(1, length), true);
+                showListBar();
                 return 0;
             }
         }
@@ -9607,16 +9730,16 @@ bool panelSelfTest(const std::wstring& path) {
         const auto fold = std::find_if(visualHits.begin(), visualHits.end(), [](const VHit& hit) { return hit.command == FoldCommand; });
         const bool found = fold != visualHits.end() && fold->block < visualBlocks.size();
         const VBlock closedBlock = found ? visualBlocks[fold->block] : VBlock{};
-        const int closed = found ? blockHeight(dc, closedBlock, view.right - sp(10), false) : 0;
+        const int closed = found ? blockHeight(dc, closedBlock, visualWidth(view), false) : 0;
         if (found) activateVisualHit(visualView, size_t(fold - visualHits.begin()));
         visualFolds.clear();
-        const int open = found ? blockHeight(dc, closedBlock, view.right - sp(10), false) : 0;
+        const int open = found ? blockHeight(dc, closedBlock, visualWidth(view), false) : 0;
         check("fold_opens_in_place", found && visualFoldsOpen.count(closedBlock.title) && open > closed + sp(20) && inlinePage == InlinePage::settings);
         paintVisual(dc, view);
         const auto again = std::find_if(visualHits.begin(), visualHits.end(), [](const VHit& hit) { return hit.command == FoldCommand; });
         if (again != visualHits.end()) activateVisualHit(visualView, size_t(again - visualHits.begin()));
         visualFolds.clear();
-        check("fold_closes_again", found && !visualFoldsOpen.count(closedBlock.title) && blockHeight(dc, closedBlock, view.right - sp(10), false) == closed);
+        check("fold_closes_again", found && !visualFoldsOpen.count(closedBlock.title) && blockHeight(dc, closedBlock, visualWidth(view), false) == closed);
         ReleaseDC(visualView, dc);
     }
     // Pages slide in from the side their tab is on.
@@ -9722,7 +9845,7 @@ bool panelSelfTest(const std::wstring& path) {
         RECT view{}; GetClientRect(visualView, &view);
         HDC dc = GetDC(visualView);
         bool sized = true;
-        for (size_t i = 0; i < visualBlocks.size(); ++i) sized = sized && blockHeight(dc, visualBlocks[i], view.right - sp(10), i == 0) > 0;
+        for (size_t i = 0; i < visualBlocks.size(); ++i) sized = sized && blockHeight(dc, visualBlocks[i], visualWidth(view), i == 0) > 0;
         ReleaseDC(visualView, dc);
         check("stability_blocks_have_heights", sized);
     }

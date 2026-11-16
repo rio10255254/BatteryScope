@@ -705,7 +705,7 @@ inline const std::map<std::wstring_view, const wchar_t*> translations = {
     {L"還沒有結果：從「⋯ → 省電實驗室 → 快速測試」開始，約 25 分鐘。", L"No results yet: start ⋯ → Power lab → Quick test (about 25 minutes)."},
     {L"差異明確", L"Clear difference"},
     {L"差異不明確", L"Unclear difference"},
-    {L"每條是兩種設定輪流量測的平均差，細線是 95% 範圍；「明確」才會被動態省電採用。", L"Each bar is the average difference between two settings measured in turn; the thin line is the 95% range. Only clear savings are used by dynamic saving."},
+    {L"每條是兩種設定輪流量測的平均差：亮燈到平均差為止，兩側較暗的燈是 95% 範圍；「明確」才會被動態省電採用。", L"Each bar is the average difference between two settings measured in turn: the bright LEDs end at the average, and the dimmer ones on either side are the 95% range. Only clear savings are used by dynamic saving."},
     {L"用電池時，電花在哪裡", L"Where battery power goes"},
     {L"CPU 其他", L"Rest of CPU"},
     {L"螢幕與其他", L"Screen and the rest"},
