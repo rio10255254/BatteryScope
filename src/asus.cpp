@@ -319,6 +319,11 @@ Snapshot read() {
     wchar_t text[128]{}; DWORD bytes = sizeof(text);
     if (RegGetValueW(HKEY_LOCAL_MACHINE, L"HARDWARE\\DESCRIPTION\\System\\BIOS", L"SystemProductName", RRF_RT_REG_SZ, nullptr, text, &bytes) == ERROR_SUCCESS)
         s.model = text;
+    // Some firmware writes the model twice ("... GA403UV_GA403UV"): the repeat is dropped.
+    if (const size_t mark = s.model.rfind(L'_'); mark != std::wstring::npos && mark > 0) {
+        const std::wstring tail = s.model.substr(mark + 1);
+        if (!tail.empty() && mark >= tail.size() && s.model.compare(mark - tail.size(), tail.size(), tail) == 0) s.model.resize(mark);
+    }
     Acpi acpi;
     s.driver = acpi.available();
     if (!s.driver) return s;
