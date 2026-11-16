@@ -47,10 +47,26 @@ void drawRimLight(HDC dc, const RECT& r, float radius, COLORREF color, double an
 // soft rounded-rect sprites worked out once per size and colour, then only copied.
 // A soft halo (or shadow) around r, fading out over `spread` px; moved by (dx, dy).
 void softHalo(HDC dc, const RECT& r, float radius, COLORREF color, BYTE alpha, int spread, int dx = 0, int dy = 0);
+// While one of these lives, light and shadow drawn into `dc` stay inside `area` (logical
+// coordinates): near an edge they are squeezed so they are gone when they reach it, and never
+// cut. A window's own area, one row of a list. `shadowsOnly` holds in only the shadows: keys
+// standing in a well keep their shadows inside it while their light still spills over its rim.
+// They nest.
+class LightBounds {
+public:
+    LightBounds(HDC dc, const RECT& area, bool shadowsOnly = false);
+    LightBounds(const LightBounds&) = delete;
+    LightBounds& operator=(const LightBounds&) = delete;
+    ~LightBounds();
+private:
+    bool had_[2]; RECT previous_[2];
+};
 void clearSprites();
 // A keycap. `lit` 0-1 lights it from inside (the palette's light), `pressed` 0-1 sinks it,
 // `hover` 0-1 brightens it a little. Contrast themes get a flat face and an outline.
-void keycap(HDC dc, RECT r, float radius, const Palette& p, double lit, double pressed = 0, double hover = 0);
+// `opacity` 0-1 fades the whole key in over what is already drawn (a key rising out of a flat
+// row under the pointer, the light moving from one choice to the next).
+void keycap(HDC dc, RECT r, float radius, const Palette& p, double lit, double pressed = 0, double hover = 0, double opacity = 1);
 // A well: the panel sunk in, shaded along its top inner edge, lit along its lower edge.
 void well(HDC dc, const RECT& r, float radius, const Palette& p);
 // An LED cell: `lit` 0-1 blends `off` to `on` and adds a halo in `halo`.
@@ -60,7 +76,8 @@ void spotlight(HDC dc, const RECT& key, float radius, POINT at, COLORREF color, 
 // A ring of light spreading over a key from where it was pressed, clipped to the key. progress 0-1.
 void ripple(HDC dc, const RECT& key, float radius, POINT at, COLORREF color, double progress);
 // A dot-matrix pixel icon: rows of '#' cells, each cell `unit` px with a small gap.
-void pixelIcon(HDC dc, const char* const* rows, int count, int x, int y, int unit, COLORREF color);
+// `gap` is the space left inside each cell (-1: a small one at larger sizes).
+void pixelIcon(HDC dc, const char* const* rows, int count, int x, int y, int unit, COLORREF color, int gap = -1);
 
 bool startGraphics();
 void stopGraphics();
@@ -74,14 +91,19 @@ void strokeRound(HDC dc, const RECT& r, COLORREF color, float radius, float widt
 // if `text` holds any other character; width is 0 in that case.
 // `gap` leaves that many pixels between cells, so the digits read as a dot matrix.
 int pixelDigitsWidth(const std::wstring& text, int unit);
-// The lit cells of `text` in the 5x7 digits: seven rows of '#' and '.', glyphs one column apart.
-// False (rows untouched) if the text holds a character the digits lack.
+// The cells of `text` in the 5x7 digits: seven rows of '#' (lit) and '.' (unlit), with a column
+// of ' ' between glyphs. False (rows untouched) if the text holds a character the digits lack.
 bool pixelDigitRows(const std::wstring& text, std::string rows[7]);
-bool drawPixelDigits(HDC dc, const std::wstring& text, int x, int y, int unit, COLORREF color, int gap = 0);
+// `ghost`, when given, is the colour of a glyph's unlit cells (a display's dark dots).
+bool drawPixelDigits(HDC dc, const std::wstring& text, int x, int y, int unit, COLORREF color, int gap = 0, COLORREF ghost = CLR_INVALID);
 
 // A square notification-area icon showing `percent` (0-100) in 3x5 pixel
 // digits on a badge. The caller owns the icon (DestroyIcon).
 HICON makePercentIcon(int size, int percent, COLORREF badge, COLORREF edge, COLORREF digits);
+// The same badge holding a level instead of digits, for the tray icon's short shows: filled
+// from the bottom to `fraction` (0-1), or with `steps` > 0 as that many bars of rising height,
+// lit up to `fraction` of them. The caller owns the icon (DestroyIcon).
+HICON makeLevelIcon(int size, double fraction, COLORREF badge, COLORREF edge, COLORREF fill, int steps = 0);
 
 // The battery mascot: a 16x14-cell pixel sprite whose body fills with the
 // battery level, with a face for each mood. `frame` 1 blinks.
@@ -89,7 +111,8 @@ enum class Mood { calm, sleepy, busy, charging, tired, critical, full };
 // `face` is used on the filled part of the body, `faceLight` on the empty part.
 struct MascotColors { COLORREF outline, empty, level, face, faceLight, cheek, sweat, accent; };
 constexpr int MascotCells = 16, MascotRows = 14;
-void drawMascot(HDC dc, int x, int y, int unit, Mood mood, double level, int frame, const MascotColors& colors);
+// `look` -1 or 1 turns its eyes a cell to the left or the right.
+void drawMascot(HDC dc, int x, int y, int unit, Mood mood, double level, int frame, const MascotColors& colors, int look = 0);
 // Saves a bitmap as PNG through GDI+.
 bool saveBitmapPng(HBITMAP bitmap, const std::wstring& path);
 
