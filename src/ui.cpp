@@ -587,7 +587,7 @@ const Baked& haloSprite(const HaloId& id) {
 // The most a key's light and shadow reach past its face, in any state.
 int keyMargin(int h, bool lit) {
     const int unit = std::max(1, h / 22);
-    return std::max(lit ? std::max(10, h * 4 / 5) : 0, (unit * 6 + 2) + (unit * 4 + 1)) + 1;
+    return std::max(lit ? std::max(10, h * 3 / 5) : 0, (unit * 6 + 2) + (unit * 4 + 1)) + 1;
 }
 // A key: its light on the panel (when lit), its shadow, its face from top to bottom, the catch
 // light along its top edge and, lit, the light showing along its rim.
@@ -596,7 +596,7 @@ const Baked& keySprite(const KeyId& id, const Palette& p) {
     const double lit = id.lit / 16.0, pressed = id.pressed / 4.0, hover = id.hover / 4.0;
     const int w = id.w, h = id.h, unit = std::max(1, h / 22);
     const double radius = std::min({double(id.radius), w / 2.0, h / 2.0});
-    const int glowSpread = std::max(10, h * 4 / 5); // the light spreads wide and thin over the panel, as in the reference clip
+    const int glowSpread = std::max(10, h * 3 / 5); // the light spreads wide and thin over the panel
     // Under the pointer the shadow lengthens, as if the key stood a little taller; pressed, it shortens.
     const int drop = int(std::lround((1 - pressed) * unit * (2.5 + 1.5 * hover))) + 1;
     const int shadowSpread = unit * 4 + 2 + int(std::lround(hover * unit * 2));
@@ -743,6 +743,31 @@ void keycap(HDC dc, RECT r, float radius, const Palette& p, double lit, double p
         roomFor(dc, r, keyMargin(height, lit > 0), 0), roomFor(dc, r, keyMargin(height, false), 1)};
     const Baked& baked = keySprite(id, p);
     stamp(dc, baked, r.left - baked.margin, r.top - baked.margin, BYTE(std::lround(opacity * 255)));
+}
+void keycapStretched(HDC dc, RECT r, int baseW, int baseH, float radius, const Palette& p, double lit) {
+    if (r.right <= r.left || r.bottom <= r.top || baseW <= 0 || baseH <= 0) return;
+    if (p.highContrast) { keycap(dc, r, radius, p, lit); return; }
+    trimSprites();
+    lit = std::clamp(lit, 0.0, 1.0);
+    // Room above and below as where it is; at its sides it is on the move, so none is taken off.
+    const int litMargin = keyMargin(baseH, lit > 0), shadeMargin = keyMargin(baseH, false);
+    Room light = roomFor(dc, r, litMargin, 0), shade = roomFor(dc, r, shadeMargin, 1);
+    if (light.left != 32767) light.left = light.right = short(litMargin);
+    if (shade.left != 32767) shade.left = shade.right = short(shadeMargin);
+    const KeyId id{baseW, baseH, int(std::lround(radius)), static_cast<unsigned char>(std::lround(lit * 16)), 4, 0, paletteTag(p), light, shade};
+    const Baked& baked = keySprite(id, p);
+    if (!baked.bitmap || !bakeDC) return;
+    const int m = baked.margin, cap = m + std::min(baseW / 2, int(radius) + 3);
+    const double sy = double(r.bottom - r.top) / baseH;
+    const int top = int(r.top) - int(std::lround(m * sy)), height = int(r.bottom - r.top) + int(std::lround(m * sy)) * 2;
+    const int left = int(r.left) - m, right = int(r.right) + m;
+    if (right - left < cap * 2) { stamp(dc, baked, left, int(r.top) - m); return; }
+    HGDIOBJ old = SelectObject(bakeDC, baked.bitmap);
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    GdiAlphaBlend(dc, left, top, cap, height, bakeDC, 0, 0, cap, baked.h, blend);
+    GdiAlphaBlend(dc, left + cap, top, right - left - cap * 2, height, bakeDC, cap, 0, baked.w - cap * 2, baked.h, blend);
+    GdiAlphaBlend(dc, right - cap, top, cap, height, bakeDC, baked.w - cap, 0, cap, baked.h, blend);
+    SelectObject(bakeDC, old);
 }
 void spotlight(HDC dc, const RECT& key, float radius, POINT at, COLORREF c, double strength, int reach) {
     if (!graphicsToken || strength <= .01 || reach <= 0 || key.right <= key.left) return;

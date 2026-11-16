@@ -67,6 +67,10 @@ void clearSprites();
 // `opacity` 0-1 fades the whole key in over what is already drawn (a key rising out of a flat
 // row under the pointer, the light moving from one choice to the next).
 void keycap(HDC dc, RECT r, float radius, const Palette& p, double lit, double pressed = 0, double hover = 0, double opacity = 1);
+// A lit key on the move, stretched or squashed to `r` from its resting size (baseW x baseH):
+// the resting key's bitmap is stretched (its ends kept, its middle drawn longer), so a move
+// costs three blends a frame and no new bitmaps.
+void keycapStretched(HDC dc, RECT r, int baseW, int baseH, float radius, const Palette& p, double lit);
 // A well: the panel sunk in, shaded along its top inner edge, lit along its lower edge.
 void well(HDC dc, const RECT& r, float radius, const Palette& p);
 // An LED cell: `lit` 0-1 blends `off` to `on` and adds a halo in `halo`.
