@@ -628,9 +628,9 @@ int wmain(int argc, wchar_t** argv) {
                 "the ASUS performance mode is both an experiment and a dynamic saving setting");
             gov::Governor fw;
             check(fw.profileFor(gov::Activity::reading, 0).values[size_t(gov::Setting::firmwareMode)] == DWORD(2)
-                && fw.profileFor(gov::Activity::heavy, 0).values[size_t(gov::Setting::firmwareMode)] == DWORD(0)
+                && fw.profileFor(gov::Activity::heavy, 0).values[size_t(gov::Setting::firmwareMode)] == DWORD(2)
                 && !fw.profileFor(gov::Activity::game, 0).values[size_t(gov::Setting::firmwareMode)],
-                "silent firmware mode for light use, balanced for heavy work, untouched in games");
+                "on battery the silent firmware mode for light and heavy work alike, untouched in games");
             lab::ExperimentResult silent; silent.experiment = L"asus-mode@browse"; silent.arm0 = L"平衡"; silent.arm1 = L"靜音";
             silent.battery = lab::comparePairs({{14, 12.5}, {14.2, 12.6}, {13.9, 12.4}});
             const auto silentEvidence = gov::learn({silent});
@@ -954,7 +954,8 @@ int wmain(int argc, wchar_t** argv) {
             check(governor.activity() == gov::Activity::reading && in.actual[size_t(Setting::powerMode)] == DWORD(0) && in.actual[size_t(Setting::energyPreference)] == DWORD(80),
                 "after settling, reading uses efficiency");
             step(2, lab::Context::heavy, 0);
-            check(governor.activity() == gov::Activity::heavy && in.actual[size_t(Setting::powerMode)] == DWORD(1), "a move toward performance is immediate");
+            check(governor.activity() == gov::Activity::heavy && in.actual[size_t(Setting::powerMode)] == DWORD(0) && in.actual[size_t(Setting::energyPreference)] == DWORD(30),
+                "a move toward performance is immediate (on battery: a more eager processor, still in efficiency)");
             step(2, lab::Context::idle, 300);
             check(governor.activity() == gov::Activity::heavy, "a short idle moment does not drop performance at once");
             step(20, lab::Context::idle, 302);
@@ -1139,13 +1140,16 @@ int wmain(int argc, wchar_t** argv) {
                 bo.systemCpu = 8;
                 check(burstDetector.assess(bo).activity == Activity::responsive, "a click without one is plain input");
                 gov::Governor g; gov::Options o; g.setOptions(o);
-                check(g.profileFor(Activity::burst, 0).values[size_t(Setting::powerMode)] == DWORD(1) && g.profileFor(Activity::burst, 1).values[size_t(Setting::powerMode)] == DWORD(0),
-                    "a burst gets balanced, and efficiency when saving harder");
-                check(g.profileFor(Activity::heavy, 0).values[size_t(Setting::cpuBoost)] == DWORD(2) && g.profileFor(Activity::burst, 0).values[size_t(Setting::cpuBoost)] == DWORD(3),
-                    "heavy work and bursts switch Boost on themselves: a plan with Boost off must not hold them at the base clock");
-                check(g.profileFor(Activity::heavy, 1).values[size_t(Setting::cpuBoost)] == DWORD(2) && g.profileFor(Activity::heavy, 1).values[size_t(Setting::powerMode)] == DWORD(1)
-                    && g.profileFor(Activity::heavy, 2).values[size_t(Setting::cpuBoost)] == DWORD(0),
-                    "being behind the battery target does not throttle heavy work; a very low battery does");
+                check(g.profileFor(Activity::burst, 0).values[size_t(Setting::energyPreference)] == DWORD(33) && g.profileFor(Activity::burst, 1).values[size_t(Setting::energyPreference)] == DWORD(50),
+                    "a burst gets an eager processor, and a calmer one when saving harder");
+                {
+                    bool savingOnly = true;
+                    for (Activity a : {Activity::idle, Activity::reading, Activity::media, Activity::interactive, Activity::responsive, Activity::burst, Activity::call, Activity::heavy}) {
+                        const auto p = g.profileFor(a, 0);
+                        savingOnly = savingOnly && p.values[size_t(Setting::powerMode)] == DWORD(0) && p.values[size_t(Setting::cpuBoost)] == DWORD(0);
+                    }
+                    check(savingOnly, "on battery the automatic mode only saves: efficiency and no Boost for every activity, heavy work included");
+                }
                 gov::Input li; li.onBattery = true; li.actual = {DWORD(1), DWORD(60), DWORD(0), DWORD(120)}; li.detected = Activity::interactive; li.ms = 100;
                 li.batteryPercent = 50.0; g.update(li);
                 check(g.stretchLevel() == 0, "no extra saving with half a battery");

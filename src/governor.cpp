@@ -149,9 +149,7 @@ void Governor::note(const std::wstring& text) {
     while (log.size() > 30) log.pop_front();
 }
 Profile Governor::profileFor(Activity activity, int stretch) const {
-    // Extra saving steps an activity down, but heavy work keeps its power unless the battery is
-    // very low (two steps): merely being behind the target does not throttle a load that is running.
-    if (!(activity == Activity::heavy && stretch < 2)) for (int i = 0; i < stretch; ++i) activity = stretched(activity);
+    for (int i = 0; i < stretch; ++i) activity = stretched(activity);
     Profile p;
     auto set = [&](Setting s, std::optional<DWORD> v) { p.values[size_t(s)] = v; };
     const std::optional<DWORD> low = options_.refreshRate ? std::optional<DWORD>(60) : std::nullopt;
@@ -159,19 +157,18 @@ Profile Governor::profileFor(Activity activity, int stretch) const {
     switch (activity) {
     // Defaults from the first real test (Zephyrus G14): efficiency saved 2-3 W in every activity
     // for a few milliseconds of response, and CPU Boost cost about 5 W in light use. So
-    // everything except a burst, heavy work and calls runs in efficiency with Boost off;
-    // bursts and heavy work get balanced with Boost switched on.
-    // ASUS laptops: the firmware's silent mode for light use, balanced for bursts, calls and heavy work.
+    // On battery the automatic mode only saves (0.35.1, as its user asked): every activity runs
+    // in efficiency with Boost off and the firmware's silent mode, however heavy the load. The
+    // activities still differ in how eager the processor is (energy preference) and in the
+    // refresh rate. Plugged in, the app puts the automatic mode on balanced instead.
     case Activity::idle: set(Setting::powerMode, Efficiency); set(Setting::energyPreference, 90u); set(Setting::cpuBoost, 0u); set(Setting::refreshRate, low); set(Setting::firmwareMode, Silent); break;
     case Activity::reading: set(Setting::powerMode, Efficiency); set(Setting::energyPreference, 80u); set(Setting::cpuBoost, 0u); set(Setting::refreshRate, low); set(Setting::firmwareMode, Silent); break;
     case Activity::media: set(Setting::powerMode, Efficiency); set(Setting::energyPreference, 80u); set(Setting::cpuBoost, 0u); set(Setting::refreshRate, low); set(Setting::firmwareMode, Silent); break;
     case Activity::interactive: set(Setting::powerMode, Efficiency); set(Setting::energyPreference, 70u); set(Setting::cpuBoost, 0u); set(Setting::refreshRate, top); set(Setting::firmwareMode, Silent); break;
     case Activity::responsive: set(Setting::powerMode, Efficiency); set(Setting::energyPreference, 50u); set(Setting::cpuBoost, 0u); set(Setting::refreshRate, top); set(Setting::firmwareMode, Silent); break;
-    // Bursts and heavy work switch Boost on themselves (3: efficient enabled, 2: aggressive). Left
-    // at "as the user had it", a plan with Boost off kept heavy work at the base clock.
-    case Activity::burst: set(Setting::powerMode, Balanced); set(Setting::energyPreference, 33u); set(Setting::cpuBoost, 3u); set(Setting::refreshRate, top); set(Setting::firmwareMode, FirmwareBalanced); break;
-    case Activity::call: set(Setting::powerMode, Balanced); set(Setting::energyPreference, 55u); set(Setting::cpuBoost, 0u); set(Setting::firmwareMode, FirmwareBalanced); break;
-    case Activity::heavy: set(Setting::powerMode, Balanced); set(Setting::energyPreference, 30u); set(Setting::cpuBoost, 2u); set(Setting::firmwareMode, FirmwareBalanced); break;
+    case Activity::burst: set(Setting::powerMode, Efficiency); set(Setting::energyPreference, 33u); set(Setting::cpuBoost, 0u); set(Setting::refreshRate, top); set(Setting::firmwareMode, Silent); break;
+    case Activity::call: set(Setting::powerMode, Efficiency); set(Setting::energyPreference, 55u); set(Setting::cpuBoost, 0u); set(Setting::firmwareMode, Silent); break;
+    case Activity::heavy: set(Setting::powerMode, Efficiency); set(Setting::energyPreference, 30u); set(Setting::cpuBoost, 0u); set(Setting::firmwareMode, Silent); break;
     default: break; // game: everything as the user had it
     }
     // Lab evidence: a vetoed saving leaves the setting alone; a proven one is used.

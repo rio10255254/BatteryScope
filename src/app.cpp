@@ -6492,7 +6492,20 @@ void loadModeLink() {
 // Sets the CPU Boost and Windows power mode that go with the firmware mode, once per mode while
 // plugged in; `now` after the user picked a mode (also under protection mode, which only stops
 // automatic changes).
+// Plugged in, the automatic mode is the balanced mode (on battery it only saves; see the
+// governor). Checked with every sample: whatever the battery session left behind is put right.
+void applyAutomaticPluggedIn() {
+    if (!dynamicEnabled || governor.held(bs::gov::Setting::firmwareMode)) return; // a mode chosen by hand stays
+    if (!asusAvailable || demo || isolatedPreview || current.history.empty() || controlCheckBusy) return;
+    if (labController && labController->status().running) return;
+    if (bs::stability::writeGuard().held() || autoWritesPaused()) return;
+    const auto& p = current.history.back();
+    if (!p.acKnown || !p.onAc) return;
+    if (const auto mode = bs::asus::remembered().mode; mode && *mode == bs::asus::Mode::balanced) return;
+    if (bs::asus::setMode(bs::asus::Mode::balanced) == ERROR_SUCCESS) { bs::stability::note(L"automatic plugged-in balanced"); modeLinkDone = -1; }
+}
 void applyModeCompanions(bool now) {
+    if (!now) applyAutomaticPluggedIn();
     if (!modeLink || !asusAvailable || demo || isolatedPreview || current.history.empty() || controlCheckBusy) return;
     if (labController && labController->status().running) return;
     if (bs::stability::writeGuard().held() || (!now && autoWritesPaused())) return;
@@ -9239,7 +9252,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             DWORD status = ERROR_SUCCESS; std::wstring done;
             if (id == AsusAutoId) {
                 governor.release(bs::gov::Setting::firmwareMode); governorTick();
-                done = tr(L"效能模式交給動態省電：輕度使用靜音，需要時平衡。");
+                done = tr(L"自動：用電池時只省電、不開 Boost；插電時是平衡。");
+                applyAutomaticPluggedIn(); applyModeCompanions(false);
             } else if (id == AsusSilentId || id == AsusBalancedId || id == AsusTurboId) {
                 const auto mode = id == AsusSilentId ? bs::asus::Mode::silent : id == AsusTurboId ? bs::asus::Mode::turbo : bs::asus::Mode::balanced;
                 status = bs::asus::setMode(mode); done = tr(L"效能模式：") + std::wstring(tr(bs::asus::modeKey(mode)));
