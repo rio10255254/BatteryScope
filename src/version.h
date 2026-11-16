@@ -6,5 +6,5 @@
 #define BS_VERSION_MAJOR 0
 #define BS_VERSION_MINOR 32
 #define BS_VERSION_PATCH 0
-#define BS_VERSION_STRING "0.31.0"
+#define BS_VERSION_STRING "0.32.0"
 #endif
