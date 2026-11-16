@@ -10,6 +10,7 @@
 #include "stability.h"
 #include "verify.h"
 #include "ui.h"
+#include "fx.h"
 #include <commctrl.h>
 #include <pdh.h>
 #include <shellapi.h>
@@ -72,7 +73,7 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     RefreshAutoId = 266, DarkModeId = 267, AutoSaverCycleId = 268, PerfPageId = 269, FanMenuId = 270, PowerLimitMenuId = 271,
     FanPreset0Id = 272 /* ..275 */, PowerPreset0Id = 276 /* ..279 */, CpuBoostToggleId = 280, WinModeMenuId = 281,
     StabilityPageId = 282, ReportId = 283, ReportFullId = 284, MarkProblemId = 285, StabilityFolderId = 286, ProtectToggleId = 287, VerifyControlsId = 288,
-    ModeLinkMenuId = 289, ModeLinkToggleId = 290, ModeLinkWindowsId = 291, ModeLinkImportId = 292, PowerLimitResetId = 293, IdleDisplayToggleId = 294, IdleDisplayMenuId = 295,
+    ModeLinkMenuId = 289, ModeLinkToggleId = 290, ModeLinkWindowsId = 291, ModeLinkImportId = 292, PowerLimitResetId = 293, IdleDisplayToggleId = 294, IdleDisplayMenuId = 295, EffectsCycleId = 296,
     DimAfter0Id = 370 /* ..375 */, DisplayOff0Id = 380 /* ..386 */, DimLevel0Id = 390 /* ..393 */, ModeBoost0Id = 340 /* ..358: + mode * 8 + boost */,
     SettingRowId = 300 /* ..329, one per settings row */,
     TrayShow = 200, TrayExit = 201;
@@ -297,7 +298,9 @@ HWND tooltip = nullptr;
 std::wstring tooltipText;
 bool recordMotion = false;
 std::vector<double> motionTicks;
-bool canAnimate() { return motionEnabled && !suppressMotion; }
+// How much moves: 0 everything (also beyond the window), 1 only inside the window, 2 nothing.
+int effectsLevel = 0;
+bool canAnimate() { return motionEnabled && !suppressMotion && effectsLevel < 2; }
 void stepMotion(double now);
 void refreshPowerButton();
 std::wstring dynamicPill(); // "動態 · 閱讀" while dynamic saving runs on battery
@@ -383,6 +386,211 @@ void keycap(HDC dc, const RECT& rect, int radius, double lit, double pressed = 0
 }
 int textWidth(HDC dc, const std::wstring& text, HFONT face) {
     font(dc, fontFor(face, text)); SIZE size{}; GetTextExtentPoint32W(dc, text.c_str(), int(text.size()), &size); return size.cx;
+}
+// ----- Effects beyond the window -----
+// Light that leaves the panel: sparks from a key that was pressed, a halo as the panel opens,
+// sparks between the panel and its tray icon, the old theme wiped away in a circle, and light
+// running round the screen's edge when the charger goes in or out or the mode changes. All of
+// it is drawn by bs::fx into click-through windows that exist only while something moves; a
+// timer runs only then. None of it happens with Windows' animations off, in battery saver, or
+// with the effects setting below "full".
+constexpr UINT_PTR FxTimer = 100;
+bs::fx::Overlay fxOverlay, fxEdgeOverlay[4];
+bs::fx::Stage fxStage;
+bs::fx::EdgeLights fxEdge;
+bool fxTimerOn = false, fxForce = false; // fxForce: frame dumps play effects although motion is otherwise off
+unsigned fxSeed = 1;
+uint64_t fxModeAt = 0;
+int acLine = [] { SYSTEM_POWER_STATUS s{}; return GetSystemPowerStatus(&s) && s.ACLineStatus <= 1 ? int(s.ACLineStatus) : -1; }(); // 1 plugged in, 0 on battery
+bool batterySaverOn() { SYSTEM_POWER_STATUS s{}; return GetSystemPowerStatus(&s) && (s.SystemStatusFlag & 1); }
+bool fxOutside() { return mainWindow && (fxForce || (canAnimate() && effectsLevel == 0 && !theme.highContrast && !batterySaverOn())); }
+int fxCell() { return std::max(3, px(4)); }
+void armFx() { if (!fxTimerOn) fxTimerOn = SetTimer(mainWindow, FxTimer, USER_TIMER_MINIMUM, nullptr) != 0; }
+RECT panelScreenRect() {
+    RECT panel = panelRest;
+    if (IsRectEmpty(&panel)) GetWindowRect(mainWindow, &panel);
+    return panel;
+}
+// The tray icon's centre; without one, the corner of the screen under the panel.
+POINT fxTrayPoint() {
+    NOTIFYICONIDENTIFIER id{}; id.cbSize = sizeof(id); id.hWnd = mainWindow; id.uID = 1;
+    RECT icon{};
+    if (trayAdded && SUCCEEDED(Shell_NotifyIconGetRect(&id, &icon)) && !IsRectEmpty(&icon)) return {(icon.left + icon.right) / 2, (icon.top + icon.bottom) / 2};
+    const RECT panel = panelScreenRect();
+    MONITORINFO monitor{}; monitor.cbSize = sizeof(monitor);
+    GetMonitorInfoW(MonitorFromRect(&panel, MONITOR_DEFAULTTONEAREST), &monitor);
+    return {panel.right - px(40), monitor.rcMonitor.bottom - px(20)};
+}
+// The overlay over the panel, its surroundings and the way to the tray icon, ready to draw on.
+bool fxBegin() {
+    if (!fxOutside()) return false;
+    const RECT panel = panelScreenRect();
+    const POINT tray = fxTrayPoint();
+    RECT area = panel; InflateRect(&area, px(150), px(150));
+    const RECT trayArea{tray.x - px(48), tray.y - px(48), tray.x + px(48), tray.y + px(48)};
+    UnionRect(&area, &area, &trayArea);
+    MONITORINFO monitor{}; monitor.cbSize = sizeof(monitor);
+    GetMonitorInfoW(MonitorFromRect(&panel, MONITOR_DEFAULTTONEAREST), &monitor);
+    IntersectRect(&area, &area, &monitor.rcMonitor);
+    const POINT origin = fxOverlay.origin(); const SIZE size = fxOverlay.size();
+    if (!fxOverlay.visible() || origin.x != area.left || origin.y != area.top || size.cx != area.right - area.left || size.cy != area.bottom - area.top) {
+        fxStage.bind(nullptr, 0, 0, {});
+        if (!fxOverlay.show(area)) return false;
+        fxStage.bind(fxOverlay.pixels(), fxOverlay.size().cx, fxOverlay.size().cy, fxOverlay.origin());
+        fxStage.feather(px(40));
+    }
+    armFx();
+    if (!fxTimerOn) { fxStage.bind(nullptr, 0, 0, {}); fxOverlay.hide(); return false; } // nothing to drive it: show nothing rather than leave it up
+    return true;
+}
+void stepFx() {
+    const double now = motionNow();
+    bool any = false;
+    if (fxOverlay.visible()) {
+        RECT changed{};
+        const bool alive = fxStage.render(now, &changed);
+        fxOverlay.present(&changed);
+        if (alive) any = true; else { fxStage.bind(nullptr, 0, 0, {}); fxOverlay.hide(); }
+    }
+    if (fxEdgeOverlay[0].visible()) {
+        const bool alive = fxEdge.render(now);
+        for (auto& strip : fxEdgeOverlay) strip.present();
+        if (alive) any = true;
+        else for (int i = 0; i < 4; ++i) { fxEdge.bind(i, nullptr); fxEdgeOverlay[i].hide(); }
+    }
+    if (!any && fxTimerOn) { KillTimer(mainWindow, FxTimer); fxTimerOn = false; }
+}
+void stopFx() {
+    fxStage.bind(nullptr, 0, 0, {}); fxOverlay.hide();
+    fxEdge.stop();
+    for (int i = 0; i < 4; ++i) { fxEdge.bind(i, nullptr); fxEdgeOverlay[i].hide(); }
+    if (fxTimerOn && mainWindow) { KillTimer(mainWindow, FxTimer); fxTimerOn = false; }
+}
+// The recipes, written against a stage so frame dumps can play them without windows.
+void fxAddOpen(bs::fx::Stage& stage, RECT panel, POINT tray, double now) {
+    // Sparks rise from the tray icon to the panel's edge; the panel's light blooms round it and
+    // settles, and a band of light sweeps up the panel as it powers on.
+    const POINT dock{std::clamp<LONG>(tray.x, panel.left + px(30), panel.right - px(30)), tray.y >= panel.bottom ? panel.bottom : tray.y <= panel.top ? panel.top : (panel.top + panel.bottom) / 2};
+    stage.add(bs::fx::streak(tray, dock, theme.glow, theme.halo, 18, fxCell(), 340, ++fxSeed), now);
+    stage.add(bs::fx::bloom(panel, px(10), px(120), theme.halo, 900, theme.dark ? .8 : .7), now, 110);
+    stage.add(bs::fx::sweep(panel, theme.glow, px(150), 520, theme.dark ? .26 : .5), now, 140);
+    stage.add(bs::fx::burst(dock, theme.glow, theme.halo, 14, px(70), fxCell(), 560, ++fxSeed, tray.y >= panel.bottom ? 1.5707963 : -1.5707963, 2.6, px(20)), now, 240);
+}
+void fxAddClose(bs::fx::Stage& stage, RECT panel, POINT tray, double now) {
+    // The panel's light runs back into the tray icon and lands with a ring.
+    const POINT from{std::clamp<LONG>(tray.x, panel.left + px(30), panel.right - px(30)), tray.y >= panel.bottom ? panel.bottom - px(40) : panel.top + px(40)};
+    stage.add(bs::fx::streak(from, tray, theme.glow, theme.halo, 16, fxCell(), 320, ++fxSeed), now);
+    stage.add(bs::fx::ring(tray, theme.halo, px(2), px(34), px(3), 380, .9), now, 250);
+    stage.add(bs::fx::burst(tray, theme.glow, theme.halo, 8, px(30), fxCell(), 380, ++fxSeed), now, 250);
+}
+void fxAddToggle(bs::fx::Stage& stage, POINT at, bool on, double now) {
+    if (on) {
+        stage.add(bs::fx::burst(at, theme.glow, theme.halo, 22, px(80), fxCell(), 640, ++fxSeed, -1.5707963, 6.2831853, px(22)), now, 110);
+        stage.add(bs::fx::ring(at, theme.halo, px(8), px(52), px(3), 440, .85), now, 110);
+    } else stage.add(bs::fx::burst(at, theme.dark ? RGB(150, 152, 164) : RGB(120, 114, 104), theme.dark ? RGB(90, 92, 104) : RGB(160, 154, 144), 10, px(42), fxCell(), 520, ++fxSeed, 1.5707963, 2.4, px(34)), now, 90);
+}
+void fxAddChoice(bs::fx::Stage& stage, POINT at, double now) {
+    stage.add(bs::fx::burst(at, theme.glow, theme.halo, 26, px(100), fxCell(), 700, ++fxSeed, -1.5707963, 6.2831853, px(20)), now, 130);
+    stage.add(bs::fx::ring(at, theme.halo, px(12), px(86), px(4), 520, .85), now, 130);
+}
+void fxAddTab(bs::fx::Stage& stage, POINT at, double now) {
+    // The light lands on a tab key and throws sparks down past the panel's edge.
+    stage.add(bs::fx::burst(at, theme.glow, theme.halo, 16, px(76), fxCell(), 600, ++fxSeed, 1.5707963, 2.5, px(30)), now, 140);
+    stage.add(bs::fx::ring(at, theme.halo, px(6), px(40), px(3), 400, .7), now, 140);
+}
+void fxAddMascot(bs::fx::Stage& stage, POINT at, double now) {
+    stage.add(bs::fx::burst(at, theme.glow, theme.halo, 18, px(86), fxCell(), 700, ++fxSeed, -1.5707963, 2.4, px(46)), now);
+}
+void fxPanelOpened() { if (fxBegin()) fxAddOpen(fxStage, panelScreenRect(), fxTrayPoint(), motionNow()); }
+void fxPanelClosing() { if (fxBegin()) fxAddClose(fxStage, panelScreenRect(), fxTrayPoint(), motionNow()); }
+void fxToggle(POINT screen, bool on) { if (fxBegin()) fxAddToggle(fxStage, screen, on, motionNow()); }
+void fxChoice(POINT screen) { if (fxBegin()) fxAddChoice(fxStage, screen, motionNow()); }
+void fxTab(POINT screen) { if (fxBegin()) fxAddTab(fxStage, screen, motionNow()); }
+void fxMascot(POINT screen) { if (fxBegin()) fxAddMascot(fxStage, screen, motionNow()); }
+// Light round the edge of the screen the tray is on. Not over a full-screen game, a
+// presentation or in quiet hours.
+void fxEdgePlay(bs::fx::EdgeShow show, COLORREF color, double life, double reach = 1, int pulses = 1) {
+    if (!fxOutside()) return;
+    if (!fxForce) {
+        QUERY_USER_NOTIFICATION_STATE state{};
+        if (FAILED(SHQueryUserNotificationState(&state)) || state != QUNS_ACCEPTS_NOTIFICATIONS) return;
+    }
+    const POINT tray = fxTrayPoint();
+    MONITORINFO monitor{}; monitor.cbSize = sizeof(monitor);
+    if (!GetMonitorInfoW(MonitorFromPoint(tray, MONITOR_DEFAULTTOPRIMARY), &monitor)) return;
+    fxEdge.layout(monitor.rcMonitor, px(96), false);
+    for (int i = 0; i < 4; ++i) {
+        if (!fxEdgeOverlay[i].show(fxEdge.strip(i))) { for (int k = 0; k < 4; ++k) { fxEdge.bind(k, nullptr); fxEdgeOverlay[k].hide(); } return; }
+        fxEdge.bind(i, fxEdgeOverlay[i].pixels());
+    }
+    fxEdge.play(show, color, life, motionNow(), reach, pulses);
+    armFx();
+    if (!fxTimerOn) { fxEdge.stop(); for (int k = 0; k < 4; ++k) { fxEdge.bind(k, nullptr); fxEdgeOverlay[k].hide(); } }
+}
+// The performance mode changed by hand: a burst along the bottom edge, cool and short for
+// silent, wide and warm for turbo.
+void fxModeEdge(int level) {
+    const uint64_t now = GetTickCount64();
+    if (now - fxModeAt < 900) return; // one burst for a change that sets several things
+    fxModeAt = now;
+    if (level <= 0) fxEdgePlay(bs::fx::EdgeShow::burst, RGB(120, 170, 255), 900, .34);
+    else if (level == 1) fxEdgePlay(bs::fx::EdgeShow::burst, RGB(236, 236, 242), 760, .6);
+    else fxEdgePlay(bs::fx::EdgeShow::burst, RGB(255, 122, 48), 680, 1);
+}
+void fxPower(bool pluggedIn) {
+    if (pluggedIn) fxEdgePlay(bs::fx::EdgeShow::connect, theme.halo, 1500);
+    else fxEdgePlay(bs::fx::EdgeShow::disconnect, theme.halo, 950);
+}
+bool renderPanel(HDC dc, RECT rect);
+// The day/night change: the panel as it looked is laid over the panel, the new theme is applied
+// underneath, and the old look is wiped away in a circle from where the change was made, a
+// ring of the new light on its edge running on past the panel. False when it cannot be shown
+// (the caller then crossfades).
+bool fxThemeReveal(const ui::Palette& next) {
+    if (!fxOutside() || hidden || !IsWindowVisible(mainWindow)) return false;
+    RECT client{}; GetClientRect(mainWindow, &client);
+    const int w = client.right, h = client.bottom;
+    if (w <= 0 || h <= 0) return false;
+    HDC screen = GetDC(mainWindow), dc = CreateCompatibleDC(screen);
+    BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(info.bmiHeader); info.bmiHeader.biWidth = w; info.bmiHeader.biHeight = -h;
+    info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32;
+    void* bits = nullptr; HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    ReleaseDC(mainWindow, screen);
+    if (!bitmap || !bits) { if (bitmap) DeleteObject(bitmap); DeleteDC(dc); return false; }
+    HGDIOBJ old = SelectObject(dc, bitmap);
+    const bool drawn = renderPanel(dc, client);
+    GdiFlush();
+    std::vector<uint32_t> pixels(size_t(w) * size_t(h));
+    std::memcpy(pixels.data(), bits, pixels.size() * 4);
+    SelectObject(dc, old); DeleteObject(bitmap); DeleteDC(dc);
+    if (!drawn) return false;
+    // Opaque, with the window's rounded corners cut away.
+    const int radius = px(8);
+    for (auto& p : pixels) p |= 0xFF000000u;
+    for (int y = 0; y < radius && y < h; ++y) for (int x = 0; x < radius && x < w; ++x) {
+        const double d = std::hypot(radius - x - .5, radius - y - .5), cover = std::clamp(radius - d + .5, 0.0, 1.0);
+        if (cover >= 1) continue;
+        for (const auto& [px_, py_] : {std::pair<int, int>{x, y}, {w - 1 - x, y}, {x, h - 1 - y}, {w - 1 - x, h - 1 - y}}) {
+            uint32_t& p = pixels[size_t(py_) * size_t(w) + size_t(px_)];
+            const uint32_t a = uint32_t(std::lround(cover * 255));
+            p = (a << 24) | ((((p >> 16) & 255) * a / 255) << 16) | ((((p >> 8) & 255) * a / 255) << 8) | ((p & 255) * a / 255);
+        }
+    }
+    if (!fxBegin()) return false;
+    POINT at{0, 0}; ClientToScreen(mainWindow, &at);
+    POINT center{}; GetCursorPos(&center);
+    const RECT panel{at.x, at.y, at.x + w, at.y + h};
+    if (!PtInRect(&panel, center)) center = {(panel.left + panel.right) / 2, (panel.top + panel.bottom) / 2};
+    double reach = 0;
+    for (const POINT corner : {POINT{panel.left, panel.top}, POINT{panel.right, panel.top}, POINT{panel.left, panel.bottom}, POINT{panel.right, panel.bottom}})
+        reach = std::max(reach, std::hypot(double(corner.x - center.x), double(corner.y - center.y)));
+    const double now = motionNow();
+    fxStage.reveal(std::move(pixels), w, h, at, center, reach + px(90), 700, next.halo, px(6), now);
+    fxStage.add(bs::fx::burst(center, next.glow, next.halo, 30, px(130), fxCell(), 760, ++fxSeed), now, 40);
+    // The first frame goes up before the panel repaints, so the new theme never flashes through.
+    SetWindowPos(fxOverlay.window(), HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    stepFx();
+    return true;
 }
 // ----- Menus -----
 // One menu look for the whole app instead of the Windows popup menu: the same
@@ -655,7 +863,7 @@ struct VBar {
     std::vector<VSegment> segments;     // stacked parts instead of one fill
 };
 struct VBlock {
-    enum class Kind { heading, note, meter, bars, series, chips, legend, action, segments, banner, timeline, card, check, fold } kind = Kind::note;
+    enum class Kind { heading, note, meter, bars, series, chips, legend, action, segments, banner, timeline, card, check, fold, display } kind = Kind::note;
     std::wstring title, text, value;
     double amount = 0, goal = 0, scale = 0;
     std::vector<VBar> bars;
@@ -672,6 +880,14 @@ VBlock vMeter(const std::wstring& title, const std::wstring& value, double amoun
 VBlock vBars(std::vector<VBar> bars, double scale = 0) { VBlock b; b.kind = VBlock::Kind::bars; b.bars = std::move(bars); b.scale = scale; return b; }
 VBlock vSeries(const std::wstring& title, std::vector<double> values, double goal, const std::wstring& value) {
     VBlock b; b.kind = VBlock::Kind::series; b.title = title; b.series = std::move(values); b.goal = goal; b.value = value; return b;
+}
+// The display at the top of a page: a reading in dot-matrix digits (`digits`, e.g. "6.8 W"),
+// a label above and a line under it, and the battery as a percentage and ten cells
+// (`fraction` 0-1; negative: no battery shown). `light`: the cells' colour (0: the panel's light).
+VBlock vDisplay(const std::wstring& label, const std::wstring& digits, const std::wstring& line, const std::wstring& percent, double fraction, bool charging, COLORREF light = 0) {
+    VBlock b; b.kind = VBlock::Kind::display; b.title = label; b.value = digits; b.text = line; b.items = {{percent, light}};
+    b.amount = fraction; b.toggle = charging ? 1 : 0;
+    return b;
 }
 VBlock vChips(std::vector<std::pair<std::wstring, COLORREF>> chips) { VBlock b; b.kind = VBlock::Kind::chips; b.items = std::move(chips); return b; }
 VBlock vLegend(std::vector<std::pair<std::wstring, COLORREF>> entries) { VBlock b; b.kind = VBlock::Kind::legend; b.items = std::move(entries); return b; }
@@ -768,6 +984,7 @@ int blockHeight(HDC dc, const VBlock& b, int width, bool first) {
     case VBlock::Kind::timeline: return sp(88);
     case VBlock::Kind::card: return sp(30) + (b.text.empty() ? 0 : noteHeight(dc, b.text, width - sp(18))) + sp(8);
     case VBlock::Kind::check: return sp(30) + (b.text.empty() ? 0 : noteHeight(dc, b.text, width - sp(28)));
+    case VBlock::Kind::display: return sp(112);
     }
     return 0;
 }
@@ -910,6 +1127,8 @@ Arrival arrival(double since, int direction) {
 // When each switch or segmented control last changed and which way (by its key).
 std::map<int, std::pair<double, int>> visualChangedAt;
 double tabChangedAt = -1; int tabDirection = 1;
+double mascotHopAt = -1; // motionNow() when the mascot was last poked
+bool heroMoving = false;  // the battery tab's digits are counting or scanning in
 // The keycap switch from the reference clip: a key in a well; on, it sits at the right and is
 // lit from inside. Pressed it stretches toward where it will go; moving, it lifts; landing,
 // its light blooms and runs a quarter turn along its edge.
@@ -932,25 +1151,118 @@ void drawCheckGlyph(HDC dc, RECT r, COLORREF color) {
     const POINT cells[] = {{0, 2}, {1, 3}, {2, 2}, {3, 1}, {4, 0}};
     for (const auto& c : cells) fill(dc, {ox + c.x * u, oy + c.y * u, ox + (c.x + 1) * u - g, oy + (c.y + 1) * u + u - g}, color);
 }
+// Dot-matrix digits that behave like a display. When first shown a number counts up to its
+// value; when it changes, the new value scans in from the left behind a lit column. `x` is the
+// left edge, or the right edge with `rightAlign`. Returns 1 while moving, 0 at rest, and -1
+// (drawing nothing) when the text holds characters the digits lack.
+struct MatrixState { std::wstring shown, previous; double changedAt = -1, firstAt = -1; };
+std::map<std::wstring, MatrixState> matrixStates;
+int drawMatrix(HDC dc, const std::wstring& key, const std::wstring& text, int x, int y, int unit, COLORREF color, int gap, bool rightAlign = false) {
+    std::string rows[7];
+    if (!ui::pixelDigitRows(text, rows)) { matrixStates.erase(key); return -1; }
+    const double now = motionNow();
+    auto [it, fresh] = matrixStates.try_emplace(key);
+    auto& state = it->second;
+    if (fresh) { state.shown = text; state.firstAt = canAnimate() ? now : -1; }
+    else if (state.shown != text) {
+        state.previous = state.shown; state.shown = text;
+        std::string was[7];
+        state.changedAt = canAnimate() && ui::pixelDigitRows(state.previous, was) ? now : -1;
+    }
+    auto place = [&](const std::wstring& shown) { return rightAlign ? x - ui::pixelDigitsWidth(shown, unit) : x; };
+    // Counting up from nothing when the page opens.
+    if (state.firstAt >= 0 && now - state.firstAt < 620) {
+        size_t digits = 0; int decimals = -1;
+        while (digits < text.size() && (iswdigit(text[digits]) || (text[digits] == L'.' && decimals < 0))) { if (text[digits] == L'.') decimals = 0; else if (decimals >= 0) ++decimals; ++digits; }
+        if (digits) {
+            const double t = (now - state.firstAt) / 620, eased = 1 - (1 - t) * (1 - t) * (1 - t);
+            const std::wstring counted = number(_wtof(text.substr(0, digits).c_str()) * eased, std::max(0, decimals)) + text.substr(digits);
+            if (ui::drawPixelDigits(dc, counted, place(counted), y, unit, color, gap)) return 1;
+        }
+    }
+    state.firstAt = -1;
+    if (state.changedAt >= 0 && now - state.changedAt < 300) {
+        // The new value scans in column by column; the column at the front is lit.
+        std::string was[7];
+        ui::pixelDigitRows(state.previous, was);
+        const int columns = int(std::max(rows[0].size(), was[0].size()));
+        const int newShift = rightAlign ? columns - int(rows[0].size()) : 0, oldShift = rightAlign ? columns - int(was[0].size()) : 0;
+        const int left = rightAlign ? x - (columns * unit - unit + unit) : x;
+        const double front = (now - state.changedAt) / 300 * (columns + 1);
+        for (int column = 0; column < columns; ++column) {
+            const bool arrived = column < front;
+            const std::string* source = arrived ? rows : was;
+            const int index = column - (arrived ? newShift : oldShift);
+            const bool head = column <= front && column > front - 1.5;
+            for (int row = 0; row < 7; ++row) {
+                const bool on = index >= 0 && index < int(source[row].size()) && source[row][size_t(index)] == '#';
+                const RECT cell{left + column * unit, y + row * unit, left + (column + 1) * unit - gap, y + (row + 1) * unit - gap};
+                if (head) ui::led(dc, cell, theme.glow, theme.halo, on ? 1.0 : .25, on ? color : Surface);
+                else if (on) fill(dc, cell, color);
+            }
+        }
+        return 1;
+    }
+    state.changedAt = -1;
+    ui::drawPixelDigits(dc, text, place(text), y, unit, color, gap);
+    return 0;
+}
+// Ten battery cells lit up to the level; while charging, a light marches up the empty cells
+// with every sample.
+void drawBatteryCells(HDC dc, int right, int top, int cellWidth, int cellHeight, double fraction, COLORREF light, bool charging) {
+    const int cells = 10, gap = std::max(1, sp(2)), x0 = right - cells * cellWidth - (cells - 1) * gap;
+    const int full = int(fraction * cells), march = charging && full < cells ? full + int(sampleTick % (cells - full)) : -1;
+    for (int k = 0; k < cells; ++k) {
+        double lit = std::clamp(fraction * cells - k, 0.0, 1.0);
+        if (k == march) lit = std::max(lit, .7);
+        const int x = x0 + k * (cellWidth + gap);
+        ui::led(dc, {x, top, x + cellWidth, top + cellHeight}, light, light == theme.glow ? theme.halo : light, lit * paintFade, theme.ledOff);
+    }
+}
 // A row of LED cells across r, lit from the left: `parts` are (fraction, colour) runs, one after
 // another; a cell half way into a run glows half. Unlit cells are the panel's dark LEDs.
 COLORREF ledHalo(COLORREF on) { return on == theme.glow ? theme.halo : on; }
-void ledRow(HDC dc, const RECT& r, const std::vector<std::pair<double, COLORREF>>& parts) {
+void ledRow(HDC dc, const RECT& r, const std::vector<std::pair<double, COLORREF>>& parts, double flare = 0) {
     const int gap = std::max(1, sp(3)), target = std::max(3, sp(7));
     const int width = r.right - r.left, count = std::max(4, (width + gap) / (target + gap));
     const double cell = double(width - gap * (count - 1)) / count;
     double start = 0;
     std::vector<std::pair<double, COLORREF>> runs; // cumulative end (in cells) and colour
     for (const auto& [fraction, color] : parts) { start += std::clamp(fraction, 0.0, 1.0) * count; runs.emplace_back(start, color); }
-    for (int k = 0; k < count; ++k) {
+    auto cellRect = [&](int k) {
         const int x0 = r.left + int(std::lround(k * (cell + gap))), x1 = r.left + int(std::lround(k * (cell + gap) + cell));
-        double lit = 0; COLORREF color = theme.glow; double before = 0;
+        return RECT{x0, r.top, std::max(x0 + 1, x1), r.bottom};
+    };
+    struct Lit { double amount; COLORREF color; };
+    std::vector<Lit> cells(size_t(count), Lit{0, theme.glow});
+    for (int k = 0; k < count; ++k) {
+        double before = 0;
         for (const auto& [end, c] : runs) {
             const double amount = std::clamp(std::min(end, k + 1.0) - std::max(before, double(k)), 0.0, 1.0);
-            if (amount > lit) { lit = amount; color = c; }
+            if (amount > cells[size_t(k)].amount) cells[size_t(k)] = {amount, c};
             before = end;
         }
-        ui::led(dc, {x0, r.top, std::max(x0 + 1, x1), r.bottom}, color, ledHalo(color), lit * paintFade, theme.ledOff);
+    }
+    // One glow behind each stretch of lit cells of a colour (a single blend), then the cells.
+    if (keyLook()) for (int k = 0; k < count;) {
+        if (cells[size_t(k)].amount < .5) { ++k; continue; }
+        int end = k;
+        while (end + 1 < count && cells[size_t(end + 1)].amount >= .5 && cells[size_t(end + 1)].color == cells[size_t(k)].color) ++end;
+        const RECT first = cellRect(k), last = cellRect(end);
+        ui::softHalo(dc, {first.left, r.top, last.right, r.bottom}, 2.0f, ledHalo(cells[size_t(k)].color), BYTE(150 * paintFade), std::max(3, int(r.bottom - r.top) / 2 + 2));
+        k = end + 1;
+    }
+    int lead = -1;
+    for (int k = 0; k < count; ++k) {
+        const auto& c = cells[size_t(k)];
+        fill(dc, cellRect(k), blend(theme.ledOff, c.color, c.amount * paintFade));
+        if (c.amount > 0) lead = k;
+    }
+    // While the value is on the move its leading LED flares.
+    if (flare > 0 && lead >= 0 && keyLook()) {
+        const RECT at = cellRect(lead);
+        ui::softHalo(dc, at, 2.0f, ledHalo(cells[size_t(lead)].color), BYTE(190 * flare * paintFade), sp(9));
+        fill(dc, at, blend(cells[size_t(lead)].color, RGB(255, 255, 255), .5 * flare));
     }
 }
 // Section labels are engraved: small, spaced and quiet.
@@ -960,6 +1272,9 @@ void drawEngraved(HDC dc, const std::wstring& text, RECT r, COLORREF color) {
     SetTextCharacterExtra(dc, 0);
 }
 double benchKinds[16] = {}; bool benchOn = false; // --paint-bench: time per kind of block
+bool visualLive = false; // painting the view on screen (not a capture): changes may throw sparks
+// The last press in the view: a ring of light spreads over the key from there.
+size_t visualRippleBlock = 0; POINT visualRippleAt{}; double visualRippleStart = -1;
 void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
     // A partial repaint draws into the kept back buffer, so nothing may land outside its part.
     const int clipSaved = update ? SaveDC(dc) : 0;
@@ -1009,6 +1324,17 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
         const double benchStart = benchOn ? motionNow() : 0;
         const int top = y + rise;
         const bool focused = GetFocus() == visualView;
+        // A key under the pointer catches a pool of light there; a pressed key sends a ring of
+        // light out from the press.
+        const double rippleT = visualRippleStart >= 0 && i == visualRippleBlock ? (now - visualRippleStart) / 420.0 : -1;
+        if (rippleT >= 0 && rippleT < 1) visualAnimating = true;
+        auto keyLight = [&](const RECT& key, int radius, double hot) {
+            if (!keyLook()) return;
+            const POINT mouse{visualMouse.x, visualMouse.y + rise};
+            if (hot > 0 && PtInRect(&key, mouse)) ui::spotlight(dc, key, float(sp(radius)), mouse, theme.glow, (theme.dark ? .22 : .5) * hot * paintFade, sp(64));
+            const POINT pressed{visualRippleAt.x, visualRippleAt.y + rise};
+            if (rippleT > 0 && rippleT < 1 && PtInRect(&key, pressed)) ui::ripple(dc, key, float(sp(radius)), pressed, theme.glow, rippleT);
+        };
         switch (b.kind) {
         case VBlock::Kind::fold: {
             // "About this page  >": a quiet row; its text unrolls beneath it.
@@ -1047,7 +1373,7 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
             const RECT cells{bar.left + sp(6), bar.top + sp(6), bar.right - sp(6), bar.bottom - sp(6)};
             const double scale = b.scale > 0 ? b.scale : std::max(b.goal * 1.6, b.amount * 1.1);
             const double fraction = b.amount > 0 && scale > 0 ? glide(std::to_wstring(i) + L"|" + b.title, std::min(1.0, b.amount / scale), now) * appear : 0;
-            ledRow(dc, cells, {{fraction, over ? warnLed : theme.glow}});
+            ledRow(dc, cells, {{fraction, over ? warnLed : theme.glow}}, visualAnimating ? 1.0 : 0.0);
             if (b.goal > 0 && scale > 0) {
                 const int x = cells.left + int(std::min(1.0, b.goal / scale) * (cells.right - cells.left));
                 fill(dc, {x - sp(1), bar.top - sp(3), x + sp(1), bar.top + sp(2)}, Ink);
@@ -1163,7 +1489,7 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
             const RECT row = isSwitch ? RECT{0, top, width, top + h} : commandKey(top, width, h);
             if (isSwitch) {
                 if (hot > 0) rounded(dc, {row.left, row.top + sp(2), row.right, row.bottom - sp(2)}, blend(Surface, theme.highContrast ? Selected : blend(Surface, Ink, .05), hot), 12);
-            } else keycap(dc, row, 12, 0, press, hot);
+            } else { keycap(dc, row, 12, 0, press, hot); keyLight(row, 12, hot); }
             if (index == visualFocus && focused) outline(dc, row, Green, 12, 2.0f);
             const COLORREF ink = hot > .5 && theme.highContrast ? theme.selectedInk : Ink;
             int right = row.right - sp(14);
@@ -1174,6 +1500,11 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
                 else if (std::abs(it->second.to - b.toggle) > .01) {
                     it->second.move(b.toggle, now, canAnimate() ? TravelMs : 0); it->second.quick = true;
                     if (canAnimate()) visualChangedAt[int(b.amount)] = {now, b.toggle ? 1 : -1};
+                    if (visualLive) { // sparks from where the key lands, some past the panel's edge
+                        POINT at{b.toggle ? right - sp(14) : right - sp(36), (row.top + row.bottom) / 2};
+                        ClientToScreen(visualView, &at);
+                        fxToggle(at, b.toggle != 0);
+                    }
                 }
                 if (it->second.active(now)) visualAnimating = true;
                 Arrival motion;
@@ -1241,6 +1572,12 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
                     const int way = b.toggle > it->second.to ? 1 : -1;
                     it->second.move(b.toggle, now, canAnimate() ? TravelMs + 20 : 0); it->second.quick = true;
                     if (canAnimate()) visualChangedAt[100000 + int(i)] = {now, way};
+                    if (visualLive && b.toggle < n) {
+                        const RECT key = segmentKey(tray, n, b.toggle);
+                        POINT at{(key.left + key.right) / 2, (key.top + key.bottom) / 2};
+                        ClientToScreen(visualView, &at);
+                        fxChoice(at);
+                    }
                 }
                 if (it->second.active(now)) visualAnimating = true;
                 at = it->second.value(now);
@@ -1255,6 +1592,7 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
                 const double lit = b.toggle >= 0 ? std::clamp(1 - std::abs(at - k), 0.0, 1.0) : 0.0;
                 const double hot = index == visualHover || index == visualFocus ? 1.0 : 0.0;
                 keycap(dc, key, 10, lit * paintFade, lit, hot * (1 - lit));
+                keyLight(key, 10, std::max(hot, lit));
                 if (k == b.toggle && motion.glow > 0) ui::drawRimLight(dc, key, float(sp(10)), theme.rim, motion.angle, motion.glow * .8 * paintFade);
                 if (index == visualFocus && focused) outline(dc, key, Green, 10, 2.0f);
                 const int down = int(std::lround(lit * sp(1)));
@@ -1283,6 +1621,7 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
                 const int w = textWidth(dc, b.value, normalFont) + sp(30);
                 const RECT button{sp(26), top + h - sp(42), sp(26) + w, top + h - sp(10)};
                 keycap(dc, button, 10, 0, press, hot);
+                keyLight(button, 10, hot);
                 const int down = int(std::lround(press * sp(1)));
                 drawText(dc, b.value, {button.left, button.top + down, button.right, button.bottom + down}, Ink, normalFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
                 if (index >= 0 && index == visualFocus && focused) outline(dc, button, Green, 10, 2.0f);
@@ -1344,6 +1683,31 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
             }
             drawText(dc, b.title, {sp(28), top + sp(3), right, top + sp(27)}, b.toggle == 1 ? Muted : Ink, normalFont);
             if (!b.text.empty()) drawText(dc, b.text, {sp(28), top + sp(28), width - sp(4), top + h}, Muted, smallFont, DT_LEFT | DT_WORDBREAK);
+            break;
+        }
+        case VBlock::Kind::display: {
+            // The page's display: a well with the reading in dot-matrix digits and the battery as
+            // a percentage over ten cells.
+            const RECT box{0, top + sp(2), width, top + h - sp(8)};
+            card(dc, box, Surface, 16);
+            const bool battery = b.amount >= 0;
+            const int textRight = battery ? width - sp(112) : width - sp(16);
+            drawText(dc, b.title, {sp(16), box.top + sp(8), textRight, box.top + sp(26)}, Muted, smallFont);
+            const int unit = std::max(3, sp(5));
+            const int moving = drawMatrix(dc, L"v|" + std::to_wstring(i) + L"|w", b.value, sp(16), box.top + sp(31), unit, Ink, std::max(1, unit / 4));
+            if (moving < 0) drawText(dc, b.value, {sp(14), box.top + sp(26), textRight, box.top + sp(70)}, Ink, valueFont);
+            if (moving > 0) visualAnimating = true;
+            drawText(dc, b.text, {sp(16), box.bottom - sp(27), textRight, box.bottom - sp(7)}, Muted, smallFont);
+            if (battery) {
+                const COLORREF light = lightOf(b.items.empty() ? COLORREF(0) : b.items[0].second);
+                const int dotUnit = std::max(2, sp(3));
+                if (!b.items.empty()) {
+                    const int percent = drawMatrix(dc, L"v|" + std::to_wstring(i) + L"|p", b.items[0].first, width - sp(16), box.top + sp(14), dotUnit, Ink, std::max(1, dotUnit / 3), true);
+                    if (percent < 0) drawText(dc, b.items[0].first, {width - sp(110), box.top + sp(8), width - sp(16), box.top + sp(40)}, Ink, titleFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+                    if (percent > 0) visualAnimating = true;
+                }
+                drawBatteryCells(dc, width - sp(16), box.top + sp(46), sp(6), sp(22), std::clamp(b.amount, 0.0, 1.0), light, b.toggle == 1);
+            }
             break;
         }
         case VBlock::Kind::legend: {
@@ -1467,7 +1831,9 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (whole || IsRectEmpty(&part)) part = r;
         IntersectRect(&part, &part, &r);
         const bool full = part.left <= 0 && part.top <= 0 && part.right >= r.right && part.bottom >= r.bottom;
+        visualLive = true;
         paintVisual(buffer, r, full ? nullptr : &part);
+        visualLive = false;
         BitBlt(target, part.left, part.top, part.right - part.left, part.bottom - part.top, buffer, part.left, part.top, SRCCOPY);
         EndPaint(window, &ps);
         return 0;
@@ -1482,7 +1848,11 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             return 0;
         }
         const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-        for (const auto& hit : visualHits) if (PtInRect(&hit.rect, pt)) { setFade(visualPress, hit.block, 1, 70); break; } // the row gives a little under the press
+        for (const auto& hit : visualHits) if (PtInRect(&hit.rect, pt)) {
+            if (canAnimate()) { visualRippleBlock = hit.block; visualRippleAt = pt; visualRippleStart = motionNow(); }
+            setFade(visualPress, hit.block, 1, 70); // the key gives a little under the press, and light spreads from it
+            break;
+        }
         return 0;
     }
     case WM_MOUSEMOVE: {
@@ -1518,7 +1888,7 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             if (visualHover >= 0 && visualHover < int(visualHits.size())) setFade(visualHoverFade, visualHits[size_t(visualHover)].block, 0, 180);
             if (hover >= 0) setFade(visualHoverFade, visualHits[size_t(hover)].block, 1, 110);
             visualHover = hover; // setFade repaints just those rows
-        }
+        } else if (hover >= 0 && keyLook() && canAnimate()) invalidateBlock(visualHits[size_t(hover)].block); // the pool of light follows the pointer
         TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0}; TrackMouseEvent(&tracking);
         return 0;
     }
@@ -1609,6 +1979,8 @@ void showVisual(std::vector<VBlock> blocks, bool keepScroll) {
         visualScroll = 0; visualFocus = -1; visualHover = -1; visualScrollMotion.duration = 0;
         // A new page comes in: its blocks rise into place, bars grow, switches start where they are.
         visualValues.clear(); visualKnobs.clear(); visualHoverFade.clear(); visualPress.clear(); visualPulse.clear(); visualFolds.clear(); visualChangedAt.clear();
+        for (auto it = matrixStates.begin(); it != matrixStates.end();) it = it->first.rfind(L"v|", 0) == 0 ? matrixStates.erase(it) : std::next(it); // the page's digits count up again
+        visualRippleStart = -1;
         visualMouse = {-1, -1};
         visualEnterAt = canAnimate() ? motionNow() : -1;
         if (visualEnterAt >= 0) armVisualTimer();
@@ -1694,6 +2066,8 @@ RECT tabRect(size_t index, size_t count, RECT client) {
     return {left, strip.top, index + 1 == count ? strip.right : left + cell, strip.bottom};
 }
 int tabHover = -1;
+POINT tabMouse{-1, -1};                                          // the pointer over the tab keys
+int tabRippleIndex = -1; POINT tabRippleAt{}; double tabRippleStart = -1; // the last tab press
 // The light moves to the new tab (in tab positions): quick, then it blooms on the key it lands
 // on and runs along its edge, as in the reference clip.
 Transition tabSlide; bool tabSlideKnown = false;
@@ -1725,7 +2099,13 @@ void drawTabs(HDC dc, RECT client) {
         tabSlide.move(double(activeIndex), now, canAnimate() && !hidden ? TravelMs + 40 : 0);
         tabSlide.quick = true;
         tabChangedAt = canAnimate() && !hidden ? now : -1;
-        if (tabSlide.duration) armMotionTimer();
+        if (tabSlide.duration) {
+            armMotionTimer();
+            const RECT key = tabRect(activeIndex, tabs.size(), client);
+            POINT at{(key.left + key.right) / 2, key.bottom - sp(4)};
+            ClientToScreen(mainWindow, &at);
+            fxTab(at);
+        }
     }
     const double at = std::clamp(tabSlide.value(now), 0.0, double(tabs.size() - 1));
     const Arrival motion = tabChangedAt >= 0 ? arrival(now - tabChangedAt, tabDirection) : Arrival{};
@@ -1736,6 +2116,11 @@ void drawTabs(HDC dc, RECT client) {
         const double lit = std::clamp(1 - std::abs(at - double(i)), 0.0, 1.0);
         const double hot = int(i) == tabHover ? 1.0 : 0.0;
         keycap(dc, r, 12, lit, lit, hot * (1 - lit));
+        if (keyLook()) {
+            if (hot > 0 && PtInRect(&r, tabMouse)) ui::spotlight(dc, r, float(sp(12)), tabMouse, theme.glow, theme.dark ? .22 : .5, sp(48));
+            const double rippleT = tabRippleStart >= 0 && int(i) == tabRippleIndex ? (now - tabRippleStart) / 420.0 : -1;
+            if (rippleT > 0 && rippleT < 1) ui::ripple(dc, r, float(sp(12)), tabRippleAt, theme.glow, rippleT);
+        }
         if (i == activeIndex && motion.glow > 0) ui::drawRimLight(dc, r, float(sp(12)), theme.rim, motion.angle, motion.glow * .8);
         OffsetRect(&r, 0, int(std::lround(lit * sp(1))));
         const COLORREF ink = theme.highContrast ? (lit > .5 ? theme.selectedInk : Ink) : blend(blend(Muted, Ink, hot * .6), theme.accentInk, lit);
@@ -2250,6 +2635,7 @@ void showLowBatteryNotice() {
         break;
     }
     showBalloon(tr(L"電量偏低 · ") + valueText(p.percent, L"%", 0), body, BalloonTarget::none);
+    fxEdgePlay(bs::fx::EdgeShow::pulse, RGB(240, 82, 74), 1000, 1, 2); // the screen's edge pulses red twice
 }
 // One drain notification per process, at most every 10 minutes, on battery only.
 void checkDrainAlert() {
@@ -2277,9 +2663,11 @@ void checkBatteryNotices() {
                 tr(L"。可能有程式或裝置讓電腦無法進入深度睡眠。"), BalloonTarget::powerDetails);
     }
     const bool firmwareLimit = chargeLimit && *chargeLimit <= int(chargeReminderTarget) + 1;
-    if (chargeReminderTarget && !firmwareLimit && chargeReminder.update(current.history.back(), chargeReminderTarget))
+    if (chargeReminderTarget && !firmwareLimit && chargeReminder.update(current.history.back(), chargeReminderTarget)) {
         showBalloon(tr(L"電量已達 ") + std::to_wstring(chargeReminderTarget) + L"%",
             tr(L"可以拔掉充電器了；長時間維持高電量會加速電池老化。"), BalloonTarget::none);
+        fxEdgePlay(bs::fx::EdgeShow::pulse, theme.halo, 900); // the screen's edge pulses once in the panel's light
+    }
 }
 void refreshList();
 void positionPanel() {
@@ -2369,6 +2757,26 @@ void stepMotion(double now) {
         if (themeMotion.active(now)) { showThemeBlend(std::clamp(themeMotion.value(now), 0.0, 1.0)); active = true; }
         else { themeMotion.duration = 0; themeBlend = -1; applyTheme(); }
     }
+    if (tabRippleStart >= 0) {
+        // The ring of light on a pressed tab key.
+        RECT client{}; GetClientRect(mainWindow, &client);
+        RECT tabBar = tabArea(client);
+        if (!hidden) InvalidateRect(mainWindow, &tabBar, FALSE);
+        if (now - tabRippleStart < 420 && !hidden) active = true; else tabRippleStart = -1;
+    }
+    if (heroMoving) {
+        // The battery tab's dot-matrix digits counting or scanning in.
+        RECT client{}; GetClientRect(mainWindow, &client);
+        RECT hero{0, sp(70), client.right, sp(184)};
+        if (!hidden) { InvalidateRect(mainWindow, &hero, FALSE); active = true; } else heroMoving = false;
+    }
+    if (mascotHopAt >= 0) {
+        // The mascot's hop: only the header repaints.
+        RECT client{}; GetClientRect(mainWindow, &client);
+        RECT header{0, 0, client.right, sp(40)};
+        if (!hidden) InvalidateRect(mainWindow, &header, FALSE);
+        if (now - mascotHopAt < 360 && !hidden) active = true; else mascotHopAt = -1;
+    }
     if (tabChangedAt >= 0) {
         // The tab thumb's light settles after the thumb has landed.
         if (now - tabChangedAt < TravelMs + SettleMs && !hidden) {
@@ -2402,6 +2810,7 @@ void showMain() {
     ShowWindow(mainWindow, SW_SHOWNORMAL); stepMotion(now);
     SetForegroundWindow(mainWindow); wake.notify_one();
     if (panelMotion.active(now)) armMotionTimer();
+    if (!wasVisible) fxPanelOpened(); // sparks rise from the tray icon; the panel's light blooms round it
     // Home is the performance dashboard: the first time the panel opens it starts there.
     static bool homeShown = false;
     if (!homeShown && !demo && !isolatedPreview) { homeShown = true; if (inlinePage == InlinePage::none) showPerformancePage(); }
@@ -2417,6 +2826,7 @@ void hideMain() {
     for (auto& row : rowMotions) { row.hover = {}; row.selected.duration = row.bar.duration = 0; }
     for (auto& item : buttonMotions) item.second = {};
     for (auto& item : pressMotions) item.second = {};
+    if (IsWindowVisible(mainWindow)) fxPanelClosing(); // its light runs back into the tray icon
     panelTargetShown = false; hidden = true; wake.notify_one();
     double now = motionNow(); panelMotion.move(0, now, canAnimate() ? 150 : 0);
     stepMotion(now); if (panelMotion.active(now)) armMotionTimer();
@@ -2855,6 +3265,7 @@ bool fullPanelPage(InlinePage page) {
 }
 void paint(HDC dc, RECT bounds) {
     fill(dc, bounds, Background);
+    heroMoving = false; // set again below while the battery tab's digits are on the move
     drawTabs(dc, bounds);
     const int w = bounds.right, margin = sp(18), right = w - margin;
     const std::wstring subtitle = demo ? tr(L"示範資料 · 關閉操作已停用") : tr(L"電池與背景活動");
@@ -2866,7 +3277,9 @@ void paint(HDC dc, RECT bounds) {
         const int unit = std::max(2, px(2)), left = margin + textWidth(dc, L"BatteryScope", titleFont) + sp(10);
         if (left + ui::MascotCells * unit <= w - sp(100)) {
             const auto mood = currentMood();
-            ui::drawMascot(dc, left, sp(9), unit, mood, mascotLevel(), sampleTick % 5 == 4 ? 1 : 0, mascotColors(mood));
+            const double hop = mascotHopAt >= 0 ? std::clamp((motionNow() - mascotHopAt) / 360.0, 0.0, 1.0) : 1.0;
+            const int lift = hop < 1 ? int(std::lround(std::sin(3.14159265 * hop) * sp(6))) : 0;
+            ui::drawMascot(dc, left, sp(9) - lift, unit, mood, mascotLevel(), sampleTick % 5 == 4 || hop < 1 ? 1 : 0, mascotColors(mood));
             mascotRect = {left, sp(9), left + ui::MascotCells * unit, sp(9) + ui::MascotRows * unit};
         }
     }
@@ -2911,29 +3324,27 @@ void paint(HDC dc, RECT bounds) {
     card(dc, {margin, sp(78), right, sp(180)}, Surface, 16);
     drawText(dc, desktop ? tr(L"CPU 功率") : p.charging ? tr(L"充電功率") : plugged ? tr(L"外部電源") : tr(L"目前耗電"), {margin + sp(16), sp(84), right - sp(122), sp(103)}, Muted, smallFont);
     const int digitUnit = std::max(3, px(4));
-    if (!ui::drawPixelDigits(dc, currentW, margin + sp(16), (sp(102) + sp(150)) / 2 - digitUnit * 7 / 2, digitUnit, Ink, std::max(1, digitUnit / 4)))
+    bool digitsMoving = false;
+    if (const int moving = drawMatrix(dc, L"hero|w", currentW, margin + sp(16), (sp(102) + sp(150)) / 2 - digitUnit * 7 / 2, digitUnit, Ink, std::max(1, digitUnit / 4)); moving < 0)
         drawText(dc, currentW, {margin + sp(14), sp(102), right - sp(119), sp(150)}, Ink, valueFont);
+    else digitsMoving |= moving > 0;
     drawText(dc, rateLabel, {margin + sp(16), sp(152), right - sp(150), sp(172)}, Muted, smallFont);
     const bool low = p.percent && !plugged && *p.percent <= 20;
     const COLORREF level = !p.percent ? Muted : p.charging ? Green : low && *p.percent <= 10 ? Danger : low ? theme.warn : Green;
     const std::wstring percentText = desktop ? std::wstring() : valueText(p.percent, L"%", 0);
     const int percentUnit = std::max(3, px(3)), percentWidth = ui::pixelDigitsWidth(percentText, percentUnit);
-    if (!ui::drawPixelDigits(dc, percentText, right - sp(16) - percentWidth, (sp(88) + sp(116)) / 2 - percentUnit * 7 / 2,
-        percentUnit, p.percent ? Ink : Muted, std::max(1, percentUnit / 3)))
+    (void)percentWidth;
+    if (const int moving = drawMatrix(dc, L"hero|p", percentText, right - sp(16), (sp(88) + sp(116)) / 2 - percentUnit * 7 / 2,
+        percentUnit, p.percent ? Ink : Muted, std::max(1, percentUnit / 3), true); moving < 0)
         drawText(dc, percentText, {right - sp(112), sp(84), right - sp(16), sp(116)},
             p.percent ? Ink : Muted, titleFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+    else digitsMoving |= moving > 0;
+    heroMoving = digitsMoving && !suppressMotion;
+    if (heroMoving) armMotionTimer();
     if (!desktop) {
-        // Ten cells lit up to the level: in the panel's light, amber or red when low. While
-        // charging the next cell breathes with each sample.
-        const double fraction = p.percent ? std::clamp(*p.percent / 100, 0.0, 1.0) : 0;
+        // Ten cells lit up to the level: in the panel's light, amber or red when low.
         const COLORREF light = level == Danger ? RGB(240, 82, 74) : level == theme.warn ? RGB(242, 169, 59) : theme.glow;
-        const int cells = 10, gap = std::max(1, sp(2)), cellWidth = sp(6), x0 = right - sp(16) - cells * cellWidth - (cells - 1) * gap;
-        for (int k = 0; k < cells; ++k) {
-            double lit = std::clamp(fraction * cells - k, 0.0, 1.0);
-            if (p.charging && lit < 1 && lit >= 0 && k == int(fraction * cells)) lit = std::max(lit, sampleTick % 2 ? .75 : .35);
-            const int x = x0 + k * (cellWidth + gap);
-            ui::led(dc, {x, sp(122), x + cellWidth, sp(142)}, light, light == theme.glow ? theme.halo : light, lit, theme.ledOff);
-        }
+        drawBatteryCells(dc, right - sp(16), sp(122), sp(6), sp(20), p.percent ? std::clamp(*p.percent / 100, 0.0, 1.0) : 0, light, p.charging);
     }
     const bool atLimit = plugged && !p.charging && chargeLimit && p.percent && std::abs(*p.percent - *chargeLimit) <= 1.5;
     drawText(dc, desktop ? tr(L"桌上型電腦") : p.charging ? tr(L"充電中") : atLimit ? tr(L"充電上限 ") + std::to_wstring(*chargeLimit) + L"%" :
@@ -3371,6 +3782,7 @@ void loadSettings() {
     autoSaverThreshold = saver == 20 || saver == 30 ? saver : 0;
     performanceApps = readNames(L"PerformanceApps");
     showMascot = readSetting(L"Mascot", 1) != 0;
+    effectsLevel = int(std::min<DWORD>(readSetting(L"Effects", 0), 2));
     miniEnabled = readSetting(L"MiniWindow", 0) == 1;
     historyEnabled = readSetting(L"History", 1) != 0;
     updateChecks = readSetting(L"UpdateCheck", 1) != 0;
@@ -3514,7 +3926,9 @@ void setTheme(ui::ThemeChoice choice) {
     if (!writeSetting(L"Theme", DWORD(choice))) setNotice(tr(L"無法儲存設定。"));
     const bool nowDark = ui::palette(choice, previewContrast).dark;
     if (canAnimate() && !hidden && !contrast && !ui::highContrastOn() && wasDark != nowDark) {
-        // Light to dark (or back): every colour crossfades on the quick curve, then the theme is applied.
+        // With full effects the old look is wiped away in a circle from where the change was made.
+        if (fxThemeReveal(ui::palette(choice, previewContrast))) { themeMotion.duration = 0; themeBlend = -1; applyTheme(); return; }
+        // Otherwise every colour crossfades on the quick curve, then the theme is applied.
         themeMotion.from = themeMotion.to = wasDark ? 1.0 : 0.0; themeMotion.duration = 0;
         themeMotion.move(nowDark ? 1.0 : 0.0, motionNow(), 160); themeMotion.quick = true;
         armMotionTimer();
@@ -5354,12 +5768,12 @@ void showGoalPage() {
 // program itself. The same rows as every other page: a switch turns on or off, a value row
 // steps to its next choice.
 enum class Row { section, target, perfApps, lowBattery, chargeReminder, drainAlert,
-    sleepAlert, theme, mascot, trayPercent, mini, language, startup, hotkey, history, clearHistory, updates };
+    sleepAlert, theme, mascot, trayPercent, mini, language, startup, hotkey, history, clearHistory, updates, effects };
 struct SettingRow { Row row; const wchar_t* label; const wchar_t* detail; };
 const SettingRow settingRows[] = {
     {Row::section, L"提醒", nullptr}, {Row::lowBattery, L"低電量提醒", nullptr}, {Row::chargeReminder, L"充電提醒", nullptr},
     {Row::drainAlert, L"背景耗電提醒", L"有程式在背景持續耗電時通知"}, {Row::sleepAlert, L"睡眠耗電提醒", L"睡眠時掉電太快時通知"},
-    {Row::section, L"外觀", nullptr}, {Row::theme, L"主題", nullptr}, {Row::language, L"語言 / Language", nullptr},
+    {Row::section, L"外觀", nullptr}, {Row::theme, L"主題", nullptr}, {Row::effects, L"動態特效", nullptr}, {Row::language, L"語言 / Language", nullptr},
     {Row::mascot, L"電池小精靈", nullptr}, {Row::trayPercent, L"系統匣顯示電量", nullptr}, {Row::mini, L"迷你浮動視窗", nullptr},
     {Row::section, L"一般", nullptr}, {Row::startup, L"登入時啟動", nullptr}, {Row::hotkey, L"快速鍵 Ctrl+Alt+B", L"隨時叫出或收起面板"},
     {Row::history, L"記錄每日歷史", L"只存在這台電腦，保留 60 天"}, {Row::clearHistory, L"清除歷史紀錄", nullptr}, {Row::updates, L"更新", nullptr}};
@@ -5379,6 +5793,7 @@ std::wstring rowValue(Row row) {
     case Row::sleepAlert: return onOff(sleepAlerts);
     case Row::theme: return themeChoice == ui::ThemeChoice::system ? tr(L"跟隨 Windows") : themeChoice == ui::ThemeChoice::dark ? tr(L"深色") : tr(L"淺色");
     case Row::mascot: return onOff(showMascot);
+    case Row::effects: return effectsLevel == 0 ? tr(L"完整") : effectsLevel == 1 ? tr(L"只在面板內") : tr(L"關閉");
     case Row::trayPercent: return onOff(trayPercent);
     case Row::mini: return onOff(miniEnabled);
     case Row::language: return english ? L"English" : L"繁體中文";
@@ -5401,6 +5816,7 @@ bool rowOn(Row row) {
     case Row::drainAlert: return drainAlerts;
     case Row::sleepAlert: return sleepAlerts;
     case Row::mascot: return showMascot;
+    case Row::effects: return effectsLevel == 0;
     case Row::trayPercent: return trayPercent;
     case Row::mini: return miniEnabled;
     case Row::startup: return autoStart;
@@ -5428,6 +5844,7 @@ int rowCommand(Row row) {
     case Row::sleepAlert: return SleepAlertId;
     case Row::theme: return themeChoice == ui::ThemeChoice::system ? ThemeDarkId : themeChoice == ui::ThemeChoice::dark ? ThemeLightId : ThemeSystemId;
     case Row::mascot: return MascotToggleId;
+    case Row::effects: return EffectsCycleId;
     case Row::trayPercent: return TrayPercentId;
     case Row::mini: return MiniToggleId;
     case Row::language: return english ? LanguageZhId : LanguageEnId;
@@ -5984,6 +6401,7 @@ void cycleAsusMode() {
     if (status != ERROR_SUCCESS) { showOsd(tr(L"效能模式沒有切換")); return; }
     if (dynamicEnabled) governor.hold(bs::gov::Setting::firmwareMode);
     applyModeCompanions(true);
+    fxModeEdge(next == bs::asus::Mode::silent ? 0 : next == bs::asus::Mode::turbo ? 2 : 1);
     showOsd(tr(L"效能模式：") + std::wstring(tr(bs::asus::modeKey(next))), -1, next == bs::asus::Mode::silent ? Green : next == bs::asus::Mode::turbo ? theme.warn : COLORREF(0));
 }
 void stepKeyboard(unsigned code) {
@@ -6289,17 +6707,25 @@ void showPerformancePage() {
         h.keyboardDevice = true; h.keyboard = 1;
     }
     std::vector<VBlock> v;
-    // The battery in one line.
+    // The display: power in dot-matrix digits, the battery as a percentage and ten cells.
     if (!current.history.empty()) {
         const auto& p = current.history.back();
-        std::vector<std::pair<std::wstring, COLORREF>> chips;
-        if (p.percent) chips.push_back({valueText(p.percent, L"%", 0), *p.percent <= 20 ? theme.warn : Green});
         const bool plugged = p.acKnown && (p.onAc || p.charging);
-        if (p.charging) chips.push_back({tr(L"充電 ") + valueText(calculateCharging(current.history).watts, L" W"), Green});
-        else if (plugged) chips.push_back({tr(L"插電"), 0});
-        else chips.push_back({tr(L"耗電 ") + valueText(current.power.currentWatts, L" W"), 0});
-        if (!plugged) if (auto left = remainingText(current.power); !left.empty()) chips.push_back({left, 0});
-        v.push_back(vChips(std::move(chips)));
+        const auto charge = calculateCharging(current.history);
+        const std::wstring label = !p.present ? tr(L"CPU 功率") : p.charging ? tr(L"充電功率") : plugged ? tr(L"外部電源") : tr(L"目前耗電");
+        std::wstring digits = p.charging ? valueText(charge.watts, L" W") : plugged ? std::wstring(tr(L"插電中")) : valueText(current.power.currentWatts, L" W");
+        std::wstring line = p.charging ? durationText(chargeEta(charge, p).hours) : plugged ? std::wstring() : remainingText(current.power);
+        if (!p.present) {
+            const bool live = current.energy.ready && !current.energy.timingMismatch;
+            const Value watts = live ? (current.energy.packageWatts ? current.energy.packageWatts : current.energy.coreWatts) : Value{};
+            digits = watts ? valueText(watts, L" W") : std::wstring(tr(L"無電池")); line.clear();
+        }
+        if (!plugged && p.present && current.power.averageWatts) line += (line.empty() ? L"" : L" · ") + std::wstring(tr(L"近 5 分鐘 ")) + valueText(current.power.averageWatts, L" W");
+        const bool low = p.percent && !plugged && *p.percent <= 20;
+        VBlock display = vDisplay(label, digits, line, p.present ? valueText(p.percent, L"%", 0) : std::wstring(), p.present && p.percent ? *p.percent / 100 : -1, p.charging,
+            low && *p.percent <= 10 ? Danger : low ? theme.warn : COLORREF(0));
+        if (p.charging) display.scale = double(sampleTick % 1000); // the marching cell moves with each sample
+        v.push_back(std::move(display));
     }
     if (auto banner = stabilityRow(true)) v.push_back(std::move(*banner));
     if (asusAvailable && powerLimitStuck())
@@ -7831,6 +8257,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (wp == SIZE_MINIMIZED) hideMain(); else layout(); return 0;
     case WM_TIMER:
         if (wp == MotionTimer) { stepMotion(motionNow()); return 0; }
+        if (wp == FxTimer) { stepFx(); return 0; }
         if (wp == NoticeTimer) { KillTimer(window, NoticeTimer); noticeUntil = 0; InvalidateRect(window, nullptr, FALSE); return 0; }
         if (wp == UpdateTimer) { SetTimer(window, UpdateTimer, 6 * 3600 * 1000, nullptr); maybeCheckForUpdate(); return 0; }
         if (wp == GovernorTimer) { governorTick(); return 0; }
@@ -7939,6 +8366,15 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             return 0;
         }
         if (id == HistoryId) { showHistoryPage(); return 0; }
+        if (id == EffectsCycleId) {
+            // Full (also beyond the window) → inside the panel only → none → full.
+            effectsLevel = (effectsLevel + 1) % 3;
+            if (!writeSetting(L"Effects", DWORD(effectsLevel))) setNotice(tr(L"無法儲存設定。"));
+            if (effectsLevel != 0) stopFx();
+            setNotice(effectsLevel == 0 ? tr(L"完整特效：火花、光環與螢幕邊緣的光會超出面板。") : effectsLevel == 1 ? tr(L"特效只留在面板內。") : tr(L"已關閉動態特效。"));
+            if (inlinePage == InlinePage::settings) showSettingsPage();
+            return 0;
+        }
         if (id == MascotToggleId) {
             showMascot = !showMascot;
             if (!writeSetting(L"Mascot", showMascot ? 1 : 0)) setNotice(tr(L"無法儲存設定。"));
@@ -8284,6 +8720,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
                 if (status == ERROR_SUCCESS && dynamicEnabled) { governor.hold(bs::gov::Setting::firmwareMode); done += tr(L"（這次用電池期間動態省電不改它）"); }
                 if (status == ERROR_SUCCESS) {
                     applyModeCompanions(true);
+                    fxModeEdge(mode == bs::asus::Mode::silent ? 0 : mode == bs::asus::Mode::turbo ? 2 : 1);
                     if (modeLink && !current.history.empty() && current.history.back().onAc) done += tr(L" · CPU Boost ") + std::wstring(boostName(modeBoost[int(mode)]));
                 }
             } else if (id == GpuAutoId) {
@@ -8518,10 +8955,15 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_MOUSEMOVE: {
         RECT client{}; GetClientRect(window, &client);
         const int hover = tabAt({GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}, client);
+        tabMouse = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         if (hover != tabHover) {
             tabHover = hover;
             RECT bar = tabArea(client); InvalidateRect(window, &bar, FALSE);
             TRACKMOUSEEVENT tracking{sizeof(tracking), TME_LEAVE, window, 0}; TrackMouseEvent(&tracking);
+        } else if (hover >= 0 && keyLook() && canAnimate()) {
+            // The pool of light follows the pointer across the key.
+            RECT key = tabRect(size_t(hover), visibleTabs().size(), client); InflateRect(&key, sp(4), sp(4));
+            InvalidateRect(window, &key, FALSE);
         }
         break;
     }
@@ -8635,6 +9077,14 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             if (wp == PBT_APMRESUMEAUTOMATIC) { bs::stability::note(L"resume"); countWake(); }
         }
         if (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND || wp == PBT_APMPOWERSTATUSCHANGE) { resetSamples = true; wake.notify_one(); }
+        if (wp == PBT_APMPOWERSTATUSCHANGE && !demo && !isolatedPreview) {
+            // The charger went in or out: light runs round the edge of the screen.
+            SYSTEM_POWER_STATUS power{};
+            if (GetSystemPowerStatus(&power) && power.ACLineStatus <= 1) {
+                if (acLine >= 0 && acLine != int(power.ACLineStatus)) fxPower(power.ACLineStatus == 1);
+                acLine = int(power.ACLineStatus);
+            }
+        }
         // After sleep the firmware and the keyboard may have forgotten: set things again once they are awake.
         if (wp == PBT_APMRESUMEAUTOMATIC && asusAvailable && !demo && !isolatedPreview) { asusReadAt = 0; SetTimer(window, AsusTimer, 10000, nullptr); }
         return TRUE;
@@ -8649,12 +9099,20 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         {
             RECT client{}; GetClientRect(window, &client);
             if (const int tab = tabAt(point, client); tab >= 0) {
+                if (canAnimate()) { tabRippleIndex = tab; tabRippleAt = point; tabRippleStart = motionNow(); armMotionTimer(); }
                 const Tab target = visibleTabs()[size_t(tab)];
                 if (target != activeTab() || (target == Tab::ranking && inlinePage != InlinePage::none) || (target == Tab::performance && inlinePage == InlinePage::stability)) SendMessageW(window, WM_COMMAND, tabCommand(target), 0);
                 return 0;
             }
         }
-        if (PtInRect(&mascotRect, point)) { setNotice(mascotLine()); ++sampleTick; InvalidateRect(window, nullptr, FALSE); return 0; }
+        if (PtInRect(&mascotRect, point)) {
+            setNotice(mascotLine()); ++sampleTick;
+            // It hops, and throws sparks up past the top of the panel.
+            if (canAnimate()) { mascotHopAt = motionNow(); armMotionTimer(); }
+            POINT at{(mascotRect.left + mascotRect.right) / 2, mascotRect.top}; ClientToScreen(window, &at);
+            fxMascot(at);
+            InvalidateRect(window, nullptr, FALSE); return 0;
+        }
         // The battery cards open the battery's history and health.
         if (inlinePage == InlinePage::none && PtInRect(&batteryCardsRect, point)) { SendMessageW(window, WM_COMMAND, HistoryId, 0); return 0; }
         break;
@@ -8695,6 +9153,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_CLOSE: hideMain(); return 0;
     case WM_DESTROY: {
+        stopFx();
         KillTimer(window, MotionTimer); motionTimerRunning = false;
         KillTimer(window, NoticeTimer); KillTimer(window, UpdateTimer); KillTimer(window, GovernorTimer); KillTimer(window, StabilityTimer); KillTimer(window, StartupTimer);
         if (displayNotify) { UnregisterPowerSettingNotification(displayNotify); displayNotify = nullptr; }
@@ -8775,14 +9234,9 @@ Snapshot demoSnapshot() {
     state.lastSleep = sleep; state.sleepCount = 1;
     state.servicesKnown = true; state.totalProcesses = 5; state.ms = now; return state;
 }
-bool captureWindow(const std::wstring& path) {
-    RECT rect{}; GetClientRect(mainWindow, &rect); int w = rect.right, h = rect.bottom;
-    HDC screen = GetDC(mainWindow), dc = CreateCompatibleDC(screen);
-    BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); info.bmiHeader.biWidth = w;
-    info.bmiHeader.biHeight = -h; info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32; info.bmiHeader.biCompression = BI_RGB;
-    void* pixels = nullptr; HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
-    if (!bitmap) { DeleteDC(dc); ReleaseDC(mainWindow, screen); return false; }
-    HGDIOBJ old = SelectObject(dc, bitmap);
+// The whole panel, its own drawing and every visible child, into `dc` (captures, and the old
+// look the theme change wipes away).
+bool renderPanel(HDC dc, RECT rect) {
     SendMessageW(mainWindow, WM_PRINT, reinterpret_cast<WPARAM>(dc), PRF_CLIENT | PRF_CHILDREN | PRF_ERASEBKGND);
     // The main canvas is owner drawn; WM_PRINTCLIENT supplies its content explicitly.
     paint(dc, rect);
@@ -8818,11 +9272,135 @@ bool captureWindow(const std::wstring& path) {
         } else SendMessageW(child, WM_PRINT, reinterpret_cast<WPARAM>(dc), PRF_CLIENT | PRF_NONCLIENT | PRF_CHILDREN | PRF_ERASEBKGND);
         RestoreDC(dc, -1);
     }
+    return true;
+}
+bool captureWindow(const std::wstring& path) {
+    RECT rect{}; GetClientRect(mainWindow, &rect); int w = rect.right, h = rect.bottom;
+    HDC screen = GetDC(mainWindow), dc = CreateCompatibleDC(screen);
+    BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); info.bmiHeader.biWidth = w;
+    info.bmiHeader.biHeight = -h; info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32; info.bmiHeader.biCompression = BI_RGB;
+    void* pixels = nullptr; HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+    if (!bitmap) { DeleteDC(dc); ReleaseDC(mainWindow, screen); return false; }
+    HGDIOBJ old = SelectObject(dc, bitmap);
+    renderPanel(dc, rect);
     BITMAPFILEHEADER file{}; file.bfType = 0x4d42; file.bfOffBits = sizeof(file) + sizeof(BITMAPINFOHEADER); file.bfSize = file.bfOffBits + w * h * 4;
     std::ofstream output(std::filesystem::path(path), std::ios::binary);
     output.write(reinterpret_cast<char*>(&file), sizeof(file)); output.write(reinterpret_cast<char*>(&info.bmiHeader), sizeof(info.bmiHeader));
     output.write(reinterpret_cast<char*>(pixels), w * h * 4);
     bool ok = output.good(); SelectObject(dc, old); DeleteObject(bitmap); DeleteDC(dc); ReleaseDC(mainWindow, screen); return ok;
+}
+// The effects beyond the window as pictures: the panel on a made-up desktop with each effect at
+// fixed times, composed without overlay windows (--demo-screenshot <base>.bmp --fx-frames).
+bool dumpFxFrames(const std::wstring& base) {
+    fxForce = true;
+    RECT client{}; GetClientRect(mainWindow, &client);
+    const int w = client.right, h = client.bottom;
+    auto grab = [&] {
+        std::vector<uint32_t> pixels(size_t(w) * size_t(h));
+        HDC screen = GetDC(mainWindow), dc = CreateCompatibleDC(screen);
+        BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(info.bmiHeader); info.bmiHeader.biWidth = w; info.bmiHeader.biHeight = -h;
+        info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32;
+        void* bits = nullptr; HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+        HGDIOBJ old = SelectObject(dc, bitmap);
+        renderPanel(dc, client); GdiFlush();
+        std::memcpy(pixels.data(), bits, pixels.size() * 4);
+        for (auto& p : pixels) p |= 0xFF000000u;
+        SelectObject(dc, old); DeleteObject(bitmap); DeleteDC(dc); ReleaseDC(mainWindow, screen);
+        return pixels;
+    };
+    const int W = w + px(320), H = h + px(300);
+    const RECT desk{0, 0, W, H};
+    const RECT panel{px(160), px(120), px(160) + w, px(120) + h};
+    const POINT tray{panel.right - px(70), H - px(22)};
+    bool ok = true;
+    auto write = [&](const std::wstring& name, const std::vector<uint32_t>& under, const bs::fx::Canvas* over, int ow, int oh) {
+        BITMAPINFOHEADER header{}; header.biSize = sizeof(header); header.biWidth = ow; header.biHeight = -oh; header.biPlanes = 1; header.biBitCount = 32;
+        std::vector<uint32_t> out = under;
+        if (over) for (size_t i = 0; i < out.size(); ++i) {
+            const uint32_t s = over->px[i], a = s >> 24, inv = 255 - a, d = out[i];
+            const uint32_t r = ((s >> 16) & 255) + ((d >> 16) & 255) * inv / 255, g = ((s >> 8) & 255) + ((d >> 8) & 255) * inv / 255, b = (s & 255) + (d & 255) * inv / 255;
+            out[i] = 0xFF000000u | (std::min<uint32_t>(r, 255) << 16) | (std::min<uint32_t>(g, 255) << 8) | std::min<uint32_t>(b, 255);
+        }
+        BITMAPFILEHEADER file{}; file.bfType = 0x4d42; file.bfOffBits = sizeof(file) + sizeof(header); file.bfSize = file.bfOffBits + DWORD(out.size() * 4);
+        std::ofstream output(std::filesystem::path(base + name), std::ios::binary);
+        output.write(reinterpret_cast<const char*>(&file), sizeof(file)); output.write(reinterpret_cast<const char*>(&header), sizeof(header));
+        output.write(reinterpret_cast<const char*>(out.data()), std::streamsize(out.size() * 4));
+        ok = ok && output.good();
+    };
+    // A desktop to show light against: a dim wallpaper with a taskbar strip.
+    auto desktop = [&](const std::vector<uint32_t>* panelPixels) {
+        std::vector<uint32_t> scene(size_t(W) * size_t(H));
+        for (int y = 0; y < H; ++y) for (int x = 0; x < W; ++x) {
+            const int r = 28 + 40 * y / H, g = 44 + 30 * x / W, b = 70 + 50 * (H - y) / H;
+            scene[size_t(y) * size_t(W) + size_t(x)] = y >= H - px(44) ? 0xFF1C1C20u : 0xFF000000u | uint32_t(r << 16) | uint32_t(g << 8) | uint32_t(b);
+        }
+        if (panelPixels) for (int y = 0; y < h; ++y)
+            std::memcpy(&scene[size_t(panel.top + y) * size_t(W) + size_t(panel.left)], &(*panelPixels)[size_t(y) * size_t(w)], size_t(w) * 4);
+        return scene;
+    };
+    const std::vector<uint32_t> look = grab();
+    const POINT tabPoint{panel.left + w / 4, panel.bottom - sp(14)}, switchPoint{panel.right - sp(34), panel.top + h / 2}, modePoint{panel.left + w / 2, panel.top + h / 3};
+    struct Scene { const wchar_t* name; double life; std::function<void(bs::fx::Stage&)> play; bool withPanel; };
+    const Scene scenes[] = {
+        {L"open", 900, [&](bs::fx::Stage& stage) { fxAddOpen(stage, panel, tray, 0); }, true},
+        {L"close", 560, [&](bs::fx::Stage& stage) { fxAddClose(stage, panel, tray, 0); }, false},
+        {L"toggle", 680, [&](bs::fx::Stage& stage) { fxAddToggle(stage, switchPoint, true, 0); }, true},
+        {L"choice", 740, [&](bs::fx::Stage& stage) { fxAddChoice(stage, modePoint, 0); }, true},
+        {L"tab", 660, [&](bs::fx::Stage& stage) { fxAddTab(stage, tabPoint, 0); }, true},
+        {L"mascot", 620, [&](bs::fx::Stage& stage) { fxAddMascot(stage, {panel.left + px(150), panel.top + px(10)}, 0); }, true},
+    };
+    for (const auto& scene : scenes) {
+        const auto under = desktop(scene.withPanel ? &look : nullptr);
+        bs::fx::Stage stage; stage.own(desk); stage.feather(px(40));
+        scene.play(stage);
+        for (int k = 0; k < 6; ++k) {
+            stage.render(scene.life * (.08 + k * .165));
+            write(std::wstring(L"_") + scene.name + L"_" + std::to_wstring(k) + L".bmp", under, &stage.canvas(), W, H);
+        }
+    }
+    {
+        // The theme change: the other theme lies underneath; the look just captured is wiped away.
+        const auto before = themeChoice;
+        themeChoice = theme.dark ? ui::ThemeChoice::light : ui::ThemeChoice::dark; applyTheme();
+        const std::vector<uint32_t> next = grab();
+        const auto under = desktop(&next);
+        bs::fx::Stage stage; stage.own(desk); stage.feather(px(40));
+        const POINT center{panel.right - px(60), panel.top + px(170)};
+        stage.reveal(look, w, h, {panel.left, panel.top}, center, std::hypot(double(w), double(h)) + px(90), 700, theme.halo, px(6), 0);
+        stage.add(bs::fx::burst(center, theme.glow, theme.halo, 30, px(130), fxCell(), 760, 5), 0, 40);
+        for (int k = 0; k < 6; ++k) {
+            stage.render(700 * (.04 + k * .16));
+            write(L"_theme_" + std::to_wstring(k) + L".bmp", under, &stage.canvas(), W, H);
+        }
+        themeChoice = before; applyTheme();
+    }
+    {
+        // Light round the screen's edge, on a screen of its own (smaller than a real one).
+        const int SW = px(1440), SH = px(900); // a 2880 x 1800 screen at 200%
+        std::vector<uint32_t> screen(size_t(SW) * size_t(SH));
+        for (int y = 0; y < SH; ++y) for (int x = 0; x < SW; ++x) screen[size_t(y) * size_t(SW) + size_t(x)] = 0xFF000000u | uint32_t((30 + 30 * y / SH) << 16) | uint32_t((44 + 26 * x / SW) << 8) | uint32_t(74 + 40 * (SH - y) / SH);
+        struct Show { const wchar_t* name; bs::fx::EdgeShow show; COLORREF color; double life, reach; int pulses; };
+        const Show shows[] = {{L"plug", bs::fx::EdgeShow::connect, theme.halo, 1500, 1, 1}, {L"unplug", bs::fx::EdgeShow::disconnect, theme.halo, 950, 1, 1},
+            {L"turbo", bs::fx::EdgeShow::burst, RGB(255, 122, 48), 680, 1, 1}, {L"silent", bs::fx::EdgeShow::burst, RGB(120, 170, 255), 900, .34, 1},
+            {L"low", bs::fx::EdgeShow::pulse, RGB(240, 82, 74), 1000, 1, 2}};
+        for (const auto& show : shows) {
+            bs::fx::EdgeLights lights; lights.layout({0, 0, SW, SH}, px(96));
+            lights.play(show.show, show.color, show.life, 0, show.reach, show.pulses);
+            for (int k = 0; k < 6; ++k) {
+                lights.render(show.life * (.08 + k * .165));
+                // The four strips placed on one canvas.
+                std::vector<uint32_t> over(size_t(SW) * size_t(SH), 0);
+                for (int i = 0; i < 4; ++i) {
+                    const RECT r = lights.strip(i); const auto& c = lights.canvas(i);
+                    for (int y = 0; y < c.h; ++y) std::memcpy(&over[size_t(r.top + y) * size_t(SW) + size_t(r.left)], c.px + size_t(y) * size_t(c.w), size_t(c.w) * 4);
+                }
+                bs::fx::Canvas canvas; canvas.px = over.data(); canvas.w = SW; canvas.h = SH;
+                write(std::wstring(L"_edge_") + show.name + L"_" + std::to_wstring(k) + L".bmp", screen, &canvas, SW, SH);
+            }
+        }
+    }
+    fxForce = false;
+    return ok;
 }
 int diagnostic(const std::wstring& path) {
     Collector collector; Snapshot state;
@@ -9068,6 +9646,37 @@ bool panelSelfTest(const std::wstring& path) {
         RECT client{}; GetClientRect(mainWindow, &client);
         const RECT first = tabRect(0, visibleTabs().size(), client);
         check("tabs_are_keys_along_the_bottom", first.top > client.bottom - tabBarHeight() && first.bottom < client.bottom);
+        // The page opens with its display: the reading in dot-matrix digits.
+        check("performance_page_opens_with_the_display", !visualBlocks.empty() && visualBlocks.front().kind == VBlock::Kind::display && !visualBlocks.front().value.empty());
+        // Effects beyond the window: the overlay shows while something moves and is gone after;
+        // light round the screen's edge the same. (The test's clock is fixed, so nothing is timing.)
+        const double clockBefore = motionClock;
+        fxForce = true; motionClock = 5000;
+        POINT origin{40, 40}; ClientToScreen(mainWindow, &origin);
+        fxToggle(origin, true);
+        const bool shown = fxOverlay.visible() && fxTimerOn && fxStage.active() && IsWindowVisible(fxOverlay.window()) &&
+            (GetWindowLongPtrW(fxOverlay.window(), GWL_EXSTYLE) & (WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE)) == (WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE);
+        motionClock = 5300; stepFx();
+        bool lit = false;
+        if (fxOverlay.visible()) for (int k = 0; k < fxOverlay.size().cx * fxOverlay.size().cy && !lit; ++k) lit = (fxOverlay.pixels()[k] >> 24) != 0;
+        motionClock = 7000; stepFx();
+        check("effects_overlay_shows_then_goes", shown && lit && !fxOverlay.visible() && !fxStage.active() && !fxTimerOn && GetForegroundWindow() != fxOverlay.window());
+        motionClock = 8000;
+        fxEdgePlay(bs::fx::EdgeShow::connect, theme.halo, 1500);
+        const bool running = fxEdge.active() && fxEdgeOverlay[0].visible() && fxEdgeOverlay[3].visible();
+        motionClock = 8400; stepFx();
+        motionClock = 9600; stepFx();
+        check("edge_lights_play_then_go", running && !fxEdge.active() && !fxEdgeOverlay[0].visible() && !fxEdgeOverlay[2].visible() && !fxTimerOn);
+        // The day/night wipe: the old look is laid over the panel and wiped away.
+        motionClock = 10000;
+        const bool wasDark = theme.dark;
+        const bool wiping = fxThemeReveal(ui::palette(wasDark ? ui::ThemeChoice::light : ui::ThemeChoice::dark));
+        const bool covering = wiping && fxOverlay.visible() && fxStage.active();
+        motionClock = 11000; stepFx();
+        check("theme_reveal_covers_then_clears", (!IsWindowVisible(mainWindow) && !wiping) || (covering && !fxOverlay.visible() && theme.dark == wasDark));
+        stopFx();
+        fxForce = false; motionClock = clockBefore;
+        check("effects_level_names_itself", rowValue(Row::effects) == tr(L"完整") && effectsLevel == 0);
     }
     SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
     check("settings_page_closes_on_return", inlinePage == InlinePage::none || inlineClosing);
@@ -9680,12 +10289,25 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
                 for (auto& b : visualBlocks) if (b.kind == VBlock::Kind::action && b.toggle >= 0) { b.toggle = 1 - b.toggle; break; }
                 for (auto& b : visualBlocks) if (b.kind == VBlock::Kind::segments && b.toggle >= 0 && !b.commands.empty()) { b.toggle = (b.toggle + 1) % int(b.commands.size()); break; }
                 for (auto& b : visualBlocks) if (b.kind == VBlock::Kind::action && b.toggle < 0 && !b.value.empty()) { b.value = L"5 min"; break; }
+                for (auto& b : visualBlocks) if (b.kind == VBlock::Kind::display) { b.value = L"12.4 W"; break; }
+                for (size_t k = 0; k < visualHits.size(); ++k) { // the pointer rests on the first command key and presses it
+                    const auto& hit = visualHits[k];
+                    if (hit.block >= visualBlocks.size() || visualBlocks[hit.block].kind != VBlock::Kind::action || visualBlocks[hit.block].toggle >= 0) continue;
+                    visualMouse = {hit.rect.left + (hit.rect.right - hit.rect.left) * 2 / 3, (hit.rect.top + hit.rect.bottom) / 2};
+                    visualHover = int(k); setFade(visualHoverFade, hit.block, 1, 110);
+                    visualRippleBlock = hit.block; visualRippleAt = visualMouse; visualRippleStart = t0 + 60;
+                    break;
+                }
                 for (int k = 1; k <= 22; ++k) {
                     motionClock = t0 + (k - 1) * 33.3;
                     wchar_t suffix[16]; swprintf(suffix, 16, L"_%02d.bmp", k);
                     shotOK = captureWindow(base + suffix) && shotOK;
                 }
                 motionClock = -1;
+            } else if (screenshot && option(L"--fx-frames")) {
+                std::wstring base = args[1];
+                if (base.size() > 4) base.resize(base.size() - 4);
+                shotOK = dumpFxFrames(base);
             } else shotOK = trayTest ? panelSelfTest(args[1]) : captureWindow(args[1]);
             DestroyWindow(window); continue;
         }
