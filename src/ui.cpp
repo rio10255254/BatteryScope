@@ -278,7 +278,47 @@ HICON makePercentIcon(int size, int percent, COLORREF badge, COLORREF edge, COLO
     DeleteObject(color); if (mask) DeleteObject(mask);
     return result;
 }
-void drawMascot(HDC dc, int x, int y, int unit, Mood mood, double level, int frame, const MascotColors& c) {
+HICON makeLevelIcon(int size, double fraction, COLORREF badge, COLORREF edge, COLORREF fill, int steps) {
+    if (size < 8) return nullptr;
+    fraction = std::clamp(fraction, 0.0, 1.0);
+    BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(info.bmiHeader); info.bmiHeader.biWidth = size;
+    info.bmiHeader.biHeight = -size; info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32; info.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP color = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!color || !bits) { if (color) DeleteObject(color); return nullptr; }
+    auto* pixels = static_cast<DWORD*>(bits);
+    auto argb = [](COLORREF c) { return 0xFF000000u | (DWORD(GetRValue(c)) << 16) | (DWORD(GetGValue(c)) << 8) | GetBValue(c); };
+    auto paint = [&](int left, int top, int right, int bottom, DWORD value) {
+        for (int y = std::max(0, top); y < std::min(size, bottom); ++y)
+            for (int x = std::max(0, left); x < std::min(size, right); ++x) pixels[y * size + x] = value;
+    };
+    std::fill(pixels, pixels + size * size, 0u); // transparent
+    const int corner = std::max(1, size / 16), pad = std::max(2, size / 6);
+    paint(corner, 0, size - corner, size, argb(edge)); paint(0, corner, size, size - corner, argb(edge));
+    paint(corner, corner, size - corner, size - corner, argb(badge));
+    const int inner = size - pad * 2;
+    const COLORREF dim = mix(badge, fill, .22);
+    if (steps > 0) {
+        const int gap = std::max(1, size / 16), bar = std::max(1, (inner - gap * (steps - 1)) / steps);
+        const int lit = int(std::lround(fraction * steps));
+        for (int k = 0; k < steps; ++k) {
+            const int height = std::max(2, inner * (k + 1) / steps), x = pad + k * (bar + gap);
+            paint(x, size - pad - height, x + bar, size - pad, argb(k < lit ? fill : dim));
+        }
+    } else {
+        paint(pad, pad, size - pad, size - pad, argb(dim));
+        paint(pad, size - pad - int(std::lround(inner * fraction)), size - pad, size - pad, argb(fill));
+    }
+    HBITMAP mask = CreateBitmap(size, size, 1, 1, nullptr);
+    std::vector<BYTE> zeros(size_t((size + 15) / 16 * 2 * size), 0);
+    if (mask) SetBitmapBits(mask, DWORD(zeros.size()), zeros.data());
+    ICONINFO icon{}; icon.fIcon = TRUE; icon.hbmColor = color; icon.hbmMask = mask;
+    HICON result = mask ? CreateIconIndirect(&icon) : nullptr;
+    DeleteObject(color); if (mask) DeleteObject(mask);
+    return result;
+}
+void drawMascot(HDC dc, int x, int y, int unit, Mood mood, double level, int frame, const MascotColors& c, int look) {
+    look = std::clamp(look, -1, 1);
     // Cells: o outline, b body (filled to the battery level), e face, c cheek,
     // s sweat, a accent (Zz or bolt). Columns 12-15 hold effects beside the body.
     std::string grid[MascotRows] = {
@@ -289,7 +329,7 @@ void drawMascot(HDC dc, int x, int y, int unit, Mood mood, double level, int fra
     const bool blink = frame == 1;
     // Eyes at columns 3-4 and 6-7, rows 5-6; mouth on row 8.
     auto eyes = [&](const char* top, const char* bottom) {
-        for (int i = 0; i < 6; ++i) { if (top[i] != '.') put(5, 3 + i, top[i]); if (bottom[i] != '.') put(6, 3 + i, bottom[i]); }
+        for (int i = 0; i < 6; ++i) { if (top[i] != '.') put(5, 3 + i + look, top[i]); if (bottom[i] != '.') put(6, 3 + i + look, bottom[i]); }
     };
     auto mouth = [&](const char* row8, const char* row9) {
         for (int i = 0; i < 6; ++i) { if (row8[i] != '.') put(8, 3 + i, row8[i]); if (row9 && row9[i] != '.') put(9, 3 + i, row9[i]); }
@@ -708,24 +748,46 @@ void spotlight(HDC dc, const RECT& key, float radius, POINT at, COLORREF c, doub
     g.Restore(state);
 }
 void ripple(HDC dc, const RECT& key, float radius, POINT at, COLORREF c, double progress) {
-    if (!graphicsToken || progress <= 0 || progress >= 1 || key.right <= key.left) return;
-    Canvas canvas(dc);
-    auto& g = canvas.g;
-    Gdiplus::GraphicsPath face; roundPath(face, rectF(key), radius);
-    Gdiplus::GraphicsState state = g.Save();
-    g.SetClip(&face);
-    // Far enough to pass the key's farthest corner.
-    double reach = 0;
-    for (const POINT corner : {POINT{key.left, key.top}, POINT{key.right, key.top}, POINT{key.left, key.bottom}, POINT{key.right, key.bottom}})
-        reach = std::max(reach, std::hypot(double(corner.x - at.x), double(corner.y - at.y)));
-    const double eased = 1 - (1 - progress) * (1 - progress);
-    const float r = float(reach * eased), width = float(std::max(2.0, (key.bottom - key.top) * .12 * (1 + progress)));
-    const BYTE alpha = BYTE(190 * (1 - progress));
-    Gdiplus::SolidBrush wash(color(c, BYTE(alpha / 5)));
-    g.FillEllipse(&wash, float(at.x) - r, float(at.y) - r, r * 2, r * 2);
-    Gdiplus::Pen pen(color(c, alpha), width);
-    g.DrawEllipse(&pen, float(at.x) - r, float(at.y) - r, r * 2, r * 2);
-    g.Restore(state);
+    // A soft wave, not a drawn ring: light that rises toward the wave's front and falls away at
+    // once beyond it, with a faint wash left behind; all of it thins as it spreads. Worked out
+    // per pixel into one scratch bitmap (a key is small) and laid on with a single blend.
+    const int w = int(key.right - key.left), h = int(key.bottom - key.top);
+    if (progress <= 0 || progress >= 1 || w <= 0 || h <= 0 || w > 4096 || h > 1024) return;
+    static HDC scratchDC = nullptr; static HBITMAP scratch = nullptr; static HGDIOBJ scratchOld = nullptr; static uint32_t* pixels = nullptr; static int scratchW = 0, scratchH = 0;
+    if (!scratch || scratchW < w || scratchH < h) {
+        if (!scratchDC) scratchDC = CreateCompatibleDC(nullptr);
+        if (scratch) { SelectObject(scratchDC, scratchOld); DeleteObject(scratch); scratch = nullptr; }
+        scratchW = std::max(scratchW, w); scratchH = std::max(scratchH, h);
+        BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(info.bmiHeader);
+        info.bmiHeader.biWidth = scratchW; info.bmiHeader.biHeight = -scratchH; info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32;
+        void* memory = nullptr;
+        scratch = scratchDC ? CreateDIBSection(scratchDC, &info, DIB_RGB_COLORS, &memory, nullptr, 0) : nullptr;
+        if (!scratch || !memory) { if (scratch) DeleteObject(scratch); scratch = nullptr; scratchW = scratchH = 0; return; }
+        pixels = static_cast<uint32_t*>(memory); scratchOld = SelectObject(scratchDC, scratch);
+    }
+    const double ax = at.x - key.left, ay = at.y - key.top;
+    double reach = 0; // far enough to pass the key's farthest corner
+    for (const double cx : {0.0, double(w)}) for (const double cy : {0.0, double(h)}) reach = std::max(reach, std::hypot(cx - ax, cy - ay));
+    const double eased = 1 - (1 - progress) * (1 - progress), front = reach * eased, fade = (1 - progress) * (1 - progress);
+    const double depth = std::max(10.0, h * .9), rise = depth * .28, peak = .34 * fade, wash = .05 * fade;
+    const double hw = w / 2.0, hh = h / 2.0, corner = std::min({double(radius), hw, hh});
+    const uint32_t cr = GetRValue(c), cg = GetGValue(c), cb = GetBValue(c);
+    for (int y = 0; y < h; ++y) {
+        uint32_t* row = pixels + size_t(y) * size_t(scratchW);
+        for (int x = 0; x < w; ++x) {
+            const double d = std::hypot(x + .5 - ax, y + .5 - ay);
+            double a = 0;
+            if (d < front) {
+                const double behind = front - d; // how far behind the wave's front
+                a = behind < rise ? peak * smoothStep(behind / rise) : behind < depth ? wash + (peak - wash) * (1 - smoothStep((behind - rise) / (depth - rise))) : wash;
+                a *= std::clamp(.5 - roundDistance(x + .5, y + .5, hw, hh, hw, hh, corner), 0.0, 1.0); // inside the key's rounded face
+            }
+            const uint32_t alpha = uint32_t(a * 255 + .5);
+            row[x] = alpha ? (alpha << 24) | ((cr * alpha / 255) << 16) | ((cg * alpha / 255) << 8) | (cb * alpha / 255) : 0;
+        }
+    }
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    GdiAlphaBlend(dc, key.left, key.top, w, h, scratchDC, 0, 0, w, h, blend);
 }
 void well(HDC dc, const RECT& r, float radius, const Palette& p) {
     if (r.right <= r.left || r.bottom <= r.top) return;

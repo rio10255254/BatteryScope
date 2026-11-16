@@ -47,7 +47,8 @@ constexpr UINT SampleMessage = WM_APP + 1, TrayMessage = WM_APP + 2, ActionMessa
     PopupClickMessage = WM_APP + 15, // a notification was clicked: wParam its BalloonTarget
     TuningDoneMessage = WM_APP + 16, // fan or power preset applied: wParam the status
     StabilityMessage = WM_APP + 17,  // 0: incidents found (see stab::news); 2: report built, lParam zipped
-    StabilityPingMessage = WM_APP + 18; // the stability thread checking that the panel's thread answers
+    StabilityPingMessage = WM_APP + 18, // the stability thread checking that the panel's thread answers
+    FrameMessage = WM_APP + 19;         // the frame clock: the display is about to show a new frame
 constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, DetailsId = 104,
     BackgroundId = 105, AllId = 106, StartupId = 107, HideId = 108, MenuId = 109,
     LanguageZhId = 110, LanguageEnId = 111, PowerDetailsId = 112, PowerModeId = 113,
@@ -306,8 +307,63 @@ void refreshPowerButton();
 std::wstring dynamicPill(); // "動態 · 閱讀" while dynamic saving runs on battery
 void closeInlinePage(bool immediate = false);
 void finishInlineClose();
+// ----- Frame clock -----
+// Animation is paced by the display, not by window timers. A window timer ticks every 15.6 ms
+// at best and drifts against the screen, so on a 120 Hz panel frames land unevenly and motion
+// judders. While something is moving (and only then) a thread waits for each pass of the
+// compositor (DwmFlush: once per refresh of the display, whatever its rate) and posts one frame
+// message; every animation of the panel steps on it. The next message is not posted until the
+// last one has been handled, so slow frames never queue up ahead of the pointer and the keys.
+constexpr UINT_PTR FrameFallbackTimer = 103;
+uint64_t frameSteppedAt = 0; // GetTickCount64() when the last frame was handled
+std::atomic<bool> frameWanted{false}, framePosted{false}, frameQuit{false};
+HANDLE frameWake = nullptr;
+std::thread frameThread;
+bool frameClockFailed = false;
+void frameLoop() {
+    // Where DwmFlush does not wait (no compositor: Wine, remote sessions), a timer paces instead.
+    HANDLE pace = CreateWaitableTimerExW(nullptr, nullptr, 0x00000002 /* high resolution */, TIMER_ALL_ACCESS);
+    LARGE_INTEGER frequency{}; QueryPerformanceFrequency(&frequency);
+    while (!frameQuit) {
+        if (!frameWanted) { WaitForSingleObject(frameWake, INFINITE); continue; }
+        LARGE_INTEGER before{}, after{}; QueryPerformanceCounter(&before);
+        const bool flushed = SUCCEEDED(DwmFlush());
+        QueryPerformanceCounter(&after);
+        const double waited = double(after.QuadPart - before.QuadPart) * 1000 / double(frequency.QuadPart);
+        if (!flushed || waited < 2) {
+            LARGE_INTEGER due{}; due.QuadPart = -LONGLONG((8 - std::max(0.0, waited)) * 10000);
+            if (pace && SetWaitableTimer(pace, &due, 0, nullptr, nullptr, FALSE)) WaitForSingleObject(pace, 20); else Sleep(8);
+        }
+        if (frameQuit) break;
+        if (frameWanted && mainWindow && !framePosted.exchange(true) && !PostMessageW(mainWindow, FrameMessage, 0, 0)) framePosted = false;
+    }
+    if (pace) CloseHandle(pace);
+}
+// Asks for frame messages until the panel's thread says nothing moves any more. False if the
+// clock could not be started (the caller falls back to a window timer).
+bool wantFrames() {
+    if (frameClockFailed) return false;
+    if (!frameThread.joinable()) {
+        frameWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        try { if (frameWake) frameThread = std::thread(frameLoop); } catch (...) {}
+        if (!frameThread.joinable()) { frameClockFailed = true; return false; }
+    }
+    if (!frameWanted.exchange(true)) {
+        SetEvent(frameWake);
+        // A slow timer stands behind the clock: should the compositor stop answering (the
+        // display asleep, a remote session), motion still advances and always finishes.
+        if (mainWindow) SetTimer(mainWindow, FrameFallbackTimer, 48, nullptr);
+    }
+    return true;
+}
+void stopFrameClock() {
+    if (!frameThread.joinable()) return;
+    frameQuit = true; frameWanted = false; SetEvent(frameWake);
+    frameThread.join();
+    CloseHandle(frameWake); frameWake = nullptr;
+}
 void armMotionTimer() {
-    if (!motionTimerRunning) motionTimerRunning = SetTimer(mainWindow, MotionTimer, USER_TIMER_MINIMUM, nullptr) != 0;
+    if (!motionTimerRunning) motionTimerRunning = wantFrames() || SetTimer(mainWindow, MotionTimer, USER_TIMER_MINIMUM, nullptr) != 0;
     if (!motionTimerRunning) {
         panelMotion.duration = 0;
         panelHeightMotion.duration = 0;
@@ -384,6 +440,13 @@ void card(HDC dc, RECT rect, COLORREF color, int radius) {
 void keycap(HDC dc, const RECT& rect, int radius, double lit, double pressed = 0, double hover = 0, double opacity = 1) {
     ui::keycap(dc, rect, float(sp(radius)), theme, lit, pressed, hover, opacity);
 }
+// Where the lit key of a tray is while it glides from choice `a` to choice `b` (f: 0 to 1). It
+// keeps the size of the nearer choice, so the same key bitmap serves the whole way.
+RECT glideBetween(const RECT& a, const RECT& b, double f) {
+    const RECT& like = f < .5 ? a : b;
+    const int x = int(std::lround(a.left + (b.left - a.left) * f)), y = int(std::lround(a.top + (b.top - a.top) * f));
+    return {x, y, x + int(like.right - like.left), y + int(like.bottom - like.top)};
+}
 // A dotted hairline: between the rows of a list, and after a section's label.
 void dottedRule(HDC dc, int left, int right, int y, COLORREF color) {
     const int unit = std::max(1, px(1)), pitch = unit * 4;
@@ -410,7 +473,7 @@ int acLine = [] { SYSTEM_POWER_STATUS s{}; return GetSystemPowerStatus(&s) && s.
 bool batterySaverOn() { SYSTEM_POWER_STATUS s{}; return GetSystemPowerStatus(&s) && (s.SystemStatusFlag & 1); }
 bool fxOutside() { return mainWindow && (fxForce || (canAnimate() && effectsLevel == 0 && !theme.highContrast && !batterySaverOn())); }
 int fxCell() { return std::max(3, px(4)); }
-void armFx() { if (!fxTimerOn) fxTimerOn = SetTimer(mainWindow, FxTimer, USER_TIMER_MINIMUM, nullptr) != 0; }
+void armFx() { if (!fxTimerOn) fxTimerOn = wantFrames() || SetTimer(mainWindow, FxTimer, USER_TIMER_MINIMUM, nullptr) != 0; }
 RECT panelScreenRect() {
     RECT panel = panelRest;
     if (IsRectEmpty(&panel)) GetWindowRect(mainWindow, &panel);
@@ -534,15 +597,18 @@ void fxEdgePlay(bs::fx::EdgeShow show, COLORREF color, double life, double reach
 }
 // The performance mode changed by hand: a burst along the bottom edge, cool and short for
 // silent, wide and warm for turbo.
+void playTrayShow(int kind, int level);
 void fxModeEdge(int level) {
     const uint64_t now = GetTickCount64();
     if (now - fxModeAt < 900) return; // one burst for a change that sets several things
     fxModeAt = now;
+    playTrayShow(3, std::clamp(level, 0, 2));
     if (level <= 0) fxEdgePlay(bs::fx::EdgeShow::burst, RGB(120, 170, 255), 900, .34);
     else if (level == 1) fxEdgePlay(bs::fx::EdgeShow::burst, RGB(236, 236, 242), 760, .6);
     else fxEdgePlay(bs::fx::EdgeShow::burst, RGB(255, 122, 48), 680, 1);
 }
 void fxPower(bool pluggedIn) {
+    playTrayShow(pluggedIn ? 1 : 2, 0);
     if (pluggedIn) fxEdgePlay(bs::fx::EdgeShow::connect, theme.halo, 1500);
     else fxEdgePlay(bs::fx::EdgeShow::disconnect, theme.halo, 950);
 }
@@ -1020,7 +1086,7 @@ double paintFade = 1;                                      // the block being pa
 COLORREF faded(COLORREF c) { return paintFade >= 1 ? c : blend(Surface, c, paintFade); }
 double easeOut(double t) { t = std::clamp(t, 0.0, 1.0); return 1 - (1 - t) * (1 - t) * (1 - t); }
 void armVisualTimer() {
-    if (visualView && !visualTimerOn) visualTimerOn = SetTimer(visualView, VisualTimer, USER_TIMER_MINIMUM, nullptr) != 0;
+    if (visualView && !visualTimerOn) visualTimerOn = wantFrames() || SetTimer(visualView, VisualTimer, USER_TIMER_MINIMUM, nullptr) != 0;
 }
 // How far block `index` has come in (0-1) while the page opens. The clean style does it in two
 // stages, as in the reference clip: each block moves into place quickly and evenly
@@ -1074,6 +1140,7 @@ std::vector<char> visualMoving;               // blocks still in motion when las
 // happens in block coordinates (x = 0 at the inset); hit areas, the pointer and repaint
 // rectangles are in the view's client coordinates.
 int visualInset() { return sp(14); }
+Transition visualBounce; // the page giving at an end of its scroll: from = how far (px, signed)
 int visualWidth(const RECT& client) { return int(client.right) - sp(30); }
 RECT visualDirty{};
 void addVisualDirty(const RECT& r) {
@@ -1143,6 +1210,7 @@ Arrival arrival(double since, int direction) {
 std::map<int, std::pair<double, int>> visualChangedAt;
 double tabChangedAt = -1; int tabDirection = 1;
 double mascotHopAt = -1; // motionNow() when the mascot was last poked
+double titleDecodeAt = -1; // motionNow() when a page's title began to decode
 bool heroMoving = false;  // the battery tab's digits are counting or scanning in
 // The keycap switch from the reference clip: a key in a well; on, it sits at the right and is
 // lit from inside. Pressed it stretches toward where it will go; moving, it lifts; landing,
@@ -1285,9 +1353,18 @@ void ledRow(HDC dc, const RECT& r, const std::vector<std::pair<double, COLORREF>
     }
 }
 // Section labels are quiet, and a dotted rule runs on from the label to the edge.
-void drawEngraved(HDC dc, const std::wstring& text, RECT r, COLORREF color) {
+// `run` 0-1: as a page opens the rule runs out from the label behind a lit head.
+void drawEngraved(HDC dc, const std::wstring& text, RECT r, COLORREF color, double run = 1) {
     drawText(dc, text, r, color, strongFont);
-    dottedRule(dc, int(r.left) + textWidth(dc, text, strongFont) + sp(10), int(r.right), (int(r.top) + int(r.bottom)) / 2, blend(Surface, color, .38));
+    run = std::clamp(run, 0.0, 1.0);
+    const int from = int(r.left) + textWidth(dc, text, strongFont) + sp(10), y = (int(r.top) + int(r.bottom)) / 2;
+    const int unit = std::max(1, px(1)), pitch = unit * 4, count = std::max(0, (int(r.right) - from) / pitch), shown = int(std::lround(count * run));
+    const COLORREF dot = blend(Surface, color, .38);
+    dottedRule(dc, from, from + shown * pitch, y, dot);
+    if (run < 1 && keyLook()) for (int k = 0; k < 4 && shown - 1 - k >= 0; ++k) {
+        const int x = from + (shown - 1 - k) * pitch;
+        fill(dc, {x, y, x + unit, y + unit}, blend(theme.glow, dot, k / 4.0));
+    }
 }
 double benchKinds[16] = {}; bool benchOn = false; // --paint-bench: time per kind of block
 bool visualLive = false; // painting the view on screen (not a capture): changes may throw sparks
@@ -1308,7 +1385,9 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
     const RECT lightArea{-inset, -30000, int(client.right) - inset, 30000};
     visualAnimating = false;
     if (visualEnterAt >= 0 && now - visualEnterAt > 32.0 * 12 + 300) visualEnterAt = -1;
-    int y = -visualScroll;
+    // Springing back from an end: out fast, back slowly.
+    const int bounce = visualBounce.active(now) ? int(std::lround(visualBounce.from * std::sin(3.14159265 * std::pow(visualBounce.progress(now), .45)))) : 0;
+    int y = -visualScroll + bounce;
     visualHits.clear(); visualPlots.clear();
     visualSpans.assign(visualBlocks.size(), {0, 0});
     if (visualMoving.size() != visualBlocks.size()) visualMoving.assign(visualBlocks.size(), 1);
@@ -1355,7 +1434,7 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
         auto keyLight = [&](const RECT& key, int radius, double hot) {
             if (!keyLook()) return;
             const POINT mouse{pointer.x, pointer.y + rise};
-            if (hot > 0 && PtInRect(&key, mouse)) ui::spotlight(dc, key, float(sp(radius)), mouse, theme.glow, (theme.dark ? .22 : .5) * hot * paintFade, sp(64));
+            if (hot > 0 && PtInRect(&key, mouse)) ui::spotlight(dc, key, float(sp(radius)), mouse, theme.glow, (theme.dark ? .13 : .4) * hot * paintFade, sp(72));
             const POINT pressed{rippleAt.x, rippleAt.y + rise};
             if (rippleT > 0 && rippleT < 1 && PtInRect(&key, pressed)) ui::ripple(dc, key, float(sp(radius)), pressed, theme.glow, rippleT);
         };
@@ -1382,7 +1461,7 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
             break;
         }
         case VBlock::Kind::heading:
-            drawEngraved(dc, b.title, {sp(4), top + h - sp(22), width, top + h - sp(4)}, Muted);
+            drawEngraved(dc, b.title, {sp(4), top + h - sp(22), width, top + h - sp(4)}, Muted, settleEase(move));
             break;
         case VBlock::Kind::note:
             drawText(dc, b.text, {sp(4), top, width - sp(4), top + h}, Muted, smallFont, DT_LEFT | DT_WORDBREAK);
@@ -1614,15 +1693,26 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
                     if (motion.active) visualAnimating = true;
                 }
             }
+            // Only the chosen key stands up, lit, and it glides to a new choice; another key
+            // rises under the pointer.
             for (int k = 0; k < n; ++k) {
                 const RECT key = segmentKey(tray, n, k);
                 const int index = int(hitsBefore) + k;
                 const double lit = b.toggle >= 0 ? std::clamp(1 - std::abs(at - k), 0.0, 1.0) : 0.0;
                 const double hot = index == visualHover || index == visualFocus ? 1.0 : 0.0;
-                // Only the chosen key stands up, lit; another rises under the pointer.
-                keycap(dc, key, 10, lit * paintFade, lit, hot * (1 - lit), std::max(lit, hot));
-                if (std::max(hot, lit) > 0) keyLight(key, 10, std::max(hot, lit));
-                if (k == b.toggle && motion.glow > 0) ui::drawRimLight(dc, key, float(sp(10)), theme.rim, motion.angle, motion.glow * .8 * paintFade);
+                if (hot * (1 - lit) > 0) { keycap(dc, key, 10, 0, 0, 1, hot * (1 - lit)); keyLight(key, 10, hot); }
+            }
+            if (b.toggle >= 0) {
+                const int from = std::clamp(int(std::floor(at)), 0, n - 1), to = std::min(n - 1, from + 1);
+                const RECT thumb = glideBetween(segmentKey(tray, n, from), segmentKey(tray, n, to), std::clamp(at - from, 0.0, 1.0));
+                keycap(dc, thumb, 10, paintFade, 1, 0, paintFade);
+                keyLight(thumb, 10, 1);
+                if (motion.glow > 0) ui::drawRimLight(dc, thumb, float(sp(10)), theme.rim, motion.angle, motion.glow * .8 * paintFade);
+            }
+            for (int k = 0; k < n; ++k) {
+                const RECT key = segmentKey(tray, n, k);
+                const int index = int(hitsBefore) + k;
+                const double lit = b.toggle >= 0 ? std::clamp(1 - std::abs(at - k), 0.0, 1.0) : 0.0;
                 if (index == visualFocus && focused) outline(dc, key, Green, 10, 2.0f);
                 const int down = int(std::lround(lit * sp(1)));
                 const COLORREF labelInk = theme.highContrast ? (lit > .5 ? theme.selectedInk : Ink) : blend(Muted, theme.accentInk, lit);
@@ -1766,7 +1856,7 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
         const auto [top, h] = visualSpans[i];
         addVisualDirty({0, top - sp(18), client.right, visualBlocks[i].kind == VBlock::Kind::fold ? client.bottom : top + h + sp(18)});
     }
-    visualContent = y + visualScroll;
+    visualContent = y + visualScroll - bounce;
     SetViewportOrgEx(dc, clientOrigin.x, clientOrigin.y, nullptr);
     // A thin scroll indicator on the right when the page is taller than the view: it shows while
     // scrolling (and briefly when a page opens or the pointer comes near), then fades.
@@ -1797,9 +1887,16 @@ void scrollVisual(int to) {
 Transition visualScrollMotion;
 void scrollVisualSmooth(int to) {
     RECT r{}; GetClientRect(visualView, &r);
-    const int target = std::clamp(to, 0, std::max(0, visualContent - int(r.bottom)));
+    const int limit = std::max(0, visualContent - int(r.bottom));
+    const int target = std::clamp(to, 0, limit);
     if (!canAnimate()) { visualScrollMotion.duration = 0; scrollVisual(target); return; }
     const double now = motionNow();
+    // Asked to go past an end it is already at: the page gives a little and springs back.
+    if (to != target && visualScroll == target && limit > 0 && !visualBounce.active(now)) {
+        visualBounce.from = to < 0 ? sp(16) : -sp(16); visualBounce.to = 0; visualBounce.started = now; visualBounce.duration = 300; visualBounce.tangent = 0;
+        armVisualTimer(); InvalidateRect(visualView, nullptr, FALSE);
+        return;
+    }
     if (!visualScrollMotion.active(now)) { visualScrollMotion.from = visualScrollMotion.to = visualScroll; visualScrollMotion.duration = 0; }
     visualScrollMotion.move(target, now, 190);
     armVisualTimer();
@@ -1820,24 +1917,31 @@ void activateVisualHit(HWND window, size_t index) {
     actionAnchor = anchor; actionAnchored = true;
     PostMessageW(GetParent(window), WM_COMMAND, hit.command, 0);
 }
+// One frame of the view's motion: only the blocks in motion repaint; the whole view only while
+// it scrolls.
+void stepVisual() {
+    const HWND window = visualView;
+    if (!window) { visualTimerOn = false; return; }
+    bool scrolling = false;
+    if (visualScrollMotion.duration) {
+        const double now = motionNow();
+        scrollVisual(int(std::lround(visualScrollMotion.value(now))));
+        if (visualScrollMotion.active(now)) scrolling = true; else visualScrollMotion.duration = 0;
+    }
+    if (visualBounce.duration) { // springing back from an end
+        if (visualBounce.active(motionNow())) scrolling = true; else visualBounce.duration = 0;
+        InvalidateRect(window, nullptr, FALSE);
+    }
+    if (scrolling) InvalidateRect(window, nullptr, FALSE);
+    else if (!IsRectEmpty(&visualDirty)) InvalidateRect(window, &visualDirty, FALSE);
+    UpdateWindow(window);
+    if ((!visualAnimating && !scrolling) || hidden) { KillTimer(window, VisualTimer); visualTimerOn = false; }
+}
 LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     switch (message) {
     case WM_ERASEBKGND: return 1;
     case WM_TIMER:
-        if (wp == VisualTimer) {
-            bool scrolling = false;
-            if (visualScrollMotion.duration) {
-                const double now = motionNow();
-                scrollVisual(int(std::lround(visualScrollMotion.value(now))));
-                if (visualScrollMotion.active(now)) scrolling = true; else visualScrollMotion.duration = 0;
-            }
-            // Only the blocks in motion repaint; the whole view only while it scrolls.
-            if (scrolling) InvalidateRect(window, nullptr, FALSE);
-            else if (!IsRectEmpty(&visualDirty)) InvalidateRect(window, &visualDirty, FALSE);
-            UpdateWindow(window);
-            if ((!visualAnimating && !scrolling) || hidden) { KillTimer(window, VisualTimer); visualTimerOn = false; }
-            return 0;
-        }
+        if (wp == VisualTimer) { stepVisual(); return 0; }
         if (wp == ScrollFadeTimer) {
             KillTimer(window, ScrollFadeTimer);
             RECT r{}; GetClientRect(window, &r); r.left = r.right - sp(16);
@@ -2149,17 +2253,29 @@ void drawTabs(HDC dc, RECT client) {
         card(dc, tray, Surface, 16);
     }
     const ui::LightBounds inTray(dc, [&] { RECT tray = tabStrip(client); InflateRect(&tray, sp(5), sp(5)); return tray; }(), true);
+    // Only the open tab's key stands up, lit, and it glides to the tab that is opened; another
+    // key rises under the pointer.
+    for (size_t i = 0; i < tabs.size(); ++i) {
+        const RECT r = tabRect(i, tabs.size(), client);
+        const double lit = std::clamp(1 - std::abs(at - double(i)), 0.0, 1.0);
+        const double hot = int(i) == tabHover ? 1.0 : 0.0;
+        if (hot * (1 - lit) > 0) keycap(dc, r, 12, 0, 0, 1, hot * (1 - lit));
+    }
+    {
+        const size_t from = size_t(std::floor(at)), to = std::min(tabs.size() - 1, from + 1);
+        const RECT thumb = glideBetween(tabRect(from, tabs.size(), client), tabRect(to, tabs.size(), client), std::clamp(at - double(from), 0.0, 1.0));
+        keycap(dc, thumb, 12, 1, 1, 0);
+        if (motion.glow > 0) ui::drawRimLight(dc, thumb, float(sp(12)), theme.rim, motion.angle, motion.glow * .8);
+    }
     for (size_t i = 0; i < tabs.size(); ++i) {
         RECT r = tabRect(i, tabs.size(), client);
         const double lit = std::clamp(1 - std::abs(at - double(i)), 0.0, 1.0);
         const double hot = int(i) == tabHover ? 1.0 : 0.0;
-        keycap(dc, r, 12, lit, lit, hot * (1 - lit), std::max(lit, hot)); // only the open tab's key stands up
         if (keyLook()) {
-            if (hot > 0 && PtInRect(&r, tabMouse)) ui::spotlight(dc, r, float(sp(12)), tabMouse, theme.glow, theme.dark ? .22 : .5, sp(48));
+            if (hot > 0 && PtInRect(&r, tabMouse)) ui::spotlight(dc, r, float(sp(12)), tabMouse, theme.glow, theme.dark ? .13 : .4, sp(52));
             const double rippleT = tabRippleStart >= 0 && int(i) == tabRippleIndex ? (now - tabRippleStart) / 420.0 : -1;
             if (rippleT > 0 && rippleT < 1) ui::ripple(dc, r, float(sp(12)), tabRippleAt, theme.glow, rippleT);
         }
-        if (i == activeIndex && motion.glow > 0) ui::drawRimLight(dc, r, float(sp(12)), theme.rim, motion.angle, motion.glow * .8);
         OffsetRect(&r, 0, int(std::lround(lit * sp(1))));
         const COLORREF ink = theme.highContrast ? (lit > .5 ? theme.selectedInk : Ink) : blend(blend(Muted, Ink, hot * .6), theme.accentInk, lit);
         int rows = 0; const char* const* icon = tabIcon(tabs[i], rows);
@@ -2243,6 +2359,7 @@ struct Popup {
     COLORREF color = 0;             // accent; 0 is the theme's
     BalloonTarget target = BalloonTarget::none;
     Transition shown;               // 0 hidden, 1 resting in place
+    Transition levelMotion;         // osd: the bar gliding to a new level
     uint64_t hideAt = 0;            // GetTickCount64() when it starts to leave
     bool hover = false, closeHot = false, timer = false;
     RECT rest{};                    // screen position when shown
@@ -2279,7 +2396,10 @@ void paintPopup(HDC dc, RECT r, const Popup& p) {
         // The level as a row of LEDs in a well.
         const RECT track{r.left + sp(16), r.top + sp(36), r.right - sp(16), r.top + sp(36) + sp(14)};
         ui::well(dc, track, float(sp(5)), theme);
-        ledRow(dc, {track.left + sp(4), track.top + sp(4), track.right - sp(4), track.bottom - sp(4)}, {{std::clamp(p.level / 100.0, 0.0, 1.0), light}});
+        const double now = motionNow();
+        const bool gliding = p.levelMotion.active(now);
+        ledRow(dc, {track.left + sp(4), track.top + sp(4), track.right - sp(4), track.bottom - sp(4)},
+            {{std::clamp((gliding ? p.levelMotion.value(now) : double(p.level)) / 100.0, 0.0, 1.0), light}}, gliding ? 1.0 : 0.0);
         break;
     }
     case PopupKind::notice: {
@@ -2318,7 +2438,21 @@ void placePopup(Popup& p, double now) {
     SetLayeredWindowAttributes(p.window, 0, BYTE(std::clamp(int(std::lround(v * 248)), 0, 248)), LWA_ALPHA);
     SetWindowPos(p.window, HWND_TOPMOST, p.rest.left, p.rest.top + rise, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
 }
-void armPopup(Popup& p, UINT ms) { SetTimer(p.window, PopupTimer, ms, nullptr); p.timer = true; }
+void armPopup(Popup& p, UINT ms) {
+    SetTimer(p.window, PopupTimer, ms, nullptr); p.timer = true;
+    if (ms == USER_TIMER_MINIMUM) wantFrames(); // on the move: placed on every frame of the display
+}
+// Popups on their way in or out move with the display's frames. True while any is moving.
+bool stepPopups(double now) {
+    bool moving = false;
+    for (Popup* p : {&osdPopup, &noticePopup, &notifyPopup})
+        if (p->window && p->timer && p->shown.active(now)) { placePopup(*p, now); moving = true; }
+    if (osdPopup.window && osdPopup.levelMotion.duration) { // the key display's bar on its way to a new level
+        InvalidateRect(osdPopup.window, nullptr, FALSE);
+        if (osdPopup.levelMotion.active(now)) moving = true; else osdPopup.levelMotion.duration = 0;
+    }
+    return moving;
+}
 void hidePopup(Popup& p) {
     if (!p.window || !IsWindowVisible(p.window) || p.shown.to == 0) return;
     p.shown.move(0, motionNow(), canAnimate() ? 170 : 0);
@@ -2399,6 +2533,13 @@ void showPopup(Popup& p, RECT rest, uint64_t ms) {
     armPopup(p, USER_TIMER_MINIMUM);
 }
 void showOsd(const std::wstring& text, int level = -1, COLORREF color = 0) {
+    {
+        // Still showing a level: the bar glides to the new one. Otherwise it starts there.
+        const double now = motionNow();
+        const bool showing = osdPopup.window && IsWindowVisible(osdPopup.window) && osdPopup.shown.to > 0 && osdPopup.level >= 0 && level >= 0;
+        if (!showing) { osdPopup.levelMotion = {}; osdPopup.levelMotion.from = osdPopup.levelMotion.to = level; }
+        else { osdPopup.levelMotion.quick = true; osdPopup.levelMotion.move(level, now, canAnimate() ? 150 : 0); }
+    }
     osdPopup.body = text; osdPopup.level = level; osdPopup.color = color;
     // Bottom centre of the screen in use, where Windows shows its own volume display.
     MONITORINFO monitor{}; monitor.cbSize = sizeof(monitor);
@@ -2641,11 +2782,50 @@ HICON currentTrayIcon(HICON* retired) {
     trayIcon = next; trayIconKey = key;
     return trayIcon;
 }
+// ----- The tray icon's short shows -----
+// Feedback where the panel is not: for a moment the tray icon stops showing the percentage and
+// shows what just happened. The charger going in fills it three times, the charger coming out
+// drains it once, and a performance mode chosen by hand shows as one, two or three bars.
+constexpr UINT_PTR TrayShowTimer = 102;
+struct TrayPlay { int kind = 0; double startedAt = 0; int level = 0; } trayShow; // kind: 1 charger in, 2 charger out, 3 mode (level 0-2)
+double trayShowLife(int kind) { return kind == 1 ? 1500 : kind == 2 ? 800 : 1200; }
+// The icon for a show `t` ms in (the caller destroys it); null when the show is over.
+HICON trayShowIcon(const TrayPlay& show, double t, int size) {
+    if (!show.kind || t < 0 || t >= trayShowLife(show.kind)) return nullptr;
+    if (show.kind == 1) return ui::makeLevelIcon(size, std::min(1.0, std::fmod(t, 500.0) / 400.0), RGB(16, 44, 36), RGB(72, 196, 156), RGB(96, 226, 180));
+    if (show.kind == 2) return ui::makeLevelIcon(size, 1 - settleEase(t / 700), RGB(36, 46, 58), RGB(120, 134, 148), RGB(206, 216, 228));
+    static const COLORREF fills[] = {RGB(120, 170, 255), RGB(232, 236, 244), RGB(255, 132, 58)};
+    const int level = std::clamp(show.level, 0, 2);
+    return ui::makeLevelIcon(size, std::min(1.0, t / 240) * (level + 1) / 3.0, RGB(28, 32, 42), blend(RGB(28, 32, 42), fills[level], .6), fills[level], 3);
+}
+bool updateTray(bool add);
+void stepTrayShow() {
+    const double t = motionNow() - trayShow.startedAt;
+    HICON icon = trayAdded ? trayShowIcon(trayShow, t, GetSystemMetricsForDpi(SM_CXSMICON, dpi)) : nullptr;
+    if (!icon) { // over: the percentage comes back
+        KillTimer(mainWindow, TrayShowTimer);
+        const bool was = trayShow.kind != 0;
+        trayShow.kind = 0;
+        if (was && trayAdded) updateTray(false);
+        return;
+    }
+    NOTIFYICONDATAW data{}; data.cbSize = sizeof(data); data.hWnd = mainWindow; data.uID = 1;
+    data.uFlags = NIF_ICON; data.hIcon = icon;
+    Shell_NotifyIconW(NIM_MODIFY, &data);
+    DestroyIcon(icon); // the shell keeps its own copy
+}
+void playTrayShow(int kind, int level) {
+    if (!trayAdded || isolatedPreview || !mainWindow || !canAnimate() || effectsLevel != 0) return;
+    trayShow = {kind, motionNow(), level};
+    SetTimer(mainWindow, TrayShowTimer, 66, nullptr);
+    stepTrayShow();
+}
 bool updateTray(bool add) {
     if (isolatedPreview) return false;
     NOTIFYICONDATAW data{}; data.cbSize = sizeof(data); data.hWnd = mainWindow; data.uID = 1;
     HICON retired = nullptr;
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP; data.uCallbackMessage = TrayMessage; data.hIcon = currentTrayIcon(&retired);
+    if (trayShow.kind && !add) data.uFlags &= ~UINT(NIF_ICON); // a show is playing: it puts the percentage back itself
     wcsncpy_s(data.szTip, trayText().c_str(), _TRUNCATE);
     const bool shown = Shell_NotifyIconW(add ? NIM_ADD : NIM_MODIFY, &data) != FALSE;
     if (retired) DestroyIcon(retired); // the shell keeps its own copy of the new icon
@@ -2808,6 +2988,13 @@ void stepMotion(double now) {
         RECT client{}; GetClientRect(mainWindow, &client);
         RECT hero{0, sp(70), client.right, sp(184)};
         if (!hidden) { InvalidateRect(mainWindow, &hero, FALSE); active = true; } else heroMoving = false;
+    }
+    if (titleDecodeAt >= 0) {
+        // A page's title decoding: only its line repaints.
+        RECT client{}; GetClientRect(mainWindow, &client);
+        RECT line{0, sp(82), client.right, sp(122)};
+        if (!hidden) InvalidateRect(mainWindow, &line, FALSE);
+        if (now - titleDecodeAt < 360 && !hidden) active = true; else titleDecodeAt = -1;
     }
     if (mascotHopAt >= 0) {
         // The mascot's hop: only the header repaints.
@@ -3258,9 +3445,9 @@ void drawButton(const DRAWITEMSTRUCT& item) {
     bool choice = id == BackgroundId || id == AllId || id == EcoToggleId || id == PerfAppToggleId;
     for (HWND mode : modeButtons) choice |= mode == item.hwndItem;
     const bool filter = id == BackgroundId || id == AllId; // filters stay quiet when on: an LED, not a lit key
-    const double standing = disabled ? 0.0 : filter ? std::max(hover, press) : choice ? std::max({lit, hover, press}) : 1.0;
     const double keyLit = filter ? 0.0 : lit;
-    if (disabled && !theme.highContrast) outline(dc, key, blend(Background, Muted, .22), 11);
+    const double standing = disabled ? (keyLit > 0 ? 1.0 : 0.0) : filter ? std::max(hover, press) : choice ? std::max({lit, hover, press}) : 1.0; // a choice that is on stays lit even where it cannot be changed
+    if (disabled && keyLit <= 0 && !theme.highContrast) outline(dc, key, blend(Background, Muted, .22), 11);
     keycap(dc, key, id == MenuId || id == HideId ? 10 : 11, keyLit, std::max(press, keyLit), hover * (1 - keyLit), theme.highContrast ? 1.0 : standing);
     const int down = int(std::lround(std::max(press, keyLit) * sp(1)));
     RECT face = key; OffsetRect(&face, 0, down);
@@ -3360,6 +3547,42 @@ bool fullPanelPage(InlinePage page) {
         page == InlinePage::lab || page == InlinePage::settings || page == InlinePage::dynamic || page == InlinePage::goal ||
         page == InlinePage::performance || page == InlinePage::stability || page == InlinePage::confirm || page == InlinePage::error;
 }
+// The mascot watches the pointer while it is over the panel: its eyes turn a cell toward it.
+int mascotLook = 0;
+int mascotLookNow() {
+    if (suppressMotion || isolatedPreview || !canAnimate() || hidden || !mainWindow || IsRectEmpty(&mascotRect)) return 0;
+    POINT at{}; RECT panel{};
+    if (!GetCursorPos(&at) || !GetWindowRect(mainWindow, &panel) || !PtInRect(&panel, at)) return 0;
+    ScreenToClient(mainWindow, &at);
+    const int mid = (mascotRect.left + mascotRect.right) / 2;
+    return at.x < mid - sp(36) ? -1 : at.x > mid + sp(36) ? 1 : 0;
+}
+void watchPointer() {
+    if (!showMascot || IsRectEmpty(&mascotRect) || mascotLookNow() == mascotLook) return;
+    RECT r = mascotRect; InflateRect(&r, sp(2), sp(8));
+    InvalidateRect(mainWindow, &r, FALSE);
+}
+// A title part way through decoding: the first `settled` characters are final, the rest are
+// stand-ins of the same kind (so the width hardly moves) that change every 45 ms.
+std::wstring decodedTitle(const std::wstring& title, double elapsed, size_t& settled) {
+    const size_t n = title.size();
+    settled = n;
+    if (elapsed >= 340 || n == 0) return title;
+    static const std::wstring han = L"效能省電池硬體實驗設定", upper = L"ABDEGHKMNPRSUVXZ", lower = L"abdeghkmnprsuvxz", digits = L"0123456789";
+    std::wstring shown = title;
+    const unsigned beat = unsigned(std::max(0.0, elapsed) / 45);
+    for (size_t i = 0; i < n; ++i) {
+        const double due = 70 + 230.0 * double(i) / double(std::max<size_t>(1, n - 1));
+        if (elapsed >= due) continue;
+        settled = std::min(settled, i);
+        const wchar_t c = title[i];
+        const std::wstring* pool = c >= 0x2E80 ? &han : iswupper(c) ? &upper : iswlower(c) ? &lower : iswdigit(c) ? &digits : nullptr;
+        if (!pool) continue;
+        unsigned h = (unsigned(i) + 1) * 2654435761u ^ (beat + 1) * 40503u; h ^= h >> 13; h *= 2246822519u; h ^= h >> 16;
+        shown[i] = (*pool)[h % pool->size()];
+    }
+    return shown;
+}
 void paint(HDC dc, RECT bounds) {
     fill(dc, bounds, Background);
     const ui::LightBounds lightBounds(dc, bounds);
@@ -3377,8 +3600,9 @@ void paint(HDC dc, RECT bounds) {
             const auto mood = currentMood();
             const double hop = mascotHopAt >= 0 ? std::clamp((motionNow() - mascotHopAt) / 360.0, 0.0, 1.0) : 1.0;
             const int lift = hop < 1 ? int(std::lround(std::sin(3.14159265 * hop) * sp(6))) : 0;
-            ui::drawMascot(dc, left, sp(9) - lift, unit, mood, mascotLevel(), sampleTick % 5 == 4 || hop < 1 ? 1 : 0, mascotColors(mood));
             mascotRect = {left, sp(9), left + ui::MascotCells * unit, sp(9) + ui::MascotRows * unit};
+            mascotLook = mascotLookNow();
+            ui::drawMascot(dc, left, sp(9) - lift, unit, mood, mascotLevel(), sampleTick % 5 == 4 || hop < 1 ? 1 : 0, mascotColors(mood), mascotLook);
         }
     }
     drawText(dc, subtitle, {margin, sp(40), w - (english ? sp(136) : sp(116)), sp(62)}, Muted, smallFont);
@@ -3388,7 +3612,26 @@ void paint(HDC dc, RECT bounds) {
     const int top = listTop();
     if (fullPage) {
         // A page sits on the panel's face under its title; no card around it.
-        drawText(dc, inlineTitle, {margin, sp(86), right, sp(118)}, Ink, titleFont, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+        {
+            // A new page's title decodes: its characters flicker through others, in the
+            // panel's light, and settle one after another from the left.
+            static std::wstring shownTitle;
+            if (inlineTitle != shownTitle) {
+                shownTitle = inlineTitle;
+                titleDecodeAt = canAnimate() && !hidden && keyLook() ? motionNow() : -1;
+                if (titleDecodeAt >= 0) armMotionTimer();
+            }
+            const RECT at{margin, sp(86), right, sp(118)};
+            const double elapsed = titleDecodeAt >= 0 ? motionNow() - titleDecodeAt : 1e9;
+            size_t settled = inlineTitle.size();
+            const std::wstring shown = decodedTitle(inlineTitle, elapsed, settled);
+            if (settled >= shown.size()) drawText(dc, inlineTitle, at, Ink, titleFont, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            else {
+                const std::wstring head = shown.substr(0, settled);
+                drawText(dc, head, at, Ink, titleFont, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+                drawText(dc, shown.substr(settled), {at.left + (settled ? textWidth(dc, head, titleFont) : 0), at.top, at.right, at.bottom}, Green, titleFont, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
+            }
+        }
         if (inlinePage == InlinePage::powerMode) {
             const bool plugged = pluggedInNow();
             const std::wstring now = effectiveMode == EffectiveMode::unknown ? tr(L"目前生效：無法讀取") :
@@ -8221,6 +8464,15 @@ std::wstring controlTip(HWND control) {
     if (control == killButton) return tr(L"強制結束前會再次確認，未儲存資料可能遺失");
     return tr(L"選擇宿主內要停止的服務，不結束整個宿主");
 }
+// One frame: everything in motion takes its step. When nothing moves any more the clock stops.
+void stepFrame() {
+    frameSteppedAt = GetTickCount64();
+    if (motionTimerRunning) stepMotion(motionNow());
+    if (visualTimerOn) stepVisual();
+    if (fxTimerOn) stepFx();
+    const bool popups = stepPopups(motionNow());
+    if (!motionTimerRunning && !visualTimerOn && !fxTimerOn && !popups) frameWanted = false;
+}
 LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     if (message == taskbarCreated && taskbarCreated) { trayAdded = updateTray(true); if (!trayAdded && hidden) showMain(); return 0; }
     switch (message) {
@@ -8337,9 +8589,16 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     }
     case WM_SIZE:
         if (wp == SIZE_MINIMIZED) hideMain(); else layout(); return 0;
+    case FrameMessage: stepFrame(); framePosted = false; return 0; // the display is about to show a frame
     case WM_TIMER:
+        if (wp == FrameFallbackTimer) {
+            if (!frameWanted) KillTimer(window, FrameFallbackTimer);
+            else if (GetTickCount64() - frameSteppedAt > 40) stepFrame(); // the clock has gone quiet
+            return 0;
+        }
         if (wp == MotionTimer) { stepMotion(motionNow()); return 0; }
         if (wp == FxTimer) { stepFx(); return 0; }
+        if (wp == TrayShowTimer) { stepTrayShow(); return 0; }
         if (wp == ListBarTimer) {
             RECT track{}, thumb{};
             const double since = listBarSeenAt < 0 ? 1e9 : motionNow() - listBarSeenAt;
@@ -9042,6 +9301,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         return DefWindowProcW(window, message, wp, lp);
     }
     case GovernorNowMessage: governorTick(); return 0;
+    case WM_SETCURSOR: watchPointer(); break; // also sent for the pointer moving over the panel's child windows
     case WM_LBUTTONUP: case WM_CAPTURECHANGED:
         if (listBarDrag) {
             listBarDrag = false; scrollingThumb = false;
@@ -9800,6 +10060,66 @@ bool panelSelfTest(const std::wstring& path) {
         stopFx();
         fxForce = false; motionClock = clockBefore;
         check("effects_level_names_itself", rowValue(Row::effects) == tr(L"完整") && effectsLevel == 0);
+        {
+            // The calmer panel (0.32): rows lie flat and a key rises only under the pointer.
+            RECT vr{}; GetClientRect(visualView, &vr);
+            RECT mainClient{}; GetClientRect(mainWindow, &mainClient);
+            auto viewPixel = [&](POINT at) {
+                HDC screen = GetDC(visualView), mem = CreateCompatibleDC(screen);
+                HBITMAP bitmap = CreateCompatibleBitmap(screen, vr.right, vr.bottom);
+                HGDIOBJ old = SelectObject(mem, bitmap);
+                paintVisual(mem, vr);
+                const COLORREF c = GetPixel(mem, at.x, at.y);
+                SelectObject(mem, old); DeleteObject(bitmap); DeleteDC(mem); ReleaseDC(visualView, screen);
+                return c;
+            };
+            int row = -1;
+            viewPixel({0, 0}); // paints once so the hit areas are this page's
+            for (size_t k = 0; k < visualHits.size() && row < 0; ++k) {
+                const auto& hit = visualHits[k];
+                if (hit.block < visualBlocks.size() && visualBlocks[hit.block].kind == VBlock::Kind::action && visualBlocks[hit.block].toggle < 0 && hit.rect.top > sp(4) && hit.rect.bottom < vr.bottom) row = int(k);
+            }
+            bool flat = false, rises = false;
+            if (row >= 0) {
+                const RECT r = visualHits[size_t(row)].rect;
+                const POINT at{r.left - sp(4), (r.top + r.bottom) / 2}; // beside the text: bare panel, or the risen key's face
+                const int hoverBefore = visualHover;
+                visualHover = -1; visualHoverFade.clear();
+                flat = viewPixel(at) == Surface;
+                visualHover = row; setFade(visualHoverFade, visualHits[size_t(row)].block, 1, 0);
+                rises = viewPixel(at) != Surface;
+                visualHover = hoverBefore; visualHoverFade.clear();
+            }
+            check("rows_lie_flat_until_pointed", row >= 0 && flat && rises);
+            check("view_runs_the_panel_width", vr.right == mainClient.right && row >= 0 && visualHits[size_t(row)].rect.left == visualInset());
+            check("list_has_no_windows_scroll_bar", !(GetWindowLongPtrW(viewport, GWL_STYLE) & WS_VSCROLL));
+            // Light and shadow are gone by the edge of their bounds instead of being cut there.
+            HDC screen = GetDC(mainWindow), mem = CreateCompatibleDC(screen);
+            HBITMAP bitmap = CreateCompatibleBitmap(screen, 200, 120);
+            HGDIOBJ old = SelectObject(mem, bitmap);
+            const RECT all{0, 0, 200, 120}, key{50, 40, 150, 80};
+            fill(mem, all, RGB(0, 0, 0));
+            ui::keycap(mem, key, 8.0f, theme, 1);
+            const bool spills = GetPixel(mem, 39, 60) != RGB(0, 0, 0);
+            fill(mem, all, RGB(0, 0, 0));
+            { const ui::LightBounds bounds(mem, {40, 30, 160, 90}); ui::keycap(mem, key, 8.0f, theme, 1); }
+            const bool held = GetPixel(mem, 39, 60) == RGB(0, 0, 0) && GetPixel(mem, 36, 60) == RGB(0, 0, 0) && GetPixel(mem, 46, 60) != RGB(0, 0, 0);
+            SelectObject(mem, old); DeleteObject(bitmap); DeleteDC(mem); ReleaseDC(mainWindow, screen);
+            check("light_fades_out_inside_its_bounds", theme.highContrast || (spills && held));
+            // A page's title decodes into place: stand-ins of the same kind, all in the font.
+            size_t settled = 9;
+            const std::wstring early = decodedTitle(L"效能", 0, settled);
+            const bool scrambled = settled == 0 && early.size() == 2 && ui::pixelCovers(early);
+            const std::wstring late = decodedTitle(L"效能", 400, settled);
+            check("title_decodes_then_settles", scrambled && late == L"效能" && settled == 2 && decodedTitle(L"Setup", 0, settled).size() == 5);
+            // The tray icon's shows: a frame while they last, nothing after.
+            const TrayPlay charging{1, 0, 0}, mode{3, 0, 2};
+            HICON a = trayShowIcon(charging, 100, 16), b = trayShowIcon(mode, 1000, 16), over = trayShowIcon(charging, 5000, 16);
+            check("tray_icon_shows_end", a && b && !over);
+            if (a) DestroyIcon(a);
+            if (b) DestroyIcon(b);
+            if (over) DestroyIcon(over);
+        }
     }
     SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
     check("settings_page_closes_on_return", inlinePage == InlinePage::none || inlineClosing);
@@ -10426,6 +10746,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
                     wchar_t suffix[16]; swprintf(suffix, 16, L"_%02d.bmp", k);
                     shotOK = captureWindow(base + suffix) && shotOK;
                 }
+                // Then the page arriving from the first tab: the lit key glides along the tab
+                // tray, the title decodes, section rules run out and the blocks come in.
+                // 16 frames 25 ms apart, named _e01.._e16.
+                const double t1 = t0 + 2000;
+                motionClock = t1;
+                visualHover = -1; visualMouse = {-1, -1}; visualRippleStart = -1; visualHoverFade.clear();
+                visualEnterAt = t1; visualEnterDir = 1; titleDecodeAt = t1;
+                tabSlide.from = tabSlide.to > 1 ? 0 : 4; tabSlide.started = t1; tabSlide.duration = TravelMs + 40; tabSlide.quick = true; tabSlide.tangent = 0;
+                tabChangedAt = t1; tabDirection = 1;
+                for (int k = 1; k <= 16; ++k) {
+                    motionClock = t1 + (k - 1) * 25.0;
+                    wchar_t suffix[16]; swprintf(suffix, 16, L"_e%02d.bmp", k);
+                    shotOK = captureWindow(base + suffix) && shotOK;
+                }
                 motionClock = -1;
             } else if (screenshot && option(L"--fx-frames")) {
                 std::wstring base = args[1];
@@ -10439,6 +10773,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (worker.joinable()) worker.join();
     if (actionWorker.joinable()) actionWorker.join();
     if (stab::thread.joinable()) stab::thread.join();
+    stopFrameClock();
     for (auto f : {normalFont, smallFont, strongFont, titleFont, valueFont, metricFont}) if (f) DeleteObject(f);
     for (auto f : fallbackOwned) DeleteObject(f);
     ui::unloadPixelFont();

@@ -100,6 +100,10 @@ bool drawPixelDigits(HDC dc, const std::wstring& text, int x, int y, int unit, C
 // A square notification-area icon showing `percent` (0-100) in 3x5 pixel
 // digits on a badge. The caller owns the icon (DestroyIcon).
 HICON makePercentIcon(int size, int percent, COLORREF badge, COLORREF edge, COLORREF digits);
+// The same badge holding a level instead of digits, for the tray icon's short shows: filled
+// from the bottom to `fraction` (0-1), or with `steps` > 0 as that many bars of rising height,
+// lit up to `fraction` of them. The caller owns the icon (DestroyIcon).
+HICON makeLevelIcon(int size, double fraction, COLORREF badge, COLORREF edge, COLORREF fill, int steps = 0);
 
 // The battery mascot: a 16x14-cell pixel sprite whose body fills with the
 // battery level, with a face for each mood. `frame` 1 blinks.
@@ -107,7 +111,8 @@ enum class Mood { calm, sleepy, busy, charging, tired, critical, full };
 // `face` is used on the filled part of the body, `faceLight` on the empty part.
 struct MascotColors { COLORREF outline, empty, level, face, faceLight, cheek, sweat, accent; };
 constexpr int MascotCells = 16, MascotRows = 14;
-void drawMascot(HDC dc, int x, int y, int unit, Mood mood, double level, int frame, const MascotColors& colors);
+// `look` -1 or 1 turns its eyes a cell to the left or the right.
+void drawMascot(HDC dc, int x, int y, int unit, Mood mood, double level, int frame, const MascotColors& colors, int look = 0);
 // Saves a bitmap as PNG through GDI+.
 bool saveBitmapPng(HBITMAP bitmap, const std::wstring& path);
 
