@@ -1,6 +1,7 @@
 #include "ui.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cwctype>
 #include <tuple>
 #include <utility>
@@ -36,11 +37,6 @@ struct Canvas {
         g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
     }
 };
-void roundCaps(Gdiplus::Pen& pen) {
-    pen.SetLineJoin(Gdiplus::LineJoinRound);
-    pen.SetStartCap(Gdiplus::LineCapRound);
-    pen.SetEndCap(Gdiplus::LineCapRound);
-}
 // GDI fallbacks when GDI+ is unavailable.
 void gdiRound(HDC dc, const RECT& r, COLORREF fill, COLORREF* outline, float radius) {
     HBRUSH brush = outline ? static_cast<HBRUSH>(GetStockObject(NULL_BRUSH)) : CreateSolidBrush(fill);
@@ -67,7 +63,7 @@ COLORREF mix(COLORREF a, COLORREF b, double t) {
     auto channel = [t](int x, int y) { return int(std::lround(x + (y - x) * t)); };
     return RGB(channel(GetRValue(a), GetRValue(b)), channel(GetGValue(a), GetGValue(b)), channel(GetBValue(a), GetBValue(b)));
 }
-Palette palette(ThemeChoice choice, bool forceContrast, bool mac) {
+Palette palette(ThemeChoice choice, bool forceContrast) {
     Palette p;
     if (forceContrast || highContrastOn()) {
         // Contrast themes: all text and strokes in WindowText, emphasis through the
@@ -78,46 +74,38 @@ Palette palette(ThemeChoice choice, bool forceContrast, bool mac) {
         p.faint = GetSysColor(COLOR_GRAYTEXT);
         p.accentDim = p.selected = GetSysColor(COLOR_HIGHLIGHT);
         p.accentInk = p.selectedInk = GetSysColor(COLOR_HIGHLIGHTTEXT);
+        p.keyTop = p.keyBottom = p.raised;
+        p.litTop = p.litMid = p.litBottom = p.glow = p.halo = p.selected;
+        p.rim = p.border; p.well = p.background; p.ledOff = p.faint; p.shadow = p.border;
         const COLORREF bg = p.background;
         p.dark = (GetRValue(bg) * 299 + GetGValue(bg) * 587 + GetBValue(bg) * 114) / 1000 < 128;
         p.highContrast = true;
         return p;
     }
     const bool light = choice == ThemeChoice::light || (choice == ThemeChoice::system && systemPrefersLight());
-    if (mac) {
-        // macOS system colours: one window grey under toolbar and content alike (no card on a
-        // card), white grouped boxes with hairline edges and separators, label and secondary
-        // label greys, system blue. Dark: the graphite window with lifted boxes.
-        if (light) {
-            p.background = RGB(240, 240, 240); p.surface = RGB(240, 240, 240); p.raised = RGB(255, 255, 255); p.border = RGB(214, 214, 216);
-            p.ink = RGB(29, 29, 31); p.muted = RGB(110, 110, 115); p.faint = RGB(160, 160, 166);
-            p.accent = RGB(0, 122, 255); p.accentDim = RGB(153, 199, 255); p.accentSoft = RGB(226, 238, 255); p.accentInk = RGB(255, 255, 255);
-            p.warn = RGB(214, 120, 0); p.danger = RGB(230, 45, 35);
-            p.selected = RGB(226, 238, 255); p.selectedInk = p.ink;
-            p.dark = false;
-        } else {
-            p.background = RGB(30, 30, 31); p.surface = RGB(30, 30, 31); p.raised = RGB(44, 44, 46); p.border = RGB(64, 64, 68);
-            p.ink = RGB(245, 245, 247); p.muted = RGB(152, 152, 158); p.faint = RGB(99, 99, 104);
-            p.accent = RGB(10, 132, 255); p.accentDim = RGB(28, 78, 150); p.accentSoft = RGB(22, 48, 86); p.accentInk = RGB(255, 255, 255);
-            p.warn = RGB(255, 159, 10); p.danger = RGB(255, 69, 58);
-            p.selected = RGB(22, 48, 86); p.selectedInk = p.ink;
-            p.dark = true;
-        }
-        return p;
-    }
     if (light) {
-        p.background = RGB(242, 245, 248); p.surface = RGB(255, 255, 255); p.raised = RGB(235, 240, 244); p.border = RGB(214, 222, 230);
-        p.ink = RGB(16, 24, 32); p.muted = RGB(84, 99, 114); p.faint = RGB(124, 136, 148);
-        p.accent = RGB(4, 128, 92); p.accentDim = RGB(146, 210, 188); p.accentSoft = RGB(221, 242, 234); p.accentInk = RGB(255, 255, 255);
-        p.warn = RGB(168, 104, 0); p.danger = RGB(190, 52, 40);
-        p.selected = RGB(221, 242, 234); p.selectedInk = p.ink;
+        // Day: an ivory panel, keys a shade lighter, wells a shade darker, amber light.
+        p.background = p.surface = RGB(230, 227, 222); p.raised = RGB(241, 238, 233); p.border = RGB(205, 201, 195);
+        p.ink = RGB(42, 40, 37); p.muted = RGB(87, 83, 77); p.faint = RGB(140, 135, 127);
+        p.accent = RGB(135, 84, 10); p.accentDim = RGB(217, 181, 122); p.accentSoft = RGB(243, 223, 184); p.accentInk = RGB(42, 40, 37);
+        p.warn = RGB(161, 92, 0); p.danger = RGB(184, 53, 44);
+        p.selected = RGB(243, 223, 184); p.selectedInk = p.ink;
+        p.keyTop = RGB(243, 240, 235); p.keyBottom = RGB(228, 224, 218);
+        p.litTop = RGB(248, 213, 146); p.litMid = RGB(244, 232, 210); p.litBottom = RGB(242, 237, 230);
+        p.rim = RGB(240, 170, 66); p.well = RGB(211, 207, 201); p.glow = RGB(245, 195, 103); p.halo = RGB(244, 175, 61);
+        p.ledOff = RGB(195, 190, 183); p.shadow = RGB(90, 78, 60);
         p.dark = false;
     } else {
-        p.background = RGB(14, 19, 26); p.surface = RGB(23, 31, 41); p.raised = RGB(31, 41, 53); p.border = RGB(43, 55, 68);
-        p.ink = RGB(236, 242, 247); p.muted = RGB(150, 164, 178); p.faint = RGB(98, 112, 126);
-        p.accent = RGB(104, 225, 188); p.accentDim = RGB(52, 116, 100); p.accentSoft = RGB(27, 56, 53); p.accentInk = RGB(8, 30, 24);
-        p.warn = RGB(242, 196, 107); p.danger = RGB(245, 146, 146);
-        p.selected = RGB(27, 56, 53); p.selectedInk = p.ink;
+        // Night: a charcoal panel, smoked keys, deep wells, an ice-blue neon light.
+        p.background = p.surface = RGB(27, 27, 29); p.raised = RGB(46, 47, 53); p.border = RGB(52, 53, 59);
+        p.ink = RGB(236, 236, 239); p.muted = RGB(164, 164, 172); p.faint = RGB(110, 110, 118);
+        p.accent = RGB(180, 195, 255); p.accentDim = RGB(74, 85, 144); p.accentSoft = RGB(37, 43, 69); p.accentInk = RGB(242, 246, 255);
+        p.warn = RGB(242, 169, 59); p.danger = RGB(255, 107, 99);
+        p.selected = RGB(37, 43, 69); p.selectedInk = p.ink;
+        p.keyTop = RGB(49, 50, 56); p.keyBottom = RGB(37, 38, 43);
+        p.litTop = RGB(70, 71, 83); p.litMid = RGB(52, 53, 61); p.litBottom = RGB(43, 44, 50);
+        p.rim = RGB(220, 246, 255); p.well = RGB(14, 14, 16); p.glow = RGB(221, 246, 255); p.halo = RGB(125, 145, 255);
+        p.ledOff = RGB(36, 37, 43); p.shadow = RGB(0, 0, 0);
         p.dark = true;
     }
     return p;
@@ -130,18 +118,10 @@ Palette mixPalette(const Palette& a, const Palette& b, double t) {
     p.ink = m(a.ink, b.ink); p.muted = m(a.muted, b.muted); p.faint = m(a.faint, b.faint);
     p.accent = m(a.accent, b.accent); p.accentDim = m(a.accentDim, b.accentDim); p.accentSoft = m(a.accentSoft, b.accentSoft); p.accentInk = m(a.accentInk, b.accentInk);
     p.warn = m(a.warn, b.warn); p.danger = m(a.danger, b.danger); p.selected = m(a.selected, b.selected); p.selectedInk = m(a.selectedInk, b.selectedInk);
+    p.keyTop = m(a.keyTop, b.keyTop); p.keyBottom = m(a.keyBottom, b.keyBottom); p.litTop = m(a.litTop, b.litTop); p.litMid = m(a.litMid, b.litMid);
+    p.litBottom = m(a.litBottom, b.litBottom); p.rim = m(a.rim, b.rim); p.well = m(a.well, b.well); p.glow = m(a.glow, b.glow);
+    p.halo = m(a.halo, b.halo); p.ledOff = m(a.ledOff, b.ledOff); p.shadow = m(a.shadow, b.shadow);
     return p;
-}
-void drawGlow(HDC dc, const RECT& r, COLORREF c, double strength, float spread) {
-    if (!graphicsToken || strength <= .01 || r.right <= r.left) return;
-    Canvas canvas(dc);
-    const float w = float(r.right - r.left) + spread * 2, h = float(r.bottom - r.top) + spread * 2;
-    Gdiplus::GraphicsPath halo; halo.AddEllipse(float(r.left) - spread, float(r.top) - spread, w, h);
-    Gdiplus::PathGradientBrush brush(&halo);
-    brush.SetCenterColor(color(c, BYTE(std::clamp(strength, 0.0, 1.0) * 120)));
-    Gdiplus::Color edge = color(c, 0); int count = 1;
-    brush.SetSurroundColors(&edge, &count);
-    canvas.g.FillPath(&brush, &halo);
 }
 void drawRimLight(HDC dc, const RECT& r, float radius, COLORREF c, double angle, double strength) {
     if (!graphicsToken || strength <= .01 || r.right <= r.left) return;
@@ -191,102 +171,11 @@ void strokeRound(HDC dc, const RECT& r, COLORREF c, float radius, float width) {
     Gdiplus::Pen pen(color(c), width);
     canvas.g.DrawPath(&pen, &path);
 }
-void drawSeries(HDC dc, const RECT& plot, const std::vector<std::vector<POINT>>& segments, COLORREF line, float width, COLORREF fill) {
-    if (!graphicsToken) {
-        HPEN pen = CreatePen(PS_SOLID, std::max(1, int(width)), line); HGDIOBJ old = SelectObject(dc, pen);
-        for (const auto& segment : segments) if (segment.size() > 1) Polyline(dc, segment.data(), int(segment.size()));
-        SelectObject(dc, old); DeleteObject(pen); return;
-    }
-    Canvas canvas(dc);
-    for (const auto& segment : segments) {
-        if (segment.empty()) continue;
-        std::vector<Gdiplus::PointF> points;
-        points.reserve(segment.size());
-        for (const auto& p : segment) points.emplace_back(float(p.x), float(p.y));
-        if (points.size() == 1) {
-            Gdiplus::SolidBrush dot(color(line));
-            canvas.g.FillEllipse(&dot, points[0].X - width, points[0].Y - width, width * 2, width * 2);
-            continue;
-        }
-        Gdiplus::GraphicsPath area;
-        area.AddLines(points.data(), INT(points.size()));
-        area.AddLine(points.back().X, points.back().Y, points.back().X, float(plot.bottom));
-        area.AddLine(points.back().X, float(plot.bottom), points.front().X, float(plot.bottom));
-        area.CloseFigure();
-        Gdiplus::LinearGradientBrush gradient(Gdiplus::PointF(0, float(plot.top) - 1), Gdiplus::PointF(0, float(plot.bottom) + 1),
-            color(fill, 96), color(fill, 0));
-        canvas.g.FillPath(&gradient, &area);
-        Gdiplus::Pen pen(color(line), width); roundCaps(pen);
-        canvas.g.DrawLines(&pen, points.data(), INT(points.size()));
-    }
-}
-void drawDashedLine(HDC dc, POINT a, POINT b, COLORREF c, float width) {
-    if (!graphicsToken) {
-        HPEN pen = CreatePen(PS_DOT, 1, c); HGDIOBJ old = SelectObject(dc, pen);
-        MoveToEx(dc, a.x, a.y, nullptr); LineTo(dc, b.x, b.y); SelectObject(dc, old); DeleteObject(pen); return;
-    }
-    Canvas canvas(dc);
-    Gdiplus::Pen pen(color(c), width);
-    pen.SetDashStyle(Gdiplus::DashStyleDash);
-    canvas.g.DrawLine(&pen, float(a.x), float(a.y), float(b.x), float(b.y));
-}
-void drawBattery(HDC dc, const RECT& r, double fraction, COLORREF outline, COLORREF level, bool bolt, COLORREF boltColor, COLORREF boltEdge) {
-    const int height = r.bottom - r.top, nub = std::max(2, height / 6);
-    const float stroke = std::max(1.5f, height * .09f), radius = height * .26f;
-    RECT body{r.left, r.top, r.right - nub - 1, r.bottom};
-    RECT tip{body.right + 1, r.top + height * 3 / 10, r.right, r.bottom - height * 3 / 10};
-    fillRound(dc, tip, outline, float(nub) / 2);
-    strokeRound(dc, body, outline, radius, stroke);
-    const int gap = int(std::ceil(stroke + height * .1f));
-    RECT inner{body.left + gap, body.top + gap, body.right - gap, body.bottom - gap};
-    const double clamped = std::clamp(fraction, 0.0, 1.0);
-    if (clamped > 0 && inner.right > inner.left) {
-        RECT filled = inner;
-        filled.right = inner.left + std::max(int(std::lround((inner.right - inner.left) * clamped)), int(radius / 2) + 1);
-        fillRound(dc, filled, level, std::max(1.0f, radius - gap));
-    }
-    if (!bolt || !graphicsToken) return;
-    Canvas canvas(dc);
-    const float cx = (body.left + body.right) / 2.0f, cy = (body.top + body.bottom) / 2.0f, s = height * .42f;
-    const Gdiplus::PointF shape[] = {
-        {cx + s * .15f, cy - s}, {cx - s * .55f, cy + s * .12f}, {cx - s * .02f, cy + s * .12f},
-        {cx - s * .15f, cy + s}, {cx + s * .55f, cy - s * .12f}, {cx + s * .02f, cy - s * .12f}};
-    Gdiplus::GraphicsPath path; path.AddPolygon(shape, 6);
-    Gdiplus::Pen edge(color(boltEdge), std::max(1.5f, height * .1f)); edge.SetLineJoin(Gdiplus::LineJoinRound);
-    canvas.g.DrawPath(&edge, &path);
-    Gdiplus::SolidBrush brush(color(boltColor));
-    canvas.g.FillPath(&brush, &path);
-}
-void drawChevron(HDC dc, const RECT& r, COLORREF c, float width) {
-    const float cx = (r.left + r.right) / 2.0f, cy = (r.top + r.bottom) / 2.0f;
-    const float s = std::min(r.right - r.left, r.bottom - r.top) * .16f;
-    if (!graphicsToken) {
-        HPEN pen = CreatePen(PS_SOLID, std::max(1, int(width)), c); HGDIOBJ old = SelectObject(dc, pen);
-        POINT points[] = {{int(cx - s * 1.6f), int(cy - s * .6f)}, {int(cx), int(cy + s * .8f)}, {int(cx + s * 1.6f), int(cy - s * .6f)}};
-        Polyline(dc, points, 3); SelectObject(dc, old); DeleteObject(pen); return;
-    }
-    Canvas canvas(dc);
-    Gdiplus::Pen pen(color(c), width); roundCaps(pen);
-    const Gdiplus::PointF points[] = {{cx - s * 1.6f, cy - s * .6f}, {cx, cy + s * .8f}, {cx + s * 1.6f, cy - s * .6f}};
-    canvas.g.DrawLines(&pen, points, 3);
-}
-void drawDots(HDC dc, const RECT& r, COLORREF c, float radius) {
-    const float cx = (r.left + r.right) / 2.0f, cy = (r.top + r.bottom) / 2.0f, step = radius * 3.4f;
-    for (int i = -1; i <= 1; ++i) {
-        RECT dot{int(std::lround(cx + i * step - radius)), int(std::lround(cy - radius)),
-            int(std::lround(cx + i * step + radius)), int(std::lround(cy + radius))};
-        fillRound(dc, dot, c, radius);
-    }
-}
 
 namespace {
 void rectFill(HDC dc, const RECT& r, COLORREF color) {
     if (r.right <= r.left || r.bottom <= r.top) return;
     SetDCBrushColor(dc, color); FillRect(dc, &r, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
-}
-int fitSteps(const RECT& r, int unit, int steps) {
-    const int room = int(std::min(r.right - r.left, r.bottom - r.top)) / (2 * std::max(1, unit));
-    return std::clamp(steps, 0, std::max(0, room - 1));
 }
 // 5x7 glyphs; each row string uses '#' for a lit cell.
 struct DigitGlyph { wchar_t c; int width; const char* rows[7]; };
@@ -315,89 +204,6 @@ const DigitGlyph* digitGlyph(wchar_t c) {
 HANDLE pixelFontHandle = nullptr;
 std::vector<bool> pixelCoverage;
 }
-void pixelFill(HDC dc, const RECT& r, COLORREF color, int unit, int steps) {
-    unit = std::max(1, unit); steps = fitSteps(r, unit, steps);
-    for (int i = 0; i < steps; ++i) {
-        const int inset = (steps - i) * unit;
-        rectFill(dc, {r.left + inset, r.top + i * unit, r.right - inset, r.top + (i + 1) * unit}, color);
-        rectFill(dc, {r.left + inset, r.bottom - (i + 1) * unit, r.right - inset, r.bottom - i * unit}, color);
-    }
-    rectFill(dc, {r.left, r.top + steps * unit, r.right, r.bottom - steps * unit}, color);
-}
-void pixelFrame(HDC dc, const RECT& r, COLORREF color, int unit, int steps) {
-    unit = std::max(1, unit); steps = fitSteps(r, unit, steps);
-    const int s = steps * unit;
-    rectFill(dc, {r.left + s, r.top, r.right - s, r.top + unit}, color);
-    rectFill(dc, {r.left + s, r.bottom - unit, r.right - s, r.bottom}, color);
-    rectFill(dc, {r.left, r.top + s, r.left + unit, r.bottom - s}, color);
-    rectFill(dc, {r.right - unit, r.top + s, r.right, r.bottom - s}, color);
-    for (int i = 1; i < steps; ++i) { // stair pixels between the edges
-        const int x = (steps - i) * unit, y = i * unit;
-        rectFill(dc, {r.left + x, r.top + y, r.left + x + unit, r.top + y + unit}, color);
-        rectFill(dc, {r.right - x - unit, r.top + y, r.right - x, r.top + y + unit}, color);
-        rectFill(dc, {r.left + x, r.bottom - y - unit, r.left + x + unit, r.bottom - y}, color);
-        rectFill(dc, {r.right - x - unit, r.bottom - y - unit, r.right - x, r.bottom - y}, color);
-    }
-}
-void pixelBox(HDC dc, const RECT& r, COLORREF fill, COLORREF outline, int unit, int steps, COLORREF shadow) {
-    RECT body = r;
-    if (shadow != CLR_INVALID) {
-        body.bottom -= unit;
-        RECT drop = body; OffsetRect(&drop, 0, unit);
-        pixelFill(dc, drop, shadow, unit, steps);
-    }
-    pixelFill(dc, body, fill, unit, steps);
-    if (outline != CLR_INVALID) pixelFrame(dc, body, outline, unit, steps);
-}
-void pixelSegments(HDC dc, const RECT& r, double fraction, COLORREF on, COLORREF off, int unit) {
-    unit = std::max(1, unit);
-    const int block = unit * 2, pitch = block + unit;
-    const int count = std::max(1, int(r.right - r.left + unit) / pitch);
-    const int lit = fraction > 0 ? std::max(1, int(std::lround(std::clamp(fraction, 0.0, 1.0) * count))) : 0;
-    for (int i = 0; i < count; ++i)
-        rectFill(dc, {r.left + i * pitch, r.top, r.left + i * pitch + block, r.bottom}, i < lit ? on : off);
-}
-void pixelBattery(HDC dc, const RECT& r, double fraction, COLORREF outline, COLORREF level, COLORREF empty,
-    bool bolt, COLORREF boltColor, COLORREF boltEdge, int unit, int cells) {
-    unit = std::max(1, unit);
-    RECT body{r.left, r.top, r.right - 2 * unit, r.bottom};
-    rectFill(dc, {body.right, r.top + (r.bottom - r.top) / 3, r.right, r.bottom - (r.bottom - r.top) / 3}, outline);
-    pixelFrame(dc, body, outline, unit, 1);
-    RECT inner{body.left + 2 * unit, body.top + 2 * unit, body.right - 2 * unit, body.bottom - 2 * unit};
-    const int width = int(inner.right - inner.left);
-    cells = std::max(1, cells);
-    const double clamped = std::clamp(fraction, 0.0, 1.0);
-    const int lit = clamped > 0 ? std::max(1, int(std::ceil(clamped * cells - .001))) : 0;
-    for (int i = 0; i < cells; ++i) {
-        const int left = inner.left + width * i / cells, right = inner.left + width * (i + 1) / cells - (i + 1 < cells ? unit : 0);
-        rectFill(dc, {left, inner.top, right, inner.bottom}, i < lit ? level : empty);
-    }
-    if (!bolt) return;
-    static const char* shape[7] = {"...##", "..##.", ".##..", "#####", "..##.", ".##..", "##..."};
-    const int cell = std::max(1, std::min(unit, int(body.bottom - body.top - 2 * unit) / 7));
-    const int x0 = (body.left + body.right) / 2 - cell * 5 / 2, y0 = (body.top + body.bottom) / 2 - cell * 7 / 2;
-    for (int pass = 0; pass < 2; ++pass)
-        for (int y = 0; y < 7; ++y) for (int x = 0; x < 5; ++x) if (shape[y][x] == '#') {
-            RECT dot{x0 + x * cell, y0 + y * cell, x0 + (x + 1) * cell, y0 + (y + 1) * cell};
-            if (pass == 0) InflateRect(&dot, cell, cell);
-            rectFill(dc, dot, pass == 0 ? boltEdge : boltColor);
-        }
-}
-void pixelChevron(HDC dc, const RECT& r, COLORREF c, int unit) {
-    static const char* shape[3] = {"#...#", ".#.#.", "..#.."};
-    const int x0 = (r.left + r.right) / 2 - unit * 5 / 2, y0 = (r.top + r.bottom) / 2 - unit * 3 / 2;
-    for (int y = 0; y < 3; ++y) for (int x = 0; x < 5; ++x) if (shape[y][x] == '#')
-        rectFill(dc, {x0 + x * unit, y0 + y * unit, x0 + (x + 1) * unit, y0 + (y + 1) * unit}, c);
-}
-void pixelDots(HDC dc, const RECT& r, COLORREF c, int unit) {
-    const int x0 = (r.left + r.right) / 2 - unit * 7 / 2, y0 = (r.top + r.bottom) / 2 - unit / 2;
-    for (int i = 0; i < 3; ++i) rectFill(dc, {x0 + i * 3 * unit, y0, x0 + i * 3 * unit + unit, y0 + unit}, c);
-}
-void pixelDottedLine(HDC dc, POINT a, POINT b, COLORREF c, int unit) {
-    unit = std::max(1, unit);
-    if (a.y == b.y) { for (int x = std::min(a.x, b.x); x < std::max(a.x, b.x); x += unit * 3) rectFill(dc, {x, a.y, x + unit, a.y + unit}, c); }
-    else { for (int y = std::min(a.y, b.y); y < std::max(a.y, b.y); y += unit * 3) rectFill(dc, {a.x, y, a.x + unit, y + unit}, c); }
-}
 int pixelDigitsWidth(const std::wstring& text, int unit) {
     int width = 0;
     for (wchar_t c : text) {
@@ -407,13 +213,14 @@ int pixelDigitsWidth(const std::wstring& text, int unit) {
     }
     return width > 0 ? width - unit : 0;
 }
-bool drawPixelDigits(HDC dc, const std::wstring& text, int x, int y, int unit, COLORREF color) {
+bool drawPixelDigits(HDC dc, const std::wstring& text, int x, int y, int unit, COLORREF color, int gap) {
     if (text.empty() || !pixelDigitsWidth(text, unit)) return false;
+    gap = std::clamp(gap, 0, unit - 1);
     for (wchar_t c : text) {
         const auto* glyph = digitGlyph(c);
         for (int row = 0; row < 7; ++row) for (int column = 0; column < glyph->width; ++column)
             if (glyph->rows[row][column] == '#')
-                rectFill(dc, {x + column * unit, y + row * unit, x + (column + 1) * unit, y + (row + 1) * unit}, color);
+                rectFill(dc, {x + column * unit, y + row * unit, x + (column + 1) * unit - gap, y + (row + 1) * unit - gap}, color);
         x += (glyph->width + 1) * unit;
     }
     return true;
@@ -600,5 +407,142 @@ HICON IconCache::get(const std::wstring& path, int size) {
 void IconCache::clear() {
     for (auto& item : icons_) if (item.second) DestroyIcon(item.second);
     icons_.clear();
+}
+}
+
+// ----- Keycap style -----
+namespace ui {
+namespace {
+// Soft rounded-rect halos, worked out once per size, radius, spread and colour: a keycap's
+// shadow and a lit key's glow are copies of these, not something computed every frame.
+struct SpriteKey {
+    int w, h, radius, spread; COLORREF color; BYTE alpha;
+    bool operator<(const SpriteKey& o) const { return std::tie(w, h, radius, spread, color, alpha) < std::tie(o.w, o.h, o.radius, o.spread, o.color, o.alpha); }
+};
+struct Sprite { HDC dc = nullptr; HBITMAP bitmap = nullptr; HGDIOBJ original = nullptr; };
+std::map<SpriteKey, Sprite> sprites;
+const Sprite* haloSprite(const SpriteKey& key) {
+    if (auto found = sprites.find(key); found != sprites.end()) return &found->second;
+    if (sprites.size() > 400) clearSprites(); // sizes change with the window; keep the cache small
+    const int w = key.w + key.spread * 2, h = key.h + key.spread * 2;
+    if (w <= 0 || h <= 0 || w > 4096 || h > 4096) return nullptr;
+    BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(info.bmiHeader);
+    info.bmiHeader.biWidth = w; info.bmiHeader.biHeight = -h; info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32;
+    void* bits = nullptr;
+    HDC screen = GetDC(nullptr);
+    HBITMAP bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HDC dc = CreateCompatibleDC(screen);
+    ReleaseDC(nullptr, screen);
+    if (!bitmap || !dc || !bits) { if (bitmap) DeleteObject(bitmap); if (dc) DeleteDC(dc); return nullptr; }
+    // Distance from each pixel to the rounded rect; inside is solid, outside fades to nothing.
+    const double hw = key.w / 2.0, hh = key.h / 2.0, r = std::min({double(key.radius), hw, hh});
+    const double cx = w / 2.0, cy = h / 2.0, spread = std::max(1, key.spread);
+    auto* out = static_cast<uint32_t*>(bits);
+    for (int y = 0; y < h; ++y) for (int x = 0; x < w; ++x) {
+        const double qx = std::abs(x + .5 - cx) - (hw - r), qy = std::abs(y + .5 - cy) - (hh - r);
+        const double d = std::hypot(std::max(qx, 0.0), std::max(qy, 0.0)) + std::min(std::max(qx, qy), 0.0) - r;
+        double a = d <= 0 ? 1 : std::max(0.0, 1 - d / spread);
+        a = a * a * (3 - 2 * a) * key.alpha / 255.0; // smoothstep: a soft edge without a visible ring
+        const uint32_t A = uint32_t(std::lround(a * 255));
+        out[size_t(y) * size_t(w) + size_t(x)] = (A << 24) | (uint32_t(GetRValue(key.color) * A / 255) << 16) |
+            (uint32_t(GetGValue(key.color) * A / 255) << 8) | uint32_t(GetBValue(key.color) * A / 255);
+    }
+    Sprite sprite{dc, bitmap, SelectObject(dc, bitmap)};
+    return &sprites.emplace(key, sprite).first->second;
+}
+void solid(HDC dc, const RECT& r, COLORREF c) {
+    if (r.right <= r.left || r.bottom <= r.top) return;
+    SetDCBrushColor(dc, c); FillRect(dc, &r, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+}
+}
+void clearSprites() {
+    for (auto& [key, sprite] : sprites) { SelectObject(sprite.dc, sprite.original); DeleteObject(sprite.bitmap); DeleteDC(sprite.dc); }
+    sprites.clear();
+}
+void softHalo(HDC dc, const RECT& r, float radius, COLORREF c, BYTE alpha, int spread, int dx, int dy) {
+    if (alpha == 0 || r.right <= r.left || r.bottom <= r.top) return;
+    const SpriteKey key{int(r.right - r.left), int(r.bottom - r.top), int(std::lround(radius)), std::max(1, spread), c, alpha};
+    const Sprite* sprite = haloSprite(key);
+    if (!sprite) return;
+    const int w = key.w + key.spread * 2, h = key.h + key.spread * 2;
+    BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+    GdiAlphaBlend(dc, r.left - key.spread + dx, r.top - key.spread + dy, w, h, sprite->dc, 0, 0, w, h, blend);
+}
+void keycap(HDC dc, RECT r, float radius, const Palette& p, double lit, double pressed, double hover) {
+    if (r.right <= r.left || r.bottom <= r.top) return;
+    lit = std::clamp(lit, 0.0, 1.0); pressed = std::clamp(pressed, 0.0, 1.0); hover = std::clamp(hover, 0.0, 1.0);
+    if (p.highContrast) {
+        fillRound(dc, r, lit > .5 ? p.selected : p.raised, radius);
+        strokeRound(dc, r, lit > .5 ? p.selectedInk : p.border, radius, lit > .5 ? 2.0f : 1.0f);
+        return;
+    }
+    const int h = r.bottom - r.top, unit = std::max(1, h / 22);
+    // Light first (it spills onto the panel round the key), then the key's shadow on the panel.
+    if (lit > 0) softHalo(dc, r, radius, p.halo, BYTE((p.dark ? 115 : 105) * lit), std::max(8, h / 2));
+    const int drop = int(std::lround((1 - pressed) * unit * 3));
+    softHalo(dc, r, radius, p.shadow, BYTE(p.dark ? 150 : 52), unit * 5 + 2, 0, drop + 1);
+    softHalo(dc, r, radius, p.shadow, BYTE(p.dark ? 110 : 34), 2, 0, 1);
+    OffsetRect(&r, 0, int(std::lround(pressed * unit)));
+    // The face: lighter at the top, a little brighter under the pointer, warm (or cool) when lit.
+    const COLORREF lift = RGB(255, 255, 255);
+    const double brighten = hover * (p.dark ? .05 : .25);
+    const COLORREF top = mix(mix(p.keyTop, p.litTop, lit), lift, brighten);
+    const COLORREF middle = mix(mix(mix(p.keyTop, p.keyBottom, .62), p.litMid, lit), lift, brighten);
+    const COLORREF bottom = mix(mix(p.keyBottom, p.litBottom, lit), lift, brighten);
+    if (!graphicsToken) { gdiRound(dc, r, middle, nullptr, radius); return; }
+    Canvas canvas(dc);
+    auto& g = canvas.g;
+    const auto box = rectF(r);
+    Gdiplus::GraphicsPath path; roundPath(path, box, radius);
+    Gdiplus::LinearGradientBrush face(Gdiplus::PointF(0, box.Y - 1), Gdiplus::PointF(0, box.Y + box.Height + 1), color(top), color(bottom));
+    Gdiplus::Color stops[] = {color(top), color(middle), color(bottom)};
+    Gdiplus::REAL positions[] = {0.0f, .62f, 1.0f};
+    face.SetInterpolationColors(stops, positions, 3);
+    g.FillPath(&face, &path);
+    // The edge: a catch light along the top when unlit; lit, the light shows along the rim.
+    Gdiplus::GraphicsState state = g.Save();
+    g.SetClip(&path);
+    const float band = std::max(1.0f, float(unit) * (lit > .5 ? 2.0f : 1.0f));
+    const COLORREF catchLight = mix(p.dark ? RGB(80, 82, 92) : RGB(255, 255, 255), p.rim, lit);
+    Gdiplus::SolidBrush edge(color(catchLight, BYTE(p.dark ? 40 + 150 * lit : 230)));
+    g.FillRectangle(&edge, box.X, box.Y, box.Width, band);
+    g.Restore(state);
+    if (lit > 0) {
+        auto inner = box; inner.Inflate(-.5f, -.5f);
+        Gdiplus::GraphicsPath rimPath; roundPath(rimPath, inner, std::max(0.0f, radius - .5f));
+        Gdiplus::Pen rim(color(p.rim, BYTE((p.dark ? 235 : 150) * lit)), p.dark ? 1.5f : 1.0f);
+        g.DrawPath(&rim, &rimPath);
+    }
+}
+void well(HDC dc, const RECT& r, float radius, const Palette& p) {
+    if (r.right <= r.left || r.bottom <= r.top) return;
+    if (p.highContrast) { strokeRound(dc, r, p.border, radius, 1.0f); return; }
+    if (!graphicsToken) { gdiRound(dc, r, p.well, nullptr, radius); return; }
+    Canvas canvas(dc);
+    auto& g = canvas.g;
+    const auto box = rectF(r);
+    Gdiplus::GraphicsPath path; roundPath(path, box, radius);
+    Gdiplus::SolidBrush fill(color(p.well));
+    g.FillPath(&fill, &path);
+    Gdiplus::GraphicsState state = g.Save();
+    g.SetClip(&path);
+    // Shade under the top edge, as if the panel overhangs; a faint light on the lower edge.
+    const float shade = std::clamp(box.Height * .22f, 3.0f, 9.0f);
+    Gdiplus::LinearGradientBrush top(Gdiplus::PointF(0, box.Y - .5f), Gdiplus::PointF(0, box.Y + shade), color(p.shadow, BYTE(p.dark ? 200 : 60)), color(p.shadow, 0));
+    g.FillRectangle(&top, box.X, box.Y, box.Width, shade);
+    Gdiplus::SolidBrush lower(color(RGB(255, 255, 255), BYTE(p.dark ? 14 : 150)));
+    g.FillRectangle(&lower, box.X, box.Y + box.Height - 1, box.Width, 1.0f);
+    g.Restore(state);
+}
+void led(HDC dc, const RECT& r, COLORREF on, COLORREF halo, double lit, COLORREF off) {
+    lit = std::clamp(lit, 0.0, 1.0);
+    if (lit > 0) softHalo(dc, r, 1.0f, halo, BYTE(150 * lit), std::max(3, int(std::min(r.right - r.left, r.bottom - r.top)) / 2 + 2));
+    solid(dc, r, mix(off, on, lit));
+}
+void pixelIcon(HDC dc, const char* const* rows, int count, int x, int y, int unit, COLORREF c) {
+    const int gap = unit >= 3 ? std::max(1, unit / 4) : 0;
+    for (int row = 0; row < count; ++row)
+        for (int column = 0; rows[row][column]; ++column)
+            if (rows[row][column] == '#') solid(dc, {x + column * unit, y + row * unit, x + (column + 1) * unit - gap, y + (row + 1) * unit - gap}, c);
 }
 }
