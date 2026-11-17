@@ -1258,7 +1258,9 @@ void drawSwitch(HDC dc, RECT r, double on, double stretch = 0, const Arrival& mo
     const float radius = float(kh) * .3f;
     const ui::LightBounds inGroove(dc, r, true);
     ui::keycap(dc, knob, radius, theme, (on > .5 ? std::max(on, motion.glow) : on) * paintFade);
-    (void)radius;
+    // Off, a dark key in a dark groove is hard to find: a hairline marks its edge.
+    if (theme.dark && !theme.highContrast && on < 1)
+        ui::strokeRound(dc, knob, blend(theme.well, Muted, .45 * (1 - on) * paintFade), radius, 1.0f);
 }
 // A check mark from five small cells (dot-matrix, as every glyph of the style).
 void drawCheckGlyph(HDC dc, RECT r, COLORREF color) {
@@ -1859,7 +1861,7 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
             // A step: a lit LED when done, a dark one still to do, a small dot when it cannot be told.
             const RECT box{sp(4), top + sp(8), sp(16), top + sp(20)};
             if (b.toggle == 1) { ui::led(dc, box, theme.glow, theme.halo, paintFade, theme.ledOff); drawCheckGlyph(dc, box, theme.dark ? theme.well : Ink); }
-            else if (b.toggle == 0) ui::led(dc, box, theme.glow, theme.halo, 0, theme.ledOff);
+            else if (b.toggle == 0) { ui::led(dc, box, theme.glow, theme.halo, 0, theme.ledOff); if (!theme.highContrast) ui::strokeRound(dc, box, faded(blend(Surface, Muted, .5)), float(sp(2)), 1.0f); }
             else fill(dc, {sp(8), top + sp(12), sp(12), top + sp(16)}, Muted);
             int right = width - sp(4);
             if (!b.value.empty()) {
@@ -3652,14 +3654,15 @@ void drawButton(const DRAWITEMSTRUCT& item) {
         } else if (filter && lit > .5 && !theme.highContrast) {
             // A filter that is on: an LED beside its name.
             const int s = sp(6), mid = (face.top + face.bottom) / 2;
-            left = (face.left + face.right - (textWidth(dc, title, faceFont) + s + sp(6))) / 2;
+            const int width = textWidth(dc, title, faceFont) + s + sp(6);
+            left = id == AllId ? std::max(int(face.left), int(face.right) - width - sp(4)) : int(face.left) + sp(4); // set to the page's edges, as its text is
             ui::led(dc, {left, mid - s / 2, left + s, mid - s / 2 + s}, theme.glow, theme.halo, 1, theme.ledOff);
             drawText(dc, title, {left + s + sp(6), face.top, face.right, face.bottom}, text, faceFont, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
         } else if (filter && !theme.highContrast) {
             // A filter reads as a row does: its setting, and the small arrow that says it changes.
             const int width = textWidth(dc, title, faceFont) + sp(16);
-            left = std::max(int(face.left) + sp(4), int(face.left + face.right - width) / 2);
-            drawText(dc, title, {left, face.top, face.right - sp(16), face.bottom}, text, faceFont, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+            left = id == AllId ? std::max(int(face.left) + sp(4), int(face.right) - width - sp(2)) : int(face.left) + sp(4);
+            drawText(dc, title, {left, face.top, face.right - sp(10), face.bottom}, text, faceFont, DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
             drawMenuArrow(dc, std::min(int(face.right) - sp(14), left + width - sp(8)), (face.top + face.bottom) / 2 - sp(5), sp(10), Muted, false);
         } else drawText(dc, title, face, text, faceFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
     }
@@ -3951,20 +3954,20 @@ void paint(HDC dc, RECT bounds) {
     }
     const std::wstring sortLabel = energyReady ? tr(L"估計 W ↓") : tr(L"活動排序 ↓");
     const int chipWidth = textWidth(dc, sortLabel, smallFont) + sp(16);
-    drawText(dc, tr(L"CPU 耗電排行"), {margin, top - sp(78), right - chipWidth - sp(8), top - sp(56)}, Ink, strongFont);
-    const RECT sortChip{right - chipWidth, top - sp(76), right, top - sp(58)};
+    drawText(dc, tr(L"CPU 耗電排行"), {margin + sp(4), top - sp(78), right - chipWidth - sp(8), top - sp(56)}, Ink, strongFont);
+    const RECT sortChip{right - chipWidth - sp(4), top - sp(76), right - sp(4), top - sp(58)};
     drawText(dc, sortLabel, sortChip, Muted, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER); // the sorted column, as a table shows it
     drawText(dc, energyReady ? tr(L"30 秒平均 · 已觀測 ") + number(current.energy.observedCpuCoverage * 100, 0) + tr(L"% 的 CPU 時間") : tr(L"能源暫不可用，依 CPU / I/O 活動排序"),
-        {margin, top - sp(56), right, top - sp(40)}, Muted, smallFont);
+        {margin + sp(4), top - sp(56), right - sp(4), top - sp(40)}, Muted, smallFont);
     if (displayed.empty()) {
         drawText(dc, backgroundOnly ? tr(L"目前沒有符合篩選的程序") : tr(L"正在讀取程序…"),
             {margin, top + sp(12), right, top + sp(44)}, Muted, normalFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
     }
     int footer = h - sp(51) + headerLift(); // anchored to the bottom: not lifted with the rest
     std::wstring status = current.processes.empty() ? notice : selectionHint();
-    drawText(dc, status, {margin, footer, right, footer + sp(19)}, Muted, smallFont);
+    drawText(dc, status, {margin + sp(4), footer, right - sp(4), footer + sp(19)}, Muted, smallFont);
     drawText(dc, tr(L"個別瓦數僅估計 CPU，非程式總耗電"),
-        {margin, footer + sp(21), right, footer + sp(39)}, Muted, smallFont);
+        {margin + sp(4), footer + sp(21), right - sp(4), footer + sp(39)}, Muted, smallFont);
 }
 std::wstring powerDetailsText() {
     PowerSample p; if (!current.history.empty()) p = current.history.back();
