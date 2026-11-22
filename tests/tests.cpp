@@ -190,6 +190,22 @@ int wmain(int argc, wchar_t** argv) {
             check(early && late && bottomLit && ended, "edge light runs from the bottom centre to the top and ends dark");
             edge.play(EdgeShow::burst, RGB(255, 120, 60), 600, 0, .4);
             check(edge.intensity(.2, .5) > 0 && edge.intensity(.6, .5) == 0, "a mode burst stays within its reach");
+            // A mode change: the comets are low on the sides early, have met at the top midway, the
+            // meeting sends an echo back down, and the show ends dark; turbo arrives sooner than silent.
+            for (int level = 0; level < 3; ++level) {
+                edge.play(EdgeShow::mode, RGB(255, 122, 48), 1800, 0, 1, 1, level);
+                const bool starts = edge.intensity(0, .03) > .1 && edge.intensity(.9, .1) < .02;
+                const bool climbs = edge.intensity(.5, .3) > edge.intensity(.95, .3);
+                const bool meets = edge.intensity(1, .6) > .3;
+                const bool echoes = edge.intensity(.5, .8) > edge.intensity(.5, .99);
+                const bool ends = edge.intensity(.5, .999) < .02 && edge.intensity(1, .999) < .02 && edge.depth(.1, .999) < edge.depth(.1, .4);
+                check(starts && climbs && meets && echoes && ends, ("a mode change runs round the whole border, meets at the top and fades (level " + std::to_string(level) + ")").c_str());
+            }
+            {
+                EdgeLights slow, quick;
+                slow.play(EdgeShow::mode, 0, 1800, 0, 1, 1, 0); quick.play(EdgeShow::mode, 0, 1800, 0, 1, 1, 2);
+                check(quick.intensity(.9, .42) > slow.intensity(.9, .42), "turbo's light climbs sooner than silent's");
+            }
         }
         english = true; check(std::wstring(tr(L"充電功率")) == L"Charging power", "charging strings are localized");
         english = false; check(std::wstring(tr(L"充電功率")) == L"充電功率", "language switch returns to Chinese");
