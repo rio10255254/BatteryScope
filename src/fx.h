@@ -88,7 +88,10 @@ enum class EdgeShow {
     connect,    // two lights run from the bottom centre round both sides, meet at the top, and the border glows and fades
     disconnect, // the border glows and drains from the top down to the bottom centre
     burst,      // a burst from the bottom centre outward to `reach` of the way
-    pulse       // the whole border pulses `pulses` times
+    pulse,      // the whole border pulses `pulses` times
+    mode        // a performance mode change: two lights run round the whole border and meet at the top, the
+                // meeting blooms and sends an echo back down, and the border breathes out. `level` 0 (silent,
+                // calm), 1 (balanced) or 2 (turbo, quicker and hotter) sets its character
 };
 class EdgeLights {
 public:
@@ -96,19 +99,22 @@ public:
     void layout(const RECT& monitor, int thickness, bool allocate = true);
     RECT strip(int index) const { return strips_[index]; } // screen coordinates
     void bind(int index, uint32_t* pixels);                // the strip's bitmap; else own memory
-    void play(EdgeShow show, COLORREF color, double life, double now, double reach = 1, int pulses = 1);
+    void play(EdgeShow show, COLORREF color, double life, double now, double reach = 1, int pulses = 1, int level = 0);
     bool active() const { return playing_; }
     bool render(double now); // false when the show is over (the strips are then clear)
     void stop();
     const Canvas& canvas(int index) const { return canvases_[index]; }
+    RECT changed(int index) const; // the part of strip `index` the last render changed (canvas coordinates)
     double intensity(double u, double t) const; // light at border position u (0-1) at time t (0-1)
+    double depth(double light, double t) const;  // how far in from the edge the glow reaches (0-1 of the strip)
 private:
     RECT monitor_{}, strips_[4]{};
     int thickness_ = 0;
     Canvas canvases_[4];
     std::vector<uint32_t> memory_[4];
     bool playing_ = false, drawn_ = false;
-    EdgeShow show_ = EdgeShow::pulse; COLORREF color_ = 0; double start_ = 0, life_ = 0, reach_ = 1; int pulses_ = 1;
+    int drawnDepth_[4]{}, shownDepth_[4]{}; // how far in from the screen's edge this frame and the one before drew, per strip
+    EdgeShow show_ = EdgeShow::pulse; COLORREF color_ = 0; double start_ = 0, life_ = 0, reach_ = 1; int pulses_ = 1, level_ = 0;
 };
 
 // A click-through, always-on-top layered window holding one bitmap with per-pixel alpha. It

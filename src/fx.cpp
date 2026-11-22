@@ -10,6 +10,8 @@ double clamp01(double v) { return std::clamp(v, 0.0, 1.0); }
 double easeOut(double t) { t = clamp01(t); return 1 - (1 - t) * (1 - t) * (1 - t); }
 double easeInOut(double t) { t = clamp01(t); return t < .5 ? 4 * t * t * t : 1 - std::pow(-2 * t + 2, 3) / 2; }
 double smooth(double t) { t = clamp01(t); return t * t * (3 - 2 * t); }
+double smoother(double t) { t = clamp01(t); return t * t * t * (t * (t * 6 - 15) + 10); } // starts and lands with no jolt
+double bell(double x, double width) { const double d = x / width; return std::exp(-d * d); }
 COLORREF mix(COLORREF a, COLORREF b, double t) {
     t = clamp01(t);
     auto channel = [t](int x, int y) { return int(std::lround(x + (y - x) * t)); };
@@ -397,14 +399,17 @@ void EdgeLights::bind(int index, uint32_t* pixels) {
     if (!pixels) { canvases_[index].w = canvases_[index].h = 0; }
     else { canvases_[index].w = strips_[index].right - strips_[index].left; canvases_[index].h = strips_[index].bottom - strips_[index].top; }
 }
-void EdgeLights::play(EdgeShow show, COLORREF color, double life, double now, double reach, int pulses) {
+void EdgeLights::play(EdgeShow show, COLORREF color, double life, double now, double reach, int pulses, int level) {
     show_ = show; color_ = color; life_ = std::max(1.0, life); start_ = now; reach_ = clamp01(reach); pulses_ = std::max(1, pulses);
+    level_ = std::clamp(level, 0, 2);
     playing_ = true;
 }
 void EdgeLights::stop() {
     playing_ = false;
     if (drawn_) for (auto& c : canvases_) if (c.px) c.clear({0, 0, c.w, c.h});
     drawn_ = false;
+    for (int& d : drawnDepth_) d = 0;
+    for (int& d : shownDepth_) d = 0;
 }
 double EdgeLights::intensity(double u, double t) const {
     switch (show_) {
@@ -414,7 +419,9 @@ double EdgeLights::intensity(double u, double t) const {
         const double travel = .62, head = t < travel ? easeInOut(t / travel) : 1;
         const double after = t < travel ? 1 : 1 - smooth((t - travel) / (1 - travel));
         double light = 0;
-        if (u <= head) light = std::exp(-(head - u) / .16) * (t < travel ? 1 : std::max(0.0, 1 - (t - travel) / .2)) + .4 * after;
+        // The front is feathered over a short stretch instead of cut off.
+        const double front = smooth((head + .018 - u) / .018);
+        if (front > 0) light = front * (std::exp(-std::max(0.0, head - u) / .16) * (t < travel ? 1 : std::max(0.0, 1 - (t - travel) / .2)) + .4 * after);
         const double meet = (t - travel) / .3;
         if (meet > 0 && meet < 1) light += .5 * std::sin(Pi * meet);
         return clamp01(light);
@@ -436,46 +443,211 @@ double EdgeLights::intensity(double u, double t) const {
         const double wave = std::sin(Pi * t * pulses_);
         return clamp01(.9 * wave * wave * (1 - .25 * t));
     }
+    case EdgeShow::mode: {
+        // Two comets leave the bottom centre, gather speed up the sides and slow into each other at
+        // the top centre; the border they pass fills softly behind them. Where they meet the light
+        // blooms, an echo runs back down both sides, and the whole border breathes once and sinks
+        // away. Silent is calm and long-tailed; turbo travels sooner, hotter, with a stronger echo.
+        static const double travels[] = {.58, .54, .47}, tails[] = {.24, .18, .12}, fills[] = {.26, .3, .34},
+            blooms[] = {.32, .5, .8}, echoes[] = {.26, .42, .66}, breaths[] = {.16, .22, .3};
+        const int L = level_;
+        const double travel = travels[L], tail = tails[L], fill = fills[L];
+        const double ignite = smooth(t / .05);                    // the comets light up instead of popping on
+        const double head = smoother(t / travel);                 // 0 at the bottom centre, 1 at the top centre
+        const double s = t < travel ? 0 : (t - travel) / (1 - travel); // time since they met, 0-1
+        double light = 0;
+        // The comet: a bright core on the head, a tail behind it, and the border filling in its wake.
+        const double behind = head - u;
+        const double comet = (behind >= 0 ? std::exp(-behind / tail) : bell(behind, .025)) * (1 - smooth(s / .45));
+        const double core = bell(behind, .03) * (.55 + .2 * L) * (1 - smooth(s / .25));
+        const double wake = behind >= 0 ? fill * smooth(behind / .12) : 0;
+        light += ignite * (.75 * comet + core);
+        // The meeting: a bloom at the top centre, and the echo running back down to the bottom.
+        if (s > 0) {
+            light += blooms[L] * bell(1 - u, .07 + .1 * smooth(s / .4)) * std::sin(Pi * std::min(1.0, s / .45));
+            const double back = 1 - smoother(s / .6);
+            if (s < .62) light += echoes[L] * bell(u - back, .05) * (1 - s / .62);
+        }
+        // The border fills behind the comets, breathes up once after they meet and sinks away.
+        const double breath = breaths[L] * std::sin(Pi * std::clamp((s - .05) / .6, 0.0, 1.0));
+        const double fade = 1 - smoother((s - .3) / .7);
+        light += (wake + (s > 0 ? breath : 0)) * fade;
+        return clamp01(light);
+    }
     }
     return 0;
+}
+RECT EdgeLights::changed(int index) const {
+    const Canvas& c = canvases_[index];
+    const int band = std::min(std::max(drawnDepth_[index], shownDepth_[index]), (index == 0 || index == 2) ? c.h : c.w);
+    if (band <= 0) return {0, 0, 0, 0};
+    if (index == 0) return {0, 0, c.w, band};
+    if (index == 2) return {0, c.h - band, c.w, c.h};
+    if (index == 3) return {0, 0, band, c.h};
+    return {c.w - band, 0, c.w, c.h};
+}
+double EdgeLights::depth(double light, double t) const {
+    if (show_ != EdgeShow::mode) return 1;
+    // Where the light is strong the glow reaches further into the screen; as the show ends it
+    // draws back to the edge instead of only going transparent.
+    const double settle = 1 - .45 * smoother((t - .7) / .3);
+    return std::clamp((.38 + .62 * std::sqrt(clamp01(light))) * settle, .2, 1.0);
 }
 bool EdgeLights::render(double now) {
     if (!playing_) return false;
     const double t = (now - start_) / life_;
-    for (auto& c : canvases_) if (c.px && drawn_) c.clear({0, 0, c.w, c.h});
+    // Clear only the band the last frame drew in (the glow seldom fills a strip's whole depth).
+    for (int i = 0; i < 4; ++i) {
+        Canvas& c = canvases_[i];
+        if (!c.px || !drawn_ || drawnDepth_[i] <= 0) continue;
+        const int band = std::min(drawnDepth_[i], (i == 0 || i == 2) ? c.h : c.w);
+        if (i == 0) c.clear({0, 0, c.w, band});
+        else if (i == 2) c.clear({0, c.h - band, c.w, c.h});
+        else if (i == 3) c.clear({0, 0, band, c.h});
+        else c.clear({c.w - band, 0, c.w, c.h});
+    }
     drawn_ = false;
+    for (int i = 0; i < 4; ++i) { shownDepth_[i] = drawnDepth_[i]; drawnDepth_[i] = 0; } // what changes this frame: last frame's band and this one's
     if (t >= 1) { playing_ = false; return false; }
     if (t < 0) return true;
     const double W = monitor_.right - monitor_.left, H = monitor_.bottom - monitor_.top, half = W + H;
     if (W <= 0 || H <= 0) { playing_ = false; return false; }
     const int T = thickness_;
-    std::vector<double> depth(size_t(T), 0.0); // the light is strongest at the screen's edge and gone at the strip's inner side
-    const int line = std::max(2, T / 24); // a bright line on the very edge, a wide soft glow behind it
-    for (int k = 0; k < T; ++k) depth[size_t(k)] = k < line ? 1.0 : .6 * std::pow(1 - double(k - line) / (T - line), 2.4);
+    // The light is strongest at the screen's edge and gone at the strip's inner side: a bright line
+    // on the very edge, a wide soft glow behind it. The glow's profile is kept as a table over 0-1
+    // of its reach, so a glow that reaches less far is the same curve, squeezed.
+    const int line = std::max(2, T / 24);
+    const bool soft = show_ == EdgeShow::mode;
+    static float profile[1025]; static bool profiled = false;
+    if (!profiled) { for (int i = 0; i <= 1024; ++i) profile[i] = float(std::pow(1 - i / 1024.0, 2.4)); profiled = true; }
+    const double glowLevel = soft ? .7 : .6, peak = soft ? 248 : 240;
+    // A 4x4 ordered dither on the alpha (bayerInt below): a wide, faint glow has few levels to
+    // step through, and without it the glow falls off in visible bands.
     const COLORREF hot = mix(color_, RGB(255, 255, 255), .45);
+    // Everything that depends only on a position along the border is worked out once per column
+    // (or row): its light, how far its glow reaches and its colour. The pixels are then filled
+    // row by row in memory order, and only as far in as the glow reaches.
+    struct Light { float edge = 0, glow = 0, inv = 0; int reach = 0; uint32_t r = 0, g = 0, b = 0; };
+    auto lightAt = [&](double u) {
+        Light l; const double v = intensity(u, t);
+        if (v <= .004) return l;
+        const double reach = std::max(1.0, (T - line) * depth(v, t));
+        l.edge = float(v * peak); l.glow = float(v * glowLevel * peak); l.inv = float(1024.0 / reach); l.reach = int(std::ceil(reach));
+        const COLORREF c = mix(color_, hot, v); l.r = GetRValue(c); l.g = GetGValue(c); l.b = GetBValue(c);
+        return l;
+    };
+    auto level = [&](const Light& l, int d) -> float {
+        if (d < line) return l.edge;
+        const int x = d - line;
+        return x < l.reach ? l.glow * profile[std::min(1024, int(float(x) * l.inv))] : 0.f;
+    };
+    // The premultiplied pixel for a value (0-255 before dither) in a light's colour.
+    auto pixelOf = [&](const Light& l, float value, int dither) -> uint32_t {
+        const uint32_t a = uint32_t(std::min(255.f, value + (soft ? float(dither) * (1.f / 16.f) : .5f)));
+        // x * a / 255 for 8-bit x and a, without a division.
+        return a ? (a << 24) | (((l.r * a * 257 + 32896) >> 16) << 16) | (((l.g * a * 257 + 32896) >> 16) << 8) | ((l.b * a * 257 + 32896) >> 16) : 0;
+    };
+    static const int bayerInt[4][4] = {{0, 8, 2, 10}, {12, 4, 14, 6}, {3, 11, 1, 9}, {15, 7, 13, 5}};
+    std::vector<Light> col;
+    // The sides' light by screen row, for the corners of the top and bottom strips: there the
+    // side edge is near too, and each pixel takes the stronger of the two glows, so the light
+    // turns the corner without a seam whatever each edge is doing.
+    std::vector<Light> corner(static_cast<size_t>(T));
+    // The bright line on the very edge is drawn pixel by pixel. The wide glow behind it changes
+    // slowly, so a mode show (the large one) works it out once per 2x2 block, dithered by block:
+    // at 200% scaling that is one logical pixel, and a quarter of the work.
+    const int step = soft ? 2 : 1;
     for (int i = 0; i < 4; ++i) {
         Canvas& c = canvases_[i];
         if (!c.px) continue;
         const bool horizontal = i == 0 || i == 2;
         const int along = horizontal ? c.w : c.h;
-        for (int p = 0; p < along; ++p) {
+        col.assign(size_t(along), Light{});
+        int deepest = 0;
+        for (int p = 0; p < along; p += step) {
+            // A mode show's light is smooth along the border: it is worked out every other pixel.
             double u;
             if (i == 2) u = std::abs(p + .5 - W / 2) / half;                                        // bottom: 0 at its centre
             else if (i == 0) u = (W / 2 + H + (W / 2 - std::abs(p + .5 - W / 2))) / half;           // top: 1 at its centre
             else u = (W / 2 + (H - (p + T + .5))) / half;                                          // sides, from the bottom up
-            const double light = intensity(u, t);
-            if (light <= .004) continue;
-            const COLORREF color = mix(color_, hot, light);
-            const uint32_t r = GetRValue(color), g = GetGValue(color), b = GetBValue(color);
-            // In a corner the nearer of the two edges counts, so the glow turns the corner unbroken.
-            const int toSide = horizontal ? std::min(p, along - 1 - p) : T;
+            col[size_t(p)] = lightAt(u);
+            if (step > 1 && p + 1 < along) col[size_t(p + 1)] = col[size_t(p)];
+            if (col[size_t(p)].edge > 0) deepest = std::max(deepest, line + col[size_t(p)].reach);
+        }
+        drawnDepth_[i] = std::min(T, deepest);
+        if (horizontal) {
+            int cornerDeep = 0;
             for (int k = 0; k < T; ++k) {
-                const int d = std::min((i == 0 || i == 3) ? k : T - 1 - k, toSide); // distance from the screen's edge
-                const uint32_t a = uint32_t(light * depth[size_t(d)] * 240);
-                if (!a) continue;
-                // The strips were just cleared and hold nothing else: the premultiplied pixel is written as is.
-                (horizontal ? c.px[size_t(k) * size_t(c.w) + size_t(p)] : c.px[size_t(p) * size_t(c.w) + size_t(k)]) =
-                    (a << 24) | ((r * a / 255) << 16) | ((g * a / 255) << 8) | (b * a / 255);
+                const double y = i == 0 ? k : H - T + k;
+                corner[size_t(k)] = lightAt((W / 2 + H - y - .5) / half);
+                if (corner[size_t(k)].edge > 0) { cornerDeep = std::max(cornerDeep, line + corner[size_t(k)].reach); drawnDepth_[i] = T; }
+            }
+            // The lit stretches of this edge (rows skip the dark ones), and its two corner squares.
+            std::vector<std::pair<int, int>> spans;
+            for (int p = 0; p < along;) {
+                while (p < along && col[size_t(p)].edge <= 0) ++p;
+                const int from = p;
+                while (p < along && col[size_t(p)].edge > 0) ++p;
+                if (p > from) spans.push_back({from, p});
+            }
+            const int edgeSpan = std::min(T, along / 2);
+            // One pixel's value: this edge's light, or in a corner the side's if that is stronger.
+            auto value = [&](int p, int k, const Light*& from) -> float {
+                const int d = i == 0 ? k : T - 1 - k;
+                const Light& l = col[size_t(p)];
+                float v = l.edge > 0 && d < deepest ? level(l, d) : 0.f; from = &l;
+                const int toSide = std::min(p, along - 1 - p);
+                if (toSide < edgeSpan) {
+                    const Light& side = corner[size_t(k)];
+                    if (side.edge > 0 && toSide < cornerDeep) { const float w = level(side, toSide); if (w > v) { v = w; from = &side; } }
+                }
+                return v;
+            };
+            for (int k = 0; k < T;) {
+                const int d = i == 0 ? k : T - 1 - k;
+                const int rows = (d >= line && (i == 0 ? d + 1 : d - 1) >= line && k + step <= T) ? step : 1;
+                const int cols = rows; // blocks are square
+                const int* dither = bayerInt[(rows > 1 ? k >> 1 : k) & 3];
+                const bool middle = d < deepest || (i == 2 && T - 1 - (k + rows - 1) < deepest);
+                auto fill = [&](int from, int to) {
+                    for (int p = from; p < to; p += cols) {
+                        const Light* l = nullptr; const float v = value(p, k, l);
+                        if (v <= 0) continue;
+                        const uint32_t px = pixelOf(*l, v, dither[(cols > 1 ? p >> 1 : p) & 3]);
+                        if (!px) continue;
+                        for (int r = 0; r < rows; ++r) {
+                            uint32_t* row = c.px + size_t(k + r) * size_t(c.w);
+                            row[p] = px; if (cols > 1 && p + 1 < to) row[p + 1] = px;
+                        }
+                    }
+                };
+                fill(0, edgeSpan);                                   // the left corner square
+                if (middle) for (const auto& [from, to] : spans) {   // the lit stretches between
+                    const int a = std::max(from, edgeSpan), b = std::min(to, along - edgeSpan);
+                    if (a < b) fill(cols > 1 ? a & ~1 : a, b);
+                }
+                fill(along - edgeSpan, along);                       // the right corner square
+                k += rows;
+            }
+        } else {
+            for (int p = 0; p < along;) {
+                const Light& l = col[size_t(p)];
+                const int rows = soft && p + 1 < along && col[size_t(p + 1)].edge > 0 && l.edge > 0 ? step : 1;
+                if (l.edge <= 0) { ++p; continue; }
+                const int reach = std::min(T, line + l.reach);
+                drawnDepth_[i] = std::max(drawnDepth_[i], reach);
+                for (int d = 0; d < reach;) {
+                    const int cols = d >= line && d + step <= reach ? step : 1;
+                    const int k = i == 3 ? d : T - 1 - d;
+                    const float v = level(l, d);
+                    const uint32_t px = v > 0 ? pixelOf(l, v, bayerInt[(rows > 1 ? p >> 1 : p) & 3][(cols > 1 ? d >> 1 : k) & 3]) : 0;
+                    if (px) for (int r = 0; r < rows; ++r) {
+                        uint32_t* row = c.px + size_t(p + r) * size_t(c.w);
+                        row[k] = px; if (cols > 1) row[i == 3 ? k + 1 : k - 1] = px;
+                    }
+                    d += cols;
+                }
+                p += rows;
             }
         }
     }

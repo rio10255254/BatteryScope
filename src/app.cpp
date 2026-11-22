@@ -548,7 +548,7 @@ void stepFx() {
     }
     if (fxEdgeOverlay[0].visible()) {
         const bool alive = fxEdge.render(now);
-        for (auto& strip : fxEdgeOverlay) strip.present();
+        for (int i = 0; i < 4; ++i) { const RECT band = fxEdge.changed(i); fxEdgeOverlay[i].present(&band); } // only the band that changed
         if (alive) any = true;
         else for (int i = 0; i < 4; ++i) { fxEdge.bind(i, nullptr); fxEdgeOverlay[i].hide(); }
     }
@@ -603,7 +603,7 @@ void fxTab(POINT screen) { if (fxBegin()) fxAddTab(fxStage, screen, motionNow())
 void fxMascot(POINT screen) { if (fxBegin()) fxAddMascot(fxStage, screen, motionNow()); }
 // Light round the edge of the screen the tray is on. Not over a full-screen game, a
 // presentation or in quiet hours.
-void fxEdgePlay(bs::fx::EdgeShow show, COLORREF color, double life, double reach = 1, int pulses = 1) {
+void fxEdgePlay(bs::fx::EdgeShow show, COLORREF color, double life, double reach = 1, int pulses = 1, int level = 0, int thickness = 96) {
     if (!fxOutside()) return;
     if (!fxForce) {
         QUERY_USER_NOTIFICATION_STATE state{};
@@ -612,26 +612,28 @@ void fxEdgePlay(bs::fx::EdgeShow show, COLORREF color, double life, double reach
     const POINT tray = fxTrayPoint();
     MONITORINFO monitor{}; monitor.cbSize = sizeof(monitor);
     if (!GetMonitorInfoW(MonitorFromPoint(tray, MONITOR_DEFAULTTOPRIMARY), &monitor)) return;
-    fxEdge.layout(monitor.rcMonitor, px(96), false);
+    fxEdge.layout(monitor.rcMonitor, px(thickness), false);
     for (int i = 0; i < 4; ++i) {
         if (!fxEdgeOverlay[i].show(fxEdge.strip(i))) { for (int k = 0; k < 4; ++k) { fxEdge.bind(k, nullptr); fxEdgeOverlay[k].hide(); } return; }
         fxEdge.bind(i, fxEdgeOverlay[i].pixels());
     }
-    fxEdge.play(show, color, life, motionNow(), reach, pulses);
+    fxEdge.play(show, color, life, motionNow(), reach, pulses, level);
     armFx();
     if (!fxTimerOn) { fxEdge.stop(); for (int k = 0; k < 4; ++k) { fxEdge.bind(k, nullptr); fxEdgeOverlay[k].hide(); } }
 }
-// The performance mode changed by hand: a burst along the bottom edge, cool and short for
-// silent, wide and warm for turbo.
+// The performance mode changed by hand: light runs round the whole screen and meets at the top,
+// cool and calm for silent, white for balanced, warm and quick for turbo. It takes its time
+// (about two seconds) and its glow reaches well into the screen.
 void playTrayShow(int kind, int level);
 void fxModeEdge(int level) {
     const uint64_t now = GetTickCount64();
-    if (now - fxModeAt < 900) return; // one burst for a change that sets several things
+    if (now - fxModeAt < 1200) return; // one show for a change that sets several things
     fxModeAt = now;
     playTrayShow(3, std::clamp(level, 0, 2));
-    if (level <= 0) fxEdgePlay(bs::fx::EdgeShow::burst, RGB(120, 170, 255), 900, .34);
-    else if (level == 1) fxEdgePlay(bs::fx::EdgeShow::burst, RGB(236, 236, 242), 760, .6);
-    else fxEdgePlay(bs::fx::EdgeShow::burst, RGB(255, 122, 48), 680, 1);
+    level = std::clamp(level, 0, 2);
+    static const COLORREF colors[] = {RGB(120, 170, 255), RGB(236, 236, 242), RGB(255, 122, 48)};
+    static const double lives[] = {2100, 1900, 1700};
+    fxEdgePlay(bs::fx::EdgeShow::mode, colors[level], lives[level], 1, 1, level, 120);
 }
 void fxPower(bool pluggedIn) {
     playTrayShow(pluggedIn ? 1 : 2, 0);
@@ -10073,13 +10075,17 @@ bool dumpFxFrames(const std::wstring& base) {
         for (int y = 0; y < SH; ++y) for (int x = 0; x < SW; ++x) screen[size_t(y) * size_t(SW) + size_t(x)] = 0xFF000000u | uint32_t((30 + 30 * y / SH) << 16) | uint32_t((44 + 26 * x / SW) << 8) | uint32_t(74 + 40 * (SH - y) / SH);
         struct Show { const wchar_t* name; bs::fx::EdgeShow show; COLORREF color; double life, reach; int pulses; };
         const Show shows[] = {{L"plug", bs::fx::EdgeShow::connect, theme.halo, 1500, 1, 1}, {L"unplug", bs::fx::EdgeShow::disconnect, theme.halo, 950, 1, 1},
-            {L"turbo", bs::fx::EdgeShow::burst, RGB(255, 122, 48), 680, 1, 1}, {L"silent", bs::fx::EdgeShow::burst, RGB(120, 170, 255), 900, .34, 1},
+            {L"turbo", bs::fx::EdgeShow::mode, RGB(255, 122, 48), 1700, 1, 2}, {L"silent", bs::fx::EdgeShow::mode, RGB(120, 170, 255), 2100, 1, 0},
+            {L"balanced", bs::fx::EdgeShow::mode, RGB(236, 236, 242), 1900, 1, 1},
             {L"low", bs::fx::EdgeShow::pulse, RGB(240, 82, 74), 1000, 1, 2}};
         for (const auto& show : shows) {
-            bs::fx::EdgeLights lights; lights.layout({0, 0, SW, SH}, px(96));
-            lights.play(show.show, show.color, show.life, 0, show.reach, show.pulses);
-            for (int k = 0; k < 6; ++k) {
-                lights.render(show.life * (.08 + k * .165));
+            const bool mode = show.show == bs::fx::EdgeShow::mode;
+            bs::fx::EdgeLights lights; lights.layout({0, 0, SW, SH}, px(mode ? 120 : 96));
+            lights.play(show.show, show.color, show.life, 0, show.reach, mode ? 1 : show.pulses, mode ? show.pulses : 0); // a mode show's level rides in `pulses`
+            // A mode show is longer and has more to it (comets, meeting, echo, breath): eight frames.
+            static const double modeTimes[] = {.04, .14, .28, .42, .54, .64, .78, .92};
+            for (int k = 0; k < (mode ? 8 : 6); ++k) {
+                lights.render(show.life * (mode ? modeTimes[k] : .08 + k * .165));
                 // The four strips placed on one canvas.
                 std::vector<uint32_t> over(size_t(SW) * size_t(SH), 0);
                 for (int i = 0; i < 4; ++i) {
