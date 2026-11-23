@@ -126,17 +126,35 @@ void reapply(bool mode, bool charge);
 
 // Fan curves and CPU power limits, as G-Helper writes them. The firmware resets both whenever
 // the performance mode changes, so BatteryScope writes them again after every mode change
-// (fans 0.1 s after, power 1.1 s after, on a worker thread). Presets only, inside the
-// factory range: fan curves are the firmware's own curves of another mode, power limits stay
-// at or below what balanced allows.
-enum class FanPreset { factory, quiet, standard, strong };
+// (fans 0.1 s after, power 1.1 s after, on a worker thread). Fans come as presets (the
+// firmware's own curve of another mode where it hands them out, else BatteryScope's own) or
+// as custom curves: 8 points per fan and per performance mode, as G-Helper edits them. Power
+// limits stay at or below what balanced allows.
+enum class FanPreset { factory, quiet, standard, strong, custom };
+enum class Fan { cpu, gpu, mid };
+// A fan curve: 8 temperatures (°C, rising) then 8 duties (%, never falling), as the firmware takes it.
+using FanCurve = std::vector<uint8_t>;
+constexpr int FanPoints = 8;
+// The rules every written curve keeps (sanitizeFanCurve makes any curve keep them):
+constexpr int FanTempMin = 20, FanTempMax = 110;      // °C
+constexpr int FanFloorTemp = 90, FanFloorDuty = 50;   // at FanFloorTemp °C and above, at least FanFloorDuty %
+constexpr int FanWriteMax = 99;                       // 100% is written as 99% (G-Helper: some firmware misbehaves at 100)
+FanCurve sanitizeFanCurve(FanCurve curve);
+FanCurve presetFanCurve(FanPreset preset, Fan fan, Mode mode); // what a preset writes for that fan in that mode
+FanCurve customFanCurve(Fan fan, Mode mode);                     // the remembered custom curve (or a starting point)
+void setCustomFanCurve(Fan fan, Mode mode, const FanCurve& curve); // remembers it (sanitized)
+void resetCustomFanCurve(Fan fan, Mode mode);                     // back to the starting point
+double fanDutyAt(const FanCurve& curve, double temperature);      // the duty the curve asks for at a temperature
+std::vector<Fan> fanList();                                       // the fans this machine reports (CPU first)
+DWORD applyFans();  // writes the remembered fan setting for the current mode now (off the UI thread)
 enum class PowerPreset { factory, saver, light, standard };
 struct PowerLimits { unsigned spl = 0, sppt = 0, fppt = 0; }; // watts: sustained, slow boost, fast boost
 PowerLimits powerLimits(PowerPreset preset);   // 0s for factory
 const wchar_t* fanPresetKey(FanPreset preset);  // Chinese UI string
 struct Tuning { FanPreset fans = FanPreset::factory; PowerPreset power = PowerPreset::factory; };
 Tuning tuning();                                // remembered
-bool fanCurvesSupported();
+bool fanCurvesSupported();   // the firmware hands out its own curves
+bool fanControlSupported();  // fan curves can be written (the firmware reports its fans)
 bool powerLimitsSupported();
 // A fan curve the firmware holds for a mode: 8 temperatures (°C) then 8 duties (%); empty when unreadable.
 std::vector<uint8_t> factoryFanCurve(bool gpu, Mode mode);

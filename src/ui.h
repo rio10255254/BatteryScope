@@ -89,6 +89,9 @@ bool graphicsReady();
 
 void fillRound(HDC dc, const RECT& r, COLORREF color, float radius, BYTE alpha = 255);
 void strokeRound(HDC dc, const RECT& r, COLORREF color, float radius, float width);
+// A smooth line through `points` (antialiased), and optionally the area under it down to
+// `floorY` filled with `fill` at `fillAlpha` (0-255) fading to nothing at the floor.
+void curveLine(HDC dc, const std::vector<POINT>& points, COLORREF color, float width, int floorY = -1, COLORREF fill = 0, BYTE fillAlpha = 0);
 
 // Dot-matrix glyphs (digits and icons) carried over from the pixel heritage.
 // 5x7 bitmap digits for 0-9 . % W - and space. Returns false (drawing nothing)

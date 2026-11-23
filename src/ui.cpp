@@ -173,6 +173,30 @@ void strokeRound(HDC dc, const RECT& r, COLORREF c, float radius, float width) {
     canvas.g.DrawPath(&pen, &path);
 }
 
+void curveLine(HDC dc, const std::vector<POINT>& points, COLORREF c, float width, int floorY, COLORREF fill, BYTE fillAlpha) {
+    if (points.size() < 2) return;
+    if (!graphicsToken) {
+        HPEN pen = CreatePen(PS_SOLID, std::max(1, int(width)), c); HGDIOBJ old = SelectObject(dc, pen);
+        Polyline(dc, points.data(), int(points.size()));
+        SelectObject(dc, old); DeleteObject(pen);
+        return;
+    }
+    Canvas canvas(dc);
+    std::vector<Gdiplus::PointF> line;
+    for (const auto& p : points) line.push_back({float(p.x), float(p.y)});
+    if (floorY >= 0 && fillAlpha) {
+        std::vector<Gdiplus::PointF> area = line;
+        area.push_back({line.back().X, float(floorY)}); area.push_back({line.front().X, float(floorY)});
+        float top = float(floorY);
+        for (const auto& p : line) top = std::min(top, p.Y);
+        Gdiplus::LinearGradientBrush brush(Gdiplus::PointF(0, top - 1), Gdiplus::PointF(0, float(floorY) + 1), color(fill, fillAlpha), color(fill, 0));
+        canvas.g.FillPolygon(&brush, area.data(), int(area.size()));
+    }
+    Gdiplus::Pen pen(color(c), width);
+    pen.SetLineJoin(Gdiplus::LineJoinRound); pen.SetStartCap(Gdiplus::LineCapRound); pen.SetEndCap(Gdiplus::LineCapRound);
+    canvas.g.DrawLines(&pen, line.data(), int(line.size()));
+}
+
 namespace {
 void rectFill(HDC dc, const RECT& r, COLORREF color) {
     if (r.right <= r.left || r.bottom <= r.top) return;
