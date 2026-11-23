@@ -44,6 +44,20 @@ void store(const wchar_t* name, DWORD value) {
     RegSetValueExW(key, name, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value));
     RegCloseKey(key);
 }
+std::vector<uint8_t> loadBytes(const wchar_t* name) {
+    std::vector<uint8_t> bytes(64);
+    DWORD size = DWORD(bytes.size());
+    if (RegGetValueW(HKEY_CURRENT_USER, StoreKey, name, RRF_RT_REG_BINARY, nullptr, bytes.data(), &size) != ERROR_SUCCESS) return {};
+    bytes.resize(size);
+    return bytes;
+}
+void storeBytes(const wchar_t* name, const std::vector<uint8_t>& bytes) {
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, StoreKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) return;
+    if (bytes.empty()) RegDeleteValueW(key, name);
+    else RegSetValueExW(key, name, 0, REG_BINARY, bytes.data(), DWORD(bytes.size()));
+    RegCloseKey(key);
+}
 
 // COM on whatever thread calls: joins the thread's apartment when it already has one.
 struct Com {
@@ -477,7 +491,8 @@ DWORD firmwareKey(FirmwareKey key) {
 }
 // ----- Fan curves and power limits -----
 namespace {
-constexpr uint32_t CpuFanCurveDevice = 0x00110024, GpuFanCurveDevice = 0x00110025;
+constexpr uint32_t CpuFanCurveDevice = 0x00110024, GpuFanCurveDevice = 0x00110025, MidFanCurveDevice = 0x00110032;
+uint32_t curveDevice(Fan fan) { return fan == Fan::gpu ? GpuFanCurveDevice : fan == Fan::mid ? MidFanCurveDevice : CpuFanCurveDevice; }
 constexpr uint32_t PowerSpl = 0x001200A3, PowerSppt = 0x001200A0, PowerFppt = 0x001200C1;
 std::atomic<unsigned> tuningGeneration{0};
 bool present(uint32_t device) {
@@ -485,16 +500,20 @@ bool present(uint32_t device) {
     const auto r = acpi.available() ? acpi.get(device) : std::nullopt;
     return r && r->present;
 }
+// Writes each fan's curve for `mode` under `preset`. Every curve goes through the same rules
+// first, and 100% goes out as 99%, as G-Helper writes it.
 DWORD writeFans(Mode mode, FanPreset preset) {
     if (preset == FanPreset::factory) return ERROR_SUCCESS;
-    const Mode source = preset == FanPreset::quiet ? Mode::silent : preset == FanPreset::strong ? Mode::turbo : Mode::balanced;
-    (void)mode;
-    const auto cpu = factoryFanCurve(false, source), gpu = factoryFanCurve(true, source);
-    if (!validFanCurve(cpu)) return ERROR_NOT_SUPPORTED;
     Acpi acpi;
-    const auto a = acpi.set(CpuFanCurveDevice, cpu);
-    const auto b = validFanCurve(gpu) ? acpi.set(GpuFanCurveDevice, gpu) : std::optional<uint32_t>(1u);
-    return a == 1u && b == 1u ? ERROR_SUCCESS : ERROR_GEN_FAILURE;
+    if (!acpi.available()) return ERROR_NOT_SUPPORTED;
+    DWORD status = ERROR_SUCCESS;
+    for (const Fan fan : fanList()) {
+        FanCurve curve = sanitizeFanCurve(presetFanCurve(preset, fan, mode));
+        if (curve.size() != 16) { if (fan == Fan::cpu) status = ERROR_NOT_SUPPORTED; continue; }
+        for (int i = FanPoints; i < 2 * FanPoints; ++i) curve[size_t(i)] = uint8_t(std::min<int>(curve[size_t(i)], FanWriteMax));
+        if (acpi.set(curveDevice(fan), curve) != 1u && fan == Fan::cpu) status = ERROR_GEN_FAILURE;
+    }
+    return status;
 }
 DWORD writePower(PowerPreset preset) {
     const PowerLimits limits = powerLimits(preset);
@@ -534,16 +553,93 @@ const wchar_t* fanPresetKey(FanPreset preset) {
     case FanPreset::quiet: return L"安靜";
     case FanPreset::standard: return L"標準";
     case FanPreset::strong: return L"強力";
+    case FanPreset::custom: return L"自訂";
     default: return L"原廠";
     }
 }
 Tuning tuning() {
     Tuning t;
-    if (auto v = load(L"FanPreset"); v && *v <= DWORD(FanPreset::strong)) t.fans = FanPreset(*v);
+    if (auto v = load(L"FanPreset"); v && *v <= DWORD(FanPreset::custom)) t.fans = FanPreset(*v);
     if (auto v = load(L"PowerPreset"); v && *v <= DWORD(PowerPreset::standard)) t.power = PowerPreset(*v);
     return t;
 }
 bool fanCurvesSupported() { return validFanCurve(factoryFanCurve(false, Mode::balanced)); }
+bool fanControlSupported() {
+    // The G14 2024 hands out no curves (all zeros) but takes written ones, as it does for
+    // G-Helper: a reported fan is enough.
+    Acpi acpi;
+    return acpi.available() && (present(device::CpuFan) || fanCurvesSupported());
+}
+std::vector<Fan> fanList() {
+    std::vector<Fan> fans{Fan::cpu};
+    if (present(device::GpuFan)) fans.push_back(Fan::gpu);
+    if (present(device::MidFan)) fans.push_back(Fan::mid);
+    return fans;
+}
+FanCurve sanitizeFanCurve(FanCurve c) {
+    if (c.size() != 16) return {};
+    // Temperatures inside 20-110 °C, each at least 1 °C above the one before.
+    for (int i = 0; i < FanPoints; ++i) c[size_t(i)] = uint8_t(std::clamp<int>(c[size_t(i)], FanTempMin, FanTempMax));
+    for (int i = 1; i < FanPoints; ++i) c[size_t(i)] = uint8_t(std::max<int>(c[size_t(i)], c[size_t(i - 1)] + 1));
+    for (int i = FanPoints - 1; i >= 0; --i) {
+        const int ceiling = i == FanPoints - 1 ? FanTempMax : c[size_t(i + 1)] - 1;
+        c[size_t(i)] = uint8_t(std::min<int>(c[size_t(i)], ceiling));
+    }
+    // Duties inside 0-100 %, never falling as the temperature rises.
+    for (int i = FanPoints; i < 2 * FanPoints; ++i) c[size_t(i)] = uint8_t(std::min<int>(c[size_t(i)], 100));
+    // The floor: hot is never left without air. Every point at FanFloorTemp or above, and the
+    // last point (the fan holds it above the curve's end), runs at FanFloorDuty or more.
+    for (int i = 0; i < FanPoints; ++i)
+        if (c[size_t(i)] >= FanFloorTemp || i == FanPoints - 1) c[size_t(i + FanPoints)] = uint8_t(std::max<int>(c[size_t(i + FanPoints)], FanFloorDuty));
+    for (int i = FanPoints + 1; i < 2 * FanPoints; ++i) c[size_t(i)] = uint8_t(std::max<int>(c[size_t(i)], c[size_t(i - 1)]));
+    return c;
+}
+double fanDutyAt(const FanCurve& c, double temperature) {
+    if (c.size() != 16) return 0;
+    if (temperature <= c[0]) return c[FanPoints];
+    for (int i = 1; i < FanPoints; ++i)
+        if (temperature <= c[size_t(i)]) {
+            const double t0 = c[size_t(i - 1)], t1 = c[size_t(i)], d0 = c[size_t(i - 1 + FanPoints)], d1 = c[size_t(i + FanPoints)];
+            return t1 > t0 ? d0 + (d1 - d0) * (temperature - t0) / (t1 - t0) : d1;
+        }
+    return c[2 * FanPoints - 1];
+}
+FanCurve presetFanCurve(FanPreset preset, Fan fan, Mode mode) {
+    if (preset == FanPreset::custom) return customFanCurve(fan, mode);
+    // The firmware's own curve of the matching mode where it hands them out (factory: this
+    // mode's own); otherwise BatteryScope's own three, set for a G14-class laptop.
+    const Mode source = preset == FanPreset::quiet ? Mode::silent : preset == FanPreset::strong ? Mode::turbo : preset == FanPreset::standard ? Mode::balanced : mode;
+    if (fan != Fan::mid) {
+        const FanCurve firmware = factoryFanCurve(fan == Fan::gpu, source);
+        if (validFanCurve(firmware)) return sanitizeFanCurve(firmware);
+    }
+    static const uint8_t temps[FanPoints] = {35, 45, 55, 65, 72, 80, 88, 95};
+    static const uint8_t quiet[FanPoints] = {0, 0, 0, 15, 25, 40, 55, 70};
+    static const uint8_t standard[FanPoints] = {0, 0, 15, 25, 35, 50, 65, 80};
+    static const uint8_t strong[FanPoints] = {0, 20, 30, 40, 55, 70, 85, 100};
+    const uint8_t* duty = source == Mode::silent ? quiet : source == Mode::turbo ? strong : standard;
+    FanCurve curve(temps, temps + FanPoints);
+    curve.insert(curve.end(), duty, duty + FanPoints);
+    return curve;
+}
+namespace {
+std::wstring curveName(Fan fan, Mode mode) {
+    return std::wstring(L"FanCurve") + (fan == Fan::gpu ? L"Gpu" : fan == Fan::mid ? L"Mid" : L"Cpu") + std::to_wstring(int(mode));
+}
+}
+FanCurve customFanCurve(Fan fan, Mode mode) {
+    const FanCurve stored = loadBytes(curveName(fan, mode).c_str());
+    if (stored.size() == 16) return sanitizeFanCurve(stored);
+    // Not edited yet: start from the preset that matches the mode.
+    const FanPreset start = mode == Mode::silent ? FanPreset::quiet : mode == Mode::turbo ? FanPreset::strong : FanPreset::standard;
+    return presetFanCurve(start, fan, mode);
+}
+void setCustomFanCurve(Fan fan, Mode mode, const FanCurve& curve) {
+    const FanCurve safe = sanitizeFanCurve(curve);
+    if (safe.size() == 16) storeBytes(curveName(fan, mode).c_str(), safe);
+}
+void resetCustomFanCurve(Fan fan, Mode mode) { storeBytes(curveName(fan, mode).c_str(), {}); }
+DWORD applyFans() { return writeFans(remembered().mode.value_or(Mode::balanced), tuning().fans); }
 bool powerLimitsSupported() { return present(PowerSpl); }
 std::vector<uint8_t> factoryFanCurve(bool gpu, Mode mode) {
     // The firmware numbers fan modes with turbo and silent swapped.
@@ -585,7 +681,8 @@ DWORD setTuning(Tuning t) {
 }
 void reapply(bool mode, bool charge) {
     const Remembered memory = remembered();
-    if (mode && memory.mode) setMode(*memory.mode);
+    if (mode && memory.mode) setMode(*memory.mode); // writes the fans and limits again after it
+    else if (tuning().fans != FanPreset::factory) applyAfterMode(memory.mode.value_or(Mode::balanced)); // the fans still need writing
     if (charge && memory.chargeLimit) setChargeLimit(*memory.chargeLimit);
     if (memory.keyboard) setKeyboardBacklight(*memory.keyboard);
     if (memory.fnLock) setFnLock(*memory.fnLock);

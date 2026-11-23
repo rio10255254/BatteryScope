@@ -77,6 +77,8 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     ModeLinkMenuId = 289, ModeLinkToggleId = 290, ModeLinkWindowsId = 291, ModeLinkImportId = 292, PowerLimitResetId = 293, IdleDisplayToggleId = 294, IdleDisplayMenuId = 295, EffectsCycleId = 296, UiDiagId = 297,
     DimAfter0Id = 370 /* ..375 */, DisplayOff0Id = 380 /* ..386 */, DimLevel0Id = 390 /* ..393 */, ModeBoost0Id = 340 /* ..358: + mode * 8 + boost */,
     SettingRowId = 300 /* ..329, one per settings row */,
+    FanPageId = 400, FanCustomId = 401, FanEditFan0Id = 402 /* ..404: cpu, gpu, mid */, FanEditMode0Id = 405 /* ..407: silent, balanced, turbo */,
+    FanResetCurveId = 408, FanCopyCurveId = 409,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1, FnKeyHotkey = 10 /* ..20: F1-F11 under the software Fn lock */;
 const wchar_t* ClassName = L"BatteryScope.Main.v1";
@@ -125,7 +127,7 @@ void* effectiveWatch = nullptr;
 PowerModes powerModes;
 HWND modeButtons[6] = {}, restoreModesButton = nullptr, energySettingsButton = nullptr;
 bool isolatedPreview = false;
-enum class InlinePage { none, process, power, candidates, ledger, powerMode, history, perfApps, lab, settings, dynamic, goal, hardware, performance, stability, confirm, error };
+enum class InlinePage { none, process, power, candidates, ledger, powerMode, history, perfApps, lab, settings, dynamic, goal, hardware, performance, stability, fans, confirm, error };
 unsigned lowBatteryThreshold = 0; // percent; 0 = off
 LowBatteryMonitor lowBattery;
 bool hotkeyEnabled = false, hotkeyRegistered = false;
@@ -963,7 +965,7 @@ struct VBar {
     std::vector<VSegment> segments;     // stacked parts instead of one fill
 };
 struct VBlock {
-    enum class Kind { heading, note, meter, bars, series, chips, legend, action, segments, banner, timeline, card, check, fold, display, tiles } kind = Kind::note;
+    enum class Kind { heading, note, meter, bars, series, chips, legend, action, segments, banner, timeline, card, check, fold, display, tiles, curve } kind = Kind::note;
     std::wstring title, text, value;
     double amount = 0, goal = 0, scale = 0;
     std::vector<VBar> bars;
@@ -991,6 +993,13 @@ VBlock vDisplay(const std::wstring& label, const std::wstring& digits, const std
 }
 // Readings side by side, each in its own small well: items are "label\nvalue" (colour 0 = neutral).
 VBlock vTiles(std::vector<std::pair<std::wstring, COLORREF>> tiles) { VBlock b; b.kind = VBlock::Kind::tiles; b.items = std::move(tiles); return b; }
+// A fan curve: 16 values (8 temperatures, 8 duties) in `series`; `toggle` 1 when it can be
+// edited; `amount` the chosen point; `goal` the temperature now (0: unknown); `value` and
+// `text` the readouts above it (the chosen point, and the fan now).
+VBlock vCurve(const std::vector<uint8_t>& curve, bool editable, int chosen, double now, const std::wstring& point, const std::wstring& live) {
+    VBlock b; b.kind = VBlock::Kind::curve; b.series.assign(curve.begin(), curve.end()); b.toggle = editable ? 1 : 0;
+    b.amount = chosen; b.goal = now; b.value = point; b.text = live; return b;
+}
 VBlock vChips(std::vector<std::pair<std::wstring, COLORREF>> chips) { VBlock b; b.kind = VBlock::Kind::chips; b.items = std::move(chips); return b; }
 VBlock vLegend(std::vector<std::pair<std::wstring, COLORREF>> entries) { VBlock b; b.kind = VBlock::Kind::legend; b.items = std::move(entries); return b; }
 // A row that does something: a command, or a menu of choices opened at the row.
@@ -1036,6 +1045,16 @@ VBlock vFold(const std::wstring& title, const std::wstring& text) {
 
 HWND visualView = nullptr;
 constexpr int FoldCommand = -7001; // a hit that opens or closes its fold instead of sending a command
+constexpr int CurveCommand = -7002; // the fan curve: dragged and nudged in place, never sent
+// The fan curve's plot inside its block (block coordinates): room on the left for the duty
+// labels, below for the temperatures, a readout line above.
+RECT curvePlot(int y, int width, int height) { return {sp(44), y + sp(56), width - sp(16), y + height - sp(28)}; }
+// Where a point of the curve sits in the plot, and back.
+POINT curvePoint(const RECT& plot, double temperature, double duty) {
+    using namespace bs::asus;
+    return {plot.left + int(std::lround((temperature - FanTempMin) * (plot.right - plot.left) / double(FanTempMax - FanTempMin))),
+        plot.bottom - int(std::lround(duty * (plot.bottom - plot.top) / 100.0))};
+}
 std::vector<VBlock> visualBlocks;
 int visualScroll = 0, visualContent = 0, visualDragOffset = -1;
 double visualScrollSeenAt = -1; // when the page last scrolled, for the indicator that fades after
@@ -1088,6 +1107,7 @@ int blockHeight(HDC dc, const VBlock& b, int width, bool first) {
     case VBlock::Kind::check: return sp(30) + (b.text.empty() ? 0 : noteHeight(dc, b.text, width - sp(28)));
     case VBlock::Kind::display: return sp(112);
     case VBlock::Kind::tiles: return sp(68);
+    case VBlock::Kind::curve: return sp(254);
     }
     return 0;
 }
@@ -1218,6 +1238,11 @@ void pushBlockHits(const VBlock& b, size_t i, int y, int width, int height) {
         break;
     }
     case VBlock::Kind::series: visualPlots.push_back(placed({0, y + sp(24), width, y + sp(108)})); break;
+    case VBlock::Kind::curve: {
+        RECT plot = curvePlot(y, width, height); InflateRect(&plot, sp(10), sp(10));
+        visualHits.push_back({placed(plot), CurveCommand, i});
+        break;
+    }
     default: break;
     }
 }
@@ -1921,6 +1946,58 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
             }
             break;
         }
+        case VBlock::Kind::curve: {
+            // A fan curve in a well: duty up, temperature along; the area the safety floor keeps
+            // off-limits tinted; the curve lit, its eight points as LEDs (the chosen one bright),
+            // and where the temperature is now.
+            using namespace bs::asus;
+            const RECT plot = curvePlot(top, width, h);
+            const bool editable = b.toggle == 1;
+            drawText(dc, b.value, {sp(4), top + sp(2), width - sp(4), top + sp(20)}, Ink, strongFont);
+            drawText(dc, b.text, {sp(4), top + sp(20), width - sp(4), top + sp(37)}, Muted, smallFont);
+            const RECT box{0, top + sp(40), width, top + h - sp(4)};
+            card(dc, box, Surface, 14);
+            const COLORREF grid = blend(theme.well, Muted, theme.dark ? .28 : .34);
+            {
+                const POINT corner = curvePoint(plot, FanFloorTemp, FanFloorDuty);
+                fill(dc, {corner.x, corner.y, plot.right, plot.bottom}, blend(theme.well, dangerLed, theme.dark ? .13 : .1));
+            }
+            for (int duty = 0; duty <= 100; duty += 25) {
+                const int gy = curvePoint(plot, FanTempMin, duty).y;
+                dottedRule(dc, plot.left, plot.right, gy, grid);
+                drawText(dc, std::to_wstring(duty) + L"%", {box.left, gy - sp(8), plot.left - sp(6), gy + sp(8)}, Muted, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+            }
+            for (int temperature = 30; temperature <= FanTempMax; temperature += 10) {
+                const int gx = curvePoint(plot, temperature, 0).x;
+                for (int gy = plot.top; gy < plot.bottom; gy += sp(5)) fill(dc, {gx, gy, gx + std::max(1, sp(1) / 2), gy + std::max(1, sp(1))}, grid);
+                if ((temperature - 30) % 20 == 0)
+                    drawText(dc, std::to_wstring(temperature) + L"°", {gx - sp(20), plot.bottom + sp(4), gx + sp(20), plot.bottom + sp(20)}, Muted, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            }
+            if (b.series.size() == 16) {
+                FanCurve c; for (double v : b.series) c.push_back(uint8_t(v));
+                const COLORREF light = theme.glow;
+                std::vector<POINT> line{curvePoint(plot, FanTempMin, c[8])};
+                for (int k = 0; k < FanPoints; ++k) line.push_back(curvePoint(plot, c[size_t(k)], c[size_t(k + 8)]));
+                line.push_back(curvePoint(plot, FanTempMax, c[15]));
+                ui::curveLine(dc, line, editable ? faded(light) : blend(theme.well, Muted, .7), float(sp(2)), plot.bottom, light, BYTE((editable ? (theme.dark ? 70 : 90) : 30) * paintFade));
+                // The temperature now, and what the curve asks for there.
+                if (b.goal > 0) {
+                    const double now = std::clamp(b.goal, double(FanTempMin), double(FanTempMax));
+                    const POINT at = curvePoint(plot, now, fanDutyAt(c, now));
+                    for (int gy = plot.top; gy < plot.bottom; gy += sp(4)) fill(dc, {at.x, gy, at.x + std::max(1, sp(1)), gy + sp(2)}, faded(warnLed));
+                    const int r = sp(4);
+                    ui::led(dc, {at.x - r, at.y - r, at.x + r, at.y + r}, warnLed, warnLed, paintFade, theme.ledOff);
+                }
+                for (int k = 0; k < FanPoints; ++k) {
+                    const POINT at = curvePoint(plot, c[size_t(k)], c[size_t(k + 8)]);
+                    const bool chosen = editable && k == int(b.amount);
+                    const int r = chosen ? sp(7) : editable ? sp(5) : sp(3);
+                    ui::led(dc, {at.x - r, at.y - r, at.x + r, at.y + r}, light, ledHalo(light), (chosen ? 1.0 : editable ? .7 : .3) * paintFade, theme.ledOff);
+                    if (chosen && GetFocus() == visualView) ui::strokeRound(dc, {at.x - r - sp(3), at.y - r - sp(3), at.x + r + sp(3), at.y + r + sp(3)}, Ink, float(r + sp(3)), 1.0f);
+                }
+            }
+            break;
+        }
         case VBlock::Kind::legend: {
             int x = sp(4);
             for (const auto& [label, color] : b.items) {
@@ -1997,6 +2074,7 @@ int visualScrollTarget() { return visualScrollMotion.active(motionNow()) ? int(s
 // Runs what a row stands for: a fold opens or closes in place, anything else is the panel's command.
 void activateVisualHit(HWND window, size_t index) {
     const auto& hit = visualHits[index];
+    if (hit.command == CurveCommand) return; // edited in place
     if (hit.command == FoldCommand) {
         if (hit.block < visualBlocks.size()) {
             const auto& title = visualBlocks[hit.block].title;
@@ -2033,6 +2111,15 @@ void stepVisual() {
     UpdateWindow(window);
     if ((!visualAnimating && !scrolling) || hidden) { KillTimer(window, VisualTimer); visualTimerOn = false; }
 }
+// Fan curve editing (the fans page): which fan and which performance mode's curve is open, the
+// chosen point, and the curve while it is being changed (empty otherwise).
+bs::asus::Fan fanEditFan = bs::asus::Fan::cpu;
+int fanEditModeIndex = -1;   // 0 silent, 1 balanced, 2 turbo; -1 the mode in use
+int fanPoint = 3, fanDragPoint = -1;
+bs::asus::FanCurve fanDraft;
+bs::asus::FanPreset demoFans = bs::asus::FanPreset::custom; // the preview's own fan setting
+void fanEditPoint(int point, int temperature, int duty); // moves a point (the others keep the curve's order)
+void fanCommit();                                        // keeps the changed curve and applies it
 LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     switch (message) {
     case WM_ERASEBKGND: return 1;
@@ -2100,6 +2187,28 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             return 0;
         }
         const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        for (size_t i = 0; i < visualHits.size(); ++i) {
+            const auto& hit = visualHits[i];
+            if (hit.command != CurveCommand || !PtInRect(&hit.rect, pt) || hit.block >= visualBlocks.size()) continue;
+            const auto& b = visualBlocks[hit.block];
+            visualFocus = int(i);
+            if (b.toggle != 1 || b.series.size() != 16) return 0;
+            // The point under the press (or the nearest one along) is picked up and follows the pointer.
+            RECT plot = hit.rect; InflateRect(&plot, -sp(10), -sp(10));
+            int best = 0; double bestDistance = 1e9;
+            for (int k = 0; k < bs::asus::FanPoints; ++k) {
+                const POINT at = curvePoint(plot, b.series[size_t(k)], b.series[size_t(k + 8)]);
+                const double d = std::hypot(double(at.x - pt.x), double(at.y - pt.y) * (std::abs(at.x - pt.x) < sp(14) ? 1.0 : 3.0));
+                if (d < bestDistance) { bestDistance = d; best = k; }
+            }
+            fanDragPoint = best; fanPoint = best; SetCapture(window);
+            if (bestDistance < sp(16)) fanEditPoint(best, int(std::lround(b.series[size_t(best)])), int(std::lround(b.series[size_t(best + 8)])));
+            else { // a press away from every point moves the nearest one there
+                const double temperature = bs::asus::FanTempMin + double(pt.x - plot.left) * (bs::asus::FanTempMax - bs::asus::FanTempMin) / std::max<LONG>(1, plot.right - plot.left);
+                fanEditPoint(best, int(std::lround(temperature)), int(std::lround(double(plot.bottom - pt.y) * 100 / std::max<LONG>(1, plot.bottom - plot.top))));
+            }
+            return 0;
+        }
         for (const auto& hit : visualHits) if (PtInRect(&hit.rect, pt)) {
             if (canAnimate()) { visualRippleBlock = hit.block; visualRippleAt = pt; visualRippleStart = motionNow(); }
             setFade(visualPress, hit.block, 1, 70); // the key gives a little under the press, and light spreads from it
@@ -2108,6 +2217,16 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_MOUSEMOVE: {
+        if (fanDragPoint >= 0 && GetCapture() == window) {
+            for (const auto& hit : visualHits) if (hit.command == CurveCommand) {
+                RECT plot = hit.rect; InflateRect(&plot, -sp(10), -sp(10));
+                const int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
+                const double temperature = bs::asus::FanTempMin + double(x - plot.left) * (bs::asus::FanTempMax - bs::asus::FanTempMin) / std::max<LONG>(1, plot.right - plot.left);
+                fanEditPoint(fanDragPoint, int(std::lround(temperature)), int(std::lround(double(plot.bottom - y) * 100 / std::max<LONG>(1, plot.bottom - plot.top))));
+                break;
+            }
+            return 0;
+        }
         if (visualDragOffset >= 0 && GetCapture() == window) {
             RECT r{}; GetClientRect(window, &r);
             scrollVisual(GET_Y_LPARAM(lp) * (visualContent - r.bottom) / std::max<LONG>(1, r.bottom));
@@ -2161,6 +2280,12 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         for (auto& [block, press] : visualPress) if (press.to > 0) setFade(visualPress, block, 0, 200);
         return 0;
     case WM_LBUTTONUP: case WM_CAPTURECHANGED:
+        if (fanDragPoint >= 0) {
+            fanDragPoint = -1;
+            if (message == WM_LBUTTONUP) ReleaseCapture();
+            fanCommit();
+            return 0;
+        }
         for (auto& [block, press] : visualPress) if (press.to > 0) setFade(visualPress, block, 0, 220);
         if (message == WM_LBUTTONUP && visualDragOffset < 0) {
             const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -2180,6 +2305,34 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             else if (row.bottom > r.bottom) scrollVisual(visualScroll + row.bottom - r.bottom + sp(8));
             InvalidateRect(window, nullptr, FALSE);
         };
+        // On the fan curve: Left/Right choose a point, Up/Down move it 1% (Shift: 5%), Ctrl with
+        // Left/Right moves it 1 °C (Shift: 5 °C). Tab moves on.
+        if (visualFocus >= 0 && visualFocus < int(visualHits.size()) && visualHits[size_t(visualFocus)].command == CurveCommand) {
+            const auto& hit = visualHits[size_t(visualFocus)];
+            const auto& b = visualBlocks[hit.block];
+            const bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+            const int step = shift ? 5 : 1;
+            if (b.toggle == 1 && b.series.size() == 16 && (wp == VK_LEFT || wp == VK_RIGHT || wp == VK_UP || wp == VK_DOWN)) {
+                int k = std::clamp(fanPoint, 0, bs::asus::FanPoints - 1);
+                int temperature = int(std::lround(b.series[size_t(k)])), duty = int(std::lround(b.series[size_t(k + 8)]));
+                if (wp == VK_LEFT && !ctrl) k = std::max(0, k - 1);
+                else if (wp == VK_RIGHT && !ctrl) k = std::min(bs::asus::FanPoints - 1, k + 1);
+                else if (wp == VK_LEFT) temperature -= step;
+                else if (wp == VK_RIGHT) temperature += step;
+                else if (wp == VK_UP) duty += step;
+                else duty -= step;
+                if (k != fanPoint) { temperature = int(std::lround(b.series[size_t(k)])); duty = int(std::lround(b.series[size_t(k + 8)])); }
+                fanEditPoint(k, temperature, duty);
+                fanCommit();
+                return 0;
+            }
+        }
+        if (wp == VK_TAB && !visualHits.empty()) {
+            const int count = int(visualHits.size());
+            const int next = GetKeyState(VK_SHIFT) < 0 ? (visualFocus <= 0 ? count - 1 : visualFocus - 1) : (visualFocus + 1) % count;
+            focusRow(next);
+            return 0;
+        }
         if ((wp == VK_RETURN || wp == VK_SPACE) && visualFocus >= 0 && visualFocus < int(visualHits.size())) activateVisualHit(window, size_t(visualFocus));
         else if (wp == VK_ESCAPE) PostMessageW(GetParent(window), WM_COMMAND, IDCANCEL, 0);
         else if (wp == VK_DOWN && !visualHits.empty() && visualFocus + 1 < int(visualHits.size())) focusRow(visualFocus + 1);
@@ -2289,12 +2442,12 @@ const wchar_t* tabLabel(Tab tab) {
 }
 bool sectionPage(InlinePage page) {
     return page == InlinePage::goal || page == InlinePage::history || page == InlinePage::ledger || page == InlinePage::hardware ||
-        page == InlinePage::lab || page == InlinePage::settings || page == InlinePage::performance || page == InlinePage::stability;
+        page == InlinePage::lab || page == InlinePage::settings || page == InlinePage::performance || page == InlinePage::stability || page == InlinePage::fans;
 }
 Tab activeTab() {
     switch (inlinePage) {
     case InlinePage::goal: case InlinePage::dynamic: case InlinePage::powerMode: return Tab::saving;
-    case InlinePage::performance: case InlinePage::stability: return Tab::performance;
+    case InlinePage::performance: case InlinePage::stability: case InlinePage::fans: return Tab::performance;
     case InlinePage::history: case InlinePage::ledger: case InlinePage::power: case InlinePage::candidates: return Tab::ranking;
     case InlinePage::hardware: return Tab::hardware;
     case InlinePage::lab: return Tab::lab;
@@ -3504,7 +3657,7 @@ void layout() {
         MoveWindow(powerButton, w - sp(16) - sp(70) - key - sp(16), sp(8), key + sp(16), sp(32), TRUE);
     }
     const bool fullPage = inlinePage == InlinePage::process || inlinePage == InlinePage::powerMode || inlinePage == InlinePage::history || inlinePage == InlinePage::lab || inlinePage == InlinePage::ledger || inlinePage == InlinePage::hardware ||
-        inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic || inlinePage == InlinePage::goal || inlinePage == InlinePage::performance || inlinePage == InlinePage::stability ||
+        inlinePage == InlinePage::settings || inlinePage == InlinePage::dynamic || inlinePage == InlinePage::goal || inlinePage == InlinePage::performance || inlinePage == InlinePage::stability || inlinePage == InlinePage::fans ||
         inlinePage == InlinePage::confirm || inlinePage == InlinePage::error;
     const bool section = sectionPage(inlinePage);
     const int textTop = section ? sp(52) : fullPage ? sp(52) : top - sp(37);
@@ -3727,7 +3880,7 @@ void drawProcess(const DRAWITEMSTRUCT& item) {
 bool fullPanelPage(InlinePage page) {
     return page == InlinePage::process || page == InlinePage::powerMode || page == InlinePage::history || page == InlinePage::ledger || page == InlinePage::hardware ||
         page == InlinePage::lab || page == InlinePage::settings || page == InlinePage::dynamic || page == InlinePage::goal ||
-        page == InlinePage::performance || page == InlinePage::stability || page == InlinePage::confirm || page == InlinePage::error;
+        page == InlinePage::performance || page == InlinePage::stability || page == InlinePage::fans || page == InlinePage::confirm || page == InlinePage::error;
 }
 // The mascot watches the pointer while it is over the panel: its eyes turn a cell toward it.
 int mascotLook = 0;
@@ -6298,10 +6451,10 @@ void showChartPage(InlinePage page, const std::wstring& title, const std::wstrin
     // Which way the new page lies: along the tab bar, or deeper into (and back out of) a tab.
     const auto position = [](Tab tab) { const auto tabs = visibleTabs(); return int(std::find(tabs.begin(), tabs.end(), tab) - tabs.begin()); };
     const int before = position(activeTab());
-    const bool wasDeep = inlinePage == InlinePage::stability;
+    const bool wasDeep = inlinePage == InlinePage::stability || inlinePage == InlinePage::fans;
     showInlinePage(page, title, text);
     const int after = position(activeTab());
-    visualEnterDir = after > before ? 1 : after < before ? -1 : page == InlinePage::stability ? 1 : wasDeep ? -1 : 0;
+    visualEnterDir = after > before ? 1 : after < before ? -1 : page == InlinePage::stability || page == InlinePage::fans ? 1 : wasDeep ? -1 : 0;
     showVisual(std::move(blocks), false);
     if (visualView) SetFocus(visualView);
 }
@@ -7385,18 +7538,177 @@ void showPerformancePage() {
             v.push_back(vBars(std::move(bars), 70));
         }
         const auto t = bs::asus::tuning();
-        // Offered only where the firmware hands out its fan curves (asked once).
-        static const bool fanCurves = preview || bs::asus::fanCurvesSupported();
-        if (fanCurves) v.push_back(vAction(tr(L"風扇模式"), tr(bs::asus::fanPresetKey(t.fans)), FanMenuId, t.fans == bs::asus::FanPreset::quiet ? Green : COLORREF(0)));
+        // Fans: presets and custom curves on a page of their own (asked once whether they can be written).
+        static const bool fanControl = preview || bs::asus::fanControlSupported();
+        if (fanControl) v.push_back(vAction(tr(L"風扇"), tr(bs::asus::fanPresetKey(preview ? demoFans : t.fans)), FanPageId,
+            (preview ? demoFans : t.fans) == bs::asus::FanPreset::quiet ? Green : COLORREF(0)));
         // Not offered where a limit, once set, only goes away with a restart.
         if (!powerPresetsBlocked() || preview)
             v.push_back(vAction(tr(L"CPU 功耗上限"), powerPresetText(t.power), PowerLimitMenuId, t.power == bs::asus::PowerPreset::saver ? Green : COLORREF(0)));
     }
     if (!stabilityRow(true)) if (auto row = stabilityRow(false)) v.push_back(std::move(*row));
-    v.push_back(vFold(tr(L"關於風扇與功耗"), tr(L"風扇與功耗只提供原廠範圍內的預設：風扇曲線取自韌體各模式自己的曲線，功耗上限不超過平衡模式。每次切換效能模式後會自動重新套用，選「原廠」即還原。獨顯只有在已經醒著時才讀取溫度與時脈，不會為了顯示把它叫醒。") +
+    v.push_back(vFold(tr(L"關於風扇與功耗"), tr(L"風扇在「風扇」頁：原廠、安靜、標準、強力，或每個風扇、每個效能模式各一條自訂曲線（有安全下限）。功耗上限只提供原廠範圍內的預設，不超過平衡模式。兩者在每次切換效能模式後會自動重新套用，選「原廠」即還原。獨顯只有在已經醒著時才讀取溫度與時脈，不會為了顯示把它叫醒。") +
         (powerPresetsBlocked() && !preview ? std::wstring(L"\n") + tr(L"這台的 BIOS 切換效能模式不會解除功耗上限，設了只能靠重新開機還原，所以不提供功耗上限選項。") : std::wstring()) +
         std::wstring(L"\n") + tr(L"模式連動：CPU Boost 關掉時時脈停在基準時脈，每個效能模式的功耗都差不多（這台插電約 20 W），模式之間看不出差別。G-Helper 會在切換模式時一併設定該模式的 CPU Boost 與 Windows 電源模式；開啟模式連動後 BatteryScope 也這樣做（只在插電時；用電池時由動態省電與下方的 Boost 開關負責）。")));
     showChartPage(InlinePage::performance, tr(L"效能"), perfPageText(), std::move(v));
+}
+
+// ----- Fans -----
+// Two ways to set the fans, as G-Helper has them: a preset (factory, quiet, standard, strong),
+// or custom curves, one for each fan in each performance mode, edited point by point. The
+// firmware forgets curves at every mode change, so they are written again after each one.
+const bs::asus::Mode fanModes[3] = {bs::asus::Mode::silent, bs::asus::Mode::balanced, bs::asus::Mode::turbo};
+std::map<int, bs::asus::FanCurve> demoCurves;                        // and its custom curves, by fan * 4 + mode
+bool fanPreview() { return demo || isolatedPreview; }
+bs::asus::Snapshot fanSnapshot() {
+    bs::asus::Snapshot h = asusAvailable ? asusNow() : bs::asus::Snapshot{};
+    if (fanPreview()) { h.driver = true; h.mode = bs::asus::Mode::balanced; h.cpuTemp = 58; h.gpuTemp = 47; h.cpuFan = 31; h.gpuFan = 24; h.midFan.reset(); }
+    return h;
+}
+bs::asus::FanPreset fanSetting() { return fanPreview() ? demoFans : bs::asus::tuning().fans; }
+bs::asus::Mode fanModeInUse(const bs::asus::Snapshot& h) {
+    if (!fanPreview()) if (auto m = bs::asus::remembered().mode) return *m;
+    return h.mode.value_or(bs::asus::Mode::balanced);
+}
+bs::asus::Mode fanEditMode(const bs::asus::Snapshot& h) { return fanEditModeIndex >= 0 ? fanModes[fanEditModeIndex] : fanModeInUse(h); }
+std::vector<bs::asus::Fan> fanListShown() {
+    if (fanPreview()) return {bs::asus::Fan::cpu, bs::asus::Fan::gpu};
+    static const std::vector<bs::asus::Fan> fans = bs::asus::fanList(); // asked once: the fans do not come and go
+    return fans;
+}
+bs::asus::FanCurve fanCustom(bs::asus::Fan fan, bs::asus::Mode mode) {
+    if (fanPreview()) {
+        const auto found = demoCurves.find(int(fan) * 4 + int(mode));
+        if (found != demoCurves.end()) return found->second;
+        return bs::asus::presetFanCurve(mode == bs::asus::Mode::silent ? bs::asus::FanPreset::quiet : mode == bs::asus::Mode::turbo ? bs::asus::FanPreset::strong : bs::asus::FanPreset::standard, bs::asus::Fan::mid, mode);
+    }
+    return bs::asus::customFanCurve(fan, mode);
+}
+void fanKeep(bs::asus::Fan fan, bs::asus::Mode mode, const bs::asus::FanCurve& curve) {
+    if (fanPreview()) demoCurves[int(fan) * 4 + int(mode)] = bs::asus::sanitizeFanCurve(curve);
+    else bs::asus::setCustomFanCurve(fan, mode, curve);
+}
+// The curve the page shows: the one being changed, the custom curve open for editing, or what
+// the chosen preset writes in the mode in use (factory: the firmware's own, where it says).
+bs::asus::FanCurve fanShownCurve(const bs::asus::Snapshot& h) {
+    using namespace bs::asus;
+    if (fanDraft.size() == 16) return fanDraft;
+    const FanPreset setting = fanSetting();
+    if (setting == FanPreset::custom) return fanCustom(fanEditFan, fanEditMode(h));
+    if (setting == FanPreset::factory) {
+        if (fanPreview() || fanEditFan == Fan::mid) return {};
+        const FanCurve firmware = factoryFanCurve(fanEditFan == Fan::gpu, fanModeInUse(h));
+        return validFanCurve(firmware) ? firmware : FanCurve{};
+    }
+    return fanPreview() ? presetFanCurve(setting, Fan::mid, fanModeInUse(h)) : presetFanCurve(setting, fanEditFan, fanModeInUse(h));
+}
+// Writes the fans now, off the UI thread, when what changed is in effect.
+void fanApplySoon() {
+    if (fanPreview() || !asusAvailable) return;
+    std::thread([] { bs::asus::applyFans(); }).detach();
+}
+std::wstring fanRpm(const std::optional<unsigned>& reading) {
+    return !reading ? std::wstring(L"—") : *reading ? std::to_wstring(*reading * 100) : std::wstring(tr(L"停止"));
+}
+void showFanPage();
+void fanEditPoint(int k, int temperature, int duty) {
+    using namespace bs::asus;
+    const auto h = fanSnapshot();
+    FanCurve c = fanDraft.size() == 16 ? fanDraft : fanShownCurve(h);
+    if (c.size() != 16 || k < 0 || k >= FanPoints) return;
+    // Its temperature stays between its neighbours'; the duties keep rising: a point moved up
+    // lifts the ones after it, moved down lowers the ones before it.
+    const int lower = k ? c[size_t(k - 1)] + 1 : FanTempMin, upper = k < FanPoints - 1 ? c[size_t(k + 1)] - 1 : FanTempMax;
+    c[size_t(k)] = uint8_t(std::clamp(temperature, lower, std::max(lower, upper)));
+    const int d = std::clamp(duty, 0, 100);
+    c[size_t(k + FanPoints)] = uint8_t(d);
+    for (int j = k + 1; j < FanPoints; ++j) c[size_t(j + FanPoints)] = uint8_t(std::max<int>(c[size_t(j + FanPoints)], d));
+    for (int j = 0; j < k; ++j) c[size_t(j + FanPoints)] = uint8_t(std::min<int>(c[size_t(j + FanPoints)], d));
+    fanDraft = sanitizeFanCurve(c);
+    fanPoint = k;
+    showFanPage();
+}
+void fanCommit() {
+    if (fanDraft.size() != 16) return;
+    const auto h = fanSnapshot();
+    fanKeep(fanEditFan, fanEditMode(h), fanDraft);
+    fanDraft.clear();
+    if (fanSetting() == bs::asus::FanPreset::custom && fanEditMode(h) == fanModeInUse(h)) fanApplySoon();
+    showFanPage();
+}
+std::wstring fanPageText(const bs::asus::Snapshot& h, const bs::asus::FanCurve& curve) {
+    std::wstring t = tr(L"風扇：") + std::wstring(tr(bs::asus::fanPresetKey(fanSetting())));
+    if (h.cpuTemp) t += tr(L"\nCPU 溫度：") + std::to_wstring(*h.cpuTemp) + L" °C";
+    t += tr(L"\nCPU 風扇：") + fanRpm(h.cpuFan) + L" RPM";
+    if (h.gpuFan) t += tr(L"\n獨顯風扇：") + fanRpm(h.gpuFan) + L" RPM";
+    if (curve.size() == 16) {
+        t += tr(L"\n曲線：");
+        for (int k = 0; k < bs::asus::FanPoints; ++k) t += (k ? L"、" : L"") + std::to_wstring(curve[size_t(k)]) + L"°C " + std::to_wstring(curve[size_t(k + 8)]) + L"%";
+    }
+    return t;
+}
+void showFanPage() {
+    using namespace bs::asus;
+    const auto h = fanSnapshot();
+    const FanPreset setting = fanSetting();
+    const auto fans = fanListShown();
+    if (std::find(fans.begin(), fans.end(), fanEditFan) == fans.end()) fanEditFan = Fan::cpu;
+    std::vector<VBlock> v;
+    // Now: the temperature and both fans.
+    v.push_back(vTiles({{tr(L"CPU 溫度") + std::wstring(L"\n") + (h.cpuTemp ? std::to_wstring(*h.cpuTemp) + L" °C" : std::wstring(L"—")),
+            h.cpuTemp && *h.cpuTemp >= 90 ? theme.danger : h.cpuTemp && *h.cpuTemp >= 80 ? theme.warn : COLORREF(0)},
+        {tr(L"CPU 風扇") + std::wstring(L"\n") + fanRpm(h.cpuFan), 0},
+        {(h.gpuFan || !h.midFan ? tr(L"獨顯風扇") : tr(L"中間風扇")) + std::wstring(L"\n") + fanRpm(h.gpuFan ? h.gpuFan : h.midFan), 0}}));
+    // The setting: four presets and custom.
+    v.push_back(vHeading(tr(L"風扇模式")));
+    v.push_back(vSegments({tr(L"原廠"), tr(L"安靜"), tr(L"標準"), tr(L"強力"), tr(L"自訂")},
+        {FanPreset0Id, FanPreset0Id + 1, FanPreset0Id + 2, FanPreset0Id + 3, FanCustomId}, int(setting)));
+    static const wchar_t* const about[] = {
+        L"由韌體依效能模式控制。",
+        L"較晚起轉、轉速較低：安靜，但機身較熱。",
+        L"介於兩者之間。",
+        L"較早起轉、轉速較高：較涼，但較吵。",
+        L"每個風扇、每個效能模式各一條曲線。拖曳曲線上的點，或選中曲線後用方向鍵精確調整。"};
+    v.push_back(vNote(tr(about[int(setting)])));
+    // The curve.
+    v.push_back(vHeading(setting == FanPreset::custom ? tr(L"自訂曲線") : tr(L"目前的曲線")));
+    if (fans.size() > 1) {
+        std::vector<std::wstring> names; std::vector<int> commands; int chosen = 0;
+        for (size_t i = 0; i < fans.size(); ++i) {
+            names.push_back(fans[i] == Fan::gpu ? tr(L"獨顯") : fans[i] == Fan::mid ? tr(L"中間") : std::wstring(L"CPU"));
+            commands.push_back(FanEditFan0Id + int(fans[i]));
+            if (fans[i] == fanEditFan) chosen = int(i);
+        }
+        v.push_back(vSegments(std::move(names), std::move(commands), chosen));
+    }
+    const Mode inUse = fanModeInUse(h), editing = fanEditMode(h);
+    if (setting == FanPreset::custom) {
+        int chosen = 1;
+        for (int i = 0; i < 3; ++i) if (fanModes[i] == editing) chosen = i;
+        v.push_back(vSegments({tr(L"靜音"), tr(L"平衡"), L"Turbo"}, {FanEditMode0Id, FanEditMode0Id + 1, FanEditMode0Id + 2}, chosen));
+    }
+    const FanCurve curve = fanShownCurve(h);
+    if (curve.size() == 16) {
+        const bool editable = setting == FanPreset::custom;
+        const int k = std::clamp(fanPoint, 0, FanPoints - 1);
+        const std::optional<unsigned> temperature = fanEditFan == Fan::gpu ? h.gpuTemp : h.cpuTemp;
+        const std::optional<unsigned> rpm = fanEditFan == Fan::gpu ? h.gpuFan : fanEditFan == Fan::mid ? h.midFan : h.cpuFan;
+        const std::wstring point = editable ? tr(L"第 ") + std::to_wstring(k + 1) + tr(L" 點：") + std::to_wstring(curve[size_t(k)]) + L" °C → " + std::to_wstring(curve[size_t(k + 8)]) + L"%"
+            : tr(L"這個設定在") + std::wstring(tr(modeKey(inUse))) + tr(L"模式的曲線（唯讀）");
+        std::wstring live;
+        if (temperature && editing == inUse) live = tr(L"現在 ") + std::to_wstring(*temperature) + L" °C → " + std::to_wstring(int(std::lround(fanDutyAt(curve, *temperature)))) + L"% · " + fanRpm(rpm) + L" RPM";
+        else if (editing != inUse) live = tr(L"編輯中：") + std::wstring(tr(modeKey(editing))) + tr(L"（切到該模式時套用；目前是") + std::wstring(tr(modeKey(inUse))) + tr(L"）");
+        v.push_back(vCurve(curve, editable, k, temperature && editing == inUse ? double(*temperature) : 0, point, live));
+        if (editable) {
+            v.push_back(vAction(tr(L"重設這條曲線"), L"", FanResetCurveId));
+            v.push_back(vAction(tr(L"套用到三種模式"), L"", FanCopyCurveId));
+        }
+    } else v.push_back(vNote(tr(L"原廠曲線由韌體依效能模式控制；這台的韌體不交出曲線內容，所以這裡不顯示。選「安靜」「標準」「強力」或「自訂」即可看到並設定曲線。")));
+    v.push_back(vFold(tr(L"曲線怎麼運作與安全限制"), tr(L"每條曲線有 8 個點：溫度（20–110 °C，由低到高）對應轉速（0–100%）。兩點之間依直線過渡，最後一點以上維持最後的轉速。") + std::wstring(L"\n") +
+        tr(L"安全限制：90 °C 以上的點與最後一點至少 50%，轉速不會隨溫度升高而降低。拖曳時其他點會跟著維持這個順序。") + std::wstring(L"\n") +
+        tr(L"100% 寫入時是 99%（部分機型的韌體在 100% 會異常，G-Helper 也這樣做）。") + std::wstring(L"\n") +
+        tr(L"韌體在每次切換效能模式後會恢復原廠曲線，BatteryScope 會在切換後、喚醒與開機時重新寫入。韌體在過熱時仍可能自行提高轉速。")));
+    showChartPage(InlinePage::fans, tr(L"風扇"), fanPageText(h, curve), std::move(v));
 }
 // ----- Stability: crashes, freezes and problem reports -----
 // A black box (stability.h) keeps the last two hours on disk; a high-priority
@@ -9194,6 +9506,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             refreshPowerModeControls();
             return 0;
         }
+        if (id == IDCANCEL && inlinePage == InlinePage::fans) { fanDraft.clear(); showPerformancePage(); return 0; } // back up to the performance page
         if (id == InlineBackId || (id == IDCANCEL && inlinePage != InlinePage::none)) { closeInlinePage(); return 0; }
         if (id == InlineConfirmId) {
             if (inlinePage != InlinePage::confirm || !pendingForceRow || demo || pendingAction) return 0;
@@ -9293,10 +9606,33 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             setNotice(tr(L"這台電腦上功耗上限設了之後還原不回來，已停用這個選項。「重新啟動」電腦可以清除目前的上限。"));
             return 0;
         }
-        if ((id >= FanPreset0Id && id <= FanPreset0Id + 3) || (id >= PowerPreset0Id && id <= PowerPreset0Id + 3)) {
+        if (id == FanPageId) { fanDraft.clear(); fanEditModeIndex = -1; showFanPage(); return 0; }
+        if (id >= FanEditFan0Id && id <= FanEditFan0Id + 2) { fanEditFan = bs::asus::Fan(id - FanEditFan0Id); fanDraft.clear(); showFanPage(); return 0; }
+        if (id >= FanEditMode0Id && id <= FanEditMode0Id + 2) { fanEditModeIndex = id - FanEditMode0Id; fanDraft.clear(); showFanPage(); return 0; }
+        if (id == FanResetCurveId || id == FanCopyCurveId) {
+            const auto h = fanSnapshot();
+            const auto editing = fanEditMode(h);
+            if (id == FanResetCurveId) {
+                if (fanPreview()) demoCurves.erase(int(fanEditFan) * 4 + int(editing)); else bs::asus::resetCustomFanCurve(fanEditFan, editing);
+                setNotice(tr(L"已重設這條曲線。"));
+            } else {
+                const auto curve = fanCustom(fanEditFan, editing);
+                for (const auto mode : fanModes) fanKeep(fanEditFan, mode, curve);
+                setNotice(tr(L"已把這條曲線用在三種效能模式。"));
+            }
+            fanDraft.clear();
+            if (fanSetting() == bs::asus::FanPreset::custom) fanApplySoon();
+            showFanPage();
+            return 0;
+        }
+        if ((id >= FanPreset0Id && id <= FanPreset0Id + 3) || id == FanCustomId || (id >= PowerPreset0Id && id <= PowerPreset0Id + 3)) {
+            const bool fanChoice = id < PowerPreset0Id || id == FanCustomId;
+            const auto chosenFans = id == FanCustomId ? bs::asus::FanPreset::custom : bs::asus::FanPreset(std::clamp(id - FanPreset0Id, 0, 3));
+            if (fanChoice && fanPreview()) { demoFans = chosenFans; fanDraft.clear(); if (inlinePage == InlinePage::fans) showFanPage(); return 0; }
             if (demo || isolatedPreview || !asusAvailable) return 0;
             auto t = bs::asus::tuning();
-            if (id >= PowerPreset0Id) t.power = bs::asus::PowerPreset(id - PowerPreset0Id); else t.fans = bs::asus::FanPreset(id - FanPreset0Id);
+            if (!fanChoice) t.power = bs::asus::PowerPreset(id - PowerPreset0Id); else t.fans = chosenFans;
+            fanDraft.clear();
             // Writing fans and limits takes up to 3 s (a return to factory re-sets the mode): off the UI thread.
             HWND target = window;
             std::thread([target, t] { PostMessageW(target, TuningDoneMessage, bs::asus::setTuning(t), 0); }).detach();
@@ -9588,6 +9924,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (const Value watts = current.energy.packageWatts; watts && *watts > 28 && powerLimitStuck()) clearPowerLimitStuck(L"cpu above 28 W");
         if (inlinePage == InlinePage::hardware && !hidden) showHardwarePage();
         if (inlinePage == InlinePage::performance && !hidden) showPerformancePage();
+        if (inlinePage == InlinePage::fans && !hidden && fanDragPoint < 0 && fanDraft.empty()) showFanPage(); // live temperature and fans
         if (inlinePage == InlinePage::goal && !hidden && GetTickCount64() - goalPageShownAt >= 10000) showGoalPage();
         return 0;
     }
@@ -9676,6 +10013,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             : tr(L"韌體沒有接受這個設定，已回到原廠。"));
         asusReadAt = 0;
         if (inlinePage == InlinePage::performance) showPerformancePage();
+        if (inlinePage == InlinePage::fans) showFanPage();
         return 0;
     case PopupClickMessage:
         showMain();
@@ -9708,6 +10046,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         else if (inlinePage == InlinePage::hardware) showHardwarePage();
         else if (inlinePage == InlinePage::performance) showPerformancePage();
         else if (inlinePage == InlinePage::stability) showStabilityPage();
+        else if (inlinePage == InlinePage::fans && fanDragPoint < 0) showFanPage();
         else if (inlinePage == InlinePage::lab) showLabPage();
         else if (inlinePage == InlinePage::settings) showSettingsPage();
         InvalidateRect(window, nullptr, FALSE); // the tabs, and the mascot in the header
@@ -9783,7 +10122,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             if (const int tab = tabAt(point, client); tab >= 0) {
                 if (canAnimate()) { tabRippleIndex = tab; tabRippleAt = point; tabRippleStart = motionNow(); armMotionTimer(); }
                 const Tab target = visibleTabs()[size_t(tab)];
-                if (target != activeTab() || (target == Tab::ranking && inlinePage != InlinePage::none) || (target == Tab::performance && inlinePage == InlinePage::stability)) SendMessageW(window, WM_COMMAND, tabCommand(target), 0);
+                if (target != activeTab() || (target == Tab::ranking && inlinePage != InlinePage::none) || (target == Tab::performance && (inlinePage == InlinePage::stability || inlinePage == InlinePage::fans))) SendMessageW(window, WM_COMMAND, tabCommand(target), 0);
                 return 0;
             }
         }
@@ -10461,7 +10800,44 @@ bool panelSelfTest(const std::wstring& path) {
     SendMessageW(mainWindow, WM_COMMAND, PerfPageId, 0);
     check("performance_page_is_its_own_tab", inlinePage == InlinePage::performance && activeTab() == Tab::performance && visibleTabs().front() == Tab::performance
         && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::segments && b.commands.size() >= 3; })
-        && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::action && int(b.amount) == FanMenuId; }));
+        && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::action && int(b.amount) == FanPageId; }));
+    {
+        // Fans: presets and custom curves on their own page under the performance tab; a point
+        // dragged up lifts the curve and keeps its order, an arrow key moves it 1%, Esc goes back.
+        auto settle = [](uint64_t milliseconds) {
+            const uint64_t end = GetTickCount64() + milliseconds; MSG m{};
+            while (GetTickCount64() < end) { while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&m); DispatchMessageW(&m); } Sleep(5); }
+        };
+        demoFans = bs::asus::FanPreset::custom; demoCurves.clear();
+        SendMessageW(mainWindow, WM_COMMAND, FanPageId, 0); settle(450); UpdateWindow(visualView);
+        size_t curveBlock = visualBlocks.size();
+        for (size_t i = 0; i < visualBlocks.size(); ++i) if (visualBlocks[i].kind == VBlock::Kind::curve) curveBlock = i;
+        const bool offered = inlinePage == InlinePage::fans && activeTab() == Tab::performance && curveBlock < visualBlocks.size() && visualBlocks[curveBlock].toggle == 1
+            && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::segments && b.commands.size() == 5 && b.commands.back() == FanCustomId; });
+        check("fan_page_offers_presets_and_custom_curves", offered);
+        RECT plot{}; bool found = false;
+        for (const auto& hit : visualHits) if (hit.command == CurveCommand) { plot = hit.rect; InflateRect(&plot, -sp(10), -sp(10)); found = true; }
+        bool dragged = false, nudged = false;
+        if (found && offered) {
+            const auto before = fanCustom(bs::asus::Fan::cpu, bs::asus::Mode::balanced);
+            const POINT from = curvePoint(plot, before[3], before[11]);
+            const POINT to{from.x, from.y - (plot.bottom - plot.top) * 30 / 100};
+            SendMessageW(visualView, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(from.x, from.y));
+            SendMessageW(visualView, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(to.x, to.y));
+            SendMessageW(visualView, WM_LBUTTONUP, 0, MAKELPARAM(to.x, to.y));
+            const auto after = fanCustom(bs::asus::Fan::cpu, bs::asus::Mode::balanced);
+            bool ordered = true; for (int i = 9; i < 16; ++i) ordered = ordered && after[size_t(i)] >= after[size_t(i - 1)];
+            dragged = std::abs(int(after[11]) - int(before[11]) - 30) <= 2 && after[3] == before[3] && ordered && after[12] >= after[11];
+            SetFocus(visualView); settle(50);
+            for (size_t i = 0; i < visualHits.size(); ++i) if (visualHits[i].command == CurveCommand) visualFocus = int(i);
+            SendMessageW(visualView, WM_KEYDOWN, VK_UP, 0);
+            nudged = fanCustom(bs::asus::Fan::cpu, bs::asus::Mode::balanced)[11] == after[11] + 1;
+        }
+        check("fan_curve_point_drags_and_nudges", dragged && nudged);
+        SendMessageW(mainWindow, WM_COMMAND, IDCANCEL, 0);
+        check("fan_page_goes_back_to_performance", inlinePage == InlinePage::performance);
+        demoCurves.clear();
+    }
     check("performance_mode_offers_the_mode_link", std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) {
         return b.kind == VBlock::Kind::action && int(b.amount) == ModeLinkMenuId && b.text.find(L"Turbo") != std::wstring::npos; }) && modeLinkMenuItems().size() >= 5);
     // The demo has a blue screen this week: the home page shows a banner that leads to the stability page.
@@ -10994,6 +11370,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (screenshot && option(L"--hardware")) showHardwarePage();
     if ((screenshot || uiTest) && option(L"--protect")) protectState = 2;
     if (screenshot && option(L"--performance")) showPerformancePage();
+    if (screenshot && option(L"--fans")) { if (option(L"--preset")) demoFans = bs::asus::FanPreset::quiet; showFanPage(); if (option(L"--focus")) { SetFocus(visualView); for (size_t i = 0; i < visualHits.size(); ++i) if (visualHits[i].command == CurveCommand) visualFocus = int(i); } }
     if (screenshot && option(L"--stability")) showStabilityPage();
     if (screenshot && option(L"--lab")) showLabPage();
     // --page-scroll <n>: a chart page scrolled down by n (unscaled) pixels, to capture its lower part.

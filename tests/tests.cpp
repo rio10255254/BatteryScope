@@ -629,6 +629,26 @@ int wmain(int argc, wchar_t** argv) {
             check(asus::validFanCurve({30, 40, 50, 60, 70, 80, 90, 100, 0, 0, 10, 20, 35, 50, 70, 90})
                 && !asus::validFanCurve(Bytes(16, 0)) && !asus::validFanCurve({30, 40, 50}) && !asus::validFanCurve({30, 40, 50, 60, 70, 80, 90, 200, 0, 0, 10, 20, 35, 50, 70, 90})
                 && !asus::validFanCurve({30, 40, 50, 60, 70, 80, 90, 100, 0, 0, 10, 20, 35, 50, 70, 150}), "only plausible fan curves are written");
+            {
+                // Every written curve keeps the rules: temperatures rising inside 20-110 °C, duties never
+                // falling, and at 90 °C and above (and at the last point) at least 50%.
+                const auto wild = asus::sanitizeFanCurve({10, 10, 60, 50, 120, 120, 120, 120, 80, 20, 30, 0, 10, 0, 0, 0});
+                bool rising = true, held = true;
+                for (int i = 1; i < 8; ++i) rising = rising && wild[size_t(i)] > wild[size_t(i - 1)] && wild[size_t(i)] <= 110 && wild[0] >= 20;
+                for (int i = 9; i < 16; ++i) held = held && wild[size_t(i)] >= wild[size_t(i - 1)];
+                bool floor = wild[15] >= 50;
+                for (int i = 0; i < 8; ++i) if (wild[size_t(i)] >= 90) floor = floor && wild[size_t(i + 8)] >= 50;
+                check(wild.size() == 16 && rising && held && floor && asus::sanitizeFanCurve({1, 2, 3}).empty(), "fan curves are made safe before they are kept or written");
+                const asus::FanCurve gentle{35, 45, 55, 65, 72, 80, 88, 95, 0, 0, 15, 25, 35, 50, 65, 80};
+                check(asus::sanitizeFanCurve(gentle) == gentle, "a curve that keeps the rules is written as it is");
+                check(asus::fanDutyAt(gentle, 20) == 0 && asus::fanDutyAt(gentle, 60) == 20 && asus::fanDutyAt(gentle, 120) == 80
+                    && std::abs(asus::fanDutyAt(gentle, 76) - 42.5) < .01, "the duty at a temperature follows the curve between its points");
+                // The built-in presets, where the firmware hands out no curves, keep the rules and rise from quiet to strong.
+                const auto quiet = asus::presetFanCurve(asus::FanPreset::quiet, asus::Fan::mid, asus::Mode::balanced);
+                const auto strong = asus::presetFanCurve(asus::FanPreset::strong, asus::Fan::mid, asus::Mode::balanced);
+                check(asus::sanitizeFanCurve(quiet) == quiet && asus::sanitizeFanCurve(strong) == strong
+                    && asus::fanDutyAt(quiet, 80) < asus::fanDutyAt(strong, 80), "the fan presets keep the rules and differ");
+            }
             const auto saver = asus::powerLimits(asus::PowerPreset::saver), standard = asus::powerLimits(asus::PowerPreset::standard);
             check(asus::powerLimits(asus::PowerPreset::factory).spl == 0 && saver.spl < saver.sppt && saver.sppt < saver.fppt
                 && standard.spl <= 45 && standard.fppt <= 65 && asus::powerLimits(asus::PowerPreset::light).spl > saver.spl,
