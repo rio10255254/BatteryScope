@@ -15,8 +15,8 @@
 
 到 **[Releases 頁面](https://github.com/rio10255254/BatteryScope/releases/latest)** 下載：
 
-- **安裝版（建議）**：`BatteryScope-0.39.0-setup.exe`。不需要管理員權限，安裝到 `%LOCALAPPDATA%\Programs\BatteryScope`，會建立開始功能表捷徑，可選擇桌面捷徑與登入時啟動，並可從「設定 → 應用程式」解除安裝。
-- **免安裝版**：`BatteryScope-0.39.0-win64.zip`，解壓後執行 `BatteryScope.exe`。
+- **安裝版（建議）**：`BatteryScope-0.40.0-setup.exe`。不需要管理員權限，安裝到 `%LOCALAPPDATA%\Programs\BatteryScope`，會建立開始功能表捷徑，可選擇桌面捷徑與登入時啟動，並可從「設定 → 應用程式」解除安裝。
+- **免安裝版**：`BatteryScope-0.40.0-win64.zip`，解壓後執行 `BatteryScope.exe`。
 
 需要 Windows 10 1703 以上（建議 Windows 11），64 位元。程式沒有數位簽章，第一次開啟若出現 SmartScreen，點「其他資訊 → 仍要執行」。開啟後在右下角系統匣，圖示會顯示電量百分比；點圖示開關面板。
 
@@ -55,7 +55,7 @@
 
 ## 使用方式
 
-1. 從 [GitHub Releases](https://github.com/rio10255254/BatteryScope/releases/latest) 下載 `BatteryScope-0.39.0-win64.zip`，解壓後執行 `BatteryScope.exe`。已編譯版本適用 Windows 10（1703 以上）與 Windows 11 的 x64 筆電與桌機。
+1. 從 [GitHub Releases](https://github.com/rio10255254/BatteryScope/releases/latest) 下載 `BatteryScope-0.40.0-win64.zip`，解壓後執行 `BatteryScope.exe`。已編譯版本適用 Windows 10（1703 以上）與 Windows 11 的 x64 筆電與桌機。
    升級時先從系統匣結束舊版，再執行新版；程式會避免同時啟動多個正式監測視窗。
 2. 目前耗電顯示電池回報的整機放電功率；資料累積後顯示平均功率、耗電速度與預估續航。
 3. 硬體能源資料可用時，下方依「估計 CPU W」由高到低列出前 10 個程序／服務。每張卡片第二行顯示類型、PID 與核心分攤模型範圍。點「僅背景」切換背景篩選，點「顯示」切換前 10 名／全部；滑鼠滾輪或鍵盤上下鍵瀏覽。若能源資料不可用，會明確退回 CPU / I/O 活動排行。
@@ -170,7 +170,7 @@
 - **華碩按鍵**：華碩的軟體不在時，BatteryScope 自動接手所有 Fn 鍵——螢幕亮度、鍵盤背光、觸控板、麥克風靜音、睡眠、飛航模式、表情符號、Fn 鎖定、效能模式（Fn+F5）與 ROG 鍵（開啟 BatteryScope、切換效能模式或不動作），並在畫面下方顯示結果。按鍵同時從 ATK WMI 事件與鍵盤 HID 輸入讀取（和 G-Helper 一樣）；華碩的軟體還在執行時，交給它處理，不會重複動作。
 - **華碩服務**：一鍵停止並停用 Armoury Crate 與華碩背景服務（與 G-Helper 停止的清單相同，觸控板與系統控制驅動不動；需要管理員權限，原本的啟動方式會記下），之後可恢復停止前的設定，或「恢復成華碩預設（自動啟動）」——被 G-Helper 停用過的服務也能用這個救回來。
 - 診斷：`BatteryScope.exe --asus-dump` 列出讀到的每個韌體值、記住的設定，以及每個華碩 HID 介面的報告編號。
-- 風扇在「效能」首頁的「風扇」頁（0.39 起）：原廠、安靜、標準、強力四種預設，或像 G-Helper 一樣的自訂曲線——每個風扇（CPU、獨顯）、每個效能模式各一條 8 點曲線，可拖曳，也可用方向鍵以 1 °C／1% 精確調整；即時顯示溫度、轉速與曲線在目前溫度要求的轉速。安全下限：90 °C 以上與最後一點至少 50%，轉速不隨溫度升高而降低。韌體不交出原廠曲線的機型（如 G14 2024）也能用。
+- 風扇在「效能」首頁的「風扇」頁（0.39 起）：原廠、安靜、標準、強力四種預設，或像 G-Helper 一樣的自訂曲線——每個風扇（CPU、獨顯）、每個效能模式各一條 8 點曲線，直接拖曳點（按住 Shift 為四分之一速度微調，拖曳時點旁顯示數值），滑鼠停在曲線上可讀出任一溫度的轉速；下方有 − / + 精確調整（按住連續），也可用方向鍵以 1 °C／1% 調整；可復原／重做（Ctrl+Z／Ctrl+Y）、從預設開始、淡淡顯示另一個風扇的曲線對照；即時顯示溫度、轉速與曲線在目前溫度要求的轉速，寫入後顯示韌體是否接受。安全下限：90 °C 以上與最後一點至少 50%，轉速不隨溫度升高而降低。韌體不交出原廠曲線的機型（如 G14 2024）也能用。
 - CPU 功耗上限在「效能」首頁調整（0.22 起）。
 
 ### 省電實驗室（實驗功能）
@@ -286,7 +286,7 @@
 .\build.ps1 -Test
 ```
 
-舊版仍在執行時，可使用 `./build.ps1 -Test -OutputDirectory dist/v0.39.0` 編譯到獨立目錄，避免覆寫使用中的 EXE。
+舊版仍在執行時，可使用 `./build.ps1 -Test -OutputDirectory dist/v0.40.0` 編譯到獨立目錄，避免覆寫使用中的 EXE。
 
 預設尋找 PATH 上的 `g++.exe`，其次使用 `C:\mingw64\bin\g++.exe`，並使用同目錄的 `windres.exe`。產出 `dist\BatteryScope.exe`。
 

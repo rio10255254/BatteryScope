@@ -42,7 +42,7 @@ constexpr UINT SampleMessage = WM_APP + 1, TrayMessage = WM_APP + 2, ActionMessa
     PowerModeMessage = WM_APP + 5, UpdateMessage = WM_APP + 6, UpdateDownloadedMessage = WM_APP + 7, LabExportMessage = WM_APP + 8,
     GovernorNowMessage = WM_APP + 9, // input or a program switch: re-run the governor now
     GpuUsersMessage = WM_APP + 10,   // programs found on the discrete GPU (before switching it off)
-    SectionRefreshMessage = WM_APP + 11, AsusKeyMessage = WM_APP + 12, AsusServicesMessage = WM_APP + 13,
+    SectionRefreshMessage = WM_APP + 11, FanAppliedMessage = WM_APP + 20, AsusKeyMessage = WM_APP + 12, AsusServicesMessage = WM_APP + 13,
     OsdMessage = WM_APP + 14,      // a key's result from the key worker: wParam what, lParam the level (-1 unknown)
     PopupClickMessage = WM_APP + 15, // a notification was clicked: wParam its BalloonTarget
     TuningDoneMessage = WM_APP + 16, // fan or power preset applied: wParam the status
@@ -78,7 +78,8 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     DimAfter0Id = 370 /* ..375 */, DisplayOff0Id = 380 /* ..386 */, DimLevel0Id = 390 /* ..393 */, ModeBoost0Id = 340 /* ..358: + mode * 8 + boost */,
     SettingRowId = 300 /* ..329, one per settings row */,
     FanPageId = 400, FanCustomId = 401, FanEditFan0Id = 402 /* ..404: cpu, gpu, mid */, FanEditMode0Id = 405 /* ..407: silent, balanced, turbo */,
-    FanResetCurveId = 408, FanCopyCurveId = 409,
+    FanResetCurveId = 408, FanCopyCurveId = 409, FanPointPrevId = 410, FanPointNextId = 411, FanTempDownId = 412, FanTempUpId = 413,
+    FanDutyDownId = 414, FanDutyUpId = 415, FanUndoId = 416, FanRedoId = 417, FanLoadMenuId = 418, FanLoad0Id = 419 /* ..421: quiet, standard, strong */,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1, FnKeyHotkey = 10 /* ..20: F1-F11 under the software Fn lock */;
 const wchar_t* ClassName = L"BatteryScope.Main.v1";
@@ -965,7 +966,7 @@ struct VBar {
     std::vector<VSegment> segments;     // stacked parts instead of one fill
 };
 struct VBlock {
-    enum class Kind { heading, note, meter, bars, series, chips, legend, action, segments, banner, timeline, card, check, fold, display, tiles, curve } kind = Kind::note;
+    enum class Kind { heading, note, meter, bars, series, chips, legend, action, segments, banner, timeline, card, check, fold, display, tiles, curve, pointEdit } kind = Kind::note;
     std::wstring title, text, value;
     double amount = 0, goal = 0, scale = 0;
     std::vector<VBar> bars;
@@ -999,6 +1000,11 @@ VBlock vTiles(std::vector<std::pair<std::wstring, COLORREF>> tiles) { VBlock b; 
 VBlock vCurve(const std::vector<uint8_t>& curve, bool editable, int chosen, double now, const std::wstring& point, const std::wstring& live) {
     VBlock b; b.kind = VBlock::Kind::curve; b.series.assign(curve.begin(), curve.end()); b.toggle = editable ? 1 : 0;
     b.amount = chosen; b.goal = now; b.value = point; b.text = live; return b;
+}
+// The chosen point of a fan curve, for exact steps: `value` names it, `items` hold the
+// temperature and the duty, `commands` previous / next point and - / + for each.
+VBlock vPointEdit(const std::wstring& name, const std::wstring& temperature, const std::wstring& duty, std::vector<int> commands) {
+    VBlock b; b.kind = VBlock::Kind::pointEdit; b.value = name; b.items = {{temperature, 0}, {duty, 0}}; b.commands = std::move(commands); return b;
 }
 VBlock vChips(std::vector<std::pair<std::wstring, COLORREF>> chips) { VBlock b; b.kind = VBlock::Kind::chips; b.items = std::move(chips); return b; }
 VBlock vLegend(std::vector<std::pair<std::wstring, COLORREF>> entries) { VBlock b; b.kind = VBlock::Kind::legend; b.items = std::move(entries); return b; }
@@ -1049,6 +1055,42 @@ constexpr int CurveCommand = -7002; // the fan curve: dragged and nudged in plac
 // The fan curve's plot inside its block (block coordinates): room on the left for the duty
 // labels, below for the temperatures, a readout line above.
 RECT curvePlot(int y, int width, int height) { return {sp(44), y + sp(56), width - sp(16), y + height - sp(28)}; }
+// Fan curve editing (the fans page): which fan and which performance mode's curve is open, the
+// chosen point, and the curve while it is being changed (empty otherwise).
+bs::asus::Fan fanEditFan = bs::asus::Fan::cpu;
+int fanEditModeIndex = -1;   // 0 silent, 1 balanced, 2 turbo; -1 the mode in use
+int fanPoint = 3, fanDragPoint = -1;
+bs::asus::FanCurve fanDraft;
+bs::asus::FanPreset demoFans = bs::asus::FanPreset::custom; // the preview's own fan setting
+void fanEditPoint(int point, int temperature, int duty); // moves a point (the others keep the curve's order)
+void fanCommit();                                        // keeps the changed curve and applies it
+// The pointer over the curve: the point under it (-1 none), or else where along the plot it is
+// (block x, -1 none) for the readout of what the curve asks for there; whether it is over the
+// curve at all (for the cursor).
+int fanHoverPoint = -1, fanHoverX = -1; bool fanOverCurve = false;
+// A drag as values, so Shift can slow it to a quarter for fine steps.
+POINT fanDragLast{}; double fanDragT = 0, fanDragD = 0;
+// Undo and redo: the curves as they were before each change.
+struct FanUndo { bs::asus::Fan fan; bs::asus::Mode mode; bs::asus::FanCurve curve; };
+std::vector<FanUndo> fanUndo, fanRedo;
+// The firmware's answer to the last write (1 taken, -1 refused) and when.
+int fanWriteState = 0; uint64_t fanWriteAt = 0;
+// The +/- keys repeat while held.
+constexpr UINT_PTR FanRepeatTimer = 7;
+int fanRepeatCommand = 0; bool fanRepeated = false;
+// The point editor's keys (block coordinates): previous and next point on the first row, then
+// - and + for the temperature and for the duty.
+RECT pointEditKey(int y, int width, int k) {
+    const int keyW = sp(40), rowA = y + sp(4), rowB = y + sp(50), keyH = sp(36), half = width / 2;
+    switch (k) {
+    case 0: return {0, rowA, keyW, rowA + keyH};
+    case 1: return {width - keyW, rowA, width, rowA + keyH};
+    case 2: return {0, rowB, keyW, rowB + keyH};
+    case 3: return {half - sp(6) - keyW, rowB, half - sp(6), rowB + keyH};
+    case 4: return {half + sp(6), rowB, half + sp(6) + keyW, rowB + keyH};
+    default: return {width - keyW, rowB, width, rowB + keyH};
+    }
+}
 // Where a point of the curve sits in the plot, and back.
 POINT curvePoint(const RECT& plot, double temperature, double duty) {
     using namespace bs::asus;
@@ -1107,7 +1149,8 @@ int blockHeight(HDC dc, const VBlock& b, int width, bool first) {
     case VBlock::Kind::check: return sp(30) + (b.text.empty() ? 0 : noteHeight(dc, b.text, width - sp(28)));
     case VBlock::Kind::display: return sp(112);
     case VBlock::Kind::tiles: return sp(68);
-    case VBlock::Kind::curve: return sp(254);
+    case VBlock::Kind::curve: return sp(300);
+    case VBlock::Kind::pointEdit: return sp(96);
     }
     return 0;
 }
@@ -1243,6 +1286,9 @@ void pushBlockHits(const VBlock& b, size_t i, int y, int width, int height) {
         visualHits.push_back({placed(plot), CurveCommand, i});
         break;
     }
+    case VBlock::Kind::pointEdit:
+        for (size_t k = 0; k < b.commands.size() && k < 6; ++k) visualHits.push_back({placed(pointEditKey(y, width, int(k))), b.commands[k], i});
+        break;
     default: break;
     }
 }
@@ -1949,7 +1995,10 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
         case VBlock::Kind::curve: {
             // A fan curve in a well: duty up, temperature along; the area the safety floor keeps
             // off-limits tinted; the curve lit, its eight points as LEDs (the chosen one bright),
-            // and where the temperature is now.
+            // where the temperature is now, and faintly the other fan's curve. Under the pointer
+            // a point lights and shows its values; elsewhere a guide reads what the curve asks
+            // for at that temperature. A curve that changes a lot (another fan or mode, a reset,
+            // a preset) glides to its new shape.
             using namespace bs::asus;
             const RECT plot = curvePlot(top, width, h);
             const bool editable = b.toggle == 1;
@@ -1957,29 +2006,74 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
             drawText(dc, b.text, {sp(4), top + sp(20), width - sp(4), top + sp(37)}, Muted, smallFont);
             const RECT box{0, top + sp(40), width, top + h - sp(4)};
             card(dc, box, Surface, 14);
-            const COLORREF grid = blend(theme.well, Muted, theme.dark ? .28 : .34);
+            const COLORREF grid = blend(theme.well, Muted, theme.dark ? .28 : .34), fine = blend(theme.well, Muted, theme.dark ? .14 : .18);
             {
                 const POINT corner = curvePoint(plot, FanFloorTemp, FanFloorDuty);
                 fill(dc, {corner.x, corner.y, plot.right, plot.bottom}, blend(theme.well, dangerLed, theme.dark ? .13 : .1));
             }
-            for (int duty = 0; duty <= 100; duty += 25) {
+            for (int duty = 0; duty <= 100; duty += 5) {
                 const int gy = curvePoint(plot, FanTempMin, duty).y;
+                if (duty % 25) { if (duty % 10 == 0) dottedRule(dc, plot.left, plot.right, gy, fine); continue; }
                 dottedRule(dc, plot.left, plot.right, gy, grid);
                 drawText(dc, std::to_wstring(duty) + L"%", {box.left, gy - sp(8), plot.left - sp(6), gy + sp(8)}, Muted, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
             }
-            for (int temperature = 30; temperature <= FanTempMax; temperature += 10) {
+            for (int temperature = 25; temperature <= FanTempMax; temperature += 5) {
                 const int gx = curvePoint(plot, temperature, 0).x;
-                for (int gy = plot.top; gy < plot.bottom; gy += sp(5)) fill(dc, {gx, gy, gx + std::max(1, sp(1) / 2), gy + std::max(1, sp(1))}, grid);
-                if ((temperature - 30) % 20 == 0)
+                const bool major = temperature % 10 == 0;
+                for (int gy = plot.top; gy < plot.bottom; gy += sp(5)) fill(dc, {gx, gy, gx + std::max(1, sp(1) / 2), gy + std::max(1, sp(1))}, major ? grid : fine);
+                if (major && (temperature - 30) % 20 == 0)
                     drawText(dc, std::to_wstring(temperature) + L"°", {gx - sp(20), plot.bottom + sp(4), gx + sp(20), plot.bottom + sp(20)}, Muted, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
             }
-            if (b.series.size() == 16) {
-                FanCurve c; for (double v : b.series) c.push_back(uint8_t(v));
+            if (b.series.size() >= 16) {
+                const std::vector<double> target(b.series.begin(), b.series.begin() + 16);
+                // The glide: from what was shown to the new curve over 260 ms.
+                static std::vector<double> lastTarget, from; static double glideAt = -1;
+                if (target != lastTarget) {
+                    double change = 0;
+                    for (size_t k = 0; k < 16 && lastTarget.size() == 16; ++k) change = std::max(change, std::abs(target[k] - lastTarget[k]));
+                    if (lastTarget.size() == 16 && change > 3 && fanDragPoint < 0 && canAnimate()) {
+                        const double t = glideAt >= 0 ? std::clamp((now - glideAt) / 260.0, 0.0, 1.0) : 1.0;
+                        std::vector<double> shownNow(16);
+                        for (size_t k = 0; k < 16; ++k) shownNow[k] = from.size() == 16 ? from[k] + (lastTarget[k] - from[k]) * settleEase(t) : lastTarget[k];
+                        from = shownNow; glideAt = now;
+                    } else { from = target; glideAt = -1; }
+                    lastTarget = target;
+                }
+                std::vector<double> shown = target;
+                if (glideAt >= 0 && from.size() == 16) {
+                    const double t = (now - glideAt) / 260.0;
+                    if (t < 1) { visualAnimating = true; for (size_t k = 0; k < 16; ++k) shown[k] = from[k] + (target[k] - from[k]) * settleEase(t); }
+                }
+                FanCurve c; for (double v : target) c.push_back(uint8_t(std::lround(v)));
                 const COLORREF light = theme.glow;
-                std::vector<POINT> line{curvePoint(plot, FanTempMin, c[8])};
-                for (int k = 0; k < FanPoints; ++k) line.push_back(curvePoint(plot, c[size_t(k)], c[size_t(k + 8)]));
-                line.push_back(curvePoint(plot, FanTempMax, c[15]));
+                // The other fan's curve, faint, with its name in the corner.
+                if (b.series.size() >= 32) {
+                    std::vector<POINT> other{curvePoint(plot, FanTempMin, b.series[24])};
+                    for (int k = 0; k < FanPoints; ++k) other.push_back(curvePoint(plot, b.series[size_t(16 + k)], b.series[size_t(24 + k)]));
+                    other.push_back(curvePoint(plot, FanTempMax, b.series[31]));
+                    const COLORREF ghost = blend(theme.well, Muted, .55);
+                    ui::curveLine(dc, other, faded(ghost), float(std::max(1, sp(1))));
+                    if (!b.items.empty()) {
+                        const int tw = textWidth(dc, b.items[0].first, smallFont);
+                        fill(dc, {plot.right - tw - sp(20), plot.top + sp(2) + sp(7), plot.right - tw - sp(8), plot.top + sp(2) + sp(8)}, faded(ghost));
+                        drawText(dc, b.items[0].first, {plot.right - tw - sp(4), plot.top - sp(2), plot.right, plot.top + sp(16)}, Muted, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+                    }
+                }
+                std::vector<POINT> line{curvePoint(plot, FanTempMin, shown[8])};
+                for (int k = 0; k < FanPoints; ++k) line.push_back(curvePoint(plot, shown[size_t(k)], shown[size_t(k + 8)]));
+                line.push_back(curvePoint(plot, FanTempMax, shown[15]));
                 ui::curveLine(dc, line, editable ? faded(light) : blend(theme.well, Muted, .7), float(sp(2)), plot.bottom, light, BYTE((editable ? (theme.dark ? 70 : 90) : 30) * paintFade));
+                // A small tag with a reading, above a spot (below it near the top), kept inside the well.
+                auto tag = [&](POINT at, const std::wstring& label, bool strong) {
+                    const int tw = textWidth(dc, label, smallFont) + sp(14), th = sp(20);
+                    int x = std::clamp(int(at.x) - tw / 2, int(box.left) + sp(4), int(box.right) - sp(4) - tw);
+                    int y = at.y - sp(14) - th;
+                    if (y < box.top + sp(4)) y = at.y + sp(14);
+                    const RECT r{x, y, x + tw, y + th};
+                    rounded(dc, r, strong ? blend(theme.well, Ink, theme.dark ? .88 : .86) : blend(theme.well, Muted, .45), 6);
+                    drawText(dc, label, r, strong ? Surface : Ink, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                };
+                auto reading = [](double t, double d) { return std::to_wstring(int(std::lround(t))) + L"° · " + std::to_wstring(int(std::lround(d))) + L"%"; };
                 // The temperature now, and what the curve asks for there.
                 if (b.goal > 0) {
                     const double now = std::clamp(b.goal, double(FanTempMin), double(FanTempMax));
@@ -1988,13 +2082,53 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
                     const int r = sp(4);
                     ui::led(dc, {at.x - r, at.y - r, at.x + r, at.y + r}, warnLed, warnLed, paintFade, theme.ledOff);
                 }
+                // The guide under the pointer, away from the points.
+                const bool dragging = editable && fanDragPoint >= 0;
+                if (!dragging && fanHoverPoint < 0 && fanHoverX >= plot.left && fanHoverX <= plot.right) {
+                    const double t = FanTempMin + double(fanHoverX - plot.left) * (FanTempMax - FanTempMin) / std::max<LONG>(1, plot.right - plot.left);
+                    const POINT at = curvePoint(plot, t, fanDutyAt(c, t));
+                    for (int gy = plot.top; gy < plot.bottom; gy += sp(3)) fill(dc, {at.x, gy, at.x + std::max(1, sp(1) / 2), gy + std::max(1, sp(1))}, Muted);
+                    const int r = sp(3);
+                    ui::led(dc, {at.x - r, at.y - r, at.x + r, at.y + r}, light, ledHalo(light), .8 * paintFade, theme.ledOff);
+                    tag(at, reading(t, fanDutyAt(c, t)), false);
+                }
                 for (int k = 0; k < FanPoints; ++k) {
-                    const POINT at = curvePoint(plot, c[size_t(k)], c[size_t(k + 8)]);
+                    const POINT at = curvePoint(plot, shown[size_t(k)], shown[size_t(k + 8)]);
                     const bool chosen = editable && k == int(b.amount);
-                    const int r = chosen ? sp(7) : editable ? sp(5) : sp(3);
-                    ui::led(dc, {at.x - r, at.y - r, at.x + r, at.y + r}, light, ledHalo(light), (chosen ? 1.0 : editable ? .7 : .3) * paintFade, theme.ledOff);
+                    const bool hot = editable && (k == fanHoverPoint || (dragging && k == fanDragPoint));
+                    const int r = hot ? sp(8) : chosen ? sp(7) : editable ? sp(5) : sp(3);
+                    ui::led(dc, {at.x - r, at.y - r, at.x + r, at.y + r}, light, ledHalo(light), (chosen || hot ? 1.0 : editable ? .7 : .3) * paintFade, theme.ledOff);
                     if (chosen && GetFocus() == visualView) ui::strokeRound(dc, {at.x - r - sp(3), at.y - r - sp(3), at.x + r + sp(3), at.y + r + sp(3)}, Ink, float(r + sp(3)), 1.0f);
                 }
+                // The point under the pointer or in the hand shows its values beside it.
+                const int shownPoint = dragging ? fanDragPoint : editable ? fanHoverPoint : -1;
+                if (shownPoint >= 0 && shownPoint < FanPoints)
+                    tag(curvePoint(plot, shown[size_t(shownPoint)], shown[size_t(shownPoint + 8)]), reading(c[size_t(shownPoint)], c[size_t(shownPoint + 8)]), true);
+            }
+            break;
+        }
+        case VBlock::Kind::pointEdit: {
+            // The chosen point, exactly: < point >, then - temperature + and - duty +.
+            const RECT nameRow{sp(44), top + sp(4), width - sp(44), top + sp(40)};
+            drawText(dc, b.value, nameRow, Ink, strongFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            static const wchar_t* const glyphs[] = {L"<", L">", L"−", L"+", L"−", L"+"};
+            for (int k = 0; k < int(b.commands.size()) && k < 6; ++k) {
+                const RECT key = pointEditKey(top, width, k);
+                const int index = int(hitsBefore) + k;
+                const double hot = index == visualHover || index == visualFocus ? 1.0 : 0.0;
+                const double pressed = hot > 0 && GetKeyState(VK_LBUTTON) < 0 ? 1.0 : 0.0;
+                keycap(dc, key, 10, 0, pressed, hot);
+                keyLight(key, 10, hot);
+                RECT face = key; OffsetRect(&face, 0, int(std::lround(pressed * sp(1))));
+                drawText(dc, glyphs[k], face, hot > 0 ? Ink : blend(Muted, Ink, .4), strongFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            }
+            for (int half = 0; half < 2 && half < int(b.items.size()); ++half) {
+                const RECT minus = pointEditKey(top, width, 2 + half * 2), plus = pointEditKey(top, width, 3 + half * 2);
+                const RECT value{minus.right, minus.top, plus.left, minus.bottom};
+                const std::wstring& text = b.items[size_t(half)].first;
+                const size_t cut = text.find(L'\n');
+                drawText(dc, cut == std::wstring::npos ? std::wstring() : text.substr(0, cut), {value.left, value.top - sp(2), value.right, value.top + sp(14)}, Muted, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                drawText(dc, cut == std::wstring::npos ? text : text.substr(cut + 1), {value.left, value.top + sp(12), value.right, value.bottom}, Ink, strongFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
             }
             break;
         }
@@ -2111,20 +2245,19 @@ void stepVisual() {
     UpdateWindow(window);
     if ((!visualAnimating && !scrolling) || hidden) { KillTimer(window, VisualTimer); visualTimerOn = false; }
 }
-// Fan curve editing (the fans page): which fan and which performance mode's curve is open, the
-// chosen point, and the curve while it is being changed (empty otherwise).
-bs::asus::Fan fanEditFan = bs::asus::Fan::cpu;
-int fanEditModeIndex = -1;   // 0 silent, 1 balanced, 2 turbo; -1 the mode in use
-int fanPoint = 3, fanDragPoint = -1;
-bs::asus::FanCurve fanDraft;
-bs::asus::FanPreset demoFans = bs::asus::FanPreset::custom; // the preview's own fan setting
-void fanEditPoint(int point, int temperature, int duty); // moves a point (the others keep the curve's order)
-void fanCommit();                                        // keeps the changed curve and applies it
 LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     switch (message) {
     case WM_ERASEBKGND: return 1;
     case WM_TIMER:
         if (wp == VisualTimer) { stepVisual(); return 0; }
+        if (wp == FanRepeatTimer) {
+            // A held - or + key: after a pause it repeats, quickly.
+            if (!fanRepeatCommand || GetKeyState(VK_LBUTTON) >= 0) { KillTimer(window, FanRepeatTimer); fanRepeatCommand = 0; return 0; }
+            if (!fanRepeated) SetTimer(window, FanRepeatTimer, 55, nullptr);
+            fanRepeated = true;
+            SendMessageW(GetParent(window), WM_COMMAND, fanRepeatCommand, 0);
+            return 0;
+        }
         if (wp == ScrollFadeTimer) {
             KillTimer(window, ScrollFadeTimer);
             RECT r{}; GetClientRect(window, &r); r.left = r.right - sp(16);
@@ -2192,7 +2325,7 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             if (hit.command != CurveCommand || !PtInRect(&hit.rect, pt) || hit.block >= visualBlocks.size()) continue;
             const auto& b = visualBlocks[hit.block];
             visualFocus = int(i);
-            if (b.toggle != 1 || b.series.size() != 16) return 0;
+            if (b.toggle != 1 || b.series.size() < 16) return 0; // (it may carry the other fan's curve after its own)
             // The point under the press (or the nearest one along) is picked up and follows the pointer.
             RECT plot = hit.rect; InflateRect(&plot, -sp(10), -sp(10));
             int best = 0; double bestDistance = 1e9;
@@ -2201,13 +2334,21 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
                 const double d = std::hypot(double(at.x - pt.x), double(at.y - pt.y) * (std::abs(at.x - pt.x) < sp(14) ? 1.0 : 3.0));
                 if (d < bestDistance) { bestDistance = d; best = k; }
             }
-            fanDragPoint = best; fanPoint = best; SetCapture(window);
-            if (bestDistance < sp(16)) fanEditPoint(best, int(std::lround(b.series[size_t(best)])), int(std::lround(b.series[size_t(best + 8)])));
-            else { // a press away from every point moves the nearest one there
-                const double temperature = bs::asus::FanTempMin + double(pt.x - plot.left) * (bs::asus::FanTempMax - bs::asus::FanTempMin) / std::max<LONG>(1, plot.right - plot.left);
-                fanEditPoint(best, int(std::lround(temperature)), int(std::lround(double(plot.bottom - pt.y) * 100 / std::max<LONG>(1, plot.bottom - plot.top))));
+            fanDragPoint = best; fanPoint = best; fanHoverPoint = -1; SetCapture(window);
+            fanDragLast = pt;
+            if (bestDistance < sp(16)) {
+                fanDragT = b.series[size_t(best)]; fanDragD = b.series[size_t(best + 8)];
+                fanEditPoint(best, int(std::lround(fanDragT)), int(std::lround(fanDragD)));
+            } else { // a press away from every point moves the nearest one there
+                fanDragT = bs::asus::FanTempMin + double(pt.x - plot.left) * (bs::asus::FanTempMax - bs::asus::FanTempMin) / std::max<LONG>(1, plot.right - plot.left);
+                fanDragD = double(plot.bottom - pt.y) * 100 / std::max<LONG>(1, plot.bottom - plot.top);
+                fanEditPoint(best, int(std::lround(fanDragT)), int(std::lround(fanDragD)));
             }
             return 0;
+        }
+        for (const auto& hit : visualHits) if (PtInRect(&hit.rect, pt) && hit.command >= FanTempDownId && hit.command <= FanDutyUpId) {
+            fanRepeatCommand = hit.command; fanRepeated = false; SetTimer(window, FanRepeatTimer, 420, nullptr); // held: it repeats
+            break;
         }
         for (const auto& hit : visualHits) if (PtInRect(&hit.rect, pt)) {
             if (canAnimate()) { visualRippleBlock = hit.block; visualRippleAt = pt; visualRippleStart = motionNow(); }
@@ -2221,8 +2362,18 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             for (const auto& hit : visualHits) if (hit.command == CurveCommand) {
                 RECT plot = hit.rect; InflateRect(&plot, -sp(10), -sp(10));
                 const int x = GET_X_LPARAM(lp), y = GET_Y_LPARAM(lp);
-                const double temperature = bs::asus::FanTempMin + double(x - plot.left) * (bs::asus::FanTempMax - bs::asus::FanTempMin) / std::max<LONG>(1, plot.right - plot.left);
-                fanEditPoint(fanDragPoint, int(std::lround(temperature)), int(std::lround(double(plot.bottom - y) * 100 / std::max<LONG>(1, plot.bottom - plot.top))));
+                const double perT = double(bs::asus::FanTempMax - bs::asus::FanTempMin) / std::max<LONG>(1, plot.right - plot.left);
+                const double perD = 100.0 / std::max<LONG>(1, plot.bottom - plot.top);
+                if (GetKeyState(VK_SHIFT) < 0) { // fine: a quarter of the pointer's movement
+                    fanDragT += (x - fanDragLast.x) * perT * .25; fanDragD -= (y - fanDragLast.y) * perD * .25;
+                } else { fanDragT = bs::asus::FanTempMin + (x - plot.left) * perT; fanDragD = (plot.bottom - y) * perD; }
+                fanDragLast = {x, y};
+                fanEditPoint(fanDragPoint, int(std::lround(fanDragT)), int(std::lround(fanDragD)));
+                // Where the curve's rules stopped the point, the hand stops too (no drift past a wall).
+                if (fanDraft.size() == 16) {
+                    fanDragT = std::clamp(fanDragT, fanDraft[size_t(fanDragPoint)] - .5, fanDraft[size_t(fanDragPoint)] + .5);
+                    fanDragD = std::clamp(fanDragD, fanDraft[size_t(fanDragPoint + 8)] - .5, fanDraft[size_t(fanDragPoint + 8)] + .5);
+                }
                 break;
             }
             return 0;
@@ -2253,6 +2404,29 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
                 if (!wasShown) { r.left = r.right - sp(16); InvalidateRect(window, &r, FALSE); }
             }
         }
+        {
+            // Over an editable curve: the point under the pointer lights; elsewhere on it a guide
+            // reads the curve at that temperature.
+            int point = -1, along = -1; bool over = false; size_t block = visualBlocks.size();
+            for (const auto& hit : visualHits) if (hit.command == CurveCommand && PtInRect(&hit.rect, pt) && hit.block < visualBlocks.size()) {
+                const auto& b = visualBlocks[hit.block];
+                RECT plot = hit.rect; InflateRect(&plot, -sp(10), -sp(10));
+                over = true; block = hit.block;
+                if (b.series.size() >= 16 && b.toggle == 1)
+                    for (int k = 0; k < bs::asus::FanPoints; ++k) {
+                        const POINT at = curvePoint(plot, b.series[size_t(k)], b.series[size_t(k + 8)]);
+                        if (std::hypot(double(at.x - pt.x), double(at.y - pt.y)) < sp(14)) point = k;
+                    }
+                if (point < 0 && pt.x >= plot.left && pt.x <= plot.right) along = pt.x - visualInset();
+            }
+            if (point != fanHoverPoint || along != fanHoverX) {
+                const bool was = fanHoverPoint >= 0 || fanHoverX >= 0;
+                fanHoverPoint = point; fanHoverX = along;
+                for (size_t i = 0; i < visualBlocks.size(); ++i)
+                    if (visualBlocks[i].kind == VBlock::Kind::curve && (i == block || was)) invalidateBlock(i);
+            }
+            fanOverCurve = over;
+        }
         int hover = -1;
         for (size_t i = 0; i < visualHits.size(); ++i) if (PtInRect(&visualHits[i].rect, pt)) hover = int(i);
         if (hover != visualHover) {
@@ -2264,9 +2438,21 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCLIENT && (fanOverCurve || fanDragPoint >= 0)) {
+            // On the curve: a point can be picked up (move cursor); anywhere else on it, aimed at.
+            bool editable = false;
+            for (const auto& b : visualBlocks) if (b.kind == VBlock::Kind::curve) editable = b.toggle == 1;
+            SetCursor(LoadCursorW(nullptr, !editable ? IDC_ARROW : fanHoverPoint >= 0 || fanDragPoint >= 0 ? IDC_SIZEALL : IDC_CROSS));
+            return TRUE;
+        }
         if (LOWORD(lp) == HTCLIENT && visualHover >= 0) { SetCursor(LoadCursorW(nullptr, IDC_HAND)); return TRUE; }
         break;
     case WM_MOUSELEAVE:
+        if (fanHoverPoint >= 0 || fanHoverX >= 0) {
+            fanHoverPoint = -1; fanHoverX = -1;
+            for (size_t i = 0; i < visualBlocks.size(); ++i) if (visualBlocks[i].kind == VBlock::Kind::curve) invalidateBlock(i);
+        }
+        fanOverCurve = false;
         if (visualMouse.x >= 0) {
             for (const auto& plot : visualPlots)
                 if (PtInRect(&plot, visualMouse)) { RECT area{}; GetClientRect(window, &area); area.top = plot.top - sp(28); area.bottom = plot.bottom + sp(6); InvalidateRect(window, &area, FALSE); }
@@ -2287,6 +2473,12 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             return 0;
         }
         for (auto& [block, press] : visualPress) if (press.to > 0) setFade(visualPress, block, 0, 220);
+        if (fanRepeatCommand) {
+            KillTimer(window, FanRepeatTimer);
+            const bool repeated = fanRepeated;
+            fanRepeatCommand = 0; fanRepeated = false;
+            if (repeated) { if (message == WM_LBUTTONUP) ReleaseCapture(); return 0; } // held: it already stepped
+        }
         if (message == WM_LBUTTONUP && visualDragOffset < 0) {
             const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             for (size_t i = 0; i < visualHits.size(); ++i)
@@ -2312,7 +2504,7 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             const auto& b = visualBlocks[hit.block];
             const bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
             const int step = shift ? 5 : 1;
-            if (b.toggle == 1 && b.series.size() == 16 && (wp == VK_LEFT || wp == VK_RIGHT || wp == VK_UP || wp == VK_DOWN)) {
+            if (b.toggle == 1 && b.series.size() >= 16 && (wp == VK_LEFT || wp == VK_RIGHT || wp == VK_UP || wp == VK_DOWN)) {
                 int k = std::clamp(fanPoint, 0, bs::asus::FanPoints - 1);
                 int temperature = int(std::lround(b.series[size_t(k)])), duty = int(std::lround(b.series[size_t(k + 8)]));
                 if (wp == VK_LEFT && !ctrl) k = std::max(0, k - 1);
@@ -2326,6 +2518,10 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
                 fanCommit();
                 return 0;
             }
+        }
+        if (inlinePage == InlinePage::fans && GetKeyState(VK_CONTROL) < 0 && (wp == 'Z' || wp == 'Y')) {
+            PostMessageW(GetParent(window), WM_COMMAND, wp == 'Z' && GetKeyState(VK_SHIFT) >= 0 ? FanUndoId : FanRedoId, 0);
+            return 0;
         }
         if (wp == VK_TAB && !visualHits.empty()) {
             const int count = int(visualHits.size());
@@ -7580,7 +7776,9 @@ bs::asus::FanCurve fanCustom(bs::asus::Fan fan, bs::asus::Mode mode) {
     if (fanPreview()) {
         const auto found = demoCurves.find(int(fan) * 4 + int(mode));
         if (found != demoCurves.end()) return found->second;
-        return bs::asus::presetFanCurve(mode == bs::asus::Mode::silent ? bs::asus::FanPreset::quiet : mode == bs::asus::Mode::turbo ? bs::asus::FanPreset::strong : bs::asus::FanPreset::standard, bs::asus::Fan::mid, mode);
+        // The preview's GPU fan runs a step quieter than its CPU fan, as on a real laptop.
+        const int step = (mode == bs::asus::Mode::silent ? 1 : mode == bs::asus::Mode::turbo ? 3 : 2) - (fan == bs::asus::Fan::gpu ? 1 : 0);
+        return bs::asus::presetFanCurve(bs::asus::FanPreset(std::max(1, step)), bs::asus::Fan::mid, mode);
     }
     return bs::asus::customFanCurve(fan, mode);
 }
@@ -7605,7 +7803,31 @@ bs::asus::FanCurve fanShownCurve(const bs::asus::Snapshot& h) {
 // Writes the fans now, off the UI thread, when what changed is in effect.
 void fanApplySoon() {
     if (fanPreview() || !asusAvailable) return;
-    std::thread([] { bs::asus::applyFans(); }).detach();
+    const HWND target = mainWindow;
+    std::thread([target] { PostMessageW(target, FanAppliedMessage, bs::asus::applyFans(), 0); }).detach(); // the firmware's answer comes back to the page
+}
+// Keeps a curve as the one for that fan and mode, remembering the one before for undo.
+void fanChange(bs::asus::Fan fan, bs::asus::Mode mode, const bs::asus::FanCurve& curve) {
+    const auto before = fanCustom(fan, mode);
+    if (before == bs::asus::sanitizeFanCurve(curve)) return;
+    fanUndo.push_back({fan, mode, before});
+    if (fanUndo.size() > 64) fanUndo.erase(fanUndo.begin());
+    fanRedo.clear();
+    fanKeep(fan, mode, curve);
+}
+// Takes back the last change (or puts it back again), showing that fan and mode.
+void fanUndoStep(bool redo) {
+    auto& from = redo ? fanRedo : fanUndo;
+    auto& to = redo ? fanUndo : fanRedo;
+    if (from.empty()) return;
+    const FanUndo step = from.back(); from.pop_back();
+    to.push_back({step.fan, step.mode, fanCustom(step.fan, step.mode)});
+    fanKeep(step.fan, step.mode, step.curve);
+    fanEditFan = step.fan;
+    for (int i = 0; i < 3; ++i) if (fanModes[i] == step.mode) fanEditModeIndex = i;
+    fanDraft.clear();
+    const auto h = fanSnapshot();
+    if (fanSetting() == bs::asus::FanPreset::custom && step.mode == fanModeInUse(h)) fanApplySoon();
 }
 std::wstring fanRpm(const std::optional<unsigned>& reading) {
     return !reading ? std::wstring(L"—") : *reading ? std::to_wstring(*reading * 100) : std::wstring(tr(L"停止"));
@@ -7631,8 +7853,9 @@ void fanEditPoint(int k, int temperature, int duty) {
 void fanCommit() {
     if (fanDraft.size() != 16) return;
     const auto h = fanSnapshot();
-    fanKeep(fanEditFan, fanEditMode(h), fanDraft);
+    const auto curve = fanDraft;
     fanDraft.clear();
+    fanChange(fanEditFan, fanEditMode(h), curve);
     if (fanSetting() == bs::asus::FanPreset::custom && fanEditMode(h) == fanModeInUse(h)) fanApplySoon();
     showFanPage();
 }
@@ -7698,14 +7921,35 @@ void showFanPage() {
         std::wstring live;
         if (temperature && editing == inUse) live = tr(L"現在 ") + std::to_wstring(*temperature) + L" °C → " + std::to_wstring(int(std::lround(fanDutyAt(curve, *temperature)))) + L"% · " + fanRpm(rpm) + L" RPM";
         else if (editing != inUse) live = tr(L"編輯中：") + std::wstring(tr(modeKey(editing))) + tr(L"（切到該模式時套用；目前是") + std::wstring(tr(modeKey(inUse))) + tr(L"）");
-        v.push_back(vCurve(curve, editable, k, temperature && editing == inUse ? double(*temperature) : 0, point, live));
+        // The firmware's answer to the last write, for a few seconds.
+        if (fanWriteState && GetTickCount64() - fanWriteAt < 6000) live += fanWriteState > 0 ? tr(L" · 已寫入") : tr(L" · 韌體沒有接受");
+        VBlock chart = vCurve(curve, editable, k, temperature && editing == inUse ? double(*temperature) : 0, point, live);
+        // The other fan's curve, faintly, to compare.
+        if (fans.size() > 1) {
+            const Fan other = fanEditFan == Fan::cpu ? fans[1] : Fan::cpu;
+            FanCurve otherCurve;
+            if (setting == FanPreset::custom) otherCurve = fanCustom(other, editing);
+            else if (setting != FanPreset::factory) otherCurve = fanPreview() ? presetFanCurve(setting, Fan::mid, inUse) : presetFanCurve(setting, other, inUse);
+            if (otherCurve.size() == 16) {
+                chart.series.insert(chart.series.end(), otherCurve.begin(), otherCurve.end());
+                chart.items = {{other == Fan::gpu ? tr(L"獨顯") : other == Fan::mid ? tr(L"中間") : std::wstring(L"CPU"), 0}};
+            }
+        }
+        v.push_back(std::move(chart));
         if (editable) {
+            v.push_back(vPointEdit(tr(L"第 ") + std::to_wstring(k + 1) + L" / 8" + tr(L" 點"),
+                tr(L"這點溫度") + std::wstring(L"\n") + std::to_wstring(curve[size_t(k)]) + L" °C", tr(L"這點轉速") + std::wstring(L"\n") + std::to_wstring(curve[size_t(k + 8)]) + L"%",
+                {FanPointPrevId, FanPointNextId, FanTempDownId, FanTempUpId, FanDutyDownId, FanDutyUpId}));
+            if (!fanUndo.empty()) v.push_back(vAction(tr(L"復原上一步"), L"Ctrl+Z", FanUndoId));
+            if (!fanRedo.empty()) v.push_back(vAction(tr(L"重做"), L"Ctrl+Y", FanRedoId));
+            v.push_back(vAction(tr(L"從預設開始"), tr(L"安靜／標準／強力"), FanLoadMenuId));
             v.push_back(vAction(tr(L"重設這條曲線"), L"", FanResetCurveId));
             v.push_back(vAction(tr(L"套用到三種模式"), L"", FanCopyCurveId));
         }
     } else v.push_back(vNote(tr(L"原廠曲線由韌體依效能模式控制；這台的韌體不交出曲線內容，所以這裡不顯示。選「安靜」「標準」「強力」或「自訂」即可看到並設定曲線。")));
     v.push_back(vFold(tr(L"曲線怎麼運作與安全限制"), tr(L"每條曲線有 8 個點：溫度（20–110 °C，由低到高）對應轉速（0–100%）。兩點之間依直線過渡，最後一點以上維持最後的轉速。") + std::wstring(L"\n") +
         tr(L"安全限制：90 °C 以上的點與最後一點至少 50%，轉速不會隨溫度升高而降低。拖曳時其他點會跟著維持這個順序。") + std::wstring(L"\n") +
+        tr(L"操作：拖曳點；按住 Shift 拖曳是四分之一速度的微調。滑鼠停在曲線上會顯示該溫度的轉速。下方的 − / + 一次 1 °C 或 1%，按住會連續調整。選中曲線後：左右選點，上下 ±1%，Ctrl+左右 ±1 °C，加 Shift 一次 5。Ctrl+Z 復原，Ctrl+Y 重做。") + std::wstring(L"\n") +
         tr(L"100% 寫入時是 99%（部分機型的韌體在 100% 會異常，G-Helper 也這樣做）。") + std::wstring(L"\n") +
         tr(L"韌體在每次切換效能模式後會恢復原廠曲線，BatteryScope 會在切換後、喚醒與開機時重新寫入。韌體在過熱時仍可能自行提高轉速。")));
     showChartPage(InlinePage::fans, tr(L"風扇"), fanPageText(h, curve), std::move(v));
@@ -9609,15 +9853,44 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (id == FanPageId) { fanDraft.clear(); fanEditModeIndex = -1; showFanPage(); return 0; }
         if (id >= FanEditFan0Id && id <= FanEditFan0Id + 2) { fanEditFan = bs::asus::Fan(id - FanEditFan0Id); fanDraft.clear(); showFanPage(); return 0; }
         if (id >= FanEditMode0Id && id <= FanEditMode0Id + 2) { fanEditModeIndex = id - FanEditMode0Id; fanDraft.clear(); showFanPage(); return 0; }
+        if (id == FanPointPrevId || id == FanPointNextId) { fanPoint = std::clamp(fanPoint + (id == FanPointNextId ? 1 : -1), 0, bs::asus::FanPoints - 1); fanDraft.clear(); showFanPage(); return 0; }
+        if (id >= FanTempDownId && id <= FanDutyUpId) {
+            const auto h = fanSnapshot();
+            const auto curve = fanShownCurve(h);
+            if (fanSetting() != bs::asus::FanPreset::custom || curve.size() != 16) return 0;
+            const int k = std::clamp(fanPoint, 0, bs::asus::FanPoints - 1);
+            const int t = curve[size_t(k)] + (id == FanTempUpId ? 1 : id == FanTempDownId ? -1 : 0);
+            const int d = curve[size_t(k + 8)] + (id == FanDutyUpId ? 1 : id == FanDutyDownId ? -1 : 0);
+            fanEditPoint(k, t, d); fanCommit();
+            return 0;
+        }
+        if (id == FanUndoId || id == FanRedoId) { fanUndoStep(id == FanRedoId); showFanPage(); return 0; }
+        if (id == FanLoadMenuId) {
+            const std::vector<MenuItem> items{menuItem(FanLoad0Id, tr(L"安靜"), false, false), menuItem(FanLoad0Id + 1, tr(L"標準"), false, false), menuItem(FanLoad0Id + 2, tr(L"強力"), false, false)};
+            if (const int chosen = showMenu(items, menuAnchor(), mainWindow)) SendMessageW(window, WM_COMMAND, chosen, 0);
+            return 0;
+        }
+        if (id >= FanLoad0Id && id <= FanLoad0Id + 2) {
+            const auto h = fanSnapshot();
+            const auto editing = fanEditMode(h);
+            const auto preset = bs::asus::FanPreset(int(bs::asus::FanPreset::quiet) + (id - FanLoad0Id));
+            fanChange(fanEditFan, editing, fanPreview() ? bs::asus::presetFanCurve(preset, bs::asus::Fan::mid, editing) : bs::asus::presetFanCurve(preset, fanEditFan, editing));
+            fanDraft.clear();
+            if (fanSetting() == bs::asus::FanPreset::custom && editing == fanModeInUse(h)) fanApplySoon();
+            showFanPage();
+            return 0;
+        }
         if (id == FanResetCurveId || id == FanCopyCurveId) {
             const auto h = fanSnapshot();
             const auto editing = fanEditMode(h);
             if (id == FanResetCurveId) {
+                const auto before = fanCustom(fanEditFan, editing);
                 if (fanPreview()) demoCurves.erase(int(fanEditFan) * 4 + int(editing)); else bs::asus::resetCustomFanCurve(fanEditFan, editing);
+                if (fanCustom(fanEditFan, editing) != before) { fanUndo.push_back({fanEditFan, editing, before}); fanRedo.clear(); }
                 setNotice(tr(L"已重設這條曲線。"));
             } else {
                 const auto curve = fanCustom(fanEditFan, editing);
-                for (const auto mode : fanModes) fanKeep(fanEditFan, mode, curve);
+                for (const auto mode : fanModes) fanChange(fanEditFan, mode, curve);
                 setNotice(tr(L"已把這條曲線用在三種效能模式。"));
             }
             fanDraft.clear();
@@ -10007,6 +10280,10 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case WM_ENDSESSION:
         if (wp) stopStability(L"shutdown"); // a restart or shutdown, not a crash
         else { bs::stability::writeGuard().release(bs::stability::WriteGuard::shuttingDown, GetTickCount64(), 3000); bs::stability::note(L"shutdown cancelled"); }
+        return 0;
+    case FanAppliedMessage:
+        fanWriteState = wp == ERROR_SUCCESS ? 1 : -1; fanWriteAt = GetTickCount64();
+        if (inlinePage == InlinePage::fans && fanDragPoint < 0) showFanPage();
         return 0;
     case TuningDoneMessage:
         setNotice(wp == ERROR_SUCCESS ? std::wstring(tr(L"風扇與功耗設定已套用。")) : wp == ERROR_NOT_SUPPORTED ? std::wstring(tr(L"這台電腦不支援這個設定。"))
@@ -10834,6 +11111,25 @@ bool panelSelfTest(const std::wstring& path) {
             nudged = fanCustom(bs::asus::Fan::cpu, bs::asus::Mode::balanced)[11] == after[11] + 1;
         }
         check("fan_curve_point_drags_and_nudges", dragged && nudged);
+        {
+            // The point editor steps exactly; undo takes a step back and redo puts it again; a
+            // preset can be the starting point.
+            const auto before = fanCustom(bs::asus::Fan::cpu, bs::asus::Mode::balanced);
+            fanPoint = 3;
+            SendMessageW(mainWindow, WM_COMMAND, FanDutyUpId, 0); SendMessageW(mainWindow, WM_COMMAND, FanTempDownId, 0);
+            const auto stepped = fanCustom(bs::asus::Fan::cpu, bs::asus::Mode::balanced);
+            const bool steps = stepped[11] == before[11] + 1 && stepped[3] == before[3] - 1;
+            SendMessageW(mainWindow, WM_COMMAND, FanUndoId, 0);
+            const bool undone = fanCustom(bs::asus::Fan::cpu, bs::asus::Mode::balanced)[3] == before[3] && fanCustom(bs::asus::Fan::cpu, bs::asus::Mode::balanced)[11] == before[11] + 1;
+            SendMessageW(mainWindow, WM_COMMAND, FanRedoId, 0);
+            const bool redone = fanCustom(bs::asus::Fan::cpu, bs::asus::Mode::balanced) == stepped;
+            SendMessageW(mainWindow, WM_COMMAND, FanLoad0Id + 2, 0);
+            const bool loaded = fanCustom(bs::asus::Fan::cpu, bs::asus::Mode::balanced) == bs::asus::presetFanCurve(bs::asus::FanPreset::strong, bs::asus::Fan::mid, bs::asus::Mode::balanced);
+            const bool editor = std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::pointEdit && b.commands.size() == 6; });
+            check("fan_point_editor_steps_undoes_and_loads_presets", steps && undone && redone && loaded && editor);
+            // The other fan's curve rides along faintly for comparison.
+            check("fan_curve_shows_the_other_fan", std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::curve && b.series.size() == 32; }));
+        }
         SendMessageW(mainWindow, WM_COMMAND, IDCANCEL, 0);
         check("fan_page_goes_back_to_performance", inlinePage == InlinePage::performance);
         demoCurves.clear();
@@ -11370,7 +11666,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (screenshot && option(L"--hardware")) showHardwarePage();
     if ((screenshot || uiTest) && option(L"--protect")) protectState = 2;
     if (screenshot && option(L"--performance")) showPerformancePage();
-    if (screenshot && option(L"--fans")) { if (option(L"--preset")) demoFans = bs::asus::FanPreset::quiet; showFanPage(); if (option(L"--focus")) { SetFocus(visualView); for (size_t i = 0; i < visualHits.size(); ++i) if (visualHits[i].command == CurveCommand) visualFocus = int(i); } }
+    if (screenshot && option(L"--fans")) { if (option(L"--preset")) demoFans = bs::asus::FanPreset::quiet; showFanPage(); if (option(L"--focus")) { SetFocus(visualView); for (size_t i = 0; i < visualHits.size(); ++i) if (visualHits[i].command == CurveCommand) visualFocus = int(i); }
+        if (option(L"--hover")) { fanHoverPoint = 4; fanPoint = 4; showFanPage(); } if (option(L"--guide")) { fanHoverX = sp(200); showFanPage(); } if (option(L"--down")) { visualSlideAt = -1; visualScroll = sp(470); } }
     if (screenshot && option(L"--stability")) showStabilityPage();
     if (screenshot && option(L"--lab")) showLabPage();
     // --page-scroll <n>: a chart page scrolled down by n (unscaled) pixels, to capture its lower part.
