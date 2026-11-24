@@ -2519,7 +2519,7 @@ LRESULT CALLBACK visualProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
                 return 0;
             }
         }
-        if (inlinePage == InlinePage::fans && GetKeyState(VK_CONTROL) < 0 && (wp == 'Z' || wp == 'Y')) {
+        if (inlinePage == InlinePage::hardware && GetKeyState(VK_CONTROL) < 0 && (wp == 'Z' || wp == 'Y')) {
             PostMessageW(GetParent(window), WM_COMMAND, wp == 'Z' && GetKeyState(VK_SHIFT) >= 0 ? FanUndoId : FanRedoId, 0);
             return 0;
         }
@@ -4211,11 +4211,15 @@ void paint(HDC dc, RECT bounds) {
         plugged ? (p.percent && *p.percent >= 99.5 ? tr(L"已充滿") : tr(L"未充電")) : tr(L"剩餘電量"),
         {right - sp(146), sp(151), right - sp(16), sp(172)}, Muted, smallFont, DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
     if (!minimal) {
-        const int gap = sp(8), half = (right - margin - gap) / 2;
-        const RECT rateCard{margin, sp(187), margin + half, sp(228)}, timeCard{margin + half + gap, sp(187), right, sp(228)};
-        card(dc, rateCard, Surface, 12); card(dc, timeCard, Surface, 12);
-        batteryCardsRect = desktop ? RECT{} : RECT{rateCard.left, rateCard.top - headerLift(), timeCard.right, timeCard.bottom - headerLift()};
-        if (!desktop) drawMenuArrow(dc, timeCard.right - sp(16), (timeCard.top + timeCard.bottom) / 2 - sp(4), sp(8), Muted, false); // opens the details
+        // The rate and time on the left; on the right, the way into the battery's record, which
+        // says so (it used to be a second readout that only happened to open the record).
+        const int gap = sp(8), wide = desktop ? (right - margin - gap) / 2 : (right - margin - gap) * 62 / 100;
+        const RECT rateCard{margin, sp(187), margin + wide, sp(228)}, timeCard{margin + wide + gap, sp(187), right, sp(228)};
+        card(dc, rateCard, Surface, 12);
+        if (desktop) card(dc, timeCard, Surface, 12);
+        else keycap(dc, timeCard, 12, 0, 0, 0, 1);
+        batteryCardsRect = desktop ? RECT{} : RECT{timeCard.left, timeCard.top - headerLift(), timeCard.right, timeCard.bottom - headerLift()};
+        if (!desktop) drawMenuArrow(dc, timeCard.right - sp(16), (timeCard.top + timeCard.bottom) / 2 - sp(4), sp(8), Muted, false); // opens the record
         // Plugged in without charging, battery health is more useful than a rate.
         const auto health = batteryHealth(p);
         const bool showHealth = plugged && !p.charging && health;
@@ -4229,8 +4233,8 @@ void paint(HDC dc, RECT bounds) {
             drawText(dc, energyLive ? valueText(current.energy.unassignedCpuWatts, L" W") : std::wstring(L"—"),
                 {timeCard.left + sp(12), timeCard.top + sp(19), timeCard.right - sp(22), timeCard.bottom - sp(3)}, Ink, strongFont);
         } else {
-        drawText(dc, p.charging ? tr(L"充電速度") : showHealth ? tr(L"電池健康度") : plugged ? tr(L"電池狀態") : tr(L"耗電速度"),
-            {rateCard.left + sp(12), rateCard.top + sp(4), rateCard.right - sp(8), rateCard.top + sp(20)}, Muted, smallFont);
+        // (the remaining time joins the rate's label; the record's card names itself)
+        std::wstring rateTitle = p.charging ? tr(L"充電速度") : showHealth ? tr(L"電池健康度") : plugged ? tr(L"電池狀態") : tr(L"耗電速度");
         drawText(dc, showHealth ? healthText : plugged && !p.charging ? (p.percent && *p.percent >= 99.5 ? tr(L"已充滿") : tr(L"已接電，暫未充電")) : valueText(p.charging ? charge.percentPerHour : m.percentPerHour, tr(L" 百分點 / 小時")),
             {rateCard.left + sp(12), rateCard.top + sp(19), rateCard.right - sp(8), rateCard.bottom - sp(3)}, Ink, strongFont);
         std::wstring remaining = tr(L"估計續航 —");
@@ -4238,9 +4242,12 @@ void paint(HDC dc, RECT bounds) {
         const auto eta = chargeEta(charge, p);
         if (auto text = p.charging ? durationText(eta.hours) : remainingText(m); !text.empty()) remaining = text;
         // Plugged in without charging there is no time to show, so show stored energy instead.
-        drawText(dc, plugged ? (p.charging ? etaLabel(eta) : tr(L"剩餘容量")) : tr(L"近 5 分鐘 ") + valueText(m.averageWatts, L" W"),
-            {timeCard.left + sp(12), timeCard.top + sp(4), timeCard.right - sp(22), timeCard.top + sp(20)}, Muted, smallFont);
-        drawText(dc, remaining, {timeCard.left + sp(12), timeCard.top + sp(19), timeCard.right - sp(22), timeCard.bottom - sp(3)}, Ink, strongFont);
+        if (!plugged || p.charging) rateTitle += L" · " + remaining;
+        drawText(dc, rateTitle, {rateCard.left + sp(12), rateCard.top + sp(4), rateCard.right - sp(8), rateCard.top + sp(20)}, Muted, smallFont);
+        const auto healthNow = batteryHealth(p);
+        drawText(dc, tr(L"電池紀錄"), {timeCard.left + sp(12), timeCard.top + sp(4), timeCard.right - sp(22), timeCard.top + sp(20)}, Muted, smallFont);
+        drawText(dc, healthNow ? tr(L"健康 ") + number(*healthNow, 0) + L"%" : std::wstring(tr(L"近 7 天")),
+            {timeCard.left + sp(12), timeCard.top + sp(19), timeCard.right - sp(22), timeCard.bottom - sp(3)}, Ink, strongFont);
         }
     }
     if (!compact) {
@@ -4895,10 +4902,7 @@ void showHistoryPage() {
     }
     if (p.remainingWh && p.fullWh && *p.fullWh > 0)
         v.push_back(vMeter(tr(L"剩餘容量"), number(*p.remainingWh, 1) + L" / " + number(*p.fullWh, 1) + L" Wh", *p.remainingWh, 0, *p.fullWh));
-    if (asusAvailable && asusNow().chargeDevice) {
-        const auto limit = asusNow().chargeLimit;
-        v.push_back(vAction(tr(L"充電上限"), limit ? std::to_wstring(*limit) + L"%" : std::wstring(tr(L"未設定")), HwChargeMenuId, limit && *limit <= 80 ? Green : COLORREF(0)));
-    }
+    // (the charge limit is set on the hardware tab; the chips above show it)
     v.push_back(vHeading(tr(L"近 7 天")));
     {
         std::vector<VBar> bars;
@@ -5188,6 +5192,26 @@ void showLabPage() {
 }
 // The power mode page, set out like every other page: what is in effect, a row of three
 // choices for each power source, then the commands and the explanation.
+// Windows power mode as part of the saving tab: a row of keys for each power source.
+void appendPowerModeBlocks(std::vector<VBlock>& v) {
+    refreshPowerModeControls();
+    const bool editable = !demo && !isolatedPreview, plugged = pluggedInNow(), noBattery = batteryAbsent();
+    v.push_back(vHeading(tr(L"Windows 電源模式")));
+    for (int source = 0; source < 2; ++source) {
+        const bool ac = source == 0;
+        const bool known = ac ? powerModes.acKnown : powerModes.dcKnown;
+        const bool settable = known && (ac ? powerModes.acSettable : powerModes.dcSettable && !noBattery);
+        const PowerMode mode = ac ? powerModes.ac : powerModes.dc;
+        const int base = ac ? ModeAcEfficiencyId : ModeDcEfficiencyId;
+        v.push_back(vNote(std::wstring(ac ? tr(L"插電時") : tr(L"用電池時")) + (ac == plugged ? tr(L" · 目前") : L"")));
+        if (settable) v.push_back(vSegments({tr(L"效率"), tr(L"平衡"), tr(L"效能")}, {base, base + 1, base + 2}, mode != PowerMode::other ? int(mode) : -1));
+        else v.push_back(vChips({{known ? std::wstring(modeName(mode)) + tr(L" · 只能檢視") : std::wstring(tr(L"此電腦未提供這項設定")), 0}}));
+    }
+    const bool handBack = powerModeHeld();
+    if (editable && (handBack || (powerModes.restorable && !dynamicEnabled)))
+        v.push_back(vAction(handBack ? tr(L"交給動態省電") : tr(L"還原原本設定"), L"", RestoreModesId));
+    v.push_back(vAction(tr(L"Windows 節能設定"), L"", EnergySaverSettingsId));
+}
 std::vector<VBlock> powerModeBlocks() {
     const bool editable = !demo && !isolatedPreview, plugged = pluggedInNow(), noBattery = batteryAbsent();
     std::vector<VBlock> v;
@@ -5211,7 +5235,9 @@ std::vector<VBlock> powerModeBlocks() {
     v.push_back(vNote(powerModeText()));
     return v;
 }
-void showPowerModePage() {
+void showGoalPage();
+void showPowerModePage() { showGoalPage(); } // Windows power mode lives on the saving tab now
+void showPowerModePageOld() {
     refreshPowerModeControls();
     showChartPage(InlinePage::powerMode, tr(L"電源模式"), powerModeText(), powerModeBlocks());
     releaseInteraction();
@@ -6592,10 +6618,8 @@ std::vector<VBlock> goalBlocks() {
     {
         size_t rules = appRules.size(); for (const auto& exe : performanceApps) rules += !appRules.count(exe);
         v.push_back(vAction(tr(L"程式規則"), std::to_wstring(rules) + tr(L" 個"), AppRulesMenuId));
-        const auto modes = queryPowerModes();
-        v.push_back(vAction(tr(L"Windows 電源模式"), modes.dcKnown ? tr(L"用電池：") + std::wstring(modeName(modes.dc)) : std::wstring(), PowerModeId,
-            modes.dcKnown && modes.dc == PowerMode::efficiency ? Green : COLORREF(0)));
     }
+    appendPowerModeBlocks(v); // Windows power mode, both sources, right here
     const auto tips = savingTips();
     if (!tips.empty()) {
         v.push_back(vHeading(tr(L"可以怎麼省")));
@@ -6760,7 +6784,11 @@ std::vector<VBlock> settingsBlocks() {
         else if (rowIsSwitch(entry.row)) v.push_back(vToggle(tr(entry.label), entry.detail ? tr(entry.detail) : std::wstring(), rowOn(entry.row), command));
         else v.push_back(vAction(tr(entry.label), rowValue(entry.row), command, rowOn(entry.row) ? Green : COLORREF(0)));
     }
-    v.push_back(vFold(tr(L"省電的開關在哪裡？"), tr(L"動態省電、60 Hz、省電目標、程式規則與低電量自動省電都在「省電」分頁，每個開關只有一個地方。效能模式、風扇與功耗上限在「效能」；充電上限、鍵盤與燈效在「硬體」。")));
+    // Moved here from the ⋯ menu: the stability page and the interface diagnostic.
+    v.push_back(vHeading(tr(L"診斷")));
+    if (auto row = stabilityRow(false)) v.push_back(std::move(*row));
+    v.push_back(vAction(tr(L"介面診斷"), tr(L"量測動畫是否順暢"), UiDiagId));
+    v.push_back(vFold(tr(L"省電的開關在哪裡？"), tr(L"每個設定只有一個地方，最多下一層：「效能」放效能模式、CPU 與獨顯；「省電」放所有省電開關與 Windows 電源模式；「電池」放耗電排行，「電池紀錄」看健康與近 7 天；「硬體」放風扇曲線、功耗上限、充電上限、鍵盤與燈效；「實驗」測省電效果；這裡放提醒、外觀與一般設定。")));
     return v;
 }
 void showSettingsPage() {
@@ -7510,6 +7538,8 @@ std::wstring hardwareText(const bs::asus::Snapshot& h) {
     c += L"\n\n" + bs::asus::dump(h) + status;
     return c;
 }
+void appendFanBlocks(std::vector<VBlock>& v);
+std::wstring powerPresetText(bs::asus::PowerPreset preset);
 void showHardwarePage() {
     bs::asus::Snapshot h = asusNow();
     const bool preview = demo || isolatedPreview;
@@ -7528,17 +7558,31 @@ void showHardwarePage() {
     }
     if (h.gpuMux && !*h.gpuMux) chips.push_back({tr(L"獨顯直連"), theme.warn});
     v.push_back(vChips(std::move(chips)));
-    // Controls, each opening its choices in place.
+    // Everything on the page itself: a choice of a few is a row of keys, not a menu.
     {
-        const std::wstring unset = tr(L"未設定");
+        // Fans first (the readings, the setting and the curve), then the CPU's power limit.
+        static const bool fanControl = preview || bs::asus::fanControlSupported();
+        if (fanControl) appendFanBlocks(v);
+        if (!powerPresetsBlocked() || preview) { // not offered where a limit, once set, only goes away with a restart
+            const auto t = bs::asus::tuning();
+            v.push_back(vHeading(tr(L"CPU 功耗上限")));
+            v.push_back(vSegments({tr(L"原廠"), tr(L"省電"), tr(L"輕量"), tr(L"標準")}, {PowerPreset0Id, PowerPreset0Id + 1, PowerPreset0Id + 2, PowerPreset0Id + 3}, int(t.power)));
+            if (t.power != bs::asus::PowerPreset::factory) v.push_back(vNote(powerPresetText(t.power)));
+        }
         v.push_back(vHeading(tr(L"電池與顯示")));
-        if (h.chargeDevice) v.push_back(vAction(tr(L"充電上限"), h.chargeLimit ? std::to_wstring(*h.chargeLimit) + L"%" : unset, HwChargeMenuId,
-            h.chargeLimit && *h.chargeLimit <= 80 ? Green : COLORREF(0)));
-        if (h.overdrive) v.push_back(vAction(tr(L"螢幕 Overdrive"), *h.overdrive ? tr(L"開") : tr(L"關"), OverdriveId));
+        if (h.chargeDevice) {
+            v.push_back(vNote(tr(L"充電上限：長時間插電選 60% 或 80%，要出門前選 100%。")));
+            v.push_back(vSegments({L"60%", L"80%", L"100%"}, {Charge60Id, Charge80Id, Charge100Id},
+                h.chargeLimit == 60u ? 0 : h.chargeLimit == 80u ? 1 : h.chargeLimit == 100u ? 2 : -1));
+        }
+        if (h.overdrive) v.push_back(vToggle(tr(L"螢幕 Overdrive"), tr(L"畫面殘影較少，稍微耗電"), *h.overdrive, OverdriveId));
         v.push_back(vHeading(tr(L"鍵盤與燈效")));
-        if (h.keyboardDevice) v.push_back(vAction(tr(L"鍵盤背光"), (h.keyboard || keyboardDimmed ? std::wstring(keyboardLevelName(keyboardDimmed ? 0 : *h.keyboard)) : unset)
-            + (keyboardAutoOff ? tr(L" · 閒置自動關") : L""), HwKeyboardMenuId));
-        v.push_back(vAction(tr(L"Fn 鎖定"), h.fnLock.value_or(false) ? tr(L"開（F1–F11 免按 Fn）") : tr(L"關"), FnLockId, h.fnLock.value_or(false) ? Green : COLORREF(0)));
+        if (h.keyboardDevice) {
+            v.push_back(vNote(tr(L"鍵盤背光")));
+            v.push_back(vSegments({keyboardLevelName(0), keyboardLevelName(1), keyboardLevelName(2), keyboardLevelName(3)},
+                {Keyboard0Id, Keyboard0Id + 1, Keyboard0Id + 2, Keyboard0Id + 3}, keyboardDimmed ? 0 : h.keyboard ? int(*h.keyboard) : -1));
+        }
+        v.push_back(vToggle(tr(L"Fn 鎖定"), tr(L"F1–F11 免按 Fn"), h.fnLock.value_or(false), FnLockId));
         if (h.slash) {
             const auto s = preview ? bs::asus::Slash{} : bs::asus::slashSettings();
             v.push_back(vAction(tr(L"Slash 燈效"), s.on ? std::wstring(bs::asus::slashModeName(s.mode)) + (s.offOnBattery ? tr(L" · 用電池關") : L"") : std::wstring(tr(L"關")), HwSlashMenuId,
@@ -7546,8 +7590,14 @@ void showHardwarePage() {
         }
         v.push_back(vHeading(tr(L"華碩軟體")));
         const bool listening = preview || SUCCEEDED(asusKeys.status()) || asusKeys.keyboard();
-        v.push_back(vAction(tr(L"華碩按鍵"), !asusKeysHandled ? std::wstring(tr(L"交給華碩軟體")) : !listening ? std::wstring(tr(L"收不到按鍵")) : tr(L"BatteryScope 接手"),
-            HwKeysMenuId, !asusKeysHandled ? COLORREF(0) : !listening ? theme.warn : Green));
+        v.push_back(vToggle(tr(L"由 BatteryScope 接手華碩按鍵"), !asusKeysHandled ? std::wstring(tr(L"關：交給華碩軟體")) : !listening ? std::wstring(tr(L"收不到按鍵")) : tr(L"華碩軟體不在時處理亮度、背光、Fn 鎖定等按鍵"),
+            asusKeysHandled, KeysHandleId));
+        if (asusKeysHandled) {
+            v.push_back(vNote(tr(L"ROG 鍵")));
+            v.push_back(vSegments({tr(L"開啟面板"), tr(L"切換模式"), tr(L"不動作")}, {RogOpenId, RogModeId, RogNoneId}, int(rogKeyAction)));
+            v.push_back(vNote(L"Fn+C"));
+            v.push_back(vSegments({tr(L"Fn 鎖定"), tr(L"不動作")}, {FnCLockId, FnCNoneId}, int(fnCAction)));
+        }
         size_t running = 0, total = 0, disabled = 0;
         if (!preview) for (const auto& sv : asusServicesNow()) { if (sv.managed) { running += sv.running; ++total; } disabled += sv.startType == SERVICE_DISABLED; }
         else { running = 0; total = 9; }
@@ -7719,8 +7769,10 @@ void showPerformancePage() {
             std::replace(apps.begin(), apps.end(), L';', L'、');
             v.push_back(vNote(tr(L"正在用獨顯：") + apps));
         }
-        if (asusAvailable && h.gpuEco) v.push_back(vAction(tr(L"獨顯模式"), (gpuAuto ? tr(L"自動") + std::wstring(L" · ") : std::wstring()) + (*h.gpuEco ? L"Eco" : tr(L"標準")),
-            HwGpuMenuId, *h.gpuEco ? Green : COLORREF(0)));
+        if (asusAvailable && h.gpuEco) {
+            v.push_back(vNote(tr(L"獨顯模式：自動是用電池 Eco（斷電）、插電標準")));
+            v.push_back(vSegments({tr(L"自動"), L"Eco", tr(L"標準")}, {GpuAutoId, GpuEcoId, GpuStandardId}, gpuAuto ? 0 : *h.gpuEco ? 1 : 2));
+        }
     }
     // Fans and power limits (ASUS).
     if (asusAvailable && h.driver) {
@@ -7734,16 +7786,13 @@ void showPerformancePage() {
             v.push_back(vBars(std::move(bars), 70));
         }
         const auto t = bs::asus::tuning();
-        // Fans: presets and custom curves on a page of their own (asked once whether they can be written).
+        // The fan and power settings themselves are on the hardware tab; this row goes there.
         static const bool fanControl = preview || bs::asus::fanControlSupported();
-        if (fanControl) v.push_back(vAction(tr(L"風扇"), tr(bs::asus::fanPresetKey(preview ? demoFans : t.fans)), FanPageId,
+        if (fanControl) v.push_back(vAction(tr(L"風扇與功耗設定"), tr(bs::asus::fanPresetKey(preview ? demoFans : t.fans)) + std::wstring(tr(L"（在「硬體」）")), FanPageId,
             (preview ? demoFans : t.fans) == bs::asus::FanPreset::quiet ? Green : COLORREF(0)));
-        // Not offered where a limit, once set, only goes away with a restart.
-        if (!powerPresetsBlocked() || preview)
-            v.push_back(vAction(tr(L"CPU 功耗上限"), powerPresetText(t.power), PowerLimitMenuId, t.power == bs::asus::PowerPreset::saver ? Green : COLORREF(0)));
     }
     if (!stabilityRow(true)) if (auto row = stabilityRow(false)) v.push_back(std::move(*row));
-    v.push_back(vFold(tr(L"關於風扇與功耗"), tr(L"風扇在「風扇」頁：原廠、安靜、標準、強力，或每個風扇、每個效能模式各一條自訂曲線（有安全下限）。功耗上限只提供原廠範圍內的預設，不超過平衡模式。兩者在每次切換效能模式後會自動重新套用，選「原廠」即還原。獨顯只有在已經醒著時才讀取溫度與時脈，不會為了顯示把它叫醒。") +
+    v.push_back(vFold(tr(L"關於風扇與功耗"), tr(L"這裡只顯示溫度與轉速；風扇曲線與功耗上限在「硬體」分頁設定（原廠、安靜、標準、強力，或每個風扇、每個效能模式各一條自訂曲線，有安全下限；功耗上限不超過平衡模式），每次切換效能模式後會自動重新套用。獨顯只有在已經醒著時才讀取溫度與時脈，不會為了顯示把它叫醒。") +
         (powerPresetsBlocked() && !preview ? std::wstring(L"\n") + tr(L"這台的 BIOS 切換效能模式不會解除功耗上限，設了只能靠重新開機還原，所以不提供功耗上限選項。") : std::wstring()) +
         std::wstring(L"\n") + tr(L"模式連動：CPU Boost 關掉時時脈停在基準時脈，每個效能模式的功耗都差不多（這台插電約 20 W），模式之間看不出差別。G-Helper 會在切換模式時一併設定該模式的 CPU Boost 與 Windows 電源模式；開啟模式連動後 BatteryScope 也這樣做（只在插電時；用電池時由動態省電與下方的 Boost 開關負責）。")));
     showChartPage(InlinePage::performance, tr(L"效能"), perfPageText(), std::move(v));
@@ -7870,20 +7919,20 @@ std::wstring fanPageText(const bs::asus::Snapshot& h, const bs::asus::FanCurve& 
     }
     return t;
 }
-void showFanPage() {
+// The fans, on the hardware tab: the readings, the setting, the curve and its editor.
+void appendFanBlocks(std::vector<VBlock>& v) {
     using namespace bs::asus;
     const auto h = fanSnapshot();
     const FanPreset setting = fanSetting();
     const auto fans = fanListShown();
     if (std::find(fans.begin(), fans.end(), fanEditFan) == fans.end()) fanEditFan = Fan::cpu;
-    std::vector<VBlock> v;
     // Now: the temperature and both fans.
     v.push_back(vTiles({{tr(L"CPU 溫度") + std::wstring(L"\n") + (h.cpuTemp ? std::to_wstring(*h.cpuTemp) + L" °C" : std::wstring(L"—")),
             h.cpuTemp && *h.cpuTemp >= 90 ? theme.danger : h.cpuTemp && *h.cpuTemp >= 80 ? theme.warn : COLORREF(0)},
         {tr(L"CPU 風扇") + std::wstring(L"\n") + fanRpm(h.cpuFan), 0},
         {(h.gpuFan || !h.midFan ? tr(L"獨顯風扇") : tr(L"中間風扇")) + std::wstring(L"\n") + fanRpm(h.gpuFan ? h.gpuFan : h.midFan), 0}}));
     // The setting: four presets and custom.
-    v.push_back(vHeading(tr(L"風扇模式")));
+    v.push_back(vHeading(tr(L"風扇")));
     v.push_back(vSegments({tr(L"原廠"), tr(L"安靜"), tr(L"標準"), tr(L"強力"), tr(L"自訂")},
         {FanPreset0Id, FanPreset0Id + 1, FanPreset0Id + 2, FanPreset0Id + 3, FanCustomId}, int(setting)));
     static const wchar_t* const about[] = {
@@ -7952,8 +8001,8 @@ void showFanPage() {
         tr(L"操作：拖曳點；按住 Shift 拖曳是四分之一速度的微調。滑鼠停在曲線上會顯示該溫度的轉速。下方的 − / + 一次 1 °C 或 1%，按住會連續調整。選中曲線後：左右選點，上下 ±1%，Ctrl+左右 ±1 °C，加 Shift 一次 5。Ctrl+Z 復原，Ctrl+Y 重做。") + std::wstring(L"\n") +
         tr(L"100% 寫入時是 99%（部分機型的韌體在 100% 會異常，G-Helper 也這樣做）。") + std::wstring(L"\n") +
         tr(L"韌體在每次切換效能模式後會恢復原廠曲線，BatteryScope 會在切換後、喚醒與開機時重新寫入。韌體在過熱時仍可能自行提高轉速。")));
-    showChartPage(InlinePage::fans, tr(L"風扇"), fanPageText(h, curve), std::move(v));
 }
+void showFanPage() { showHardwarePage(); } // the fans live on the hardware tab
 // ----- Stability: crashes, freezes and problem reports -----
 // A black box (stability.h) keeps the last two hours on disk; a high-priority
 // thread notices whole-system freezes and a hung panel, and reads Windows' own
@@ -9197,18 +9246,9 @@ std::vector<MenuItem> mainMenuItems() {
         handBack.hint = std::to_wstring(heldCount()) + tr(L" 項");
         items.push_back(handBack);
     }
-    items.push_back(menuItem(PowerModeId, tr(L"電源模式")));
-    if (asusAvailable) items.push_back(submenu(tr(L"華碩效能模式"), modeMenuItems()));
-    items.push_back(menuSeparator());
-    std::vector<MenuItem> tools;
-    tools.push_back(menuItem(ExportCsvId, tr(L"匯出 CSV"), false, preview));
-    tools.push_back(menuItem(UiDiagId, tr(L"介面診斷"), false, preview));
-    tools.push_back(menuItem(ShareCardId, tr(L"分享今日卡片"), false, preview));
-    tools.push_back(menuItem(MiniToggleId, tr(L"迷你浮動視窗"), miniEnabled));
-    items.push_back(submenu(tr(L"工具"), tools));
+    // One level, no submenus: everything else has its place on a tab (the power mode on Saving,
+    // the ASUS mode on Performance, export on the battery record, the rest in Settings).
     items.push_back(menuItem(StabilityPageId, tr(L"穩定性與問題回報")));
-    items.push_back(menuItem(ProtectToggleId, tr(L"保護模式（只監測）"), protectState != 0, preview));
-    items.push_back(menuItem(MarkProblemId, tr(L"記錄剛剛發生的問題"), false, preview));
     items.push_back(menuSeparator());
     if (hidden) items.push_back(menuItem(TrayShow, tr(L"顯示面板"))); // from the tray icon
     items.push_back(menuItem(TrayExit, tr(L"結束 BatteryScope"), false, pendingAction));
@@ -9721,8 +9761,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if (id == ReviewCandidatesId) { showReviewCandidates(); return 0; }
         if (id == PowerModeId) {
             // The mode pill in the header opens the power overview while dynamic saving runs.
-            if (reinterpret_cast<HWND>(lp) == powerButton && dynamicEnabled) { showMain(); showGoalPage(); return 0; }
-            showPowerModePage(); return 0;
+            showMain(); showGoalPage(); return 0; // the saving tab holds the power mode and everything that saves
         }
         if (isModeButton(UINT(id))) {
             if (demo || isolatedPreview) return 0;
@@ -9736,11 +9775,13 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
                 setNotice(tr(L"已將「用電池時」設為") + std::wstring(modeName(mode)) + tr(L"；這次用電池期間動態省電不會改它，按「交給動態省電」可交回。"));
             } else setNotice((pluggedIn ? tr(L"已將「插電時」設為") : tr(L"已將「用電池時」設為")) + std::wstring(modeName(mode)) + tr(L"。"));
             refreshPowerModeControls();
+            if (inlinePage == InlinePage::goal) showGoalPage();
             return 0;
         }
         if (id == RestoreModesId && powerModeHeld()) {
             governor.release(bs::gov::Setting::powerMode); governorTick();
             setNotice(tr(L"電源模式已交給動態省電。")); refreshPowerModeControls();
+            if (inlinePage == InlinePage::goal) showGoalPage();
             return 0;
         }
         if (id == RestoreModesId) {
@@ -9748,9 +9789,9 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             const DWORD result = restorePowerModes();
             setNotice(result ? tr(L"無法還原電源模式：") + errorText(result) : tr(L"已還原 BatteryScope 變更前的電源模式。"));
             refreshPowerModeControls();
+            if (inlinePage == InlinePage::goal) showGoalPage();
             return 0;
         }
-        if (id == IDCANCEL && inlinePage == InlinePage::fans) { fanDraft.clear(); showPerformancePage(); return 0; } // back up to the performance page
         if (id == InlineBackId || (id == IDCANCEL && inlinePage != InlinePage::none)) { closeInlinePage(); return 0; }
         if (id == InlineConfirmId) {
             if (inlinePage != InlinePage::confirm || !pendingForceRow || demo || pendingAction) return 0;
@@ -9850,7 +9891,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             setNotice(tr(L"這台電腦上功耗上限設了之後還原不回來，已停用這個選項。「重新啟動」電腦可以清除目前的上限。"));
             return 0;
         }
-        if (id == FanPageId) { fanDraft.clear(); fanEditModeIndex = -1; showFanPage(); return 0; }
+        if (id == FanPageId) { fanDraft.clear(); fanEditModeIndex = -1; showMain(); showFanPage(); return 0; }
         if (id >= FanEditFan0Id && id <= FanEditFan0Id + 2) { fanEditFan = bs::asus::Fan(id - FanEditFan0Id); fanDraft.clear(); showFanPage(); return 0; }
         if (id >= FanEditMode0Id && id <= FanEditMode0Id + 2) { fanEditModeIndex = id - FanEditMode0Id; fanDraft.clear(); showFanPage(); return 0; }
         if (id == FanPointPrevId || id == FanPointNextId) { fanPoint = std::clamp(fanPoint + (id == FanPointNextId ? 1 : -1), 0, bs::asus::FanPoints - 1); fanDraft.clear(); showFanPage(); return 0; }
@@ -9901,7 +9942,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         if ((id >= FanPreset0Id && id <= FanPreset0Id + 3) || id == FanCustomId || (id >= PowerPreset0Id && id <= PowerPreset0Id + 3)) {
             const bool fanChoice = id < PowerPreset0Id || id == FanCustomId;
             const auto chosenFans = id == FanCustomId ? bs::asus::FanPreset::custom : bs::asus::FanPreset(std::clamp(id - FanPreset0Id, 0, 3));
-            if (fanChoice && fanPreview()) { demoFans = chosenFans; fanDraft.clear(); if (inlinePage == InlinePage::fans) showFanPage(); return 0; }
+            if (fanChoice && fanPreview()) { demoFans = chosenFans; fanDraft.clear(); if (inlinePage == InlinePage::hardware) showFanPage(); return 0; }
             if (demo || isolatedPreview || !asusAvailable) return 0;
             auto t = bs::asus::tuning();
             if (!fanChoice) t.power = bs::asus::PowerPreset(id - PowerPreset0Id); else t.fans = chosenFans;
@@ -10010,6 +10051,7 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             asusReadAt = 0;
             setNotice(status == ERROR_SUCCESS ? done : tr(L"韌體沒有接受這個設定：") + errorText(status));
             if (inlinePage == InlinePage::hardware) showHardwarePage();
+            if (inlinePage == InlinePage::performance) showPerformancePage(); // the GPU mode keys there
             return 0;
         }
         if (id == GoalCycleId) {
@@ -10195,9 +10237,8 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         applyDisplayTimers(false);
         checkBlank();
         if (const Value watts = current.energy.packageWatts; watts && *watts > 28 && powerLimitStuck()) clearPowerLimitStuck(L"cpu above 28 W");
-        if (inlinePage == InlinePage::hardware && !hidden) showHardwarePage();
+        if (inlinePage == InlinePage::hardware && !hidden && fanDragPoint < 0 && fanDraft.empty()) showHardwarePage(); // live temperature and fans (not mid-drag)
         if (inlinePage == InlinePage::performance && !hidden) showPerformancePage();
-        if (inlinePage == InlinePage::fans && !hidden && fanDragPoint < 0 && fanDraft.empty()) showFanPage(); // live temperature and fans
         if (inlinePage == InlinePage::goal && !hidden && GetTickCount64() - goalPageShownAt >= 10000) showGoalPage();
         return 0;
     }
@@ -10283,14 +10324,14 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
         return 0;
     case FanAppliedMessage:
         fanWriteState = wp == ERROR_SUCCESS ? 1 : -1; fanWriteAt = GetTickCount64();
-        if (inlinePage == InlinePage::fans && fanDragPoint < 0) showFanPage();
+        if (inlinePage == InlinePage::hardware && fanDragPoint < 0) showFanPage();
         return 0;
     case TuningDoneMessage:
         setNotice(wp == ERROR_SUCCESS ? std::wstring(tr(L"風扇與功耗設定已套用。")) : wp == ERROR_NOT_SUPPORTED ? std::wstring(tr(L"這台電腦不支援這個設定。"))
             : tr(L"韌體沒有接受這個設定，已回到原廠。"));
         asusReadAt = 0;
         if (inlinePage == InlinePage::performance) showPerformancePage();
-        if (inlinePage == InlinePage::fans) showFanPage();
+        if (inlinePage == InlinePage::hardware) showFanPage();
         return 0;
     case PopupClickMessage:
         showMain();
@@ -10320,10 +10361,9 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     case SectionRefreshMessage:
         if (inlinePage == InlinePage::goal) showGoalPage();
         else if (inlinePage == InlinePage::history) showHistoryPage();
-        else if (inlinePage == InlinePage::hardware) showHardwarePage();
+        else if (inlinePage == InlinePage::hardware && fanDragPoint < 0) showHardwarePage();
         else if (inlinePage == InlinePage::performance) showPerformancePage();
         else if (inlinePage == InlinePage::stability) showStabilityPage();
-        else if (inlinePage == InlinePage::fans && fanDragPoint < 0) showFanPage();
         else if (inlinePage == InlinePage::lab) showLabPage();
         else if (inlinePage == InlinePage::settings) showSettingsPage();
         InvalidateRect(window, nullptr, FALSE); // the tabs, and the mascot in the header
@@ -10910,7 +10950,7 @@ bool panelSelfTest(const std::wstring& path) {
     SendMessageW(mainWindow, WM_COMMAND, SettingsPageId, 0);
     const auto themeBefore = themeChoice;
     check("settings_page_lists_every_option", inlinePage == InlinePage::settings && IsWindowVisible(visualView) && !IsWindowVisible(inlineText) &&
-        visualBlocks.size() == std::size(settingRows) + 1);
+        visualBlocks.size() >= std::size(settingRows) + 3 && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return int(b.amount) == UiDiagId; }));
     check("settings_switches_are_switches", std::count_if(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::action && b.toggle >= 0; }) == 7 &&
         std::none_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.amount == DynamicToggleId || b.amount == RefreshAutoId; }));
     SendMessageW(mainWindow, WM_COMMAND, SettingRowId + int(Row::theme), 0);
@@ -11089,7 +11129,7 @@ bool panelSelfTest(const std::wstring& path) {
         SendMessageW(mainWindow, WM_COMMAND, FanPageId, 0); settle(450); UpdateWindow(visualView);
         size_t curveBlock = visualBlocks.size();
         for (size_t i = 0; i < visualBlocks.size(); ++i) if (visualBlocks[i].kind == VBlock::Kind::curve) curveBlock = i;
-        const bool offered = inlinePage == InlinePage::fans && activeTab() == Tab::performance && curveBlock < visualBlocks.size() && visualBlocks[curveBlock].toggle == 1
+        const bool offered = inlinePage == InlinePage::hardware && activeTab() == Tab::hardware && curveBlock < visualBlocks.size() && visualBlocks[curveBlock].toggle == 1
             && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::segments && b.commands.size() == 5 && b.commands.back() == FanCustomId; });
         check("fan_page_offers_presets_and_custom_curves", offered);
         RECT plot{}; bool found = false;
@@ -11130,9 +11170,13 @@ bool panelSelfTest(const std::wstring& path) {
             // The other fan's curve rides along faintly for comparison.
             check("fan_curve_shows_the_other_fan", std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::curve && b.series.size() == 32; }));
         }
-        SendMessageW(mainWindow, WM_COMMAND, IDCANCEL, 0);
-        check("fan_page_goes_back_to_performance", inlinePage == InlinePage::performance);
+        // The performance page's fan row goes straight to the fans on the hardware tab, one level.
+        SendMessageW(mainWindow, WM_COMMAND, PerfPageId, 0);
+        const bool linked = std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::action && int(b.amount) == FanPageId; });
+        SendMessageW(mainWindow, WM_COMMAND, FanPageId, 0);
+        check("fans_live_on_the_hardware_tab", linked && inlinePage == InlinePage::hardware && activeTab() == Tab::hardware);
         demoCurves.clear();
+        SendMessageW(mainWindow, WM_COMMAND, PerfPageId, 0); // back home for the checks that follow
     }
     check("performance_mode_offers_the_mode_link", std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) {
         return b.kind == VBlock::Kind::action && int(b.amount) == ModeLinkMenuId && b.text.find(L"Turbo") != std::wstring::npos; }) && modeLinkMenuItems().size() >= 5);
@@ -11198,8 +11242,18 @@ bool panelSelfTest(const std::wstring& path) {
     auto hasAction = [](const std::wstring& title) {
         return std::any_of(visualBlocks.begin(), visualBlocks.end(), [&](const VBlock& b) { return b.kind == VBlock::Kind::action && b.title == title; });
     };
-    check("hardware_page_offers_every_control", inlinePage == InlinePage::hardware && !hasAction(tr(L"效能模式")) && hasAction(tr(L"充電上限"))
-        && hasAction(tr(L"鍵盤背光")) && hasAction(tr(L"Fn 鎖定")) && hasAction(tr(L"Slash 燈效")) && hasAction(tr(L"華碩按鍵")) && hasAction(tr(L"華碩服務")));
+    auto hasKeys = [](int first) {
+        return std::any_of(visualBlocks.begin(), visualBlocks.end(), [&](const VBlock& b) { return b.kind == VBlock::Kind::segments && !b.commands.empty() && b.commands[0] == first; });
+    };
+    // Everything on the page: small choices as keys (charge limit, keyboard, power limit, fans), switches, and the rest as rows.
+    check("hardware_page_offers_every_control", inlinePage == InlinePage::hardware && !hasAction(tr(L"效能模式")) && hasKeys(Charge60Id)
+        && hasKeys(Keyboard0Id) && hasKeys(PowerPreset0Id) && hasKeys(FanPreset0Id) && hasAction(tr(L"Fn 鎖定")) && hasAction(tr(L"Slash 燈效"))
+        && hasAction(tr(L"由 BatteryScope 接手華碩按鍵")) && hasAction(tr(L"華碩服務")));
+    // The ⋯ menu is one level: no submenus.
+    {
+        const auto menu = mainMenuItems();
+        check("main_menu_has_no_submenus", std::none_of(menu.begin(), menu.end(), [](const MenuItem& m) { return !m.children.empty(); }));
+    }
     SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
     showOsd(L"Test", 50);
     check("key_display_shows_without_focus", osdPopup.window && IsWindowVisible(osdPopup.window) && GetForegroundWindow() != osdPopup.window
@@ -11309,9 +11363,11 @@ bool panelSelfTest(const std::wstring& path) {
             tight.bottom < open.bottom && key.top >= tight.bottom && key.left == tight.left);
     }
     SendMessageW(mainWindow, WM_COMMAND, PowerModeId, 0);
-    check("power_mode_page_shows_both_sources_read_only_in_demo", inlinePage == InlinePage::powerMode &&
+    // Windows power mode sits on the saving tab: both sources as keys, no page of its own.
+    check("power_mode_page_shows_both_sources_read_only_in_demo", inlinePage == InlinePage::goal &&
         !IsWindowVisible(modeButtons[0]) && visualView && IsWindowVisible(visualView) && !IsWindowEnabled(modeButtons[0]) &&
-        std::count_if(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::segments; }) == 2 &&
+        std::count_if(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) {
+            return b.kind == VBlock::Kind::segments && !b.commands.empty() && (b.commands[0] == ModeAcEfficiencyId || b.commands[0] == ModeDcEfficiencyId); }) == 2 &&
         !IsWindowEnabled(restoreModesButton) && modeSelected(ModeAcPerformanceId) && modeSelected(ModeDcEfficiencyId) &&
         !modeSelected(ModeAcEfficiencyId) && IsWindowEnabled(powerButton));
     SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
@@ -11667,7 +11723,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if ((screenshot || uiTest) && option(L"--protect")) protectState = 2;
     if (screenshot && option(L"--performance")) showPerformancePage();
     if (screenshot && option(L"--fans")) { if (option(L"--preset")) demoFans = bs::asus::FanPreset::quiet; showFanPage(); if (option(L"--focus")) { SetFocus(visualView); for (size_t i = 0; i < visualHits.size(); ++i) if (visualHits[i].command == CurveCommand) visualFocus = int(i); }
-        if (option(L"--hover")) { fanHoverPoint = 4; fanPoint = 4; showFanPage(); } if (option(L"--guide")) { fanHoverX = sp(200); showFanPage(); } if (option(L"--down")) { visualSlideAt = -1; visualScroll = sp(470); } }
+        if (option(L"--hover")) { fanHoverPoint = 4; fanPoint = 4; showFanPage(); } if (option(L"--guide")) { fanHoverX = sp(200); showFanPage(); } }
+    if (screenshot && (option(L"--down") || option(L"--down2") || option(L"--down3"))) { visualSlideAt = -1; visualScroll = sp(option(L"--down3") ? 1410 : option(L"--down2") ? 940 : 470); }
     if (screenshot && option(L"--stability")) showStabilityPage();
     if (screenshot && option(L"--lab")) showLabPage();
     // --page-scroll <n>: a chart page scrolled down by n (unscaled) pixels, to capture its lower part.
