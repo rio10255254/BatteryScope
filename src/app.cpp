@@ -1112,9 +1112,9 @@ RECT gridCell(int y, int width, int k) {
 // The point editor on one row (block coordinates): < - temperature + - duty + >, keys in the
 // order of its commands: previous, next, temperature -, +, duty -, +.
 RECT pointEditKey(int y, int width, int k) {
-    const int key = sp(34), small = sp(4), gap = sp(8), top = y + sp(4), bottom = top + sp(36);
-    const int value = std::max(sp(40), (width - 6 * key - 2 * small - gap) / 2);
-    const int x[] = {0, width - key, key + small, key + small + key + value, key + small + 2 * key + value + gap, key + small + 3 * key + 2 * value + gap};
+    const int key = sp(34), spare = sp(4), gap = sp(8), top = y + sp(4), bottom = top + sp(36);
+    const int value = std::max(sp(40), (width - 6 * key - 2 * spare - gap) / 2);
+    const int x[] = {0, width - key, key + spare, key + spare + key + value, key + spare + 2 * key + value + gap, key + spare + 3 * key + 2 * value + gap};
     return {x[k], top, x[k] + key, bottom};
 }
 RECT pointEditValue(int y, int width, int half) { // the temperature (0) or the duty (1) between its keys
