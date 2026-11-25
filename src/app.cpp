@@ -80,6 +80,7 @@ constexpr int ListId = 100, CloseId = 101, KillId = 102, ServiceId = 103, Detail
     FanPageId = 400, FanCustomId = 401, FanEditFan0Id = 402 /* ..404: cpu, gpu, mid */, FanEditMode0Id = 405 /* ..407: silent, balanced, turbo */,
     FanResetCurveId = 408, FanCopyCurveId = 409, FanPointPrevId = 410, FanPointNextId = 411, FanTempDownId = 412, FanTempUpId = 413,
     FanDutyDownId = 414, FanDutyUpId = 415, FanUndoId = 416, FanRedoId = 417, FanLoadMenuId = 418, FanLoad0Id = 419 /* ..421: quiet, standard, strong */,
+    PageView0Id = 430 /* ..433: a page's views, side by side */,
     TrayShow = 200, TrayExit = 201;
 constexpr int PanelHotkey = 1, FnKeyHotkey = 10 /* ..20: F1-F11 under the software Fn lock */;
 const wchar_t* ClassName = L"BatteryScope.Main.v1";
@@ -231,6 +232,7 @@ int pluggedRefresh();
 bool powerModeHeld();      // dynamic saving is leaving the battery power mode to the user
 void showGoalPage();
 void showHardwarePage();
+RECT pageRoom();
 // The power lab; absent in demo and preview modes.
 std::unique_ptr<bs::lab::Controller> labController;
 std::unique_ptr<bs::lab::WorkloadEngine> labEngine; // the automatic test's loads and window
@@ -966,7 +968,7 @@ struct VBar {
     std::vector<VSegment> segments;     // stacked parts instead of one fill
 };
 struct VBlock {
-    enum class Kind { heading, note, meter, bars, series, chips, legend, action, segments, banner, timeline, card, check, fold, display, tiles, curve, pointEdit } kind = Kind::note;
+    enum class Kind { heading, note, meter, bars, series, chips, legend, action, segments, banner, timeline, card, check, fold, display, tiles, curve, pointEdit, grid } kind = Kind::note;
     std::wstring title, text, value;
     double amount = 0, goal = 0, scale = 0;
     std::vector<VBar> bars;
@@ -1017,6 +1019,24 @@ VBlock vAction(const std::wstring& title, const std::wstring& value, int command
 VBlock vSegments(std::vector<std::wstring> labels, std::vector<int> commands, int selected) {
     VBlock b; b.kind = VBlock::Kind::segments; b.toggle = selected; b.commands = std::move(commands);
     for (auto& label : labels) b.items.push_back({std::move(label), 0});
+    return b;
+}
+// A row of choices with its name on the left (a choice of a few on one line, not a note and a row).
+VBlock vLabeled(const std::wstring& label, std::vector<std::wstring> labels, std::vector<int> commands, int selected) {
+    VBlock b = vSegments(std::move(labels), std::move(commands), selected); b.title = label; return b;
+}
+// The views of a page, side by side: one of them shows at a time, so a page fits without scrolling.
+VBlock vViews(std::vector<std::wstring> labels, int current) {
+    std::vector<int> commands;
+    for (size_t k = 0; k < labels.size(); ++k) commands.push_back(PageView0Id + int(k));
+    return vSegments(std::move(labels), std::move(commands), current);
+}
+// Switches and values as tiles, two to a row: a switch tile carries its switch; a value tile its
+// value and an arrow. `toggle` is -1 for a value tile.
+struct GridItem { std::wstring title, detail; int command = 0; int toggle = -1; COLORREF tone = 0; };
+VBlock vGrid(const std::vector<GridItem>& cells) {
+    VBlock b; b.kind = VBlock::Kind::grid;
+    for (const auto& c : cells) { b.items.push_back({c.title + L"\n" + c.detail, c.tone}); b.commands.push_back(c.command); b.series.push_back(c.toggle); }
     return b;
 }
 // A switch: clicking it runs `command`, which turns the setting on or off. `detail` is a short
@@ -1078,18 +1098,28 @@ int fanWriteState = 0; uint64_t fanWriteAt = 0;
 // The +/- keys repeat while held.
 constexpr UINT_PTR FanRepeatTimer = 7;
 int fanRepeatCommand = 0; bool fanRepeated = false;
-// The point editor's keys (block coordinates): previous and next point on the first row, then
-// - and + for the temperature and for the duty.
+// A row of choices' tray: the whole width, or right of its name when it has one.
+RECT segmentTray(const VBlock& b, int y, int width, int height) {
+    const int left = b.title.empty() ? 0 : width * 36 / 100;
+    return {left, y + sp(4), width, y + height - sp(4)};
+}
+// A tile of a grid (block coordinates).
+RECT gridCell(int y, int width, int k) {
+    const int gap = sp(8), w = (width - gap) / 2, col = k % 2, row = k / 2;
+    const int top = y + sp(2) + row * (sp(56) + gap), left = col * (w + gap);
+    return {left, top, col ? width : left + w, top + sp(56)};
+}
+// The point editor on one row (block coordinates): < - temperature + - duty + >, keys in the
+// order of its commands: previous, next, temperature -, +, duty -, +.
 RECT pointEditKey(int y, int width, int k) {
-    const int keyW = sp(40), rowA = y + sp(4), rowB = y + sp(50), keyH = sp(36), half = width / 2;
-    switch (k) {
-    case 0: return {0, rowA, keyW, rowA + keyH};
-    case 1: return {width - keyW, rowA, width, rowA + keyH};
-    case 2: return {0, rowB, keyW, rowB + keyH};
-    case 3: return {half - sp(6) - keyW, rowB, half - sp(6), rowB + keyH};
-    case 4: return {half + sp(6), rowB, half + sp(6) + keyW, rowB + keyH};
-    default: return {width - keyW, rowB, width, rowB + keyH};
-    }
+    const int key = sp(34), small = sp(4), gap = sp(8), top = y + sp(4), bottom = top + sp(36);
+    const int value = std::max(sp(40), (width - 6 * key - 2 * small - gap) / 2);
+    const int x[] = {0, width - key, key + small, key + small + key + value, key + small + 2 * key + value + gap, key + small + 3 * key + 2 * value + gap};
+    return {x[k], top, x[k] + key, bottom};
+}
+RECT pointEditValue(int y, int width, int half) { // the temperature (0) or the duty (1) between its keys
+    const RECT minus = pointEditKey(y, width, 2 + half * 2), plus = pointEditKey(y, width, 3 + half * 2);
+    return {minus.right, minus.top, plus.left, minus.bottom};
 }
 // Where a point of the curve sits in the plot, and back.
 POINT curvePoint(const RECT& plot, double temperature, double duty) {
@@ -1099,6 +1129,10 @@ POINT curvePoint(const RECT& plot, double temperature, double duty) {
 }
 std::vector<VBlock> visualBlocks;
 int visualScroll = 0, visualContent = 0, visualDragOffset = -1;
+// Which view of a page shows (pages with views side by side), by page; and a view switch in
+// progress, which slides the new view in from its side instead of refreshing in place.
+std::map<int, int> pageViews;
+bool viewSwitching = false; int viewSwitchDir = 0;
 double visualScrollSeenAt = -1; // when the page last scrolled, for the indicator that fades after
 // Action rows as last painted (view coordinates) and the one under the mouse or keyboard focus.
 struct VHit { RECT rect; int command; size_t block; };
@@ -1135,7 +1169,7 @@ int blockHeight(HDC dc, const VBlock& b, int width, bool first) {
     switch (b.kind) {
     case VBlock::Kind::fold: return sp(40) + int(std::lround(foldAmount(b, motionNow()) * (noteHeight(dc, b.text, width - sp(24)) + sp(8))));
     case VBlock::Kind::heading: return first ? sp(24) : sp(34);
-    case VBlock::Kind::note: return noteHeight(dc, b.text, width);
+    case VBlock::Kind::note: return noteHeight(dc, b.text, width - sp(8)); // drawn inset sp(4) each side
     case VBlock::Kind::meter: return sp(52);
     case VBlock::Kind::bars: return int(b.bars.size()) * sp(38) + sp(2);
     case VBlock::Kind::series: return sp(114);
@@ -1145,12 +1179,13 @@ int blockHeight(HDC dc, const VBlock& b, int width, bool first) {
     case VBlock::Kind::segments: return sp(54);
     case VBlock::Kind::banner: return b.amount && !b.value.empty() ? sp(44) : sp(30) + noteHeight(dc, b.text, width - sp(26)) + (b.value.empty() ? 0 : sp(42)) + sp(8); // one that leads somewhere is a single row
     case VBlock::Kind::timeline: return sp(88);
-    case VBlock::Kind::card: return sp(30) + (b.text.empty() ? 0 : noteHeight(dc, b.text, width - sp(18))) + sp(8);
-    case VBlock::Kind::check: return sp(30) + (b.text.empty() ? 0 : noteHeight(dc, b.text, width - sp(28)));
+    case VBlock::Kind::card: return sp(30) + (b.text.empty() ? 0 : noteHeight(dc, b.text, width - sp(24))) + sp(8); // drawn from sp(20) to width - sp(4)
+    case VBlock::Kind::check: return sp(30) + (b.text.empty() ? 0 : noteHeight(dc, b.text, width - sp(32))); // drawn from sp(28) to width - sp(4)
     case VBlock::Kind::display: return sp(112);
     case VBlock::Kind::tiles: return sp(68);
-    case VBlock::Kind::curve: return sp(300);
-    case VBlock::Kind::pointEdit: return sp(96);
+    case VBlock::Kind::curve: return b.scale > 0 ? int(b.scale) : sp(300); // a page may size it to fill its room
+    case VBlock::Kind::pointEdit: return sp(46);
+    case VBlock::Kind::grid: { const int rows = int(b.items.size() + 1) / 2; return rows ? rows * sp(56) + (rows - 1) * sp(8) + sp(6) : 0; }
     }
     return 0;
 }
@@ -1276,10 +1311,13 @@ void pushBlockHits(const VBlock& b, size_t i, int y, int width, int height) {
         break;
     case VBlock::Kind::banner: if (b.amount) visualHits.push_back({placed({0, y, width, y + height}), int(b.amount), i}); break;
     case VBlock::Kind::segments: {
-        const RECT tray{0, y + sp(4), width, y + height - sp(4)};
+        const RECT tray = segmentTray(b, y, width, height);
         for (size_t k = 0; k < b.commands.size(); ++k) visualHits.push_back({placed(segmentKey(tray, int(b.commands.size()), int(k))), b.commands[k], i});
         break;
     }
+    case VBlock::Kind::grid:
+        for (size_t k = 0; k < b.commands.size(); ++k) visualHits.push_back({placed(gridCell(y, width, int(k))), b.commands[k], i});
+        break;
     case VBlock::Kind::series: visualPlots.push_back(placed({0, y + sp(24), width, y + sp(108)})); break;
     case VBlock::Kind::curve: {
         RECT plot = curvePlot(y, width, height); InflateRect(&plot, sp(10), sp(10));
@@ -1782,7 +1820,17 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
         case VBlock::Kind::segments: {
             // Keys in a tray; the light moves to the chosen one, quickly, then blooms and settles.
             const int n = int(b.commands.size());
-            const RECT tray{0, top + sp(4), width, top + h - sp(4)};
+            const RECT tray = segmentTray(b, top, width, h);
+            if (!b.title.empty()) {
+                // Its name on the left: one line, or a name over a small reading.
+                const size_t cut = b.title.find(L'\n');
+                const int mid = (tray.top + tray.bottom) / 2;
+                if (cut == std::wstring::npos) drawText(dc, b.title, {sp(4), tray.top, tray.left - sp(6), tray.bottom}, Ink, normalFont);
+                else {
+                    drawText(dc, b.title.substr(0, cut), {sp(4), mid - sp(18), tray.left - sp(6), mid}, Ink, normalFont);
+                    drawText(dc, b.title.substr(cut + 1), {sp(4), mid, tray.left - sp(6), mid + sp(17)}, Muted, smallFont);
+                }
+            }
             // The choices sit in an outlined slot (not a filled tray: its edge showed through the
             // lit key's light as a step).
             outline(dc, tray, blend(Surface, Muted, .28), 14);
@@ -2107,10 +2155,49 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
             }
             break;
         }
+        case VBlock::Kind::grid: {
+            // Tiles two to a row: they lie flat in an outline and rise as keys under the pointer.
+            for (int k = 0; k < int(b.items.size()); ++k) {
+                const RECT cell = gridCell(top, width, k);
+                const int index = int(hitsBefore) + k, command = k < int(b.commands.size()) ? b.commands[size_t(k)] : 0;
+                const int toggle = k < int(b.series.size()) ? int(b.series[size_t(k)]) : -1;
+                const double hot = index == visualHover ? 1.0 : 0.0;
+                const double pressed = hot > 0 && GetKeyState(VK_LBUTTON) < 0 ? 1.0 : 0.0;
+                if (hot > 0) { keycap(dc, cell, 12, 0, pressed, 1, hot); keyLight(cell, 12, hot); }
+                else outline(dc, cell, blend(Surface, Muted, .22), 12);
+                if (index == visualFocus && focused) outline(dc, cell, Green, 12, 2.0f);
+                const std::wstring& text = b.items[size_t(k)].first;
+                const size_t cut = text.find(L'\n');
+                const std::wstring title = text.substr(0, cut), detail = cut == std::wstring::npos ? std::wstring() : text.substr(cut + 1);
+                const COLORREF tone = b.items[size_t(k)].second;
+                const int down = int(std::lround(pressed * sp(1)));
+                int textRight = cell.right - sp(22);
+                if (toggle >= 0) {
+                    auto [it, fresh] = visualKnobs.try_emplace(command);
+                    if (fresh) { it->second.from = it->second.to = toggle; it->second.duration = 0; }
+                    else if (std::abs(it->second.to - toggle) > .01) {
+                        it->second.move(toggle, now, canAnimate() ? 420 : 0); it->second.spring = true;
+                        if (canAnimate()) visualChangedAt[command] = {now, toggle ? 1 : -1};
+                        if (visualLive) { POINT at{cell.right - sp(30), cell.top + sp(20)}; at.x += inset; ClientToScreen(visualView, &at); fxToggle(at, toggle != 0); }
+                    }
+                    if (it->second.active(now)) visualAnimating = true;
+                    Arrival motion;
+                    if (auto changed = visualChangedAt.find(command); changed != visualChangedAt.end() && keyLook()) {
+                        motion = arrival(now - changed->second.first, changed->second.second);
+                        if (motion.active) visualAnimating = true;
+                    }
+                    const RECT sw{cell.right - sp(12) - sp(40), cell.top + sp(9) + down, cell.right - sp(12), cell.top + sp(9) + sp(22) + down};
+                    drawSwitch(dc, sw, it->second.value(now), pressed, motion);
+                    textRight = sw.left - sp(6);
+                } else drawMenuArrow(dc, cell.right - sp(16), cell.top + sp(15) + down, sp(10), Muted, false);
+                drawText(dc, title, {cell.left + sp(12), cell.top + sp(6) + down, textRight, cell.top + sp(30) + down}, Ink, normalFont);
+                drawText(dc, detail, {cell.left + sp(12), cell.top + sp(30) + down, cell.right - sp(10), cell.bottom - sp(6) + down},
+                    toggle < 0 && tone ? lightOf(tone) == theme.glow ? Green : tone : Muted, smallFont);
+            }
+            break;
+        }
         case VBlock::Kind::pointEdit: {
-            // The chosen point, exactly: < point >, then - temperature + and - duty +.
-            const RECT nameRow{sp(44), top + sp(4), width - sp(44), top + sp(40)};
-            drawText(dc, b.value, nameRow, Ink, strongFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+            // The chosen point, exactly, on one row: < - 65 °C + - 25% + >.
             static const wchar_t* const glyphs[] = {L"<", L">", L"−", L"+", L"−", L"+"};
             for (int k = 0; k < int(b.commands.size()) && k < 6; ++k) {
                 const RECT key = pointEditKey(top, width, k);
@@ -2123,12 +2210,9 @@ void paintVisual(HDC dc, RECT client, const RECT* update = nullptr) {
                 drawText(dc, glyphs[k], face, hot > 0 ? Ink : blend(Muted, Ink, .4), strongFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
             }
             for (int half = 0; half < 2 && half < int(b.items.size()); ++half) {
-                const RECT minus = pointEditKey(top, width, 2 + half * 2), plus = pointEditKey(top, width, 3 + half * 2);
-                const RECT value{minus.right, minus.top, plus.left, minus.bottom};
                 const std::wstring& text = b.items[size_t(half)].first;
                 const size_t cut = text.find(L'\n');
-                drawText(dc, cut == std::wstring::npos ? std::wstring() : text.substr(0, cut), {value.left, value.top - sp(2), value.right, value.top + sp(14)}, Muted, smallFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
-                drawText(dc, cut == std::wstring::npos ? text : text.substr(cut + 1), {value.left, value.top + sp(12), value.right, value.bottom}, Ink, strongFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+                drawText(dc, cut == std::wstring::npos ? text : text.substr(cut + 1), pointEditValue(top, width, half), Ink, strongFont, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
             }
             break;
         }
@@ -4891,6 +4975,11 @@ std::wstring historyText() {
 void showHistoryPage() {
     std::vector<VBlock> v;
     PowerSample p; if (!current.history.empty()) p = current.history.back();
+    // Two views side by side, each on one screen: the battery and its last seven days; the
+    // programs that used it since BatteryScope started.
+    const int view = std::clamp(pageViews[int(InlinePage::history)], 0, 1);
+    v.push_back(vViews({tr(L"近 7 天"), tr(L"程式用電")}, view));
+    if (view == 0) {
     {
         std::vector<std::pair<std::wstring, COLORREF>> chips;
         if (p.percent) chips.push_back({tr(L"電量 ") + number(*p.percent, 0) + L"%", Green});
@@ -4903,7 +4992,6 @@ void showHistoryPage() {
     if (p.remainingWh && p.fullWh && *p.fullWh > 0)
         v.push_back(vMeter(tr(L"剩餘容量"), number(*p.remainingWh, 1) + L" / " + number(*p.fullWh, 1) + L" Wh", *p.remainingWh, 0, *p.fullWh));
     // (the charge limit is set on the hardware tab; the chips above show it)
-    v.push_back(vHeading(tr(L"近 7 天")));
     {
         std::vector<VBar> bars;
         for (int i = 0; i < 7; ++i) {
@@ -4924,13 +5012,10 @@ void showHistoryPage() {
             bars.push_back({label, value, wh, 0, i == 0 ? Green : blend(Green, Surface, .4), {}});
         }
         v.push_back(vBars(std::move(bars)));
-        v.push_back(vNote(tr(L"每天用電池時的放電量，右邊是平均耗電。")));
     }
-    for (auto& block : ledgerBlocks()) v.push_back(std::move(block)); // which programs used it
-    v.push_back(vHeading(tr(L"匯出")));
-    v.push_back(vAction(tr(L"匯出 CSV"), tr(L"程序排行與 30 分鐘電量"), ExportCsvId));
-    v.push_back(vAction(tr(L"分享今日卡片"), tr(L"圖片"), ShareCardId));
+    v.push_back(vLabeled(tr(L"匯出"), {L"CSV", tr(L"今日卡片")}, {ExportCsvId, ShareCardId}, -1));
     v.push_back(vFold(tr(L"詳細數據"), powerDetailsText()));
+    } else for (auto& block : ledgerBlocks()) v.push_back(std::move(block)); // which programs used it
     showChartPage(InlinePage::history, tr(L"電池"), historyText() + L"\n\n" + ledgerText() + L"\n\n" + candidatesText() + L"\n\n" + powerDetailsText(), std::move(v));
     releaseInteraction();
 }
@@ -5123,10 +5208,9 @@ std::vector<VBlock> labBlocks(const bs::lab::Controller::Status& st) {
             double(st.step + 1), 0, double(std::max(1, st.steps))));
         if (st.paused) v.push_back(vNote(tr(L"插電中，已暫停並還原；拔掉電源後繼續。")));
     } else {
-        v.push_back(vHeading(tr(L"開始測試")));
-        v.push_back(vAction(tr(L"快速測試"), tr(L"約 30 分鐘"), LabQuickId, Green));
-        v.push_back(vAction(tr(L"完整測試"), tr(L"約 1.5 小時"), LabAutoId));
-        v.push_back(vAction(tr(L"單項實驗"), st.running ? tr(L"進行中") : std::wstring(), LabSingleMenuId));
+        // The three ways to start, one row of keys: quick (about 30 min), full (about 1.5 h), one experiment.
+        v.push_back(vLabeled(tr(L"開始測試") + std::wstring(L"\n") + tr(L"約 30 分 / 1.5 時"), {tr(L"快速"), tr(L"完整"), st.running ? tr(L"單項…") : tr(L"單項")},
+            {LabQuickId, LabAutoId, LabSingleMenuId}, -1));
     }
     // What each setting saves, per activity: the bar is the saving, the dimmer LEDs its 95% range.
     std::vector<VBar> savings;
@@ -5190,28 +5274,6 @@ void showLabPage() {
     showChartPage(InlinePage::lab, tr(L"省電實驗室"), labPageText(), labBlocks(labController->status()));
     labPageShownAt = GetTickCount64();
 }
-// The power mode page, set out like every other page: what is in effect, a row of three
-// choices for each power source, then the commands and the explanation.
-// Windows power mode as part of the saving tab: a row of keys for each power source.
-void appendPowerModeBlocks(std::vector<VBlock>& v) {
-    refreshPowerModeControls();
-    const bool editable = !demo && !isolatedPreview, plugged = pluggedInNow(), noBattery = batteryAbsent();
-    v.push_back(vHeading(tr(L"Windows 電源模式")));
-    for (int source = 0; source < 2; ++source) {
-        const bool ac = source == 0;
-        const bool known = ac ? powerModes.acKnown : powerModes.dcKnown;
-        const bool settable = known && (ac ? powerModes.acSettable : powerModes.dcSettable && !noBattery);
-        const PowerMode mode = ac ? powerModes.ac : powerModes.dc;
-        const int base = ac ? ModeAcEfficiencyId : ModeDcEfficiencyId;
-        v.push_back(vNote(std::wstring(ac ? tr(L"插電時") : tr(L"用電池時")) + (ac == plugged ? tr(L" · 目前") : L"")));
-        if (settable) v.push_back(vSegments({tr(L"效率"), tr(L"平衡"), tr(L"效能")}, {base, base + 1, base + 2}, mode != PowerMode::other ? int(mode) : -1));
-        else v.push_back(vChips({{known ? std::wstring(modeName(mode)) + tr(L" · 只能檢視") : std::wstring(tr(L"此電腦未提供這項設定")), 0}}));
-    }
-    const bool handBack = powerModeHeld();
-    if (editable && (handBack || (powerModes.restorable && !dynamicEnabled)))
-        v.push_back(vAction(handBack ? tr(L"交給動態省電") : tr(L"還原原本設定"), L"", RestoreModesId));
-    v.push_back(vAction(tr(L"Windows 節能設定"), L"", EnergySaverSettingsId));
-}
 std::vector<VBlock> powerModeBlocks() {
     const bool editable = !demo && !isolatedPreview, plugged = pluggedInNow(), noBattery = batteryAbsent();
     std::vector<VBlock> v;
@@ -5237,11 +5299,6 @@ std::vector<VBlock> powerModeBlocks() {
 }
 void showGoalPage();
 void showPowerModePage() { showGoalPage(); } // Windows power mode lives on the saving tab now
-void showPowerModePageOld() {
-    refreshPowerModeControls();
-    showChartPage(InlinePage::powerMode, tr(L"電源模式"), powerModeText(), powerModeBlocks());
-    releaseInteraction();
-}
 std::wstring candidatesText() {
     const auto candidates = reviewCandidates(current);
     std::wstring content = tr(L"依持續 CPU 活動、可讀身分與前景／服務關聯，列出值得檢查的背景程序。這不是安全關閉判定，也不是關閉後可省電量。\n");
@@ -6532,135 +6589,151 @@ std::vector<VBlock> goalBlocks() {
         // Preview: the demo history, every third sample counted as still.
         for (size_t i = 0; i < current.history.size(); ++i)
             if (current.history[i].watts && *current.history[i].watts > 0) goalSamples.push_back({current.history[i].ms, *current.history[i].watts, i % 3 == 0});
-    const auto use = goalAverage(false), still = goalAverage(true);
-    auto meterValue = [](const GoalAverage& a, unsigned goal) {
-        if (a.minutes < 1) return std::wstring(tr(L"資料不足"));
-        return number(a.watts, 1) + L" W" + (goal ? L" / " + std::to_wstring(goal) + L" W" : std::wstring());
-    };
-    v.push_back(vHeading(goalUse ? tr(L"最近 30 分鐘 vs 目標") : tr(L"最近 30 分鐘")));
-    v.push_back(vMeter(tr(L"使用中"), meterValue(use, goalUse), use.minutes >= 1 ? use.watts : 0, goalUse, 0));
-    v.push_back(vMeter(tr(L"靜態（1 分鐘沒操作）"), meterValue(still, goalStill), still.minutes >= 1 ? still.watts : 0, goalStill, 0));
-    // Where the battery's power goes right now: the CPU (what dynamic saving manages) and the
-    // rest (display, discrete GPU, storage, Wi-Fi), which the display timers and brightness act on.
-    {
-        const bool onBattery = !current.history.empty() && current.history.back().acKnown && !current.history.back().onAc;
-        Value battery = current.power.currentWatts, cpu = current.energy.packageWatts;
-        if (demo || isolatedPreview) { battery = 9.4; cpu = 2.6; }
-        if ((onBattery || demo || isolatedPreview) && battery && cpu && *battery > 0) {
-            const double package = std::min(*cpu, *battery), rest = std::max(0.0, *battery - package);
-            v.push_back(vHeading(tr(L"現在的電花在哪裡")));
-            VBar bar; bar.label = L"CPU " + number(package, 1) + tr(L" W · 螢幕與其他 ") + number(rest, 1) + L" W";
-            bar.value = number(*battery, 1) + L" W";
-            bar.segments = {{package, Green}, {rest, blend(theme.warn, Surface, .25)}};
-            v.push_back(vBars({bar}));
-            v.push_back(vLegend({{tr(L"CPU：動態省電調整"), Green}, {tr(L"螢幕、獨顯、儲存、網路"), blend(theme.warn, Surface, .25)}}));
+    // Three views side by side, each on one screen: the switches (and the Windows power mode), the
+    // goals and rules with how this battery is doing against them, and where the power goes with
+    // what would save more.
+    const int view = std::clamp(pageViews[int(InlinePage::goal)], 0, 2);
+    v.push_back(vViews({tr(L"開關"), tr(L"目標"), tr(L"分析")}, view));
+    if (view == 0) {
+        std::vector<GridItem> cells;
+        cells.push_back({tr(L"動態省電"), tr(L"依使用自動調整"), DynamicToggleId, dynamicEnabled ? 1 : 0});
+        if (dynamicEnabled) {
+            cells.push_back({tr(L"背景效率模式"), tr(L"背景程式省電執行"), DynamicEcoId, dynamicEco ? 1 : 0});
+            cells.push_back({tr(L"動態更新率"), tr(L"靜止 60 Hz、捲動最高"), DynamicRefreshId, dynamicRefresh ? 1 : 0});
         }
-    }
-    {
-        // The live series: the last 30 minutes of battery power, at most 120 columns.
-        std::vector<double> series;
-        for (const auto& point : current.history)
-            if (point.watts && *point.watts > 0 && !point.onAc && current.history.back().ms - point.ms <= 30 * 60000) series.push_back(*point.watts);
-        if (series.size() > 120) {
-            std::vector<double> thin; const double step = series.size() / 120.0;
-            for (int i = 0; i < 120; ++i) thin.push_back(series[size_t(i * step)]);
-            series.swap(thin);
-        }
-        std::wstring now;
-        if (!current.history.empty() && current.history.back().watts && !current.history.back().onAc) now = tr(L"現在 ") + number(*current.history.back().watts, 1) + L" W";
-        v.push_back(vSeries(tr(L"用電池的耗電"), std::move(series), goalUse, now));
-    }
-    {
-        std::vector<std::pair<std::wstring, COLORREF>> chips;
-        // What is in force right now; the switches themselves are the rows below.
-        if (dynamicEnabled && governor.stretchLevel())
-            chips.push_back({governor.stretchLevel() == 2 ? tr(L"最大省電") : tr(L"加強省電"), theme.warn});
-        DWORD value = 0;
-        if (bs::lab::readKnob(bs::lab::Knob::refreshRate, value) == ERROR_SUCCESS) chips.push_back({std::to_wstring(value) + L" Hz", value <= 60 ? Green : COLORREF(0)});
-        if (bs::lab::readKnob(bs::lab::Knob::cpuBoost, value) == ERROR_SUCCESS) chips.push_back({value ? tr(L"Boost 開") : tr(L"Boost 關"), value ? theme.warn : Green});
-        // Settings the user chose by hand this battery session.
-        const wchar_t* heldNames[] = {L"電源模式", L"處理器能源偏好", L"CPU Boost", L"螢幕更新率", L"華碩效能模式"};
-        if (dynamicEnabled)
-            for (size_t i = 0; i < size_t(bs::gov::Setting::count); ++i)
-                if (governor.held(bs::gov::Setting(i))) chips.push_back({tr(L"手動：") + std::wstring(tr(heldNames[i])), theme.warn});
-        if (!chips.empty()) v.push_back(vChips(std::move(chips)));
-    }
-    // Every saving switch lives here and nowhere else, grouped by what it acts on.
-    v.push_back(vHeading(tr(L"自動省電")));
-    v.push_back(vToggle(tr(L"動態省電"), tr(L"依你正在做的事自動調整電源設定"), dynamicEnabled, DynamicToggleId));
-    if (dynamicEnabled) {
-        v.push_back(vToggle(tr(L"背景程式效率模式"), tr(L"用電池時讓背景程式以省電方式執行"), dynamicEco, DynamicEcoId));
-        v.push_back(vToggle(tr(L"動態切換螢幕更新率"), tr(L"靜止與閱讀時 60 Hz，捲動與影片時回到最高"), dynamicRefresh, DynamicRefreshId));
-        if (heldCount()) v.push_back(vAction(tr(L"把手動設定交回動態省電"), std::to_wstring(heldCount()) + tr(L" 項"), ReleaseHoldsId, theme.warn));
-    }
-    v.push_back(vAction(tr(L"低電量自動省電"), autoSaverThreshold ? std::to_wstring(autoSaverThreshold) + tr(L"% 以下") : std::wstring(tr(L"關")), AutoSaverCycleId,
-        autoSaverThreshold ? Green : COLORREF(0)));
-    v.push_back(vHeading(tr(L"螢幕與裝置")));
-    {
         const int top = pluggedRefresh();
-        v.push_back(vToggle(tr(L"用電池時 60 Hz"), top > 60 ? tr(L"插電自動回到 ") + std::to_wstring(top) + tr(L" Hz · 實測省 0.7–1.5 W") : std::wstring(tr(L"插電自動回到最高更新率")),
-            refreshAuto, RefreshAutoId));
-        // Away from the PC: dim, then off. A playing video keeps the display on.
-        v.push_back(vToggle(tr(L"離開時調暗、黑屏"), idleDisplay ? idleDisplaySummary() : std::wstring(tr(L"用電池時沒人操作，先調暗再黑屏；動一下立刻回來")), idleDisplay, IdleDisplayToggleId));
-        if (idleDisplay) v.push_back(vAction(tr(L"調暗與黑屏的時間"), std::to_wstring(dimLevel) + L"%", IdleDisplayMenuId));
+        cells.push_back({tr(L"用電池 60 Hz"), top > 60 ? tr(L"插電回 ") + std::to_wstring(top) + L" Hz" : std::wstring(tr(L"插電回最高")), RefreshAutoId, refreshAuto ? 1 : 0});
+        cells.push_back({tr(L"離開時調暗"), idleDisplay ? idleDisplaySummary() : std::wstring(tr(L"再黑屏，動一下就回來")), IdleDisplayToggleId, idleDisplay ? 1 : 0});
         DWORD dark = 0;
-        if (bs::lab::readKnob(bs::lab::Knob::darkMode, dark) == ERROR_SUCCESS)
-            v.push_back(vToggle(tr(L"深色模式"), tr(L"OLED 螢幕上深色畫面較省電"), dark != 0, DarkModeId));
+        if (bs::lab::readKnob(bs::lab::Knob::darkMode, dark) == ERROR_SUCCESS) cells.push_back({tr(L"深色模式"), tr(L"OLED 較省電"), DarkModeId, dark ? 1 : 0});
+        if (asusAvailable) {
+            const auto& h = asusNow();
+            if (h.gpuEco) cells.push_back({tr(L"獨顯自動 Eco"), tr(L"用電池時關獨顯"), GpuAutoId, gpuAuto ? 1 : 0});
+            if (h.keyboardDevice) cells.push_back({tr(L"鍵盤閒置關燈"), tr(L"30 秒沒操作"), KeyboardAutoOffId, keyboardAutoOff ? 1 : 0});
+            if (h.slash) cells.push_back({tr(L"Slash 電池關"), tr(L"拔掉電源時關"), SlashBatteryId, bs::asus::slashSettings().offOnBattery ? 1 : 0});
+        }
+        v.push_back(vGrid(cells));
+        // Windows power mode, a row of keys for each power source.
+        refreshPowerModeControls();
+        const bool plugged = pluggedInNow(), noBattery = batteryAbsent();
+        for (int source = 0; source < 2; ++source) {
+            const bool ac = source == 0;
+            const bool known = ac ? powerModes.acKnown : powerModes.dcKnown;
+            const bool settable = known && (ac ? powerModes.acSettable : powerModes.dcSettable && !noBattery);
+            const PowerMode mode = ac ? powerModes.ac : powerModes.dc;
+            const int base = ac ? ModeAcEfficiencyId : ModeDcEfficiencyId;
+            const std::wstring name = std::wstring(ac ? tr(L"插電時") : tr(L"用電池時")) + (ac == plugged ? tr(L" · 目前") : L"") + L"\n" + tr(L"Windows 模式");
+            if (settable) v.push_back(vLabeled(name, {tr(L"效率"), tr(L"平衡"), tr(L"效能")}, {base, base + 1, base + 2}, mode != PowerMode::other ? int(mode) : -1));
+            else v.push_back(vChips({{std::wstring(ac ? tr(L"插電時") : tr(L"用電池時")) + L"：" + (known ? std::wstring(modeName(mode)) + tr(L" · 只能檢視") : std::wstring(tr(L"此電腦未提供這項設定"))), 0}}));
+        }
+    } else if (view == 1) {
+        const auto use = goalAverage(false), still = goalAverage(true);
+        auto meterValue = [](const GoalAverage& a, unsigned goal) {
+            if (a.minutes < 1) return std::wstring(tr(L"資料不足"));
+            return number(a.watts, 1) + L" W" + (goal ? L" / " + std::to_wstring(goal) + L" W" : std::wstring());
+        };
+        v.push_back(vMeter(tr(L"使用中（近 30 分鐘）"), meterValue(use, goalUse), use.minutes >= 1 ? use.watts : 0, goalUse, 0));
+        v.push_back(vMeter(tr(L"靜態（1 分鐘沒操作）"), meterValue(still, goalStill), still.minutes >= 1 ? still.watts : 0, goalStill, 0));
+        {
+            // The live series: the last 30 minutes of battery power, at most 120 columns.
+            std::vector<double> series;
+            for (const auto& point : current.history)
+                if (point.watts && *point.watts > 0 && !point.onAc && current.history.back().ms - point.ms <= 30 * 60000) series.push_back(*point.watts);
+            if (series.size() > 120) {
+                std::vector<double> thin; const double step = series.size() / 120.0;
+                for (int i = 0; i < 120; ++i) thin.push_back(series[size_t(i * step)]);
+                series.swap(thin);
+            }
+            std::wstring now;
+            if (!current.history.empty() && current.history.back().watts && !current.history.back().onAc) now = tr(L"現在 ") + number(*current.history.back().watts, 1) + L" W";
+            v.push_back(vSeries(tr(L"用電池的耗電"), std::move(series), goalUse, now));
+        }
+        std::vector<GridItem> cells;
+        cells.push_back({tr(L"省電目標"), goalUse ? std::to_wstring(goalUse) + (english ? L" W / " : L" W／") + std::to_wstring(goalStill) + L" W" : std::wstring(tr(L"關")), GoalCycleId, -1, goalUse ? Green : COLORREF(0)});
+        cells.push_back({tr(L"低電量自動省電"), autoSaverThreshold ? std::to_wstring(autoSaverThreshold) + tr(L"% 以下") : std::wstring(tr(L"關")), AutoSaverCycleId, -1, autoSaverThreshold ? Green : COLORREF(0)});
+        {
+            size_t rules = appRules.size(); for (const auto& exe : performanceApps) rules += !appRules.count(exe);
+            cells.push_back({tr(L"程式規則"), std::to_wstring(rules) + tr(L" 個"), AppRulesMenuId, -1});
+        }
+        if (idleDisplay) cells.push_back({tr(L"調暗與黑屏"), std::to_wstring(dimLevel) + L"%", IdleDisplayMenuId, -1});
+        if (dynamicEnabled && heldCount()) cells.push_back({tr(L"交回動態省電"), std::to_wstring(heldCount()) + tr(L" 項手動設定"), ReleaseHoldsId, -1, theme.warn});
+        const bool handBack = powerModeHeld();
+        if (!demo && !isolatedPreview && (handBack || (powerModes.restorable && !dynamicEnabled)))
+            cells.push_back({handBack ? tr(L"電源模式交回") : tr(L"還原電源模式"), tr(L"BatteryScope 變更前"), RestoreModesId, -1});
+        cells.push_back({tr(L"Windows 節能"), tr(L"系統設定"), EnergySaverSettingsId, -1});
+        v.push_back(vGrid(cells));
+    } else {
+        // Where the battery's power goes right now: the CPU (what dynamic saving manages) and the
+        // rest (display, discrete GPU, storage, Wi-Fi), which the display timers and brightness act on.
+        {
+            const bool onBattery = !current.history.empty() && current.history.back().acKnown && !current.history.back().onAc;
+            Value battery = current.power.currentWatts, cpu = current.energy.packageWatts;
+            if (demo || isolatedPreview) { battery = 9.4; cpu = 2.6; }
+            if ((onBattery || demo || isolatedPreview) && battery && cpu && *battery > 0) {
+                const double package = std::min(*cpu, *battery), rest = std::max(0.0, *battery - package);
+            
+                VBar bar; bar.label = L"CPU " + number(package, 1) + tr(L" W · 螢幕與其他 ") + number(rest, 1) + L" W";
+                bar.value = number(*battery, 1) + L" W";
+                bar.segments = {{package, Green}, {rest, blend(theme.warn, Surface, .25)}};
+                v.push_back(vBars({bar}));
+                v.push_back(vLegend({{tr(L"CPU：動態省電調整"), Green}, {tr(L"螢幕、獨顯、儲存、網路"), blend(theme.warn, Surface, .25)}}));
+            }
+        }
+        {
+            std::vector<std::pair<std::wstring, COLORREF>> chips;
+            // What is in force right now; the switches themselves are the rows below.
+            if (dynamicEnabled && governor.stretchLevel())
+                chips.push_back({governor.stretchLevel() == 2 ? tr(L"最大省電") : tr(L"加強省電"), theme.warn});
+            DWORD value = 0;
+            if (bs::lab::readKnob(bs::lab::Knob::refreshRate, value) == ERROR_SUCCESS) chips.push_back({std::to_wstring(value) + L" Hz", value <= 60 ? Green : COLORREF(0)});
+            if (bs::lab::readKnob(bs::lab::Knob::cpuBoost, value) == ERROR_SUCCESS) chips.push_back({value ? tr(L"Boost 開") : tr(L"Boost 關"), value ? theme.warn : Green});
+            // Settings the user chose by hand this battery session.
+            const wchar_t* heldNames[] = {L"電源模式", L"處理器能源偏好", L"CPU Boost", L"螢幕更新率", L"華碩效能模式"};
+            if (dynamicEnabled)
+                for (size_t i = 0; i < size_t(bs::gov::Setting::count); ++i)
+                    if (governor.held(bs::gov::Setting(i))) chips.push_back({tr(L"手動：") + std::wstring(tr(heldNames[i])), theme.warn});
+            if (!chips.empty()) v.push_back(vChips(std::move(chips)));
+        }
+        const auto tips = savingTips();
+        if (!tips.empty()) {
+            std::vector<VBar> bars;
+            for (const auto& t : tips)
+                bars.push_back({t.label, (t.measured ? tr(L"實測 −") : tr(L"估計 −")) + number(t.watts, 1) + L" W", t.watts, 0, t.measured ? Green : blend(Muted, Surface, .35), {}});
+            v.push_back(vBars(std::move(bars)));
+            v.push_back(vLegend({{tr(L"這台實測"), Green}, {tr(L"估計（跑快速測試後換成實測）"), blend(Muted, Surface, .35)}}));
+            std::wstring how;
+            for (const auto& t : tips) how += (how.empty() ? L"" : L"\n") + t.label + (english ? L": " : L"：") + t.detail;
+            if (dynamicEnabled) how += tr(L"\n動態省電已自動處理：") + handledByDynamic() + (heldCount() ? tr(L"（手動設定的項目除外，可從「⋯」交回）") : L"");
+            v.push_back(vFold(tr(L"怎麼做"), how));
+        }
+        if (const auto busy = busyPrograms(1); !busy.empty())
+            v.push_back(vAction(tr(L"正在耗電的程式"), busy.front()->name + L" " + number(*busy.front()->averageCpuWatts, 1) + L" W", InlineBackId, theme.warn));
+        if (dynamicEnabled) {
+            const auto& a = lastAssessment;
+            std::vector<std::pair<std::wstring, COLORREF>> chips{{tr(bs::gov::activityKey(governor.activity())), Green}};
+            if (signalReader && !signalReader->lastForeground().empty())
+                chips.push_back({signalReader->lastForeground() + L" · " + tr(bs::gov::categoryKey(a.category)), 0});
+            if (a.rule != bs::gov::AppRule::automatic) chips.push_back({tr(bs::gov::ruleKey(a.rule)), theme.warn});
+            v.push_back(vChips(std::move(chips)));
+            // Every candidate the detector weighed, by confidence.
+            std::vector<VBar> bars;
+            for (const auto& k : a.candidates)
+                if (bars.size() < 3) bars.push_back({std::wstring(tr(bs::gov::activityKey(k.activity))) + L" · " + tr(k.reason.c_str()), number(k.confidence * 100, 0) + L"%",
+                    k.confidence * 100, 0, k.activity == a.activity ? Green : blend(Muted, Surface, .35), {}});
+            if (!bars.empty()) v.push_back(vBars(std::move(bars), 100));
+            std::wstring recent;
+            int shown = 0;
+            for (auto it = governor.log.rbegin(); it != governor.log.rend() && shown < 4; ++it, ++shown) recent += (recent.empty() ? L"" : L"\n") + *it;
+            if (!recent.empty()) v.push_back(vFold(tr(L"最近的調整"), recent));
+        }
+        v.push_back(vFold(tr(L"動態省電怎麼運作"), tr(L"開啟後，用電池時會依你正在做的事自動切換：閒置與閱讀省電，一操作就恢復反應，高負載給效能。") + std::wstring(L"\n") +
+            tr(L"只讀取時間、程式名稱和裝置使用狀態，不截圖、不讀畫面或文字內容，也不記錄按了哪些鍵。")));
     }
-    if (asusAvailable) {
-        const auto& h = asusNow();
-        if (h.gpuEco) v.push_back(vToggle(tr(L"獨顯自動 Eco"), tr(L"用電池時關閉獨顯，插電恢復"), gpuAuto, GpuAutoId));
-        if (h.keyboardDevice) v.push_back(vToggle(tr(L"鍵盤背光閒置自動關"), tr(L"用電池時 30 秒沒操作就關，一碰就亮"), keyboardAutoOff, KeyboardAutoOffId));
-        if (h.slash) v.push_back(vToggle(tr(L"Slash 燈效用電池時關閉"), tr(L"由韌體在拔掉電源時關閉燈效"), bs::asus::slashSettings().offOnBattery, SlashBatteryId));
-    }
-    v.push_back(vHeading(tr(L"目標與規則")));
-    v.push_back(vAction(tr(L"省電目標"), goalUse ? std::to_wstring(goalUse) + (english ? L" W / " : L" W／") + std::to_wstring(goalStill) + L" W" : std::wstring(tr(L"關")), GoalCycleId));
-    {
-        size_t rules = appRules.size(); for (const auto& exe : performanceApps) rules += !appRules.count(exe);
-        v.push_back(vAction(tr(L"程式規則"), std::to_wstring(rules) + tr(L" 個"), AppRulesMenuId));
-    }
-    appendPowerModeBlocks(v); // Windows power mode, both sources, right here
-    const auto tips = savingTips();
-    if (!tips.empty()) {
-        v.push_back(vHeading(tr(L"可以怎麼省")));
-        std::vector<VBar> bars;
-        for (const auto& t : tips)
-            bars.push_back({t.label, (t.measured ? tr(L"實測 −") : tr(L"估計 −")) + number(t.watts, 1) + L" W", t.watts, 0, t.measured ? Green : blend(Muted, Surface, .35), {}});
-        v.push_back(vBars(std::move(bars)));
-        v.push_back(vLegend({{tr(L"這台實測"), Green}, {tr(L"估計（跑快速測試後換成實測）"), blend(Muted, Surface, .35)}}));
-        std::wstring how;
-        for (const auto& t : tips) how += (how.empty() ? L"" : L"\n") + t.label + (english ? L": " : L"：") + t.detail;
-        if (dynamicEnabled) how += tr(L"\n動態省電已自動處理：") + handledByDynamic() + (heldCount() ? tr(L"（手動設定的項目除外，可從「⋯」交回）") : L"");
-        v.push_back(vFold(tr(L"怎麼做"), how));
-    }
-    if (const auto busy = busyPrograms(1); !busy.empty())
-        v.push_back(vAction(tr(L"正在耗電的程式"), busy.front()->name + L" " + number(*busy.front()->averageCpuWatts, 1) + L" W", InlineBackId, theme.warn));
-    if (dynamicEnabled) {
-        v.push_back(vHeading(tr(L"動態省電現在的判斷")));
-        const auto& a = lastAssessment;
-        std::vector<std::pair<std::wstring, COLORREF>> chips{{tr(bs::gov::activityKey(governor.activity())), Green}};
-        if (signalReader && !signalReader->lastForeground().empty())
-            chips.push_back({signalReader->lastForeground() + L" · " + tr(bs::gov::categoryKey(a.category)), 0});
-        if (a.rule != bs::gov::AppRule::automatic) chips.push_back({tr(bs::gov::ruleKey(a.rule)), theme.warn});
-        v.push_back(vChips(std::move(chips)));
-        // Every candidate the detector weighed, by confidence.
-        std::vector<VBar> bars;
-        for (const auto& k : a.candidates)
-            if (bars.size() < 5) bars.push_back({std::wstring(tr(bs::gov::activityKey(k.activity))) + L" · " + tr(k.reason.c_str()), number(k.confidence * 100, 0) + L"%",
-                k.confidence * 100, 0, k.activity == a.activity ? Green : blend(Muted, Surface, .35), {}});
-        if (!bars.empty()) v.push_back(vBars(std::move(bars), 100));
-        std::wstring recent;
-        int shown = 0;
-        for (auto it = governor.log.rbegin(); it != governor.log.rend() && shown < 4; ++it, ++shown) recent += (recent.empty() ? L"" : L"\n") + *it;
-        if (!recent.empty()) v.push_back(vFold(tr(L"最近的調整"), recent));
-    }
-    v.push_back(vFold(tr(L"動態省電怎麼運作"), tr(L"開啟後，用電池時會依你正在做的事自動切換：閒置與閱讀省電，一操作就恢復反應，高負載給效能。") + std::wstring(L"\n") +
-        tr(L"只讀取時間、程式名稱和裝置使用狀態，不截圖、不讀畫面或文字內容，也不記錄按了哪些鍵。")));
     return v;
 }
 // Shows a chart page; a refresh of the page already open only updates the charts.
 void showChartPage(InlinePage page, const std::wstring& title, const std::wstring& text, std::vector<VBlock> blocks) {
-    if (inlinePage == page && visualView && IsWindowVisible(visualView)) {
+    if (inlinePage == page && visualView && IsWindowVisible(visualView) && !viewSwitching) {
         std::wstring lines;
         for (size_t i = 0; i < text.size(); ++i) { if (text[i] == L'\n' && (i == 0 || text[i - 1] != L'\r')) lines += L'\r'; lines += text[i]; }
         SetWindowTextW(inlineText, lines.c_str());
@@ -6675,6 +6748,7 @@ void showChartPage(InlinePage page, const std::wstring& title, const std::wstrin
     showInlinePage(page, title, text);
     const int after = position(activeTab());
     visualEnterDir = after > before ? 1 : after < before ? -1 : page == InlinePage::stability || page == InlinePage::fans ? 1 : wasDeep ? -1 : 0;
+    if (viewSwitching) visualEnterDir = viewSwitchDir; // another view of the same page comes in from its side
     showVisual(std::move(blocks), false);
     if (visualView) SetFocus(visualView);
 }
@@ -6777,18 +6851,19 @@ int rowCommand(Row row) {
     }
 }
 std::vector<VBlock> settingsBlocks() {
+    // Every option as a tile, two to a row, in the order of their groups (reminders, looks,
+    // general, diagnostics): the whole page on one screen.
     std::vector<VBlock> v;
+    std::vector<GridItem> cells;
     for (const auto& entry : settingRows) {
+        if (entry.row == Row::section) continue;
         const int command = SettingRowId + int(entry.row);
-        if (entry.row == Row::section) v.push_back(vHeading(tr(entry.label)));
-        else if (rowIsSwitch(entry.row)) v.push_back(vToggle(tr(entry.label), entry.detail ? tr(entry.detail) : std::wstring(), rowOn(entry.row), command));
-        else v.push_back(vAction(tr(entry.label), rowValue(entry.row), command, rowOn(entry.row) ? Green : COLORREF(0)));
+        if (rowIsSwitch(entry.row)) cells.push_back({tr(entry.label), entry.detail ? tr(entry.detail) : std::wstring(), command, rowOn(entry.row) ? 1 : 0});
+        else cells.push_back({tr(entry.label), rowValue(entry.row), command, -1, rowOn(entry.row) ? Green : COLORREF(0)});
     }
-    // Moved here from the ⋯ menu: the stability page and the interface diagnostic.
-    v.push_back(vHeading(tr(L"診斷")));
-    if (auto row = stabilityRow(false)) v.push_back(std::move(*row));
-    v.push_back(vAction(tr(L"介面診斷"), tr(L"量測動畫是否順暢"), UiDiagId));
-    v.push_back(vFold(tr(L"省電的開關在哪裡？"), tr(L"每個設定只有一個地方，最多下一層：「效能」放效能模式、CPU 與獨顯；「省電」放所有省電開關與 Windows 電源模式；「電池」放耗電排行，「電池紀錄」看健康與近 7 天；「硬體」放風扇曲線、功耗上限、充電上限、鍵盤與燈效；「實驗」測省電效果；這裡放提醒、外觀與一般設定。")));
+    if (auto row = stabilityRow(false)) cells.push_back({row->title, row->value, int(row->amount), -1, COLORREF(row->goal)});
+    cells.push_back({tr(L"介面診斷"), tr(L"量測動畫是否順暢"), UiDiagId, -1});
+    v.push_back(vGrid(cells));
     return v;
 }
 void showSettingsPage() {
@@ -7557,67 +7632,72 @@ void showHardwarePage() {
         return;
     }
     if (h.gpuMux && !*h.gpuMux) chips.push_back({tr(L"獨顯直連"), theme.warn});
-    v.push_back(vChips(std::move(chips)));
-    // Everything on the page itself: a choice of a few is a row of keys, not a menu.
-    {
-        // Fans first (the readings, the setting and the curve), then the CPU's power limit.
+    // Three views side by side, each fitting the panel: fans, power, keyboard. A choice of a few
+    // is a row of keys with its name on the left; switches and values are tiles.
+    const int view = std::clamp(pageViews[int(InlinePage::hardware)], 0, 2);
+    v.push_back(vViews({tr(L"風扇"), tr(L"電源"), tr(L"鍵盤")}, view));
+    if (view == 0) {
         static const bool fanControl = preview || bs::asus::fanControlSupported();
-        if (fanControl) appendFanBlocks(v);
+        if (fanControl) {
+            appendFanBlocks(v);
+            // The curve takes whatever room the rest leaves, so the view fits without scrolling.
+            if (visualView) {
+                const RECT r = pageRoom();
+                HDC dc = GetDC(visualView);
+                int others = 0; size_t chart = v.size();
+                for (size_t i = 0; i < v.size(); ++i) { if (v[i].kind == VBlock::Kind::curve) chart = i; else others += blockHeight(dc, v[i], visualWidth(r), i == 0); }
+                ReleaseDC(visualView, dc);
+                if (chart < v.size()) v[chart].scale = std::clamp(int(r.bottom) - others - sp(6), sp(190), sp(360));
+            }
+        } else v.push_back(vNote(tr(L"這台電腦不支援風扇控制。")));
+    } else if (view == 1) {
+        v.push_back(vChips(std::move(chips)));
         if (!powerPresetsBlocked() || preview) { // not offered where a limit, once set, only goes away with a restart
             const auto t = bs::asus::tuning();
-            v.push_back(vHeading(tr(L"CPU 功耗上限")));
-            v.push_back(vSegments({tr(L"原廠"), tr(L"省電"), tr(L"輕量"), tr(L"標準")}, {PowerPreset0Id, PowerPreset0Id + 1, PowerPreset0Id + 2, PowerPreset0Id + 3}, int(t.power)));
+            v.push_back(vLabeled(tr(L"CPU 功耗上限"), {tr(L"原廠"), tr(L"省電"), tr(L"輕量"), tr(L"標準")}, {PowerPreset0Id, PowerPreset0Id + 1, PowerPreset0Id + 2, PowerPreset0Id + 3}, int(t.power)));
             if (t.power != bs::asus::PowerPreset::factory) v.push_back(vNote(powerPresetText(t.power)));
         }
-        v.push_back(vHeading(tr(L"電池與顯示")));
-        if (h.chargeDevice) {
-            v.push_back(vNote(tr(L"充電上限：長時間插電選 60% 或 80%，要出門前選 100%。")));
-            v.push_back(vSegments({L"60%", L"80%", L"100%"}, {Charge60Id, Charge80Id, Charge100Id},
+        if (h.chargeDevice)
+            v.push_back(vLabeled(tr(L"充電上限") + std::wstring(L"\n") + tr(L"長時間插電選 80%"), {L"60%", L"80%", L"100%"}, {Charge60Id, Charge80Id, Charge100Id},
                 h.chargeLimit == 60u ? 0 : h.chargeLimit == 80u ? 1 : h.chargeLimit == 100u ? 2 : -1));
-        }
         if (h.overdrive) v.push_back(vToggle(tr(L"螢幕 Overdrive"), tr(L"畫面殘影較少，稍微耗電"), *h.overdrive, OverdriveId));
-        v.push_back(vHeading(tr(L"鍵盤與燈效")));
-        if (h.keyboardDevice) {
-            v.push_back(vNote(tr(L"鍵盤背光")));
-            v.push_back(vSegments({keyboardLevelName(0), keyboardLevelName(1), keyboardLevelName(2), keyboardLevelName(3)},
+        v.push_back(vFold(tr(L"關於這些設定"), tr(L"這台的韌體不會回報效能模式與充電上限：顯示的是 BatteryScope 最後設定的值，開機與睡眠喚醒後會自動重設。效能模式選「自動」時由動態省電管理；手動選的模式在這次用電池期間保留。華碩軟體停止後，亮度、鍵盤背光、觸控板、麥克風、睡眠、Fn 鎖定（Fn+C、Fn+Esc）、效能模式與 ROG 鍵都由 BatteryScope 接手。Fn 鎖定開啟時，F1–F11 不按 Fn 就是快捷功能。") + std::wstring(L"\n") + tr(L"效能模式、風扇、溫度與功耗上限在「效能」分頁。")));
+    } else {
+        if (h.keyboardDevice)
+            v.push_back(vLabeled(tr(L"鍵盤背光"), {keyboardLevelName(0), keyboardLevelName(1), keyboardLevelName(2), keyboardLevelName(3)},
                 {Keyboard0Id, Keyboard0Id + 1, Keyboard0Id + 2, Keyboard0Id + 3}, keyboardDimmed ? 0 : h.keyboard ? int(*h.keyboard) : -1));
-        }
-        v.push_back(vToggle(tr(L"Fn 鎖定"), tr(L"F1–F11 免按 Fn"), h.fnLock.value_or(false), FnLockId));
-        if (h.slash) {
-            const auto s = preview ? bs::asus::Slash{} : bs::asus::slashSettings();
-            v.push_back(vAction(tr(L"Slash 燈效"), s.on ? std::wstring(bs::asus::slashModeName(s.mode)) + (s.offOnBattery ? tr(L" · 用電池關") : L"") : std::wstring(tr(L"關")), HwSlashMenuId,
-                s.on ? Green : COLORREF(0)));
-        }
-        v.push_back(vHeading(tr(L"華碩軟體")));
         const bool listening = preview || SUCCEEDED(asusKeys.status()) || asusKeys.keyboard();
-        v.push_back(vToggle(tr(L"由 BatteryScope 接手華碩按鍵"), !asusKeysHandled ? std::wstring(tr(L"關：交給華碩軟體")) : !listening ? std::wstring(tr(L"收不到按鍵")) : tr(L"華碩軟體不在時處理亮度、背光、Fn 鎖定等按鍵"),
-            asusKeysHandled, KeysHandleId));
-        if (asusKeysHandled) {
-            v.push_back(vNote(tr(L"ROG 鍵")));
-            v.push_back(vSegments({tr(L"開啟面板"), tr(L"切換模式"), tr(L"不動作")}, {RogOpenId, RogModeId, RogNoneId}, int(rogKeyAction)));
-            v.push_back(vNote(L"Fn+C"));
-            v.push_back(vSegments({tr(L"Fn 鎖定"), tr(L"不動作")}, {FnCLockId, FnCNoneId}, int(fnCAction)));
-        }
         size_t running = 0, total = 0, disabled = 0;
         if (!preview) for (const auto& sv : asusServicesNow()) { if (sv.managed) { running += sv.running; ++total; } disabled += sv.startType == SERVICE_DISABLED; }
         else { running = 0; total = 9; }
-        v.push_back(vAction(tr(L"華碩服務"), total ? std::to_wstring(running) + L" / " + std::to_wstring(total) + tr(L" 執行中") + (disabled ? L" · " + std::to_wstring(disabled) + tr(L" 個停用") : L"")
-            : std::wstring(tr(L"沒有")), HwServicesMenuId, running ? theme.warn : Green));
-    }
-    if (!preview && asusKeysHandled && FAILED(asusKeys.status()) && !asusKeys.keyboard()) {
-        wchar_t code[16]; swprintf(code, 16, L"0x%08lX", static_cast<unsigned long>(asusKeys.status()));
-        v.push_back(vNote(tr(L"收不到華碩按鍵的訊號（") + std::wstring(code) + tr(L"）：ASUS System Control Interface 驅動可能沒有安裝。")));
-    }
-    if (!asusKeysSeen.empty()) {
-        std::wstring keys;
-        for (auto it = asusKeysSeen.rbegin(); it != asusKeysSeen.rend(); ++it) {
-            wchar_t code[16]; swprintf(code, 16, L"0x%02X", it->first);
-            const wchar_t* name = bs::asus::keyName(it->first);
-            keys += (keys.empty() ? L"" : std::wstring(tr(L"、"))) + (name ? std::wstring(tr(name)) + L" " + code : std::wstring(code));
+        std::vector<GridItem> cells;
+        cells.push_back({tr(L"Fn 鎖定"), tr(L"F1–F11 免按 Fn"), FnLockId, h.fnLock.value_or(false) ? 1 : 0});
+        if (h.slash) {
+            const auto sl = preview ? bs::asus::Slash{} : bs::asus::slashSettings();
+            cells.push_back({tr(L"Slash 燈效"), sl.on ? std::wstring(bs::asus::slashModeName(sl.mode)) + (sl.offOnBattery ? tr(L" · 用電池關") : L"") : std::wstring(tr(L"關")), HwSlashMenuId, -1, sl.on ? Green : COLORREF(0)});
         }
-        v.push_back(vNote(tr(L"最近按下的華碩按鍵：") + keys));
+        cells.push_back({tr(L"接手華碩按鍵"), !asusKeysHandled ? std::wstring(tr(L"交給華碩軟體")) : !listening ? std::wstring(tr(L"收不到按鍵")) : tr(L"華碩軟體不在時"), KeysHandleId, asusKeysHandled ? 1 : 0});
+        cells.push_back({tr(L"華碩服務"), total ? std::to_wstring(running) + L" / " + std::to_wstring(total) + tr(L" 執行中") + (disabled ? L" · " + std::to_wstring(disabled) + tr(L" 個停用") : L"")
+            : std::wstring(tr(L"沒有")), HwServicesMenuId, -1, running ? theme.warn : Green});
+        v.push_back(vGrid(cells));
+        if (asusKeysHandled) {
+            v.push_back(vLabeled(tr(L"ROG 鍵"), {tr(L"開啟面板"), tr(L"切換模式"), tr(L"不動作")}, {RogOpenId, RogModeId, RogNoneId}, int(rogKeyAction)));
+            v.push_back(vLabeled(L"Fn+C", {tr(L"Fn 鎖定"), tr(L"不動作")}, {FnCLockId, FnCNoneId}, int(fnCAction)));
+        }
+        if (!preview && asusKeysHandled && FAILED(asusKeys.status()) && !asusKeys.keyboard()) {
+            wchar_t code[16]; swprintf(code, 16, L"0x%08lX", static_cast<unsigned long>(asusKeys.status()));
+            v.push_back(vNote(tr(L"收不到華碩按鍵的訊號（") + std::wstring(code) + tr(L"）：ASUS System Control Interface 驅動可能沒有安裝。")));
+        }
+        if (!asusKeysSeen.empty()) {
+            std::wstring keys;
+            for (auto it = asusKeysSeen.rbegin(); it != asusKeysSeen.rend(); ++it) {
+                wchar_t code[16]; swprintf(code, 16, L"0x%02X", it->first);
+                const wchar_t* name = bs::asus::keyName(it->first);
+                keys += (keys.empty() ? L"" : std::wstring(tr(L"、"))) + (name ? std::wstring(tr(name)) + L" " + code : std::wstring(code));
+            }
+            v.push_back(vNote(tr(L"最近按下的華碩按鍵：") + keys));
+        }
     }
-    v.push_back(vFold(tr(L"關於這些設定"), tr(L"這台的韌體不會回報效能模式與充電上限：顯示的是 BatteryScope 最後設定的值，開機與睡眠喚醒後會自動重設。效能模式選「自動」時由動態省電管理；手動選的模式在這次用電池期間保留。華碩軟體停止後，亮度、鍵盤背光、觸控板、麥克風、睡眠、Fn 鎖定（Fn+C、Fn+Esc）、效能模式與 ROG 鍵都由 BatteryScope 接手。Fn 鎖定開啟時，F1–F11 不按 Fn 就是快捷功能。") + std::wstring(L"\n") + tr(L"效能模式、風扇、溫度與功耗上限在「效能」分頁。")));
     showChartPage(InlinePage::hardware, tr(L"華碩硬體"), hardwareText(h), std::move(v));
 }
 // ----- The performance dashboard (home) -----
@@ -7698,8 +7778,8 @@ void showPerformancePage() {
         v.push_back(vBanner(1, theme.warn, tr(L"CPU 功耗上限可能還在 15 W"),
             tr(L"控制檢查設下的上限，這版 BIOS 切換效能模式解除不了。按「重新套用」會再套用一次電源計畫與 Windows 電源模式（上次就是這樣在沒重開機的情況下解除的）；還不行就重新啟動。CPU 功耗一超過 25 W，這個提示會自動消失。"),
             tr(L"重新套用"), PowerLimitResetId));
-    // The performance mode: ASUS's firmware modes, else Windows' power mode for the current source.
-    v.push_back(vHeading(tr(L"效能模式")));
+    // One screen, no scrolling: the mode, the CPU (four readings and its five minutes), the GPU's
+    // mode on one line, the fans on one line. Headings give way to rows that name themselves.
     if (asusAvailable && h.modeDevice) {
         const bool autoMode = dynamicEnabled && !governor.held(bs::gov::Setting::firmwareMode);
         std::vector<std::wstring> labels; std::vector<int> commands;
@@ -7712,9 +7792,7 @@ void showPerformancePage() {
         else if (h.mode) selected = (dynamicEnabled ? 1 : 0) + (*h.mode == bs::asus::Mode::silent ? 0 : *h.mode == bs::asus::Mode::balanced ? 1 : 2);
         v.push_back(vSegments(std::move(labels), std::move(commands), selected));
         // What else changes with the mode while plugged in, as G-Helper does it.
-        VBlock link = vAction(tr(L"模式連動（插電時）"), modeLink ? tr(L"開") : tr(L"關"), ModeLinkMenuId, modeLink ? Green : COLORREF(0));
-        link.text = modeLink ? modeLinkSummary() : std::wstring(tr(L"只切換韌體模式；CPU Boost 與 Windows 電源模式不動"));
-        v.push_back(std::move(link));
+        v.push_back(vAction(tr(L"模式連動（插電時）"), modeLink ? modeLinkSummary() : std::wstring(tr(L"關")), ModeLinkMenuId, modeLink ? Green : COLORREF(0)));
     } else {
         const bool plugged = !current.history.empty() && current.history.back().acKnown && current.history.back().onAc;
         const auto modes = queryPowerModes();
@@ -7724,77 +7802,52 @@ void showPerformancePage() {
         v.push_back(vSegments({tr(L"效率"), tr(L"平衡"), tr(L"效能")}, {base, base + 1, base + 2},
             known && mode != PowerMode::other ? int(mode) : -1));
     }
-    // CPU.
-    v.push_back(vHeading(L"CPU"));
+    // CPU: temperature, clock, load and power side by side, then its last five minutes.
     {
-        // Temperature, clock and load: three readings side by side, a dash where one is unknown.
+        const Value watts = current.energy.packageWatts ? current.energy.packageWatts : current.energy.coreWatts;
+        const auto limits = bs::asus::powerLimits(bs::asus::tuning().power);
         std::vector<std::pair<std::wstring, COLORREF>> tiles;
-        tiles.push_back({tr(L"溫度") + std::wstring(L"\n") + (h.cpuTemp ? std::to_wstring(*h.cpuTemp) + L" °C" : std::wstring(L"—")),
+        tiles.push_back({tr(L"溫度") + std::wstring(L"\n") + (h.cpuTemp ? std::to_wstring(*h.cpuTemp) + L"°" : std::wstring(L"—")),
             h.cpuTemp && *h.cpuTemp >= 90 ? theme.danger : h.cpuTemp && *h.cpuTemp >= 80 ? theme.warn : COLORREF(0)});
-        tiles.push_back({tr(L"時脈 GHz") + std::wstring(L"\n") + (perf.cpuMhz ? number(*perf.cpuMhz / 1000, 2) : std::wstring(L"—")), 0});
+        tiles.push_back({L"GHz" + std::wstring(L"\n") + (perf.cpuMhz ? number(*perf.cpuMhz / 1000, 2) : std::wstring(L"—")), 0});
         double busy = 0; for (const auto& core : current.energy.cores) busy += core.busyLogicalCores;
         tiles.push_back({tr(L"負載") + std::wstring(L"\n") + (current.energy.ready ?
             number(busy * 100 / std::max<DWORD>(1, GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)), 0) + L"%" : std::wstring(L"—")), 0});
+        tiles.push_back({tr(L"功耗 W") + std::wstring(L"\n") + (watts ? number(*watts, 1) : std::wstring(L"—")), 0});
         v.push_back(vTiles(std::move(tiles)));
-        DWORD boost = 0;
-        const Value watts = current.energy.packageWatts ? current.energy.packageWatts : current.energy.coreWatts;
-        const auto limits = bs::asus::powerLimits(bs::asus::tuning().power);
-        v.push_back(vMeter(tr(L"功耗"), valueText(watts, L" W") + (limits.spl ? L" / " + std::to_wstring(limits.spl) + L" W" : std::wstring()),
-            watts.value_or(0), limits.spl, std::max(30.0, double(limits.fppt))));
         std::vector<double> series;
         for (const auto& [ms, value] : cpuPowerHistory) if (value && !cpuPowerHistory.empty() && cpuPowerHistory.back().first - ms <= 5 * 60000) series.push_back(*value);
         if (series.size() > 120) series.erase(series.begin(), series.end() - 120);
         if (series.empty() && (demo || isolatedPreview))
             for (int i = 0; i < 100; ++i) series.push_back(5.0 + 3.0 * std::sin(i / 6.0) + (i % 17 == 0 ? 9.0 : 0.0) + (i > 70 && i < 80 ? 12.0 : 0.0));
-        v.push_back(vSeries(tr(L"近 5 分鐘"), std::move(series), limits.spl, watts ? tr(L"現在 ") + valueText(watts, L" W") : std::wstring()));
+        v.push_back(vSeries(tr(L"CPU 近 5 分鐘"), std::move(series), limits.spl, limits.spl ? tr(L"上限 ") + std::to_wstring(limits.spl) + L" W" : std::wstring()));
+        DWORD boost = 0;
         if (bs::lab::readKnob(bs::lab::Knob::cpuBoost, boost) == ERROR_SUCCESS)
             v.push_back(vToggle(tr(L"CPU Boost（用電池時）"), tr(L"關閉可省 2–5 W，短暫運算稍慢"), boost != 0, CpuBoostToggleId));
     }
-    // GPU.
-    v.push_back(vHeading(L"GPU"));
+    // GPU: its mode on one line, with what the GPUs are doing under its name.
     {
-        v.push_back(vMeter(tr(L"內顯使用率"), perf.igpu ? number(*perf.igpu, 0) + L"%" : std::wstring(L"—"), perf.igpu.value_or(0), 0, 100));
-        std::vector<std::pair<std::wstring, COLORREF>> chips;
         const bool eco = h.gpuEco.value_or(false) || perf.dgpuState == 9;
-        if (eco) chips.push_back({tr(L"獨顯 Eco（斷電）"), Green});
-        else if (perf.dgpuState >= 1) chips.push_back({tr(L"獨顯休眠中"), Green});
-        else if (perf.dgpuState == 0) chips.push_back({tr(L"獨顯使用中") + (perf.nvLoad ? L" " + number(*perf.nvLoad, 0) + L"%" : std::wstring()), theme.warn});
-        else chips.push_back({tr(L"獨顯狀態未知"), 0});
-        if (perf.nvTemp) chips.push_back({number(*perf.nvTemp, 0) + L" °C", 0});
-        if (perf.nvClock) chips.push_back({number(*perf.nvClock, 0) + L" MHz", 0});
-        if (perf.nvWatts) chips.push_back({number(*perf.nvWatts, 1) + L" W", 0});
-        v.push_back(vChips(std::move(chips)));
+        // Under its name, what the GPUs are doing: the discrete one's use when it runs, else the integrated one's.
+        std::wstring state = !eco && perf.dgpuState == 0 ? tr(L"獨顯 ") + (perf.nvLoad ? number(*perf.nvLoad, 0) + L"%" : std::wstring(tr(L"使用中")))
+            : tr(L"內顯 ") + (perf.igpu ? number(*perf.igpu, 0) + L"%" : std::wstring(L"—"));
+        if (asusAvailable && h.gpuEco)
+            v.push_back(vLabeled(tr(L"獨顯模式") + std::wstring(L"\n") + state, {tr(L"自動"), L"Eco", tr(L"標準")}, {GpuAutoId, GpuEcoId, GpuStandardId}, gpuAuto ? 0 : *h.gpuEco ? 1 : 2));
+        else v.push_back(vChips({{state, eco ? Green : COLORREF(0)}}));
         if (!perf.dgpuApps.empty()) {
             std::wstring apps = perf.dgpuApps;
             std::replace(apps.begin(), apps.end(), L';', L'、');
             v.push_back(vNote(tr(L"正在用獨顯：") + apps));
         }
-        if (asusAvailable && h.gpuEco) {
-            v.push_back(vNote(tr(L"獨顯模式：自動是用電池 Eco（斷電）、插電標準")));
-            v.push_back(vSegments({tr(L"自動"), L"Eco", tr(L"標準")}, {GpuAutoId, GpuEcoId, GpuStandardId}, gpuAuto ? 0 : *h.gpuEco ? 1 : 2));
-        }
     }
-    // Fans and power limits (ASUS).
-    if (asusAvailable && h.driver) {
-        v.push_back(vHeading(tr(L"風扇與功耗")));
-        if (h.gpuTemp) v.push_back(vMeter(tr(L"獨顯溫度"), std::to_wstring(*h.gpuTemp) + L" °C", *h.gpuTemp, 80, 100));
-        if (h.cpuFan || h.gpuFan || h.midFan) {
-            std::vector<VBar> bars;
-            if (h.cpuFan) bars.push_back({L"CPU", *h.cpuFan ? std::to_wstring(*h.cpuFan * 100) + L" RPM" : std::wstring(tr(L"停止")), double(*h.cpuFan), 0, 0, {}});
-            if (h.gpuFan) bars.push_back({tr(L"獨顯"), *h.gpuFan ? std::to_wstring(*h.gpuFan * 100) + L" RPM" : std::wstring(tr(L"停止")), double(*h.gpuFan), 0, 0, {}});
-            if (h.midFan) bars.push_back({tr(L"中間"), *h.midFan ? std::to_wstring(*h.midFan * 100) + L" RPM" : std::wstring(tr(L"停止")), double(*h.midFan), 0, 0, {}});
-            v.push_back(vBars(std::move(bars), 70));
-        }
+    // Fans: their speeds on one line; their settings are on the hardware tab, one tap away.
+    if (asusAvailable && h.driver && (h.cpuFan || h.gpuFan || h.midFan)) {
         const auto t = bs::asus::tuning();
-        // The fan and power settings themselves are on the hardware tab; this row goes there.
+        std::wstring speeds = L"CPU " + (h.cpuFan ? (*h.cpuFan ? std::to_wstring(*h.cpuFan * 100) : std::wstring(tr(L"停止"))) : std::wstring(L"—"));
+        if (h.gpuFan) speeds += tr(L" · 獨顯 ") + (*h.gpuFan ? std::to_wstring(*h.gpuFan * 100) : std::wstring(tr(L"停止")));
         static const bool fanControl = preview || bs::asus::fanControlSupported();
-        if (fanControl) v.push_back(vAction(tr(L"風扇與功耗設定"), tr(bs::asus::fanPresetKey(preview ? demoFans : t.fans)) + std::wstring(tr(L"（在「硬體」）")), FanPageId,
-            (preview ? demoFans : t.fans) == bs::asus::FanPreset::quiet ? Green : COLORREF(0)));
+        v.push_back(vAction(tr(L"風扇 ") + std::wstring(tr(bs::asus::fanPresetKey(preview ? demoFans : t.fans))), speeds + L" RPM", fanControl ? FanPageId : HardwarePageId));
     }
-    if (!stabilityRow(true)) if (auto row = stabilityRow(false)) v.push_back(std::move(*row));
-    v.push_back(vFold(tr(L"關於風扇與功耗"), tr(L"這裡只顯示溫度與轉速；風扇曲線與功耗上限在「硬體」分頁設定（原廠、安靜、標準、強力，或每個風扇、每個效能模式各一條自訂曲線，有安全下限；功耗上限不超過平衡模式），每次切換效能模式後會自動重新套用。獨顯只有在已經醒著時才讀取溫度與時脈，不會為了顯示把它叫醒。") +
-        (powerPresetsBlocked() && !preview ? std::wstring(L"\n") + tr(L"這台的 BIOS 切換效能模式不會解除功耗上限，設了只能靠重新開機還原，所以不提供功耗上限選項。") : std::wstring()) +
-        std::wstring(L"\n") + tr(L"模式連動：CPU Boost 關掉時時脈停在基準時脈，每個效能模式的功耗都差不多（這台插電約 20 W），模式之間看不出差別。G-Helper 會在切換模式時一併設定該模式的 CPU Boost 與 Windows 電源模式；開啟模式連動後 BatteryScope 也這樣做（只在插電時；用電池時由動態省電與下方的 Boost 開關負責）。")));
     showChartPage(InlinePage::performance, tr(L"效能"), perfPageText(), std::move(v));
 }
 
@@ -7908,17 +7961,6 @@ void fanCommit() {
     if (fanSetting() == bs::asus::FanPreset::custom && fanEditMode(h) == fanModeInUse(h)) fanApplySoon();
     showFanPage();
 }
-std::wstring fanPageText(const bs::asus::Snapshot& h, const bs::asus::FanCurve& curve) {
-    std::wstring t = tr(L"風扇：") + std::wstring(tr(bs::asus::fanPresetKey(fanSetting())));
-    if (h.cpuTemp) t += tr(L"\nCPU 溫度：") + std::to_wstring(*h.cpuTemp) + L" °C";
-    t += tr(L"\nCPU 風扇：") + fanRpm(h.cpuFan) + L" RPM";
-    if (h.gpuFan) t += tr(L"\n獨顯風扇：") + fanRpm(h.gpuFan) + L" RPM";
-    if (curve.size() == 16) {
-        t += tr(L"\n曲線：");
-        for (int k = 0; k < bs::asus::FanPoints; ++k) t += (k ? L"、" : L"") + std::to_wstring(curve[size_t(k)]) + L"°C " + std::to_wstring(curve[size_t(k + 8)]) + L"%";
-    }
-    return t;
-}
 // The fans, on the hardware tab: the readings, the setting, the curve and its editor.
 void appendFanBlocks(std::vector<VBlock>& v) {
     using namespace bs::asus;
@@ -7926,24 +7968,9 @@ void appendFanBlocks(std::vector<VBlock>& v) {
     const FanPreset setting = fanSetting();
     const auto fans = fanListShown();
     if (std::find(fans.begin(), fans.end(), fanEditFan) == fans.end()) fanEditFan = Fan::cpu;
-    // Now: the temperature and both fans.
-    v.push_back(vTiles({{tr(L"CPU 溫度") + std::wstring(L"\n") + (h.cpuTemp ? std::to_wstring(*h.cpuTemp) + L" °C" : std::wstring(L"—")),
-            h.cpuTemp && *h.cpuTemp >= 90 ? theme.danger : h.cpuTemp && *h.cpuTemp >= 80 ? theme.warn : COLORREF(0)},
-        {tr(L"CPU 風扇") + std::wstring(L"\n") + fanRpm(h.cpuFan), 0},
-        {(h.gpuFan || !h.midFan ? tr(L"獨顯風扇") : tr(L"中間風扇")) + std::wstring(L"\n") + fanRpm(h.gpuFan ? h.gpuFan : h.midFan), 0}}));
-    // The setting: four presets and custom.
-    v.push_back(vHeading(tr(L"風扇")));
+    // The setting: four presets and custom (the readings ride in the chart's readout).
     v.push_back(vSegments({tr(L"原廠"), tr(L"安靜"), tr(L"標準"), tr(L"強力"), tr(L"自訂")},
         {FanPreset0Id, FanPreset0Id + 1, FanPreset0Id + 2, FanPreset0Id + 3, FanCustomId}, int(setting)));
-    static const wchar_t* const about[] = {
-        L"由韌體依效能模式控制。",
-        L"較晚起轉、轉速較低：安靜，但機身較熱。",
-        L"介於兩者之間。",
-        L"較早起轉、轉速較高：較涼，但較吵。",
-        L"每個風扇、每個效能模式各一條曲線。拖曳曲線上的點，或選中曲線後用方向鍵精確調整。"};
-    v.push_back(vNote(tr(about[int(setting)])));
-    // The curve.
-    v.push_back(vHeading(setting == FanPreset::custom ? tr(L"自訂曲線") : tr(L"目前的曲線")));
     if (fans.size() > 1) {
         std::vector<std::wstring> names; std::vector<int> commands; int chosen = 0;
         for (size_t i = 0; i < fans.size(); ++i) {
@@ -7951,13 +7978,13 @@ void appendFanBlocks(std::vector<VBlock>& v) {
             commands.push_back(FanEditFan0Id + int(fans[i]));
             if (fans[i] == fanEditFan) chosen = int(i);
         }
-        v.push_back(vSegments(std::move(names), std::move(commands), chosen));
+        v.push_back(vLabeled(tr(L"風扇"), std::move(names), std::move(commands), chosen));
     }
     const Mode inUse = fanModeInUse(h), editing = fanEditMode(h);
     if (setting == FanPreset::custom) {
         int chosen = 1;
         for (int i = 0; i < 3; ++i) if (fanModes[i] == editing) chosen = i;
-        v.push_back(vSegments({tr(L"靜音"), tr(L"平衡"), L"Turbo"}, {FanEditMode0Id, FanEditMode0Id + 1, FanEditMode0Id + 2}, chosen));
+        v.push_back(vLabeled(tr(L"編輯模式"), {tr(L"靜音"), tr(L"平衡"), L"Turbo"}, {FanEditMode0Id, FanEditMode0Id + 1, FanEditMode0Id + 2}, chosen));
     }
     const FanCurve curve = fanShownCurve(h);
     if (curve.size() == 16) {
@@ -7989,11 +8016,9 @@ void appendFanBlocks(std::vector<VBlock>& v) {
             v.push_back(vPointEdit(tr(L"第 ") + std::to_wstring(k + 1) + L" / 8" + tr(L" 點"),
                 tr(L"這點溫度") + std::wstring(L"\n") + std::to_wstring(curve[size_t(k)]) + L" °C", tr(L"這點轉速") + std::wstring(L"\n") + std::to_wstring(curve[size_t(k + 8)]) + L"%",
                 {FanPointPrevId, FanPointNextId, FanTempDownId, FanTempUpId, FanDutyDownId, FanDutyUpId}));
-            if (!fanUndo.empty()) v.push_back(vAction(tr(L"復原上一步"), L"Ctrl+Z", FanUndoId));
-            if (!fanRedo.empty()) v.push_back(vAction(tr(L"重做"), L"Ctrl+Y", FanRedoId));
-            v.push_back(vAction(tr(L"從預設開始"), tr(L"安靜／標準／強力"), FanLoadMenuId));
-            v.push_back(vAction(tr(L"重設這條曲線"), L"", FanResetCurveId));
-            v.push_back(vAction(tr(L"套用到三種模式"), L"", FanCopyCurveId));
+            // The curve's commands on one row of keys (undo Ctrl+Z, redo Ctrl+Y).
+            v.push_back(vSegments({tr(L"復原"), tr(L"重做"), tr(L"從預設"), tr(L"重設"), tr(L"套用全部")},
+                {FanUndoId, FanRedoId, FanLoadMenuId, FanResetCurveId, FanCopyCurveId}, -1));
         }
     } else v.push_back(vNote(tr(L"原廠曲線由韌體依效能模式控制；這台的韌體不交出曲線內容，所以這裡不顯示。選「安靜」「標準」「強力」或「自訂」即可看到並設定曲線。")));
     v.push_back(vFold(tr(L"曲線怎麼運作與安全限制"), tr(L"每條曲線有 8 個點：溫度（20–110 °C，由低到高）對應轉速（0–100%）。兩點之間依直線過渡，最後一點以上維持最後的轉速。") + std::wstring(L"\n") +
@@ -8002,7 +8027,7 @@ void appendFanBlocks(std::vector<VBlock>& v) {
         tr(L"100% 寫入時是 99%（部分機型的韌體在 100% 會異常，G-Helper 也這樣做）。") + std::wstring(L"\n") +
         tr(L"韌體在每次切換效能模式後會恢復原廠曲線，BatteryScope 會在切換後、喚醒與開機時重新寫入。韌體在過熱時仍可能自行提高轉速。")));
 }
-void showFanPage() { showHardwarePage(); } // the fans live on the hardware tab
+void showFanPage() { pageViews[int(InlinePage::hardware)] = 0; showHardwarePage(); } // the fans are the hardware tab's first view
 // ----- Stability: crashes, freezes and problem reports -----
 // A black box (stability.h) keeps the last two hours on disk; a high-priority
 // thread notices whole-system freezes and a hung panel, and reads Windows' own
@@ -8555,7 +8580,6 @@ std::wstring controlDetail(const bs::verify::Result& r) {
 std::vector<VBlock> controlCheckBlocks() {
     using namespace bs::verify;
     std::vector<VBlock> v;
-    v.push_back(vHeading(tr(L"控制檢查")));
     const int at = controlCheckAt.load();
     const std::wstring state = controlCheckBusy ? tr(L"檢查中：") + std::wstring(at >= 0 && at < int(Control::count) ? controlName(Control(at)) : L"…")
         : controlCheckedUtc ? relativeTime(controlCheckedUtc) : std::wstring(tr(L"約 40 秒"));
@@ -8566,13 +8590,19 @@ std::vector<VBlock> controlCheckBlocks() {
             tr(L"功耗上限的測試會暫時設成 15 W；有些 BIOS 要重新開機才能解除，遇到時會提醒你，之後不再測。")));
         return v;
     }
+    // One line per control (its verdict on the right); what each found is in the fold below, so
+    // the whole list fits on one screen.
+    std::wstring details;
     for (const auto& r : results) {
         if (r.verdict == Verdict::unsupported) continue;
         const int box = r.verdict == Verdict::works ? 1 : r.verdict == Verdict::noEffect || r.verdict == Verdict::refused ? 0 : -1;
-        if (r.control == Control::loadBaseline) { v.push_back(vCheck(-1, controlName(r.control), controlDetail(r), r.before ? number(*r.before, 1) + L" W" : std::wstring())); continue; }
-        v.push_back(vCheck(box, controlName(r.control), controlDetail(r), verdictName(r.verdict)));
+        const std::wstring detail = controlDetail(r);
+        if (!detail.empty()) details += (details.empty() ? L"" : L"\n") + std::wstring(controlName(r.control)) + (english ? L": " : L"：") + detail;
+        if (r.control == Control::loadBaseline) { v.push_back(vCheck(-1, controlName(r.control), std::wstring(), r.before ? number(*r.before, 1) + L" W" : std::wstring())); continue; }
+        v.push_back(vCheck(box, controlName(r.control), std::wstring(), verdictName(r.verdict)));
     }
-    v.push_back(vNote(tr(L"「有作用」是讀回或量測確認過的；「只能寫入」表示韌體接受了，但沒有辦法由程式確認效果。")));
+    v.push_back(vFold(tr(L"每項找到了什麼"), details + (details.empty() ? L"" : L"\n\n") +
+        tr(L"「有作用」是讀回或量測確認過的；「只能寫入」表示韌體接受了，但沒有辦法由程式確認效果。")));
     return v;
 }
 void startControlCheck() {
@@ -8709,6 +8739,28 @@ std::optional<VBlock> stabilityBanner(bool home) {
     return vBanner(0, 0, tr(L"一切正常"), tr(L"最近 30 天沒有藍屏、意外關機或凍結。"));
 }
 // What to do next, most useful first: things BatteryScope can see for itself are ticked off as they are done.
+// The room a tab's page has, from the main window (the view may still have another page's size).
+RECT pageRoom() {
+    RECT r{}; GetClientRect(mainWindow, &r);
+    r.bottom = r.bottom - tabBarHeight() - sp(4) - sp(52);
+    return r;
+}
+// Drops cards from the end, keeping at least one, until the page fits its room: the cards
+// repeat what the overview lists, and a view is better whole than with its last card cut off.
+void fitCards(std::vector<VBlock>& v) {
+    if (!visualView || !mainWindow) return;
+    const RECT r = pageRoom();
+    HDC dc = GetDC(visualView);
+    int total = 0;
+    for (size_t i = 0; i < v.size(); ++i) total += blockHeight(dc, v[i], visualWidth(r), i == 0);
+    for (;;) {
+        if (total <= r.bottom || std::count_if(v.begin(), v.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::card; }) <= 1) break;
+        const auto last = std::find_if(v.rbegin(), v.rend(), [](const VBlock& b) { return b.kind == VBlock::Kind::card; });
+        total -= blockHeight(dc, *last, visualWidth(r), false);
+        v.erase(std::next(last).base());
+    }
+    ReleaseDC(visualView, dc);
+}
 std::vector<VBlock> stabilitySteps(const std::vector<bs::stability::Incident>& list) {
     using namespace bs::stability;
     const uint64_t now = nowUtc(), since = now - 30ull * 86400 * Second;
@@ -8760,6 +8812,11 @@ void showStabilityPage() {
     const auto list = stabilityIncidents();
     const uint64_t now = nowUtc(), since = now - 30ull * 86400 * Second;
     std::vector<VBlock> v;
+    // Four views side by side, each on one screen: the month at a glance with the latest problems,
+    // what to do next and the protection, the control check, and the report.
+    const int view = std::clamp(pageViews[int(InlinePage::stability)], 0, 3);
+    v.push_back(vViews({tr(L"總覽"), tr(L"下一步"), tr(L"檢查"), tr(L"回報")}, view));
+    if (view == 0) {
     if (auto banner = stabilityBanner(false)) v.push_back(std::move(*banner));
     // Thirty days at a glance.
     {
@@ -8779,31 +8836,37 @@ void showStabilityPage() {
             v.push_back(vChips({{tr(L"距上次當機 ") + durationText((now - streak.since) / Second), 0}, {tr(L"順利喚醒 ") + std::to_wstring(streak.wakes) + tr(L" 次"), streak.wakes ? Green : COLORREF(0)},
                 {tr(L"順利重開 ") + std::to_wstring(streak.restarts) + tr(L" 次"), streak.restarts ? Green : COLORREF(0)}}));
     }
+        int listed = 0;
+        for (const auto& i : list) {
+            if (i.when() < since || listed >= 2) continue;
+            ++listed;
+            v.push_back(vCard(incidentTitle(i), relativeTime(i.when()), incidentCardText(i), incidentTone(i)));
+        }
+    } else if (view == 1) {
     if (auto steps = stabilitySteps(list); !steps.empty()) {
-        v.push_back(vHeading(tr(L"下一步")));
         for (auto& step : steps) v.push_back(std::move(step));
     }
-    int listed = 0;
-    for (const auto& i : list) {
-        if (i.when() < since || listed >= 6) continue;
-        if (!listed) v.push_back(vHeading(tr(L"最近的問題")));
-        ++listed;
-        v.push_back(vCard(incidentTitle(i), relativeTime(i.when()), incidentCardText(i), incidentTone(i)));
-    }
-    v.push_back(vHeading(tr(L"防護")));
     v.push_back(vToggle(tr(L"保護模式"), tr(L"只監測；不自動改任何設定"), protectState != 0, ProtectToggleId));
     {
         const uint64_t blocked = writeGuard().blockedWrites();
         v.push_back(vFold(tr(L"防護怎麼運作"), tr(L"睡眠、喚醒、闔蓋、關機與剛開機的那幾秒，一律不寫入任何設定。偵測到當機時會自動進入保護模式。") +
             (blocked ? tr(L"這次執行已擋下 ") + std::to_wstring(blocked) + tr(L" 次寫入。") : std::wstring())));
     }
-    for (auto& block : controlCheckBlocks()) v.push_back(std::move(block));
-    v.push_back(vHeading(tr(L"回報給開發者")));
-    v.push_back(vAction(tr(L"建立回報包"), stab::reportBusy ? tr(L"建立中…") : tr(L"存到桌面並複製摘要"), ReportId, Green));
-    v.push_back(vAction(tr(L"含藍屏傾印檔的回報"), tr(L"需要管理員權限"), ReportFullId));
-    v.push_back(vAction(tr(L"記錄剛剛發生的問題"), tr(L"卡頓或異常時按"), MarkProblemId));
-    v.push_back(vAction(tr(L"開啟記錄資料夾"), L"", StabilityFolderId));
-    v.push_back(vNote(stabilityStatusNote()));
+    } else if (view == 2) {
+        for (auto& block : controlCheckBlocks()) v.push_back(std::move(block));
+    } else {
+        v.push_back(vGrid({{tr(L"建立回報包"), stab::reportBusy ? tr(L"建立中…") : tr(L"存到桌面"), ReportId, -1, Green},
+            {tr(L"含藍屏傾印"), tr(L"需要管理員權限"), ReportFullId, -1}, {tr(L"記錄剛發生的問題"), tr(L"卡頓或異常時按"), MarkProblemId, -1},
+            {tr(L"記錄資料夾"), tr(L"開啟"), StabilityFolderId, -1}}));
+        int listed = 0;
+        for (const auto& i : list) {
+            if (i.when() < since || listed >= 3) continue;
+            ++listed;
+            v.push_back(vCard(incidentTitle(i), relativeTime(i.when()), incidentCardText(i), incidentTone(i)));
+        }
+        v.push_back(vNote(stabilityStatusNote()));
+    }
+    fitCards(v);
     showChartPage(InlinePage::stability, tr(L"穩定性"), stabilitySummary(), std::move(v));
 }
 // The home page's stability line when all is well (a banner takes its place otherwise).
@@ -9891,6 +9954,20 @@ LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             setNotice(tr(L"這台電腦上功耗上限設了之後還原不回來，已停用這個選項。「重新啟動」電腦可以清除目前的上限。"));
             return 0;
         }
+        if (id >= PageView0Id && id <= PageView0Id + 3) {
+            const int k = id - PageView0Id, before = pageViews[int(inlinePage)];
+            if (k == before) return 0;
+            pageViews[int(inlinePage)] = k; viewSwitching = true; viewSwitchDir = k > before ? 1 : -1;
+            switch (inlinePage) {
+            case InlinePage::goal: showGoalPage(); break;
+            case InlinePage::hardware: showHardwarePage(); break;
+            case InlinePage::history: showHistoryPage(); break;
+            case InlinePage::stability: showStabilityPage(); break;
+            default: break;
+            }
+            viewSwitching = false;
+            return 0;
+        }
         if (id == FanPageId) { fanDraft.clear(); fanEditModeIndex = -1; showMain(); showFanPage(); return 0; }
         if (id >= FanEditFan0Id && id <= FanEditFan0Id + 2) { fanEditFan = bs::asus::Fan(id - FanEditFan0Id); fanDraft.clear(); showFanPage(); return 0; }
         if (id >= FanEditMode0Id && id <= FanEditMode0Id + 2) { fanEditModeIndex = id - FanEditMode0Id; fanDraft.clear(); showFanPage(); return 0; }
@@ -10950,13 +11027,18 @@ bool panelSelfTest(const std::wstring& path) {
     SendMessageW(mainWindow, WM_COMMAND, SettingsPageId, 0);
     const auto themeBefore = themeChoice;
     check("settings_page_lists_every_option", inlinePage == InlinePage::settings && IsWindowVisible(visualView) && !IsWindowVisible(inlineText) &&
-        visualBlocks.size() >= std::size(settingRows) + 3 && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return int(b.amount) == UiDiagId; }));
-    check("settings_switches_are_switches", std::count_if(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::action && b.toggle >= 0; }) == 7 &&
-        std::none_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.amount == DynamicToggleId || b.amount == RefreshAutoId; }));
+        std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::grid
+            && b.commands.size() >= size_t(std::count_if(std::begin(settingRows), std::end(settingRows), [](const SettingRow& r) { return r.row != Row::section; })) + 1
+            && std::find(b.commands.begin(), b.commands.end(), UiDiagId) != b.commands.end(); }));
+    check("settings_switches_are_switches", std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) {
+            return b.kind == VBlock::Kind::grid && std::count_if(b.series.begin(), b.series.end(), [](double t) { return t >= 0; }) == 7
+                && std::find(b.commands.begin(), b.commands.end(), DynamicToggleId) == b.commands.end() && std::find(b.commands.begin(), b.commands.end(), RefreshAutoId) == b.commands.end(); }));
     SendMessageW(mainWindow, WM_COMMAND, SettingRowId + int(Row::theme), 0);
     check("settings_rows_do_not_change_demo_settings", themeChoice == themeBefore);
     {
         // An explanation stays folded until asked for: the row opens it in place and the page grows.
+        pageViews[int(InlinePage::hardware)] = 1;
+        SendMessageW(mainWindow, WM_COMMAND, HardwarePageId, 0);
         RECT view{}; GetClientRect(visualView, &view);
         HDC dc = GetDC(visualView);
         paintVisual(dc, view);
@@ -10967,13 +11049,15 @@ bool panelSelfTest(const std::wstring& path) {
         if (found) activateVisualHit(visualView, size_t(fold - visualHits.begin()));
         visualFolds.clear();
         const int open = found ? blockHeight(dc, closedBlock, visualWidth(view), false) : 0;
-        check("fold_opens_in_place", found && visualFoldsOpen.count(closedBlock.title) && open > closed + sp(20) && inlinePage == InlinePage::settings);
+        check("fold_opens_in_place", found && visualFoldsOpen.count(closedBlock.title) && open > closed + sp(20) && inlinePage == InlinePage::hardware);
         paintVisual(dc, view);
         const auto again = std::find_if(visualHits.begin(), visualHits.end(), [](const VHit& hit) { return hit.command == FoldCommand; });
         if (again != visualHits.end()) activateVisualHit(visualView, size_t(again - visualHits.begin()));
         visualFolds.clear();
         check("fold_closes_again", found && !visualFoldsOpen.count(closedBlock.title) && blockHeight(dc, closedBlock, visualWidth(view), false) == closed);
         ReleaseDC(visualView, dc);
+        pageViews[int(InlinePage::hardware)] = 0;
+        SendMessageW(mainWindow, WM_COMMAND, SettingsPageId, 0);
     }
     // Pages slide in from the side their tab is on.
     SendMessageW(mainWindow, WM_COMMAND, PerfPageId, 0);
@@ -11003,8 +11087,8 @@ bool panelSelfTest(const std::wstring& path) {
         const RECT first = tabRect(0, visibleTabs().size(), client);
         check("tabs_are_keys_along_the_bottom", first.top > client.bottom - tabBarHeight() && first.bottom < client.bottom);
         // The page opens with its display: the reading in dot-matrix digits.
-        check("cpu_readings_sit_in_three_wells", std::any_of(visualBlocks.begin(), visualBlocks.end(),
-            [](const VBlock& b) { return b.kind == VBlock::Kind::tiles && b.items.size() == 3; }));
+        check("cpu_readings_sit_in_four_wells", std::any_of(visualBlocks.begin(), visualBlocks.end(),
+            [](const VBlock& b) { return b.kind == VBlock::Kind::tiles && b.items.size() == 4; }));
         check("performance_page_opens_with_the_display", !visualBlocks.empty() && visualBlocks.front().kind == VBlock::Kind::display && !visualBlocks.front().value.empty());
         // Effects beyond the window: the overlay shows while something moves and is gone after;
         // light round the screen's edge the same. (The test's clock is fixed, so nothing is timing.)
@@ -11179,20 +11263,26 @@ bool panelSelfTest(const std::wstring& path) {
         SendMessageW(mainWindow, WM_COMMAND, PerfPageId, 0); // back home for the checks that follow
     }
     check("performance_mode_offers_the_mode_link", std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) {
-        return b.kind == VBlock::Kind::action && int(b.amount) == ModeLinkMenuId && b.text.find(L"Turbo") != std::wstring::npos; }) && modeLinkMenuItems().size() >= 5);
+        return b.kind == VBlock::Kind::action && int(b.amount) == ModeLinkMenuId && (b.text + b.value).find(L"Turbo") != std::wstring::npos; }) && modeLinkMenuItems().size() >= 5);
     // The demo has a blue screen this week: the home page shows a banner that leads to the stability page.
     check("performance_page_warns_of_recent_crashes", std::any_of(visualBlocks.begin(), visualBlocks.end(),
         [](const VBlock& b) { return b.kind == VBlock::Kind::banner && int(b.amount) == StabilityPageId; }));
     SendMessageW(mainWindow, WM_COMMAND, StabilityPageId, 0);
-    auto stabilityAction = [](int id) { return std::any_of(visualBlocks.begin(), visualBlocks.end(), [id](const VBlock& b) { return b.kind == VBlock::Kind::action && int(b.amount) == id; }); };
+    auto stabilityAction = [](int id) { return std::any_of(visualBlocks.begin(), visualBlocks.end(), [id](const VBlock& b) {
+        return (b.kind == VBlock::Kind::action && int(b.amount) == id) || (b.kind == VBlock::Kind::grid && std::find(b.commands.begin(), b.commands.end(), id) != b.commands.end()); }); };
+    auto stabilityView = [](int k) { pageViews[int(InlinePage::stability)] = k; showStabilityPage(); };
     auto countKind = [](VBlock::Kind kind) { return std::count_if(visualBlocks.begin(), visualBlocks.end(), [kind](const VBlock& b) { return b.kind == kind; }); };
+    // Four views side by side, none scrolls: overview, next steps, the control check, and reporting.
+    stabilityView(3);
     check("stability_page_lists_problems_and_offers_a_report", inlinePage == InlinePage::stability && activeTab() == Tab::performance
         && stabilityAction(ReportId) && stabilityAction(ReportFullId) && stabilityAction(MarkProblemId)
         && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::card && b.text.find(L"UNEXPECTED_STORE_EXCEPTION") != std::wstring::npos; }));
-    check("stability_page_has_timeline_steps_and_protection", countKind(VBlock::Kind::banner) == 1 && countKind(VBlock::Kind::timeline) == 1
-        && countKind(VBlock::Kind::check) >= 4 && countKind(VBlock::Kind::card) >= 3 && stabilityAction(ProtectToggleId)
+    stabilityView(0);
+    const bool overview = countKind(VBlock::Kind::banner) == 1 && countKind(VBlock::Kind::timeline) == 1 && countKind(VBlock::Kind::card) >= 2
         && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { // the demo crash is a few hours ago: today, or yesterday just after midnight
-            return b.kind == VBlock::Kind::timeline && b.series.size() == 30 && (int(b.series[29]) / 16 == 3 || int(b.series[28]) / 16 == 3); })
+            return b.kind == VBlock::Kind::timeline && b.series.size() == 30 && (int(b.series[29]) / 16 == 3 || int(b.series[28]) / 16 == 3); });
+    stabilityView(1);
+    check("stability_page_has_timeline_steps_and_protection", overview && countKind(VBlock::Kind::check) >= 4 && stabilityAction(ProtectToggleId)
         && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::check && b.toggle == 1; })
         && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::check && b.toggle == 0; }));
     {
@@ -11204,21 +11294,26 @@ bool panelSelfTest(const std::wstring& path) {
         ReleaseDC(visualView, dc);
         check("stability_blocks_have_heights", sized);
     }
-    // The control check: one row per control with what was seen, the ones without effect marked.
+    // The control check: one row per control with what was seen, the ones without effect marked;
+    // what each found is folded underneath so the view fits without scrolling.
+    stabilityView(2);
     check("control_check_lists_each_control_honestly", stabilityAction(VerifyControlsId)
-        && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::check && b.toggle == 1 && b.value == tr(L"有作用") && b.text.find(L"Turbo") != std::wstring::npos; })
+        && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::check && b.toggle == 1 && b.value == tr(L"有作用"); })
+        && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::fold && b.text.find(L"Turbo") != std::wstring::npos; })
         && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::check && b.toggle == 0 && b.value == tr(L"沒有作用"); })
         && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::check && b.toggle == -1 && b.value == tr(L"只能寫入"); }));
     // Protection mode shows as a banner with the way out, on the stability page and at home.
     protectState = 2;
-    showStabilityPage();
-    const bool protectOnPage = std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::banner && int(b.amount) == ProtectToggleId && b.toggle == 2; })
+    stabilityView(0);
+    const bool protectBanner = std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::banner && int(b.amount) == ProtectToggleId && b.toggle == 2; });
+    stabilityView(1);
+    const bool protectOnPage = protectBanner
         && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::action && int(b.amount) == ProtectToggleId && b.toggle == 1; });
     showPerformancePage();
     const bool protectAtHome = std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::banner && int(b.amount) == ProtectToggleId; });
     check("protection_mode_shows_a_banner_with_the_way_out", protectOnPage && protectAtHome && autoWritesPaused());
     protectState = 0;
-    showStabilityPage();
+    stabilityView(0);
     {
         RECT client{}; GetClientRect(mainWindow, &client);
         const auto tabs = visibleTabs();
@@ -11230,12 +11325,26 @@ bool panelSelfTest(const std::wstring& path) {
     SendMessageW(mainWindow, WM_COMMAND, HistoryId, 0);
     check("battery_history_belongs_to_the_battery_tab", activeTab() == Tab::ranking);
     SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
+    // The saving tab opens on its switches, one tile each; the analysis is its third view.
+    pageViews[int(InlinePage::goal)] = 0;
     SendMessageW(mainWindow, WM_COMMAND, GoalPageId, 0);
-    const auto switches = std::count_if(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::action && b.toggle >= 0; });
+    auto gridToggle = [](int id) {
+        for (const auto& b : visualBlocks) {
+            if (b.kind != VBlock::Kind::grid) continue;
+            const auto at = std::find(b.commands.begin(), b.commands.end(), id);
+            if (at != b.commands.end()) return int(b.series[size_t(at - b.commands.begin())]);
+        }
+        return -2;
+    };
+    int switches = 0;
+    for (const auto& b : visualBlocks) if (b.kind == VBlock::Kind::grid) switches += int(std::count_if(b.series.begin(), b.series.end(), [](double t) { return t >= 0; }));
     check("saving_tab_switches_each_saving", inlinePage == InlinePage::goal && switches >= 3);
-    check("saving_tab_dims_the_display_when_away", std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) {
-        return b.kind == VBlock::Kind::action && int(b.amount) == IdleDisplayToggleId && b.toggle == 1; }) && idleDisplayMenuItems().size() == 3
+    const bool dimsWhenAway = gridToggle(IdleDisplayToggleId) == 1;
+    pageViews[int(InlinePage::goal)] = 2;
+    showGoalPage();
+    check("saving_tab_dims_the_display_when_away", dimsWhenAway && idleDisplayMenuItems().size() == 3
         && std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return b.kind == VBlock::Kind::bars && !b.bars.empty() && b.bars[0].segments.size() == 2; }));
+    pageViews[int(InlinePage::goal)] = 0;
     SendMessageW(mainWindow, WM_COMMAND, InlineBackId, 0);
     // The ASUS page (preview data): every control is a row, and the key display shows without taking focus.
     SendMessageW(mainWindow, WM_COMMAND, HardwarePageId, 0);
@@ -11245,10 +11354,17 @@ bool panelSelfTest(const std::wstring& path) {
     auto hasKeys = [](int first) {
         return std::any_of(visualBlocks.begin(), visualBlocks.end(), [&](const VBlock& b) { return b.kind == VBlock::Kind::segments && !b.commands.empty() && b.commands[0] == first; });
     };
-    // Everything on the page: small choices as keys (charge limit, keyboard, power limit, fans), switches, and the rest as rows.
-    check("hardware_page_offers_every_control", inlinePage == InlinePage::hardware && !hasAction(tr(L"效能模式")) && hasKeys(Charge60Id)
-        && hasKeys(Keyboard0Id) && hasKeys(PowerPreset0Id) && hasKeys(FanPreset0Id) && hasAction(tr(L"Fn 鎖定")) && hasAction(tr(L"Slash 燈效"))
-        && hasAction(tr(L"由 BatteryScope 接手華碩按鍵")) && hasAction(tr(L"華碩服務")));
+    auto inGrid = [](int id) {
+        return std::any_of(visualBlocks.begin(), visualBlocks.end(), [id](const VBlock& b) { return b.kind == VBlock::Kind::grid && std::find(b.commands.begin(), b.commands.end(), id) != b.commands.end(); });
+    };
+    // Everything across the three views: small choices as keys (fans; power limit, charge limit; keyboard), and tiles for the rest.
+    const bool fanView = inlinePage == InlinePage::hardware && hasKeys(FanPreset0Id) && !hasAction(tr(L"效能模式"));
+    pageViews[int(InlinePage::hardware)] = 1; showHardwarePage();
+    const bool powerView = hasKeys(PowerPreset0Id) && hasKeys(Charge60Id);
+    pageViews[int(InlinePage::hardware)] = 2; showHardwarePage();
+    const bool keyView = hasKeys(Keyboard0Id) && inGrid(FnLockId) && inGrid(HwSlashMenuId) && inGrid(KeysHandleId) && inGrid(HwServicesMenuId);
+    pageViews[int(InlinePage::hardware)] = 0; showHardwarePage();
+    check("hardware_page_offers_every_control", fanView && powerView && keyView);
     // The ⋯ menu is one level: no submenus.
     {
         const auto menu = mainMenuItems();
@@ -11712,6 +11828,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     }
     if (screenshot && option(L"--details") && !current.processes.empty()) showDetails(current.processes.front());
     if (screenshot && option(L"--power-details")) showPowerDetails();
+    // --view1..--view3: which view of a page with views to show.
+    for (int k = 1; k <= 3; ++k)
+        if (screenshot && option((L"--view" + std::to_wstring(k)).c_str()))
+            for (const auto page : {InlinePage::goal, InlinePage::hardware, InlinePage::history, InlinePage::stability}) pageViews[int(page)] = k;
     if (screenshot && option(L"--candidates")) showReviewCandidates();
     if (screenshot && option(L"--ledger")) showLedger();
     if (screenshot && option(L"--power-mode")) showPowerModePage();
@@ -11727,6 +11847,30 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (screenshot && (option(L"--down") || option(L"--down2") || option(L"--down3"))) { visualSlideAt = -1; visualScroll = sp(option(L"--down3") ? 1410 : option(L"--down2") ? 940 : 470); }
     if (screenshot && option(L"--stability")) showStabilityPage();
     if (screenshot && option(L"--lab")) showLabPage();
+    // --measure: how tall each chart page is against the room it has (logical pixels), to a text file
+    // next to the screenshot.
+    if (screenshot && option(L"--measure")) {
+        std::wstring path = args[1]; if (path.size() > 4) path.resize(path.size() - 4);
+        std::ofstream out{std::filesystem::path(path + L"_measure.txt")};
+        const std::pair<const char*, void (*)()> pages[] = {{"performance", showPerformancePage}, {"saving", showGoalPage}, {"battery-record", showHistoryPage},
+            {"hardware", showHardwarePage}, {"lab", showLabPage}, {"settings", showSettingsPage}, {"stability", showStabilityPage}};
+        for (const auto& [name, show] : pages) for (int view = 0; view < 4; ++view) {
+            for (const auto page : {InlinePage::goal, InlinePage::hardware, InlinePage::history, InlinePage::stability}) pageViews[int(page)] = view;
+            show();
+            if (view && !std::any_of(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return !b.commands.empty() && b.commands[0] == PageView0Id; })) break;
+            if (view && view >= int(std::find_if(visualBlocks.begin(), visualBlocks.end(), [](const VBlock& b) { return !b.commands.empty() && b.commands[0] == PageView0Id; })->commands.size())) break;
+            RECT r{}; GetClientRect(visualView, &r);
+            HDC dc = GetDC(visualView);
+            int total = 0; std::string blocks;
+            for (size_t i = 0; i < visualBlocks.size(); ++i) {
+                const int h = blockHeight(dc, visualBlocks[i], visualWidth(r), i == 0);
+                total += h;
+                blocks += " " + std::to_string(int(visualBlocks[i].kind)) + ":" + std::to_string(h * 96 / int(dpi));
+            }
+            ReleaseDC(visualView, dc);
+            out << name << "#" << view << " content=" << total * 96 / int(dpi) << " room=" << r.bottom * 96 / int(dpi) << " blocks=" << blocks << "\n";
+        }
+    }
     // --page-scroll <n>: a chart page scrolled down by n (unscaled) pixels, to capture its lower part.
     if (screenshot && option(L"--open-folds")) { for (const auto& b : visualBlocks) if (b.kind == VBlock::Kind::fold) visualFoldsOpen.insert(b.title); visualFolds.clear(); }
     if (screenshot) for (size_t i = 0; i + 1 < args.size(); ++i) if (args[i] == L"--page-scroll") { visualScroll = sp(_wtoi(args[i + 1].c_str())); if (visualView) InvalidateRect(visualView, nullptr, FALSE); }
