@@ -6671,7 +6671,7 @@ std::vector<VBlock> goalBlocks() {
             if (demo || isolatedPreview) { battery = 9.4; cpu = 2.6; }
             if ((onBattery || demo || isolatedPreview) && battery && cpu && *battery > 0) {
                 const double package = std::min(*cpu, *battery), rest = std::max(0.0, *battery - package);
-            
+
                 VBar bar; bar.label = L"CPU " + number(package, 1) + tr(L" W · 螢幕與其他 ") + number(rest, 1) + L" W";
                 bar.value = number(*battery, 1) + L" W";
                 bar.segments = {{package, Green}, {rest, blend(theme.warn, Surface, .25)}};
